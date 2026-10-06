@@ -1,0 +1,323 @@
+{
+  "day": 15,
+  "generatedAt": "2026-10-04T06:22:07.166Z",
+  "sketch": null,
+  "evaluation": null,
+  "topics": [
+    {
+      "category": "LLD",
+      "number": 15,
+      "title": "Design Wallet / Payment System",
+      "concepts": "State, Strategy, transactions, idempotency",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "user",
+            "label": "User",
+            "x": 0,
+            "y": 0,
+            "w": 110,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "wallet",
+            "label": "WalletService",
+            "x": 250,
+            "y": 0,
+            "w": 160,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "idem",
+            "label": "Idempotency Store",
+            "x": 560,
+            "y": 0,
+            "w": 180,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "acct",
+            "label": "Wallet Account",
+            "x": 250,
+            "y": 150,
+            "w": 160,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "ledger",
+            "label": "Ledger Entries",
+            "x": 560,
+            "y": 150,
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "gw",
+            "label": "PaymentGateway",
+            "x": 0,
+            "y": 150,
+            "w": 160,
+            "h": 50,
+            "shape": "ellipse"
+          },
+          {
+            "id": "txn",
+            "label": "Txn State",
+            "x": 250,
+            "y": 280,
+            "w": 150,
+            "h": 50,
+            "shape": "ellipse"
+          }
+        ],
+        "edges": [
+          {
+            "from": "user",
+            "to": "wallet",
+            "label": "transfer(key)"
+          },
+          {
+            "from": "wallet",
+            "to": "idem",
+            "label": "check key"
+          },
+          {
+            "from": "wallet",
+            "to": "acct",
+            "label": "lock & update"
+          },
+          {
+            "from": "acct",
+            "to": "ledger",
+            "label": "append debit/credit"
+          },
+          {
+            "from": "wallet",
+            "to": "gw",
+            "label": "top-up"
+          },
+          {
+            "from": "wallet",
+            "to": "txn",
+            "label": "transitions"
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nDesign a digital wallet like Paytm or PhonePe: users top up from a bank or card, pay merchants, transfer to other users, and see a history. Money moves must be **atomic**, **idempotent** and **auditable**. This combines a transaction **State machine**, **Strategy** for payment instruments, and careful concurrency.\n\n## Requirements\n\n**Functional**\n- Create a wallet, top up via a gateway, pay a merchant, P2P transfer, withdraw to a bank, view the statement.\n- Limits (per-transaction, daily, KYC tier). Refunds and reversals.\n\n**Non-functional**\n- Never lose or create money. Balances must match the ledger exactly.\n- Client retries must not double-charge. Concurrent transfers must not overdraw.\n\n## Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Wallet` | id, user, `balance` (derived or cached), status, version |\n| `LedgerEntry` | Immutable: txnId, walletId, `DEBIT/CREDIT`, amount, balanceAfter |\n| `Transaction` | id, type, amount, from, to, `TxnState`, idempotencyKey |\n| `TxnState` | `INITIATED → PROCESSING → SUCCESS / FAILED → REVERSED` |\n| `PaymentInstrument` (Strategy) | `Card`, `UPI`, `NetBanking` for top-ups |\n| `IdempotencyStore` | key → result (first result wins) |\n| `LimitPolicy` | Chain of checks: KYC tier, daily cap, velocity |\n\n## Design decisions & trade-offs\n\n**1. Double-entry ledger as the source of truth.** Each transfer writes two entries (debit A, credit B) that sum to zero, in one transaction. A balance is the sum of entries. Cache it on the wallet row for speed, but you can always rebuild and reconcile it.\n\n**2. Atomic transfer without deadlocks.**\n```java\nvoid transfer(Wallet a, Wallet b, Money amt) {\n    Wallet first = a.id().compareTo(b.id()) < 0 ? a : b, second = first == a ? b : a;\n    synchronized (first) { synchronized (second) {\n        if (a.balance().lt(amt)) throw new InsufficientFunds();\n        a.debit(amt); b.credit(amt); ledger.append(/* two entries */);\n    }}\n}\n```\nLock in a global order (by ID) to avoid A→B / B→A deadlock. In a DB: `SELECT … FOR UPDATE` in ID order, or a conditional `UPDATE wallet SET balance = balance - :x WHERE id=:a AND balance >= :x`.\n\n**3. Idempotency.** The client sends `Idempotency-Key`. The first request stores `key → PROCESSING`, then the result. Retries return the stored result. The key's insert must be atomic (unique constraint).\n\n**4. External top-ups are a State machine.** Gateway calls are slow and may time out with an unknown outcome. Mark the transaction `PROCESSING`, credit the wallet only on a confirmed webhook or status poll, and reconcile pending ones on a schedule.\n\n**5. Reversal, never deletion.** A refund is a new transaction with opposite entries. The ledger is append-only for audit.\n\n## Follow-up questions\n\n1. The gateway times out: did the money move? How do you find out and fix it?\n2. Why is double-entry better than `UPDATE balance` alone?\n3. Two transfers out of the same wallet hit at once with just enough for one. Walk through it.\n4. Implement daily limits that are correct under concurrency.\n5. How do you produce an end-of-day reconciliation report?\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    },
+    {
+      "category": "HLD",
+      "number": 15,
+      "title": "Distributed Job Scheduler",
+      "concepts": "Scheduling, workers, queues, leader election, retries",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "api",
+            "label": "Job API",
+            "x": 0,
+            "y": 0,
+            "w": 120,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "store",
+            "label": "Job Store (next_run idx)",
+            "x": 200,
+            "y": 0,
+            "w": 210,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "sched",
+            "label": "Scheduler (leader)",
+            "x": 200,
+            "y": 150,
+            "w": 180,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "zk",
+            "label": "Leader Election (etcd)",
+            "x": 0,
+            "y": 150,
+            "w": 170,
+            "h": 50,
+            "shape": "ellipse"
+          },
+          {
+            "id": "queue",
+            "label": "Ready Queue",
+            "x": 500,
+            "y": 150,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "workers",
+            "label": "Worker Pool",
+            "x": 500,
+            "y": 0,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "dlq",
+            "label": "Retry / DLQ",
+            "x": 500,
+            "y": 280,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
+          }
+        ],
+        "edges": [
+          {
+            "from": "api",
+            "to": "store",
+            "label": "register"
+          },
+          {
+            "from": "sched",
+            "to": "store",
+            "label": "poll due jobs"
+          },
+          {
+            "from": "zk",
+            "to": "sched",
+            "label": "lease"
+          },
+          {
+            "from": "sched",
+            "to": "queue",
+            "label": "enqueue"
+          },
+          {
+            "from": "queue",
+            "to": "workers",
+            "label": "pull"
+          },
+          {
+            "from": "workers",
+            "to": "dlq",
+            "label": "on failure"
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nDesign a distributed job scheduler (like a cloud cron, Airflow's scheduler core, or Quartz at scale): users register one-off and recurring jobs; the system triggers them on time, runs them on a worker fleet, retries failures and ensures a job isn't run twice by accident. The key topics are **scheduling**, **workers and queues**, **leader election** and **retries/exactly-once semantics**.\n\n## Requirements\n\n**Functional**\n- Create jobs: a cron expression or a one-time `runAt`, payload or command, timeout, retry policy, optional dependencies.\n- Execute on time (± a few seconds). Track runs (status, logs). Cancel or pause.\n\n**Non-functional**\n- Millions of jobs; tens of thousands firing per minute at peaks (on-the-hour spikes).\n- No missed runs when nodes die. Avoid duplicate runs (or make them harmless).\n\n## Architecture\n\n- **Job store** (SQL or a partitioned KV) with an index on `next_run_at`.\n- **Scheduler**: poll for due jobs (`next_run_at <= now`) in small batches, enqueue a *run* to a queue, and compute the next `next_run_at` (for cron) in the same transaction.\n- **Partitioning**: shard jobs by `jobId` hash across N scheduler partitions. Each partition is owned by one scheduler instance via **leader election / leases** (etcd, ZooKeeper, or a DB lease row). That gives horizontal scale without double-dispatch.\n- **Workers** pull runs from the queue, heartbeat while running, write results, and ack. Failed runs are retried with backoff, then go to a DLQ.\n- An optional **timing wheel** in memory holds jobs due in the next minute for precise firing.\n\n## Key design decisions & trade-offs\n\n**1. Claiming due jobs safely.** Multiple scheduler replicas could pick up the same row. Either use partition ownership via leases, or atomically claim with `UPDATE … SET status='ENQUEUED', owner=? WHERE id=? AND status='SCHEDULED'` / `SELECT … FOR UPDATE SKIP LOCKED`.\n\n**2. Exactly-once is a myth; aim for at-least-once plus idempotency.** A worker can finish the job and crash before acking, so the run is retried. Give each run a `runId` (jobId + scheduled time) that the job uses as an idempotency key.\n\n**3. Worker failure detection.** Workers renew a visibility timeout or heartbeat. If it expires, the run is re-queued. Pick the timeout from the job's expected duration plus margin; too short gives duplicates, too long delays recovery.\n\n**4. Thundering herd at :00.** Many cron jobs fire on the hour. Spread them with jitter when allowed, pre-fetch due jobs slightly early into the timing wheel, and autoscale workers on queue depth.\n\n**5. Missed runs after downtime.** Define a policy per job: run once to catch up, run all missed, or skip.\n\n**6. DAG dependencies.** For workflows, a run becomes ready only when its upstream runs succeed. Store dependencies and evaluate on completion events.\n\n## Follow-up questions\n\n1. The leader of partition 7 crashes mid-dispatch. What happens to its jobs?\n2. How do you guarantee a \"send monthly invoice\" job doesn't email customers twice?\n3. Support 100k jobs that all fire at midnight UTC.\n4. How would you implement job timeouts and kill runaway jobs?\n5. Design priority classes so critical jobs aren't starved by batch jobs.\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    },
+    {
+      "category": "AI",
+      "number": 15,
+      "title": "MCP / MCP Client/Server",
+      "concepts": "Tools/resources/prompts, remote tool ecosystems",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "host",
+            "label": "AI App (MCP Client)",
+            "x": 0,
+            "y": 130,
+            "w": 190,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "s1",
+            "label": "MCP Server: Jira",
+            "x": 360,
+            "y": 0,
+            "w": 190,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "s2",
+            "label": "MCP Server: DB",
+            "x": 360,
+            "y": 130,
+            "w": 190,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "s3",
+            "label": "MCP Server: Files",
+            "x": 360,
+            "y": 260,
+            "w": 190,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "prims",
+            "label": "Tools · Resources · Prompts",
+            "x": 640,
+            "y": 130,
+            "w": 120,
+            "h": 50,
+            "shape": "ellipse"
+          },
+          {
+            "id": "llm",
+            "label": "LLM",
+            "x": 0,
+            "y": 0,
+            "w": 110,
+            "h": 50,
+            "shape": "ellipse"
+          }
+        ],
+        "edges": [
+          {
+            "from": "llm",
+            "to": "host",
+            "label": "tool calls"
+          },
+          {
+            "from": "host",
+            "to": "s1",
+            "label": "stdio / HTTP"
+          },
+          {
+            "from": "host",
+            "to": "s2",
+            "label": "JSON-RPC"
+          },
+          {
+            "from": "host",
+            "to": "s3"
+          },
+          {
+            "from": "s2",
+            "to": "prims",
+            "label": "exposes"
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nExplain the Model Context Protocol (MCP): an open standard for connecting AI applications to external tools and data through a common client-server protocol, instead of bespoke integrations per app. Cover its primitives (tools, resources, prompts), transports, how MCP clients and servers are built with Spring AI, and the security implications of remote tool ecosystems.\n\n## Requirements\n\n- The problem MCP solves (M apps × N integrations becomes M + N).\n- Roles: host/client and server. Primitives: **tools** (actions), **resources** (readable context), **prompts** (reusable templates).\n- Transports: stdio for local processes, Streamable HTTP for remote servers.\n- Spring AI MCP client and server starters, and exposing `@Tool` methods via an MCP server.\n- Security: auth, least privilege, tool poisoning, trust boundaries.\n\n## Key concepts\n\n| Concept | Meaning |\n|---|---|\n| **MCP server** | Wraps a system (Jira, Postgres, file system) and advertises capabilities |\n| **MCP client** | Inside the AI app; connects to servers, lists tools/resources, invokes them |\n| **Tools** | Model-invoked functions with JSON-schema inputs |\n| **Resources** | URI-addressed data the app can read into context (files, records) |\n| **Prompts** | Server-provided templates users can pick |\n| **Protocol** | JSON-RPC 2.0 messages; capability negotiation on initialise |\n\n```java\n// Server side: expose existing Spring beans' @Tool methods over MCP\n// (spring-ai-starter-mcp-server-webmvc)\n@Bean\nToolCallbackProvider tradeTools(TradeLookupService svc) {\n  return MethodToolCallbackProvider.builder().toolObjects(svc).build();\n}\n\n// Client side: (spring-ai-starter-mcp-client) servers configured in application.yml;\n// discovered tools are plugged into ChatClient\nString answer = chatClient.prompt()\n    .user(\"Summarise open P1 incidents\")\n    .toolCallbacks(mcpToolCallbackProvider)\n    .call().content();\n```\n\n## Design decisions & trade-offs\n\n1. **Standard interface vs. direct tools.** MCP shines when many AI apps (IDE assistants, chatbots, agents) need the same integrations, or when you consume third-party servers. For a single app with three internal tools, plain `@Tool` methods are simpler.\n2. **Local (stdio) vs. remote (HTTP).** Stdio servers run as child processes with the user's local permissions, which is easy and powerful. Remote servers centralise access, auth and audit, which is better for enterprise governance.\n3. **Security is the main concern.** A server's tool descriptions go straight into the model's context. A malicious or compromised server can inject instructions (tool poisoning). Only connect to trusted, vetted servers. Pin versions. Require OAuth or mTLS for remote servers. Scope credentials per user.\n4. **Least privilege per server.** A \"database\" MCP server should expose specific read-only queries or views, not arbitrary SQL with admin rights.\n5. **Tool overload.** Connecting 10 servers might add 200 tools, which hurts selection accuracy and token cost. Filter or allow-list tools per use case.\n6. **Observability.** Log every MCP call (who, which tool, arguments, result size) for audit, just like any API gateway.\n\n## Follow-up questions\n\n1. Explain the difference between an MCP tool and an MCP resource with an example.\n2. How would you expose an internal trade-lookup service to multiple AI assistants via MCP securely?\n3. What is tool poisoning, and how do you defend against it?\n4. When is MCP overkill?\n5. How do per-user permissions flow through a remote MCP server?\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    }
+  ]
+}

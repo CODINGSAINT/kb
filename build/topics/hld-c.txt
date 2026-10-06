@@ -1,0 +1,358 @@
+=== HLD 15 ===
+N|api|Job API|0|0|120
+N|store|Job Store (next_run idx)|200|0|210|cylinder
+N|sched|Scheduler (leader)|200|150|180
+N|zk|Leader Election (etcd)|0|150|170|ellipse
+N|queue|Ready Queue|500|150|150|cylinder
+N|workers|Worker Pool|500|0|150
+N|dlq|Retry / DLQ|500|280|150|cylinder
+E|api|store|register
+E|sched|store|poll due jobs
+E|zk|sched|lease
+E|sched|queue|enqueue
+E|queue|workers|pull
+E|workers|dlq|on failure
+---
+## Problem
+
+Design a distributed job scheduler (like a cloud cron, Airflow's scheduler core, or Quartz at scale): users register one-off and recurring jobs; the system triggers them on time, runs them on a worker fleet, retries failures and ensures a job isn't run twice by accident. The key topics are **scheduling**, **workers and queues**, **leader election** and **retries/exactly-once semantics**.
+
+## Requirements
+
+**Functional**
+- Create jobs: a cron expression or a one-time `runAt`, payload or command, timeout, retry policy, optional dependencies.
+- Execute on time (± a few seconds). Track runs (status, logs). Cancel or pause.
+
+**Non-functional**
+- Millions of jobs; tens of thousands firing per minute at peaks (on-the-hour spikes).
+- No missed runs when nodes die. Avoid duplicate runs (or make them harmless).
+
+## Architecture
+
+- **Job store** (SQL or a partitioned KV) with an index on `next_run_at`.
+- **Scheduler**: poll for due jobs (`next_run_at <= now`) in small batches, enqueue a *run* to a queue, and compute the next `next_run_at` (for cron) in the same transaction.
+- **Partitioning**: shard jobs by `jobId` hash across N scheduler partitions. Each partition is owned by one scheduler instance via **leader election / leases** (etcd, ZooKeeper, or a DB lease row). That gives horizontal scale without double-dispatch.
+- **Workers** pull runs from the queue, heartbeat while running, write results, and ack. Failed runs are retried with backoff, then go to a DLQ.
+- An optional **timing wheel** in memory holds jobs due in the next minute for precise firing.
+
+## Key design decisions & trade-offs
+
+**1. Claiming due jobs safely.** Multiple scheduler replicas could pick up the same row. Either use partition ownership via leases, or atomically claim with `UPDATE … SET status='ENQUEUED', owner=? WHERE id=? AND status='SCHEDULED'` / `SELECT … FOR UPDATE SKIP LOCKED`.
+
+**2. Exactly-once is a myth; aim for at-least-once plus idempotency.** A worker can finish the job and crash before acking, so the run is retried. Give each run a `runId` (jobId + scheduled time) that the job uses as an idempotency key.
+
+**3. Worker failure detection.** Workers renew a visibility timeout or heartbeat. If it expires, the run is re-queued. Pick the timeout from the job's expected duration plus margin; too short gives duplicates, too long delays recovery.
+
+**4. Thundering herd at :00.** Many cron jobs fire on the hour. Spread them with jitter when allowed, pre-fetch due jobs slightly early into the timing wheel, and autoscale workers on queue depth.
+
+**5. Missed runs after downtime.** Define a policy per job: run once to catch up, run all missed, or skip.
+
+**6. DAG dependencies.** For workflows, a run becomes ready only when its upstream runs succeed. Store dependencies and evaluate on completion events.
+
+## Follow-up questions
+
+1. The leader of partition 7 crashes mid-dispatch. What happens to its jobs?
+2. How do you guarantee a "send monthly invoice" job doesn't email customers twice?
+3. Support 100k jobs that all fire at midnight UTC.
+4. How would you implement job timeouts and kill runaway jobs?
+5. Design priority classes so critical jobs aren't starved by batch jobs.
+
+=== HLD 16 ===
+N|apps|Apps/Agents|0|130|130
+N|kafka|Kafka (buffer)|200|130|150|cylinder
+N|proc|Stream Processors|430|130|170
+N|hot|Hot store (OpenSearch)|650|0|110|cylinder
+N|cold|Cold store (S3/Parquet)|650|260|110|cylinder
+N|query|Query + Alerting|430|0|170|ellipse
+E|apps|kafka|ship logs
+E|kafka|proc|consume
+E|proc|hot|index 7d
+E|proc|cold|archive
+E|query|hot|search
+E|query|cold|on demand
+---
+## Problem
+
+Design a centralised logging and monitoring system (like ELK, Splunk or Datadog Logs): collect logs from thousands of services and hosts, make them searchable within seconds, alert on patterns and keep them affordably for months. The challenges are **high-volume ingestion**, **buffering with Kafka**, **aggregation**, **tiered storage** and **querying**.
+
+## Requirements
+
+**Functional**
+- Ingest structured (JSON) and unstructured logs, with service, host, level and trace ID.
+- Full-text and field search over recent data, aggregations (errors per service), live tail.
+- Alert rules ("> 100 5xx in 1 min"). Retention per tenant (7 days hot, 1 year cold).
+
+**Non-functional**
+- Ingestion must never block or slow the apps. Tolerate bursts (incident storms).
+- Searchable within ~10 s of emission.
+
+**Scale:** 10k services emitting 5 TB/day ≈ 60 MB/s average, 5× bursts during incidents. Hot index ~35 TB for 7 days before replication.
+
+## Architecture
+
+1. **Agents** on each host (Fluent Bit, Vector) tail files or stdout, batch, compress and ship. A local disk buffer covers network blips.
+2. **Kafka** is the ingestion buffer, partitioned by service. It absorbs bursts and decouples producers from indexers.
+3. **Stream processors** parse, enrich (Kubernetes metadata), redact PII, sample noisy debug logs, derive metrics (error counts) and evaluate alert rules on the stream.
+4. **Hot store:** Elasticsearch/OpenSearch (or a columnar store like ClickHouse or Loki-style label indexes), with time-based indexes per day for cheap deletion.
+5. **Cold store:** compressed Parquet on S3, queryable with Athena/Trino when needed.
+
+## Key design decisions & trade-offs
+
+**1. Full-text index vs. label-only index.** Elasticsearch indexes every token, so search is powerful but storage and CPU cost 1.5–3× the raw size. Loki indexes only labels and scans compressed chunks, which is much cheaper but slower for needle-in-haystack searches. Pick per use case or tier.
+
+**2. Backpressure and loss policy.** When the pipeline is behind, Kafka retention buys hours. Agents drop DEBUG before ERROR. Never block the application thread on logging (async appenders with bounded buffers).
+
+**3. Time-partitioned indexes.** Daily indexes make retention a cheap "drop index". Rollover by size handles hot days. Queries hit only the relevant time ranges.
+
+**4. Metrics derived from logs.** Counting errors by scanning logs at query time is expensive. Derive metrics in the stream and send them to a time-series DB (next topic). Use logs for detail.
+
+**5. Multi-tenancy.** Quotas per tenant on ingest rate and storage, so one noisy service can't evict others' data or starve indexing.
+
+**6. Correlation.** Inject trace IDs everywhere, so logs, metrics and traces link up during an incident.
+
+## Follow-up questions
+
+1. An incident causes 20× log volume. Walk through what each layer does.
+2. Elasticsearch vs. Loki vs. ClickHouse for logs: when would you choose each?
+3. How do you redact credit card numbers before they're stored?
+4. Design alerting with deduplication so on-call isn't paged 500 times.
+5. How do you make a 6-month-old log searchable cheaply?
+
+=== HLD 17 ===
+N|targets|Services/Hosts|0|130|150
+N|collect|Collectors (push/scrape)|200|130|200
+N|ingest|Ingest + WAL|470|0|150|cylinder
+N|tsdb|TSDB (Gorilla compressed)|470|130|210|cylinder
+N|down|Downsampler 1m→1h|470|270|190
+N|query|Query (PromQL) + Dashboards|200|270|230|ellipse
+E|targets|collect|metrics
+E|collect|ingest|batches
+E|ingest|tsdb|blocks
+E|tsdb|down|rollup
+E|query|tsdb|range query
+---
+## Problem
+
+Design a metrics / time-series monitoring system (like Prometheus at scale, Datadog metrics or M3): collect numeric measurements (CPU, request rate, latency percentiles) from many services, store them efficiently, power dashboards and alerts, and keep long-term history cheaply. The specialist topics are **time-series storage**, **compression**, **aggregation**, **retention and downsampling**, and **cardinality**.
+
+## Requirements
+
+**Functional**
+- Ingest `(metric name, labels, timestamp, value)` samples every 10–60 s.
+- Query ranges with aggregation (`sum by (service) (rate(http_requests_total[5m]))`), percentiles, dashboards.
+- Alert rules evaluated every ~30 s. Retention: raw 15 days, 1-minute rollups for a year.
+
+**Non-functional**
+- Write-heavy and append-only. Dashboards return in < 1 s for common queries.
+
+**Scale:** 10M active series × 1 sample/10 s = **1M samples/s**. At ~1.5 bytes per sample after compression, that's ~130 GB/day.
+
+## Architecture
+
+- **Collection:** pull (Prometheus scrapes `/metrics`) or push (agents, StatsD/OTel). A push gateway is used for short-lived jobs.
+- **Ingest:** a distributor hashes the series ID (name + sorted labels) to ingester shards (consistent hashing, replication factor 3). Ingesters keep recent data in memory with a **write-ahead log** and periodically flush immutable **blocks** (2 h) to object storage.
+- **Storage format:** per series, timestamps delta-of-delta encoded and values XOR-compressed (Facebook **Gorilla**), giving ~1.3 bytes/sample. An inverted index from label to series IDs answers selectors.
+- **Compaction and downsampling:** background jobs merge blocks and create 5-minute and 1-hour rollups (min, max, sum, count, so averages stay correct).
+- **Query layer:** fans out to ingesters (recent) and the store (historical), merges, and caches results by time-aligned step.
+
+## Key design decisions & trade-offs
+
+**1. Pull vs. push.** Pull gives easy health detection ("target down") and central control, but needs service discovery and struggles across firewalls and with short jobs. Push suits ephemeral and edge workloads, but you must protect against floods.
+
+**2. Cardinality is the real scaling limit.** Labels like `userId` or `requestId` create millions of series and blow memory and the index. Enforce label limits per metric and reject or aggregate high-cardinality labels at ingest.
+
+**3. Percentiles.** You can't average p99s across hosts. Store **histograms** (fixed buckets, or sketches like DDSketch or t-digest) and compute quantiles at query time from merged buckets.
+
+**4. Downsampling trade-off.** Rollups make year-long queries cheap but lose spikes. Keep min and max alongside avg so peaks remain visible.
+
+**5. Why not a general SQL DB?** Generic B-trees and row storage waste space and write throughput. A TSDB's append-only, time-partitioned, columnar, compressed design is 10–50× more efficient.
+
+## Follow-up questions
+
+1. A developer adds a `userId` label and memory triples. How do you prevent and detect this?
+2. How do you compute a correct p99 latency across 500 pods?
+3. Explain delta-of-delta and XOR compression briefly.
+4. An ingester crashes. How do you avoid losing the last 2 hours?
+5. How do you query 1 year of data in under a second?
+
+=== HLD 18 ===
+N|courier|Courier app|0|0|140
+N|ingest|GPS Ingest (UDP/WS)|200|0|190
+N|kafka|Kafka (by tripId)|480|0|160|cylinder
+N|latest|Latest-position (Redis)|480|140|200|cylinder
+N|fanout|Tracking Fan-out|200|140|180
+N|customer|Customer app|0|140|140
+N|history|Route History (TSDB)|480|270|200|cylinder
+E|courier|ingest|ping 3-5s
+E|ingest|kafka|publish
+E|kafka|latest|update
+E|kafka|history|append
+E|kafka|fanout|subscribers
+E|fanout|customer|WS push
+---
+## Problem
+
+Design live ride or delivery tracking (Uber "your driver is 3 min away", Swiggy/Zomato order map, Dunzo): ingest GPS pings from millions of moving drivers or couriers, show the live position and ETA to the right customers in real time, and store routes for later. The focus is **high-frequency GPS ingestion**, **geo queries**, **real-time push (WebSockets)** and smoothing noisy data.
+
+## Requirements
+
+**Functional**
+- Couriers send location every 3–5 s during an active trip or order.
+- Customers watching an order see the courier's position update smoothly and a live ETA.
+- Ops dashboards: all couriers in a zone. History replay for disputes.
+
+**Non-functional**
+- End-to-end latency (ping to customer screen) < 2–3 s.
+- Ingest must absorb millions of pings per second. Occasional lost pings are acceptable.
+
+**Scale:** 2M active couriers ÷ 4 s ≈ 500k pings/s, ~100 bytes each, so ~50 MB/s. Watchers: ~1–2 per active trip.
+
+## Architecture
+
+1. **Ingest gateways** accept pings (HTTPS batch, WebSocket or MQTT). Validate, attach courier and trip IDs, and publish to **Kafka**, partitioned by `tripId` to keep per-trip order.
+2. A **latest-position store** (Redis hash or GEO) is updated by consumers: `courier → (lat, lng, ts, heading)`. A geo index per zone serves dashboards and "nearby" queries.
+3. **Tracking fan-out service:** customers open a WebSocket subscribed to `trip:{id}`. Consumers push updates to the gateway node holding that subscription (via Redis pub/sub or a routing table).
+4. An **ETA service** recomputes the ETA from position plus the road graph and traffic, periodically or when the position moves significantly.
+5. **History:** compacted route points go to a time-series or columnar store (and S3) for replay and analytics.
+
+## Key design decisions & trade-offs
+
+**1. Don't write every ping to a database.** Only the latest position is hot. Keep it in memory or Redis. Kafka buffers and fans out; history is written in batches.
+
+**2. Push vs. poll for customers.** WebSocket or SSE push gives low latency and efficiency at scale. Polling every 5 s is simpler and fine for small scale, but wasteful across millions of watchers.
+
+**3. Map matching and smoothing.** Raw GPS jumps around, especially in cities. Snap to roads (map matching, Kalman filter) and **animate interpolation** on the client between pings, so the marker glides instead of teleporting.
+
+**4. Adaptive ping rate.** Send more often when moving fast or near the destination, less when stationary. That saves battery and backend load.
+
+**5. Ordering and staleness.** Mobile networks deliver late. Use device timestamps plus sequence numbers and drop pings older than the latest seen.
+
+**6. Privacy.** Customers only see the courier during the active trip. Subscriptions are authorised per trip and expire at completion.
+
+## Follow-up questions
+
+1. A courier enters a tunnel for 2 minutes. What does the customer see?
+2. How do you route an update to the one gateway server holding a customer's socket?
+3. Design the ops dashboard showing 20k couriers in a city in real time.
+4. How do you compute and smooth the ETA so it doesn't jump around?
+5. Cost-optimise: which pings can you drop without hurting UX?
+
+=== HLD 19 ===
+N|user|User|0|0|110
+N|queue|Waiting Room|200|0|150|ellipse
+N|res|Reservation Svc|420|0|170
+N|db|Inventory DB (row lock/version)|420|150|260|cylinder
+N|hold|Hold TTL expiry|150|150|160
+N|pay|Payment|420|280|130
+N|confirm|Confirm + Ticket|150|280|160
+E|user|queue|enter
+E|queue|res|admit N/s
+E|res|db|reserve (conditional)
+E|hold|db|expire holds
+E|res|pay|charge
+E|pay|confirm|on success
+---
+## Problem
+
+Design a generic ticket or seat reservation platform (concerts, airlines, events, IRCTC-like) where inventory is scarce, demand spikes violently at sale open, and correctness is non-negotiable. Unlike HLD #13 (cinema seat maps), think of it as a reusable **inventory reservation engine** with **strong consistency**, **holds with expiry**, **transactions** and **fair admission under extreme load**.
+
+## Requirements
+
+**Functional**
+- Inventory types: assigned seats, or general admission (N identical tickets).
+- `hold(items, ttl)`, then `confirm(holdId, payment)` or `release`. Holds auto-expire.
+- Purchase limits per user, presale codes, waitlists.
+
+**Non-functional**
+- Never oversell. Never charge without a ticket.
+- Survive 1M+ users arriving at sale open for 50k tickets, and stay fair (no bot advantage).
+
+## Architecture
+
+- **Edge plus waiting room:** a CDN-hosted queue page issues signed, ordered queue tokens and admits users at a controlled rate to the shop.
+- **Reservation service:** stateless API over a strongly consistent **inventory store** (sharded SQL or a single-region strongly consistent DB), partitioned by event.
+- **Holds:** rows `(eventId, itemId, status, holdId, expiresAt)`. A hold is a conditional update. A sweeper (or lazy expiry on read) releases expired holds.
+- **Checkout:** confirm moves holds to `SOLD` in one transaction after successful payment authorisation. Payment uses idempotency keys and is captured after confirmation.
+
+## Key design decisions & trade-offs
+
+**1. Conditional writes for consistency.**
+- Assigned seats: `UPDATE seats SET status='HELD', hold_id=? WHERE event=? AND seat IN (...) AND status='AVAILABLE'`. Success only if the affected row count equals the requested count, in one transaction (all-or-nothing).
+- General admission: a counter row `remaining`, with `UPDATE … SET remaining = remaining - n WHERE remaining >= n`. Hot row contention is a problem, so **split the counter into K sub-buckets** (e.g. 50 rows of 1,000) and pick randomly.
+
+**2. Hold TTL trade-off.** Long holds (15 min) are kind to users but lock inventory from others. Short holds (5 min) mean more expired checkouts. Extend the hold once the user is actively in payment.
+
+**3. Fairness and bots.** The waiting room (randomised or FIFO from sale open), per-account limits, CAPTCHA or device attestation, and verified-fan presales. Admission rate equals the measured checkout capacity.
+
+**4. Single-writer per hot event.** For extreme events, route all writes for one event to one partition or actor that processes reservations sequentially in memory with a durable log. That gives no lock contention and deterministic ordering.
+
+**5. Payment and inventory consistency.** Authorise, then confirm the inventory, then capture. If confirm fails, void the authorisation. Reconcile stuck states (hold expired after authorisation) with automatic voids or refunds.
+
+## Follow-up questions
+
+1. 1M users, 50k tickets, sale opens at 10:00:00. Walk through the first 60 seconds.
+2. Why does a single "remaining" counter row fail under load, and how do sub-buckets help?
+3. How do you stop scalper bots without hurting real fans?
+4. A user's payment authorises but their hold expired 1 s earlier. Resolve it.
+5. Add a waitlist that auto-offers released tickets to the next person.
+
+=== HLD 20 ===
+N|client|Clients|0|130|120
+N|lb|Global LB / Anycast|180|130|180
+N|gw|Gateway nodes|430|130|150
+N|filters|Filter chain: authN, rate, transform|380|0|280|ellipse
+N|disc|Service Discovery|430|270|170|cylinder
+N|svcs|Backend Services|650|130|110
+N|obs|Logs/Metrics/Traces|650|270|110|cylinder
+E|client|lb|HTTPS
+E|lb|gw|route
+E|gw|filters|per request
+E|gw|disc|resolve
+E|gw|svcs|proxy
+E|gw|obs|emit
+---
+## Problem
+
+Design a large-scale API gateway (like Kong, AWS API Gateway, Zuul or Envoy-based edges): a single entry point that routes millions of requests per second to hundreds of backend services, handling **routing**, **authentication**, **rate limiting**, **load balancing**, **resilience** and **observability** without becoming the bottleneck or a single point of failure.
+
+## Requirements
+
+**Functional**
+- Route by host, path, header or version to backend services (with canary splits).
+- AuthN (JWT/OAuth2, API keys, mTLS), authZ scopes, rate limits per key or tenant.
+- Request and response transformation, CORS, compression, caching of safe GETs.
+- Logs, metrics and traces for every request.
+
+**Non-functional**
+- Adds < 5 ms p99. Horizontally scalable. Config changes without restarts. No global outage from one bad config.
+
+**Scale:** 2M req/s peak. At ~20k req/s per node, that's ~100+ nodes across regions.
+
+## Architecture
+
+- **Edge:** DNS or anycast to regional load balancers (L4), then a fleet of **stateless gateway nodes** (L7, Envoy/NGINX/Netty-based).
+- **Data plane (per node):** TLS termination, then a filter chain (auth, rate limit, transform, route), then the upstream connection pool with load balancing (least-requests / P2C), retries, timeouts and circuit breakers.
+- **Control plane:** config store (routes, plugins, keys) pushed to nodes via xDS or watch streams. Versioned, validated and staged for rollout.
+- **Dependencies:** service discovery (Consul, Kubernetes endpoints), the auth/JWKS cache, a distributed rate-limit store (Redis), and telemetry exporters (OTel).
+
+## Key design decisions & trade-offs
+
+**1. Keep the hot path local.** JWT verification with cached JWKS keys (no network call). Rate limits use local token buckets synchronised with Redis asynchronously, or Redis with tight timeouts and fail-open. Every remote call on the request path adds latency and a failure mode.
+
+**2. Stateless nodes.** Any node can serve any request. Scale by adding nodes, and drain gracefully on deploy. State (rate counters, sessions) lives outside.
+
+**3. Resilience patterns.** Per-route timeouts and retry budgets (never retry non-idempotent POSTs blindly), circuit breakers and outlier ejection per upstream host, and bulkheads (separate pools per backend so one slow service can't exhaust all connections).
+
+**4. Config safety.** A bad route or regex can take down everything. Validate, canary new config to a few nodes, and auto-roll back on error spikes. Keep the last known good config.
+
+**5. Gateway vs. service mesh vs. BFF.** The gateway handles north-south (external) traffic and cross-cutting edge concerns. The mesh (sidecars) handles east-west mTLS and retries. BFFs do client-specific aggregation. Don't put business logic in the gateway.
+
+**6. Observability.** Inject or propagate trace context and emit RED metrics (rate, errors, duration) per route. Sample access logs at high volume.
+
+## Follow-up questions
+
+1. The auth service is down. Which requests still work, and why?
+2. How do you roll out a route change to 1% of traffic and roll it back automatically?
+3. Retry storms: one backend is slow and the gateway retries amplify the load. Fix it.
+4. Gateway or service mesh for mTLS between internal services?
+5. Design per-tenant rate limits that are accurate across 100 nodes.

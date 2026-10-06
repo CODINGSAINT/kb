@@ -1,0 +1,246 @@
+=== LLD 17 ===
+N|game|Game|300|0|130
+N|board|Board|300|150|130
+N|dice|Dice Strategy|0|0|150|ellipse
+N|player|Player queue|0|150|150
+N|jump|Snake / Ladder (Jump)|560|150|200
+N|rules|RuleSet|600|0|130|ellipse
+E|game|dice|roll
+E|game|player|next turn
+E|game|board|move(pos+roll)
+E|board|jump|lookup jump
+E|game|rules|exact end? 6 again?
+---
+## Problem
+
+Design Snake & Ladder: N players take turns rolling dice and move along a board of 100 cells; snakes send you down, ladders send you up, and the first to reach 100 wins. Interviewers use it to test a **game-engine abstraction**: clean entities, configurable rules and **Strategy** for dice and rule variations.
+
+## Requirements
+
+- Configurable board size, snakes and ladders (validated: no cycles, nothing starting at the end cell).
+- 2+ players in a turn queue. One or more dice.
+- Rule variants: exact roll needed to finish, extra turn on a 6, three 6s forfeits the turn.
+- Report each move and the winner. Optionally continue to rank all players.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Game` | Turn loop, winner detection |
+| `Board` | size, `Map<Integer, Integer> jumps` (start → end) |
+| `Jump` (or `Snake`/`Ladder` subtypes) | start, end; a snake has end < start |
+| `Player` | name, position |
+| `Dice` (Strategy) | `StandardDice(count)`, `CrookedDice` (only even numbers), `FixedDice` for tests |
+| `RuleSet` | `ExactFinishRule`, `ExtraTurnOnSix`, `ThreeSixesForfeit` |
+| `BoardFactory` | Builds a board from config and validates it |
+
+```java
+int move(Player p, int roll) {
+    int target = p.position() + roll;
+    if (target > board.size()) return p.position();     // exact-finish rule
+    return board.jumps().getOrDefault(target, target);   // O(1) snake/ladder
+}
+```
+
+## Design decisions & trade-offs
+
+**1. Snakes and ladders are the same thing.** Both are a jump from `start` to `end`. One `Map<Integer, Integer>` handles both in O(1). Separate classes add nothing except display labels. This is a nice "avoid needless inheritance" point.
+
+**2. Dice as a Strategy.** It makes the game testable: inject `FixedDice(4, 2, 6)` to script a game. Variants (two dice, crooked dice) don't touch `Game`.
+
+**3. Rules as composable objects.** Rule toggles change between house variants. A list of `Rule` objects consulted in order (`afterRoll`, `canFinish`, `grantsExtraTurn`) keeps the turn loop stable.
+
+**4. Turn order.** Use a `Deque<Player>`: poll, play, offer back (unless they finished or forfeit). With an extra-turn rule, re-offer to the front.
+
+**5. Board validation.** Reject jumps that start at 1 or 100, jumps that land on another jump's start (chains), and two jumps from the same cell. Fail at construction, not mid-game.
+
+## Follow-up questions
+
+1. Add a power-up cell that lets a player skip the next snake.
+2. How would you make the game replayable from a log?
+3. Allow chained jumps, and detect cycles in the configuration.
+4. Run 1M simulated games to estimate the average game length. What has to change?
+5. Make it a multiplayer online game: what's server state vs. client state?
+
+=== LLD 18 ===
+N|user|Passenger|0|0|130
+N|search|SearchService|280|0|160
+N|train|Train/Schedule|580|0|160
+N|book|BookingService|280|150|160
+N|inv|Seat Inventory (segments)|540|150|220|cylinder
+N|wl|Waitlist/RAC|280|280|150|ellipse
+N|pnr|PNR Booking|0|150|140
+E|user|search|from/to/date
+E|search|train|runs?
+E|user|book|book
+E|book|inv|allocate segment
+E|book|wl|if full
+E|book|pnr|issue
+---
+## Problem
+
+Design a train reservation system like IRCTC: search trains between stations on a date, check availability per class, book seats for several passengers, handle waitlists and RAC, and cancel. The distinctive challenge is **segment-based seat allocation**: one seat can be sold Delhi→Agra and again Agra→Bhopal on the same journey. It all has to be correct under heavy **concurrency** (Tatkal rush).
+
+## Requirements
+
+**Functional**
+- Search trains by source, destination and date. Show classes, fare and availability.
+- Book up to 6 passengers on one PNR, with berth preferences.
+- Allocate a confirmed seat, else RAC, else a waitlist position. Cancellations promote waitlisted passengers.
+- Cancellation and refund rules depend on time to departure.
+
+**Non-functional**
+- No overlapping allocation of a seat on any segment. Fair under huge spikes.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Station`, `Train`, `Route` (ordered stops) | Static data |
+| `TrainRun` | Train + date: the bookable instance |
+| `Coach`, `Seat` | Layout, class and berth type |
+| `SeatInventory` | Per seat, a bitset of occupied segments (stop i → i+1) |
+| `Booking` / `PNR` | passengers, status per passenger: `CNF`, `RAC`, `WL` |
+| `WaitlistQueue` | Per run and class, FIFO; promotion on cancellation |
+| `AllocationStrategy` | Berth preference, keep a group together, minimise fragmentation |
+
+## Design decisions & trade-offs
+
+**1. Segments, not seats.** Number the stops 0..k. A journey from stop `a` to `b` occupies segments `[a, b)`. Each seat keeps a `BitSet` (or `long` bitmask when k ≤ 64). It's available iff `(mask & journeyMask) == 0`, and booking does `mask |= journeyMask`. That's O(1) per seat check.
+
+**2. Allocation strategy.** Prefer seats whose occupied segments are adjacent to the journey (best fit), so long journeys aren't blocked by scattered short bookings. This is the interval-scheduling or fragmentation trade-off, and it's worth mentioning.
+
+**3. Concurrency.** Lock per `(TrainRun, Class)` partition, not globally. Within the lock: find seats, set the masks, write the booking. At scale: a sharded inventory service per train run with a single writer per partition (an actor or queue model), which gives fairness and no lock storms during Tatkal.
+
+**4. Waitlist and RAC.** When there are no confirmed seats, use RAC (a shared side-lower berth, two passengers), then WL. On cancellation: free the segment bits, then promote RAC → CNF and WL → RAC in FIFO order, inside the same partition lock.
+
+**5. PNR status per passenger.** One PNR can be partly confirmed. Model status on each passenger, not on the booking.
+
+## Follow-up questions
+
+1. A 6-person group wants to sit together. How does allocation change?
+2. Explain how a Tatkal opening at 10:00 can be handled fairly at 1M requests per second.
+3. A cancellation and a new booking race for the same seat. Walk through it.
+4. Should waitlist promotion be synchronous with the cancellation or async?
+5. How would you compute a "chance of confirmation" for WL tickets?
+
+=== LLD 19 ===
+N|cust|Customer|0|0|130
+N|order|Order|300|0|120
+N|sm|Order State Machine|580|0|180|ellipse
+N|inv|Inventory|0|150|130|cylinder
+N|pay|Payment|300|150|130
+N|ship|Shipment|580|150|140
+N|obs|Observers: email/SMS/analytics|240|280|260
+E|cust|order|place
+E|order|sm|transition
+E|order|inv|reserve
+E|order|pay|charge
+E|order|ship|create
+E|sm|obs|publish event
+---
+## Problem
+
+Design Amazon's order management: from a cart, create an order that may hold items from several sellers and warehouses; reserve inventory, take payment, split into shipments, track each shipment, and support cancellation and returns. It brings together a **State machine**, **Observer** and **Strategy** (fulfilment and payment), plus consistency across inventory and payment.
+
+## Requirements
+
+**Functional**
+- Place an order: validate the cart, reserve inventory, charge, confirm.
+- Split into shipments by warehouse and seller, each with its own lifecycle.
+- Cancel (fully or one item) before shipping. Return and refund after delivery.
+- Notify the customer on every change.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Order` | id, customer, `List<OrderLine>`, payment, status, address snapshot |
+| `OrderLine` | product, seller, qty, price snapshot, line status |
+| `OrderState` | `CREATED → PAYMENT_PENDING → CONFIRMED → PARTIALLY_SHIPPED → SHIPPED → DELIVERED`; `CANCELLED`, `RETURN_REQUESTED → RETURNED` |
+| `Shipment` | lines, warehouse, carrier, tracking; `PACKED → SHIPPED → OUT_FOR_DELIVERY → DELIVERED` |
+| `FulfilmentStrategy` | Nearest warehouse, fewest shipments, cheapest |
+| `InventoryService` | `reserve(lines, ttl)`, `commit`, `release` |
+| `OrderEventPublisher` | Observer hub: `OrderConfirmed`, `ShipmentDelivered`, … |
+
+## Design decisions & trade-offs
+
+**1. Order status is derived from shipments and lines.** With partial shipping, an order is "shipped" only when all shipments are. Derive aggregate status from children rather than setting it independently. That prevents contradictions like "order DELIVERED, shipment still in transit".
+
+**2. Transactional flow as a saga.** Reserve inventory (with a TTL), then charge payment, then commit inventory and confirm. On payment failure, release the inventory. Each step has a compensating action, so you can explain it without a distributed transaction.
+
+**3. Observer for side effects.** The state machine publishes events. Email, SMS, loyalty points and analytics subscribe. Adding "notify the seller" doesn't touch `Order`.
+
+**4. Snapshots.** Copy price, title and address into the order. Later catalogue or address edits must not rewrite history.
+
+**5. Guarded transitions.** `cancel()` is legal only before `SHIPPED` (per line). A transition table plus `canTransition(from, to)` stops illegal moves, and an optimistic version field handles concurrent updates such as a warehouse "packed" racing a customer "cancel".
+
+## Follow-up questions
+
+1. The customer cancels one item from a 3-item, 2-shipment order. What changes?
+2. Payment succeeds but the inventory reservation expired. What now?
+3. How would you implement returns with pickup, inspection and a refund?
+4. Choose warehouses to minimise shipments versus cost. Discuss the Strategy.
+5. How do you rebuild an order's full history for customer support?
+
+=== LLD 20 ===
+N|user|User|0|0|110
+N|cal|CalendarService|260|0|170
+N|conflict|ConflictChecker|580|0|170
+N|tree|Interval Index (TreeMap)|560|150|210|cylinder
+N|meet|Meeting|260|150|130
+N|rooms|Room Allocator|0|150|160|ellipse
+N|notify|Invite Notifier|260|280|160
+E|user|cal|schedule
+E|cal|conflict|check attendees
+E|conflict|tree|overlaps?
+E|cal|meet|create
+E|cal|rooms|find room
+E|meet|notify|invites/RSVP
+---
+## Problem
+
+Design a calendar and meeting scheduler like Google Calendar: create events, invite attendees, detect conflicts, find free slots common to all attendees, book rooms, and handle recurring meetings and RSVPs. The core is **interval algorithms** (overlap detection and free-slot search) plus **concurrency** when two people book the same room.
+
+## Requirements
+
+**Functional**
+- Create, update and cancel meetings with attendees, a time range, a room and an optional recurrence.
+- Detect conflicts for attendees and rooms. Suggest the earliest common free slot of length D.
+- RSVP (accept, decline, tentative). Notifications and reminders.
+
+**Non-functional**
+- A room can never be double-booked. Searching across many attendees must be fast.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Interval` (record) | start, end (half-open `[s, e)`), `overlaps(other)` |
+| `Meeting` | id, organiser, attendees, interval, room, recurrence rule |
+| `Calendar` | Per user: `TreeMap<Instant, Meeting>` keyed by start |
+| `Room` + `RoomCalendar` | Same structure, plus capacity and features |
+| `ConflictChecker` | `hasConflict(calendar, interval)` in O(log n) |
+| `SlotFinder` | Merge busy intervals across attendees, scan the gaps |
+| `RecurrenceRule` | RRULE-like; expands occurrences lazily within a window |
+| `Invitation` | attendee, RSVP status |
+
+## Design decisions & trade-offs
+
+**1. Overlap in O(log n).** With a calendar sorted by start and no internal overlaps (true for rooms), check `floorEntry(newStart)` (does it end after `newStart`?) and `ceilingEntry(newStart)` (does it start before `newEnd`?). People *can* have overlapping events, so use an interval tree, or accept the O(log n + k) scan for a person.
+
+**2. Common free slot.** Gather all attendees' busy intervals in `[from, to]`, sort by start, merge the overlapping ones, then walk the gaps and return the first gap ≥ D (respecting working hours). That's O(M log M) for M intervals. It's the classic "merge intervals" pattern from DSA.
+
+**3. Room booking atomicity.** Lock per room (`ConcurrentHashMap<RoomId, ReentrantLock>`), re-check the conflict and insert. In a database: a range-exclusion constraint, or `INSERT … WHERE NOT EXISTS (overlapping)` under serializable isolation.
+
+**4. Recurring meetings.** Store the rule plus exceptions, not 520 copies. Expand on read within the query window. Editing "this and following" splits the rule into two series.
+
+**5. Time zones.** Store instants in UTC and the organiser's zone with the rule. "9am every Monday" must survive DST shifts, so expand recurrence in the event's zone.
+
+## Follow-up questions
+
+1. Find a 30-minute slot for 50 attendees next week, fast. Optimise.
+2. Two users book the last free room for the same slot. Walk through it.
+3. How do you edit a single occurrence of a recurring meeting?
+4. A meeting created in IST recurs weekly for a US attendee. What happens at DST changes?
+5. Suggest a room by capacity, equipment and floor proximity: what's the Strategy?

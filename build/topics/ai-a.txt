@@ -1,0 +1,410 @@
+=== AI 2 ===
+N|sys|System prompt (role, rules)|0|0|220
+N|few|Few-shot examples|0|130|180
+N|ctx|Grounding context|0|260|180
+N|tmpl|Prompt Template|300|130|170
+N|llm|LLM|560|130|120|ellipse
+N|out|Validated output|560|260|170
+E|sys|tmpl|
+E|few|tmpl|
+E|ctx|tmpl|retrieved facts
+E|tmpl|llm|rendered prompt
+E|llm|out|parse/check
+---
+## Problem
+
+Explain prompt engineering as an engineering discipline: how to structure prompts (system vs. user, roles, few-shot examples, templates, grounding) so LLM outputs are accurate, consistent and safe, and how to treat prompts as versioned, tested artefacts in a Java/Spring application.
+
+## Requirements (what you must be able to explain)
+
+- System vs. user vs. assistant messages, and what belongs in each.
+- Zero-shot vs. few-shot, and when examples help or hurt.
+- Prompt templates with variables, and why string concatenation is dangerous.
+- Grounding: answering *only* from supplied context, and citing it.
+- Techniques: role prompting, step-by-step reasoning, output constraints, delimiters.
+- How you test and version prompts.
+
+## Key concepts
+
+| Concept | What it is | Practical note |
+|---|---|---|
+| **System prompt** | Persistent instructions: persona, rules, format, refusals | Highest-leverage place for behaviour; keep it stable and versioned |
+| **User prompt** | The task plus data for this turn | Put untrusted data inside clear delimiters (`<doc>...</doc>`) |
+| **Few-shot** | 2–5 input→output examples | Teaches format and edge cases; costs tokens; examples bias outputs |
+| **Template** | Prompt with placeholders filled at runtime | Spring AI `PromptTemplate` / `.user(u -> u.text(...).param(...))` |
+| **Grounding** | "Answer using only the context below; say 'I don't know' otherwise" | The core of RAG; reduces hallucination |
+| **Output constraints** | Schema, length, enum labels | Pair with structured output (topic 8) |
+
+```java
+String answer = chatClient.prompt()
+    .system("You are a support assistant for ACME. Answer only from the CONTEXT. "
+          + "If the answer is not there, reply exactly: I don't know.")
+    .user(u -> u.text("CONTEXT:\n<ctx>{ctx}</ctx>\n\nQUESTION: {q}")
+               .param("ctx", context).param("q", question))
+    .call().content();
+```
+
+## Design decisions & trade-offs
+
+1. **Clarity beats cleverness.** State the task, audience, constraints and output format explicitly. Good prompts read like a precise spec for a smart new colleague.
+2. **Few-shot vs. instructions.** Examples are great for format and tone. For reasoning tasks they can make the model over-fit to example content. Vary the examples and keep them representative.
+3. **Separate instructions from data.** Untrusted text (emails, web pages, user files) must be delimited and described as *data*. This is the first line of defence against prompt injection (topic 18).
+4. **Prompts are code.** Store them in resource files (`classpath:/prompts/support.st`), version them, review changes, and run an **evaluation set** on each change. A "small wording tweak" can shift behaviour.
+5. **Ask for reasoning carefully.** Asking for step-by-step thinking can improve hard tasks, but costs tokens and latency. For user-facing output, ask for the final answer in a separate, parseable field.
+6. **Model-specific tuning.** Prompts don't transfer perfectly between models. Re-run evals when switching providers or versions.
+
+## Follow-up questions
+
+1. A support bot sometimes invents refund policies. What do you change in the prompt and the system?
+2. When do few-shot examples make results worse?
+3. How do you version and A/B test prompts in a Spring Boot service?
+4. Where do you put user-uploaded text in the prompt, and why?
+5. How do you make a classification prompt return only one of 5 labels, reliably?
+
+=== AI 3 ===
+N|req|Request|0|130|120
+N|params|temperature / top-p / max_tokens|190|0|300|ellipse
+N|model|Model selection|190|130|170
+N|api|Provider API|440|130|150
+N|stream|Streaming tokens (SSE)|660|0|100
+N|full|Full response + usage|660|260|100
+E|req|model|route
+E|params|model|
+E|model|api|call
+E|api|stream|stream()
+E|api|full|call()
+---
+## Problem
+
+Explain the knobs and API mechanics of calling LLMs: sampling parameters (temperature, top-p, max tokens, stop sequences), streaming vs. blocking calls, token usage and cost, and how to pick a model for a task, all from the perspective of an engineer integrating LLM APIs into Java services.
+
+## Requirements
+
+- Temperature and top-p: what they do mathematically and practically.
+- Max tokens, stop sequences, and what happens when output is cut off.
+- Streaming (SSE, `Flux<String>`) vs. a single response, and when to use each.
+- Reading usage (input/output tokens) and estimating cost and latency.
+- Model selection criteria, timeouts and retries for provider APIs.
+
+## Key concepts
+
+| Parameter | Effect | Typical setting |
+|---|---|---|
+| **temperature** | Scales logits before sampling; low = focused, high = diverse | 0–0.3 extraction/classification; 0.7–1.0 creative |
+| **top-p** (nucleus) | Sample only from the smallest token set with cumulative prob ≥ p | Tune temperature *or* top-p, not both aggressively |
+| **max_tokens** | Hard cap on output tokens | Set it; check `finishReason == LENGTH` for truncation |
+| **stop sequences** | Stop generation at a marker | Useful for delimited formats |
+| **streaming** | Tokens sent as generated (SSE) | Better perceived latency for chat UIs |
+
+```java
+// application.yml
+// spring.ai.openai.chat.options.model: gpt-4o-mini
+// spring.ai.openai.chat.options.temperature: 0.2
+
+Flux<String> tokens = chatClient.prompt()
+    .user(question)
+    .options(OpenAiChatOptions.builder().temperature(0.2).maxTokens(500).build())
+    .stream().content();          // stream to the browser via SSE
+
+ChatResponse r = chatClient.prompt().user(q).call().chatResponse();
+Usage u = r.getMetadata().getUsage();   // prompt + completion tokens -> cost metrics
+```
+
+## Design decisions & trade-offs
+
+1. **Low temperature for deterministic tasks.** Extraction, classification and SQL generation want consistency. But temperature 0 isn't a guarantee of identical output, so validate the results.
+2. **Streaming trade-offs.** Streaming makes chat feel fast (time-to-first-token), but complicates validation: you can't parse JSON until the end, and moderation of partial output is harder. Stream to humans; call blocking for machine-consumed output.
+3. **Cost control.** Cost = input tokens × input price + output tokens × output price. Output is usually pricier and slower. Cap `max_tokens`, trim context, cache repeated prompts and answers, and route easy tasks to smaller models.
+4. **Model selection.** Choose by quality on *your* eval set, latency, cost, context window, tool-calling and structured-output support, data residency and compliance. Keep the provider behind Spring AI's `ChatModel` abstraction so switching is configuration, not a rewrite.
+5. **Reliability.** Provider APIs return 429s and 5xx and time out. Configure timeouts, retries with backoff (Spring AI has retry properties), fallback models, and circuit breakers (Resilience4j).
+
+## Follow-up questions
+
+1. Your JSON output is randomly cut off. Diagnose it.
+2. Explain temperature vs. top-p to a junior engineer.
+3. When should a backend endpoint *not* stream?
+4. Estimate the cost difference between two models for 1M requests/day.
+5. How do you fail over from one LLM provider to another in Spring AI?
+
+=== AI 4 ===
+N|docs|Text / Docs|0|0|130
+N|emb|Embedding Model|220|0|170
+N|vec|Vectors [0.12, -0.4, ...]|470|0|230|cylinder
+N|q|Query|0|200|110
+N|qemb|Query vector|220|200|160
+N|sim|Cosine top-k|470|200|160|ellipse
+E|docs|emb|embed
+E|emb|vec|store
+E|q|qemb|embed
+E|qemb|sim|compare
+E|vec|sim|nearest
+---
+## Problem
+
+Explain embeddings and semantic search: how text becomes vectors, why similar meanings land close together, how cosine similarity and nearest-neighbour search work, and how this differs from keyword search. It's the foundation for RAG, recommendations, dedup and clustering.
+
+## Requirements
+
+- What an embedding is (a dense vector of fixed dimension from a model) and what dimensions mean.
+- Cosine similarity vs. dot product vs. Euclidean distance.
+- Semantic vs. lexical search: strengths and failure modes of each.
+- Exact vs. approximate nearest neighbour (HNSW, IVF).
+- Practical concerns: model choice, normalisation, chunk size, re-embedding on model change.
+
+## Key concepts
+
+| Concept | Explanation |
+|---|---|
+| **Embedding** | `f(text) → ℝⁿ` (e.g. n = 768–3072) learned so semantically similar texts have nearby vectors |
+| **Cosine similarity** | `a·b / (‖a‖‖b‖)`: angle-based; 1 = same direction. With normalised vectors it equals the dot product |
+| **Semantic search** | Embed the query, find nearest document vectors |
+| **Lexical search (BM25)** | Exact term matching; great for IDs, codes, rare words |
+| **ANN index** | HNSW graph or IVF clusters: sub-linear search with slight recall loss |
+| **Recall@k** | Fraction of truly relevant docs found in the top k, the metric to tune |
+
+```java
+float[] q = embeddingModel.embed("How do I reset my password?");
+List<Document> hits = vectorStore.similaritySearch(
+    SearchRequest.builder().query("How do I reset my password?")
+        .topK(5).similarityThreshold(0.75).build());
+```
+
+## Design decisions & trade-offs
+
+1. **Semantic vs. keyword.** Embeddings find "forgot login credentials" for "reset password", which keyword search misses. But they're weak on exact identifiers ("error ORA-01555", SKU codes) and negation. **Hybrid search** (BM25 + vectors, fused with Reciprocal Rank Fusion) is the production default (topic 11).
+2. **Use the same model for queries and documents.** Vectors from different models live in different spaces. Changing the model means re-embedding the whole corpus, so plan for versioned indexes.
+3. **Chunk size affects meaning.** A whole 40-page document embedded into one vector blurs everything. Chunks that are too tiny lose context. 200–800 tokens with overlap is a common start (topic 5).
+4. **Exact vs. ANN.** Brute-force cosine is fine for < 100k vectors. Beyond that, HNSW gives ~95–99% recall at millisecond latency. Tune `ef_search` / `M` for recall vs. speed.
+5. **Similarity thresholds are model-specific.** A 0.8 cutoff for one model isn't comparable to another. Calibrate on labelled examples.
+6. **Cost and storage.** 10M chunks × 1,536 dims × 4 bytes ≈ 61 GB before index overhead. Consider smaller dimensions or quantisation.
+
+## Follow-up questions
+
+1. Why might semantic search fail for "invoice INV-2024-0042"? What's the fix?
+2. Cosine vs. dot product: when are they equivalent?
+3. You switch embedding models. What's your migration plan?
+4. How do you measure whether your semantic search is good?
+5. Explain HNSW at a high level and its tuning knobs.
+
+=== AI 5 ===
+N|docs|Documents|0|0|120
+N|chunk|Chunk + Embed|190|0|150
+N|vdb|Vector DB|420|0|130|cylinder
+N|q|User question|0|200|140
+N|ret|Retrieve top-k|190|200|150
+N|aug|Augmented prompt|420|200|160
+N|llm|LLM answer + citations|630|100|130|ellipse
+E|docs|chunk|ingest
+E|chunk|vdb|store
+E|q|ret|embed q
+E|vdb|ret|similar chunks
+E|ret|aug|context
+E|aug|llm|generate
+---
+## Problem
+
+Explain Retrieval-Augmented Generation (RAG) end to end: why it exists, the ingestion pipeline (documents → chunks → embeddings → vector store) and the query pipeline (question → retrieve → augment prompt → generate with citations), with a minimal Spring AI implementation and its typical failure modes.
+
+## Requirements
+
+- Why RAG instead of fine-tuning for private and changing knowledge.
+- Ingestion: loading, cleaning, chunking, embedding, metadata, storage.
+- Query: embedding the question, top-k retrieval, prompt assembly, grounded generation.
+- Citations and "I don't know" behaviour. Failure modes and how to evaluate.
+
+## Key concepts
+
+| Stage | What happens | Spring AI pieces |
+|---|---|---|
+| **Load** | PDFs, HTML, Confluence, DB rows → text | `PagePdfDocumentReader`, `TikaDocumentReader` |
+| **Chunk** | Split into ~300–800 token pieces, with overlap | `TokenTextSplitter` |
+| **Embed + store** | Vector per chunk + metadata (source, page, ACL) | `EmbeddingModel`, `VectorStore.add()` |
+| **Retrieve** | Top-k similar chunks for the question | `vectorStore.similaritySearch(...)` |
+| **Augment + generate** | Prompt = instructions + chunks + question | `QuestionAnswerAdvisor` / `RetrievalAugmentationAdvisor` |
+
+```java
+// ingestion
+List<Document> docs = new TokenTextSplitter().apply(new PagePdfDocumentReader(pdf).get());
+vectorStore.add(docs);
+
+// query
+String answer = chatClient.prompt()
+    .advisors(QuestionAnswerAdvisor.builder(vectorStore)
+        .searchRequest(SearchRequest.builder().topK(5).similarityThreshold(0.7).build()).build())
+    .user(question)
+    .call().content();
+```
+
+## Design decisions & trade-offs
+
+1. **RAG vs. fine-tuning.** RAG keeps knowledge fresh (re-index, don't retrain), supports per-user access control via metadata filters, and gives citations. Fine-tuning shapes style and behaviour but is a poor way to inject changing facts.
+2. **Chunking strategy dominates quality.** Split on structure (headings, paragraphs) where possible and keep the section title in each chunk. Too large dilutes relevance and wastes context; too small loses meaning.
+3. **top-k and context budget.** More chunks raise recall but add noise, cost and "lost in the middle" effects. Start at k=4–8, then add re-ranking (topic 11).
+4. **Grounding instructions.** "Answer only from the context; cite sources as [n]; if the context doesn't contain the answer, say so." Return source metadata to the UI so users can verify.
+5. **Failure modes to name:** retrieval misses (wrong chunks), stale index, conflicting documents, an answer that ignores the context, leaking documents the user can't access, and prompt injection inside documents.
+6. **Evaluate both halves separately.** Retrieval (recall@k against a labelled question→doc set) and generation (faithfulness/groundedness, answer relevance).
+
+## Follow-up questions
+
+1. Users report correct-looking but wrong answers. How do you tell whether retrieval or generation failed?
+2. How do you enforce "user X can only see HR documents of their department"?
+3. A document is updated. How does the index stay in sync?
+4. Why do tables and scanned PDFs break naive RAG, and what's the fix?
+5. When would long-context stuffing beat RAG?
+
+=== AI 6 ===
+N|starter|spring-ai-starter-model-*|0|0|230
+N|auto|Auto-configuration|0|150|180
+N|props|application.yml (keys, model, options)|0|280|290
+N|cm|ChatModel bean|330|150|160
+N|em|EmbeddingModel bean|330|0|180
+N|svc|Your @Service|600|150|150
+E|starter|auto|classpath
+E|props|auto|binds
+E|auto|cm|creates
+E|auto|em|creates
+E|cm|svc|inject
+---
+## Problem
+
+Explain Spring AI's foundations: what problem it solves, how its starters and auto-configuration wire up model clients, the core abstractions (`ChatModel`, `EmbeddingModel`, `Prompt`, `Message`, `ChatResponse`), and how configuration lets you swap providers (OpenAI, Anthropic, Azure OpenAI, Bedrock, Ollama) without changing business code.
+
+## Requirements
+
+- Spring AI's role: portable abstractions, the Spring-style programming model, and integrations (vector stores, MCP, observability).
+- Maven/Gradle starters and the auto-configured beans you get.
+- Low-level `ChatModel` vs. high-level `ChatClient`.
+- Configuring keys, models and default options. Profiles for local vs. prod.
+- Testing strategy.
+
+## Key concepts
+
+| Abstraction | Purpose |
+|---|---|
+| `ChatModel` | Provider-neutral interface: `call(Prompt) → ChatResponse`, `stream(Prompt)` |
+| `Prompt` / `Message` | List of `SystemMessage`, `UserMessage`, `AssistantMessage`, `ToolResponseMessage` + `ChatOptions` |
+| `ChatResponse` | Generations + metadata (usage, finish reason, model) |
+| `EmbeddingModel` | `embed(text) → float[]`, batch embedding |
+| `ChatOptions` | Portable options (model, temperature, maxTokens) + provider-specific subclasses |
+| Starters | `spring-ai-starter-model-openai`, `-anthropic`, `-ollama`, `spring-ai-starter-vector-store-pgvector` … |
+
+```xml
+<dependency>
+  <groupId>org.springframework.ai</groupId>
+  <artifactId>spring-ai-starter-model-openai</artifactId>
+</dependency>
+<!-- version managed by the spring-ai-bom -->
+```
+```yaml
+spring:
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat.options:
+        model: gpt-4o-mini
+        temperature: 0.2
+```
+```java
+@Service
+class Summarizer {
+  private final ChatModel chatModel;
+  Summarizer(ChatModel chatModel) { this.chatModel = chatModel; }
+  String summarize(String text) {
+    return chatModel.call(new Prompt(List.of(
+        new SystemMessage("Summarize in 3 bullets."), new UserMessage(text))))
+      .getResult().getOutput().getText();
+  }
+}
+```
+
+## Design decisions & trade-offs
+
+1. **Abstraction vs. provider features.** Portable `ChatOptions` cover the common ground. Provider-specific options (`OpenAiChatOptions`, `AnthropicChatOptions`) unlock special features but couple you to a vendor. Isolate them in configuration.
+2. **`ChatModel` vs. `ChatClient`.** `ChatModel` is low-level and explicit. `ChatClient` (topic 7) adds a fluent API, advisors, structured output and defaults. Use `ChatClient` in application code and `ChatModel` for framework-level work.
+3. **Multiple models.** With two providers on the classpath, disable auto-selection and define named beans or `ChatClient`s per model (cheap vs. smart) and inject by qualifier.
+4. **Secrets and environments.** Keys via environment variables or a vault, never in Git. Use a local model (Ollama) in the dev profile to cut cost and work offline.
+5. **Testing.** Unit-test your logic with a mocked `ChatModel`. Run integration tests against a real model sparingly, plus eval suites (topic 17). Assert on structure and key facts, not exact strings.
+
+## Follow-up questions
+
+1. How would you run OpenAI in prod and Ollama locally with the same code?
+2. What beans does adding the OpenAI starter create, and how do you override one?
+3. How do you configure two different chat models in one application?
+4. How do you unit-test a service that depends on `ChatModel`?
+5. Why is a provider-neutral abstraction valuable for an enterprise like a bank?
+
+=== AI 7 ===
+N|builder|ChatClient.Builder|0|0|190
+N|defaults|Defaults: system, advisors, tools|0|150|260|ellipse
+N|cc|ChatClient|330|80|150
+N|prompt|.prompt().user().system()|330|230|230
+N|call|.call() → content / entity|620|130|140
+N|stream|.stream() → Flux|620|270|140
+E|builder|cc|build()
+E|defaults|builder|
+E|cc|prompt|per request
+E|prompt|call|blocking
+E|prompt|stream|reactive
+---
+## Problem
+
+Master Spring AI's `ChatClient`, the fluent, high-level API most applications use: building clients with defaults, composing prompts, getting text, structured entities or streams back, attaching advisors (memory, RAG, logging) and tools, and organising multiple clients in a real Spring Boot service.
+
+## Requirements
+
+- Creating a `ChatClient` from the auto-configured `ChatClient.Builder`, with defaults.
+- The fluent request API: `.system()`, `.user()`, params, `.options()`, `.advisors()`, `.tools()`.
+- Response types: `.content()`, `.entity(Class)`, `.chatResponse()`, `.stream().content()`.
+- Advisors at a conceptual level (detail in topic 12).
+- Structuring clients per use case.
+
+## Key concepts
+
+```java
+@Configuration
+class AiConfig {
+  @Bean
+  ChatClient supportClient(ChatClient.Builder builder, ChatMemory memory, VectorStore store) {
+    return builder
+        .defaultSystem("You are ACME's support assistant. Be concise. Cite sources.")
+        .defaultAdvisors(
+            MessageChatMemoryAdvisor.builder(memory).build(),
+            QuestionAnswerAdvisor.builder(store).build(),
+            new SimpleLoggerAdvisor())
+        .build();
+  }
+}
+
+record Ticket(String category, int priority, String summary) {}
+
+Ticket t = supportClient.prompt()
+    .user(u -> u.text("Classify this email: {email}").param("email", body))
+    .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
+    .call()
+    .entity(Ticket.class);              // structured output (topic 8)
+
+Flux<String> live = supportClient.prompt().user(q).stream().content();  // SSE to UI
+```
+
+| Method | Returns | Use when |
+|---|---|---|
+| `.call().content()` | `String` | Simple text answers |
+| `.call().entity(T)` | POJO / record | Machine-consumed output |
+| `.call().chatResponse()` | Full response | You need usage, finish reason, metadata |
+| `.stream().content()` | `Flux<String>` | Chat UIs, long answers |
+
+## Design decisions & trade-offs
+
+1. **One client per use case.** A support bot, a classifier and a summariser have different system prompts, advisors and options. Define separate `ChatClient` beans instead of one generic client with conditionals.
+2. **Defaults vs. per-request.** Put stable concerns (persona, logging, memory, RAG) in defaults. Put request-specific concerns (conversation ID, filter expressions, temperature overrides) per call.
+3. **Advisor order matters.** Memory before RAG or after? Logging outermost? Advisors are a chain ordered by `getOrder()`, so be explicit (topic 12).
+4. **Streaming plus advisors.** Some advisors need the complete response (validation, structured output). Mixing streaming with post-processing needs care: buffer, or validate on completion.
+5. **Testability.** Wrap clients in your own service interfaces (`TicketClassifier`) so callers don't depend on Spring AI types, and mocking is trivial.
+
+## Follow-up questions
+
+1. How would you pass a per-user conversation ID through `ChatClient` to memory?
+2. When would you drop down to `ChatModel` instead of `ChatClient`?
+3. Design the beans for a service with a cheap classifier and an expensive answerer.
+4. How do you stream a response to a browser from a Spring MVC or WebFlux controller?
+5. How do you log prompts and responses safely (PII)?

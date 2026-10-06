@@ -1,0 +1,340 @@
+=== LLD 7 ===
+N|rider|Rider|0|0|120
+N|trip|TripService|280|0|150
+N|match|MatchingStrategy|580|0|170|ellipse
+N|loc|Driver Location Index|560|150|190|cylinder
+N|driver|Driver|300|150|120
+N|fare|FareStrategy|0|150|150|ellipse
+N|obs|Trip Observers|280|280|170
+E|rider|trip|request ride
+E|trip|match|find driver
+E|match|loc|nearby
+E|trip|driver|offer
+E|trip|fare|estimate
+E|trip|obs|status events
+---
+## Problem
+
+Design the core of a cab-booking app like Uber or Ola: a rider requests a ride, the system matches a nearby driver, the trip moves through states, and both parties get live updates. This tests **Strategy** (matching and fares), **Observer** (notifications), a trip **state machine** and **concurrency** (a driver must not get two trips).
+
+## Requirements
+
+**Functional**
+- Rider requests a ride with pickup, drop and vehicle class, and sees a fare estimate.
+- Match the best available driver. The driver accepts or declines (with a timeout).
+- Trip states: `REQUESTED → DRIVER_ASSIGNED → DRIVER_ARRIVED → IN_PROGRESS → COMPLETED`, plus `CANCELLED`.
+- Fare calculation, payment and ratings.
+
+**Non-functional**
+- A driver is offered one trip at a time, and two riders can never be assigned the same driver.
+- Matching rules and pricing (surge) must be swappable.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Rider`, `Driver` (`DriverStatus`: OFFLINE, AVAILABLE, OFFERED, ON_TRIP) | Actors |
+| `Location`, `LocationIndex` | Latest driver positions; `nearby(point, radiusKm)` (grid or geohash buckets) |
+| `TripService` | Orchestrates request → match → offer → accept |
+| `MatchingStrategy` | `NearestDriver`, `HighestRated`, `LeastIdleTime` |
+| `FareStrategy` | `BaseFare + perKm + perMin`, wrapped by `SurgeMultiplier` |
+| `Trip` | State machine plus history |
+| `TripObserver` | `RiderNotifier`, `DriverNotifier`, `ReceiptMailer` |
+
+## Design decisions & trade-offs
+
+**1. Atomic driver reservation.** Matching reads candidates without locks, but *claiming* a driver must be atomic:
+```java
+boolean offer(Driver d) {
+    return d.status().compareAndSet(DriverStatus.AVAILABLE, DriverStatus.OFFERED);
+}
+```
+If the CAS fails, another trip took the driver, so try the next candidate. If the driver declines or the offer times out (a `ScheduledExecutorService` timer), CAS back to `AVAILABLE`.
+
+**2. Location index.** A naive scan over all drivers is O(n). Bucket drivers by a grid cell or geohash prefix, then query the rider's cell and its neighbours. Updates every 3–5 seconds move a driver between buckets. A `ConcurrentHashMap<Cell, Set<DriverId>>` works in-process.
+
+**3. Strategy everywhere it varies.** The matching policy and the fare formula change by city and product (Pool vs. Premier). Inject them per request type.
+
+**4. Observer for side effects.** Trip state changes publish events. Notification, receipts and analytics subscribe. `Trip` stays free of push-notification code.
+
+**5. Trip State pattern.** Cancellation fees depend on state: free before assignment, a fee after the driver arrives. That logic lives in each state's `cancel()`.
+
+## Follow-up questions
+
+1. A driver accepts on their phone just as the offer times out. Who wins?
+2. Implement **surge pricing**. Where does the multiplier come from, and how do you lock the quoted price?
+3. How does **Pool** (shared rides) change matching and the Trip model?
+4. A driver's phone goes offline mid-trip. What happens?
+5. How would you test matching without real GPS?
+
+=== LLD 8 ===
+N|cust|Customer|0|0|130
+N|order|Order|300|0|130
+N|state|OrderState|580|0|150|ellipse
+N|rest|Restaurant|0|150|140
+N|assign|AgentAssignment|300|150|170|ellipse
+N|agent|DeliveryAgent|580|150|160
+N|notify|Notifiers|300|280|140
+E|cust|order|places
+E|order|state|current
+E|order|rest|sent to
+E|order|assign|ready → assign
+E|assign|agent|picks
+E|order|notify|on change
+---
+## Problem
+
+Design a food delivery system like Swiggy or Zomato: browse restaurants, place an order, the restaurant accepts and prepares it, an agent is assigned and picks it up, and the customer tracks it live. The heart of it is the **order state machine**, with **Strategy** for agent assignment and **Observer** for notifications.
+
+## Requirements
+
+**Functional**
+- Browse restaurants and menus (with availability), build a cart from **one** restaurant, place an order, pay.
+- Restaurant accepts or rejects. Agent assignment, pickup, delivery and live tracking.
+- Cancellation rules that depend on the stage. Ratings for food and delivery.
+
+**Non-functional**
+- Only valid state transitions are allowed.
+- An agent carries at most N orders. Assignment rules differ by city.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Restaurant`, `Menu`, `MenuItem` | Catalogue with an `isAvailable` flag |
+| `Cart` → `Order` | Order snapshots item prices at placement time |
+| `OrderState` | `PLACED → ACCEPTED → PREPARING → READY_FOR_PICKUP → PICKED_UP → DELIVERED`; `CANCELLED`, `REJECTED` |
+| `DeliveryAgent` | Location, capacity, current orders |
+| `AssignmentStrategy` | `Nearest`, `BatchingAware`, `LeastLoaded` |
+| `OrderObserver` | `CustomerNotifier`, `RestaurantNotifier`, `AgentNotifier` |
+| `PaymentService`, `RefundPolicy` | Refund amount by state |
+
+```java
+enum OrderStatus {
+    PLACED, ACCEPTED, PREPARING, READY_FOR_PICKUP, PICKED_UP, DELIVERED, CANCELLED, REJECTED;
+    private static final Map<OrderStatus, Set<OrderStatus>> NEXT = Map.of(
+        PLACED, Set.of(ACCEPTED, REJECTED, CANCELLED),
+        ACCEPTED, Set.of(PREPARING, CANCELLED), /* ... */);
+    boolean canGo(OrderStatus to) { return NEXT.getOrDefault(this, Set.of()).contains(to); }
+}
+```
+
+## Design decisions & trade-offs
+
+**1. Transition table vs. full State classes.** A transition map on an enum is compact and easy to audit. Full State classes pay off when each state has *behaviour* (cancellation refunds, allowed edits). A common answer is the enum for legality plus a `RefundPolicy` keyed by state.
+
+**2. When to assign the agent.** Assigning at `PLACED` wastes agent time if the restaurant is slow. Assigning at `READY` makes the customer wait. Assign when `remainingPrepTime ≈ agentTravelTime`. That's a Strategy, and it's the trade-off interviewers want discussed.
+
+**3. Price snapshot.** Copy price and name into `OrderItem`. Menu edits after ordering must not change the bill.
+
+**4. Observer for fan-out.** Each transition publishes `OrderStatusChanged`. Notifiers, ETA recompute and analytics subscribe independently.
+
+**5. Concurrency.** The restaurant's accept and the customer's cancel can race. Guard transitions with a conditional update (`compareAndSet` on status, or `UPDATE … WHERE status = :expected`), so only one wins.
+
+## Follow-up questions
+
+1. The customer cancels at the same instant the restaurant accepts. Who wins, and what's the refund?
+2. Add **order batching**: one agent carries two orders from nearby restaurants.
+3. The restaurant marks an item unavailable after the order is placed. What happens?
+4. How would you compute and update the ETA?
+5. Support **scheduled orders** for later delivery.
+
+=== LLD 9 ===
+N|lib|Library|300|0|130
+N|book|Book|0|0|120
+N|copy|BookItem (copy)|0|150|160
+N|member|Member|600|0|130
+N|loan|Loan|300|150|120
+N|fine|FineStrategy|600|150|150|ellipse
+N|res|Reservation|300|280|140
+E|book|copy|has N
+E|lib|copy|catalogue
+E|member|loan|borrows
+E|loan|copy|of
+E|loan|fine|overdue
+E|member|res|holds
+---
+## Problem
+
+Design a library management system: catalogue books, let members search, borrow, return and reserve copies, and charge fines for late returns. It's a pure OOP-modelling problem, so the interviewer is watching **entity relationships**, especially the difference between a *book* (title) and a *book item* (a physical copy).
+
+## Requirements
+
+**Functional**
+- Search by title, author, subject or ISBN.
+- Borrow (limit per member, e.g. 5), return, renew (if not reserved), reserve when no copy is available.
+- Fines for overdue returns. Notify members when a reserved book is available.
+- Librarians add or remove books and copies, and manage members.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Book` | ISBN, title, authors, subject (the abstract work) |
+| `BookItem` | barcode, rack location, `BookStatus` (AVAILABLE, LOANED, RESERVED, LOST) |
+| `Account` (abstract) → `Member`, `Librarian` | Shared identity; role-specific operations |
+| `Loan` | member, item, issue date, due date, return date |
+| `Reservation` | member, book (not a specific copy!), status, created time |
+| `Catalog` | Indexes: `Map<String, List<Book>>` by title, author, subject |
+| `FineStrategy` | `PerDayFine`, `CappedFine`, `GracePeriodFine` |
+| `NotificationService` | Email or SMS when a reservation is ready |
+
+## Design decisions & trade-offs
+
+**1. Book vs. BookItem.** This is the main insight. A library holds 3 copies of "Clean Code". Loans attach to *items*, and reservations attach to *books* (any copy will do). Mixing them up breaks reservations and inventory.
+
+**2. Composition over inheritance for members.** `Member` *has* an `Account` and a `MembershipPlan` (Student: 3 books / 14 days; Faculty: 10 / 30). The plan holds the limits, so new tiers mean no new subclasses.
+
+**3. Return flow.** Mark the loan returned, calculate the fine, then check the reservation queue for that `Book`. If someone is waiting, set the item to `RESERVED` for them, notify them, and start a pickup window. Otherwise set it to `AVAILABLE`.
+
+**4. Status as a small State machine.** `AVAILABLE → LOANED → AVAILABLE/RESERVED`, plus `LOST`. Invalid transitions (lending a RESERVED item to someone else) are rejected in one place.
+
+**5. Search indexing.** In memory, use maps keyed by lower-cased tokens. At scale, use a search engine. Keep `Catalog` behind an interface so swapping is painless.
+
+## Follow-up questions
+
+1. Two members reserve the same book. How is the queue ordered and enforced?
+2. Add **e-books** with concurrent licence limits. What changes?
+3. How do you handle a lost book (fine = price, item → LOST)?
+4. Model **inter-branch** transfers.
+5. Where would you put the borrowing-limit rule, and why there?
+
+=== LLD 10 ===
+N|group|Group|300|0|130
+N|user|User|0|0|120
+N|exp|Expense|300|140|130
+N|split|SplitStrategy|600|140|150|ellipse
+N|ledger|Balance Ledger|300|270|160|cylinder
+N|simplify|DebtSimplifier|600|270|160
+E|user|group|member of
+E|group|exp|has
+E|exp|split|split by
+E|exp|ledger|updates
+E|ledger|simplify|min transfers
+---
+## Problem
+
+Design Splitwise: users add shared expenses in groups, split them equally, by exact amounts or by percentage, see who owes whom, and settle up. The interesting parts are split types as a **Strategy** created by a **Factory**, a correct balance model, and **debt simplification** (a graph problem).
+
+## Requirements
+
+**Functional**
+- Users, groups, and expenses with a payer (or multiple payers) and participants.
+- Split types: `EQUAL`, `EXACT`, `PERCENT`, `SHARES`. Validate that they sum correctly.
+- Show balances per user and per group, and "simplify debts". Record settlements.
+
+**Non-functional**
+- Money must be exact (no floating point) and balances must always sum to zero.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `User`, `Group` | Membership |
+| `Expense` | id, payer(s), total, `List<Split>`, `SplitType`, metadata |
+| `Split` (abstract) → `EqualSplit`, `ExactSplit`, `PercentSplit` | user + computed amount |
+| `SplitStrategy` / `SplitFactory` | Validates and computes amounts per type |
+| `BalanceSheet` | `Map<UserId, Map<UserId, Money>>` or net balance per user |
+| `DebtSimplifier` | Turns net balances into the minimum set of transfers |
+
+```java
+interface SplitStrategy {
+    List<Split> split(Money total, List<User> users, List<BigDecimal> params);
+}
+class EqualSplitStrategy implements SplitStrategy {
+    public List<Split> split(Money total, List<User> users, List<BigDecimal> p) {
+        long share = total.paise() / users.size(), rem = total.paise() % users.size();
+        // first `rem` users pay 1 paisa extra, so the sum is exact
+    }
+}
+```
+
+## Design decisions & trade-offs
+
+**1. Money in minor units.** Use `long` paise or `BigDecimal` with fixed scale. ₹100 split 3 ways is 33.34 + 33.33 + 33.33, and someone has to absorb the remainder deterministically.
+
+**2. Net balances, not a pairwise ledger.** Storing `net[user]` (positive = is owed) makes "how much do I owe overall" O(1), and simplification needs it anyway. Keep the expense list as the source of truth, so balances can be rebuilt (event-sourcing flavour).
+
+**3. Debt simplification.** Split users into creditors and debtors by net balance. Repeatedly match the largest debtor with the largest creditor (two heaps) and settle `min(|d|, c)`. That gives at most n−1 transfers. A true minimum is NP-hard (subset-sum); the greedy approach is the standard answer, so say so.
+
+**4. Factory plus validation.** `SplitFactory.create(type)` returns the strategy. Each validates its own inputs (percentages sum to 100, exact amounts sum to the total) before any balance changes.
+
+**5. Edits and deletes.** Editing an expense means reversing its old effect and applying the new one. With balances derived from expenses, that's just a recompute.
+
+## Follow-up questions
+
+1. Multiple payers on one expense: how does the model change?
+2. Support **multi-currency** groups. Where does conversion happen, and at what rate?
+3. Why is the minimum number of transactions NP-hard, and is greedy good enough?
+4. Two users edit the same expense at the same time. How do you resolve it?
+5. How would you show a per-user history of who paid what?
+
+=== LLD 11 ===
+N|vm|VendingMachine|300|0|160
+N|state|State|600|0|130|ellipse
+N|inv|Inventory|0|0|130|cylinder
+N|recipe|BeverageFactory|0|150|160
+N|pay|PaymentHandler|300|150|150
+N|disp|Dispenser|600|150|130
+N|low|Low-stock Alert|0|280|150
+E|vm|state|delegates
+E|vm|inv|check/deduct
+E|vm|recipe|make(type)
+E|vm|pay|collect
+E|vm|disp|pour
+E|inv|low|threshold
+---
+## Problem
+
+Design a coffee vending machine that serves espresso, cappuccino, latte and so on. Each drink consumes ingredients (water, milk, beans, sugar). The machine takes payment, checks inventory, brews, returns change and reports low stock. It tests **State** (machine modes), **Factory** (beverages from recipes) and inventory consistency.
+
+## Requirements
+
+**Functional**
+- Show the menu with prices. Only drinks with enough ingredients are selectable.
+- Accept coins, notes or card. Return change or refund on cancel or failure.
+- Deduct ingredients and dispense. A technician can refill and go into maintenance mode.
+- Alert when an ingredient drops below a threshold.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `VendingMachine` | Context and facade; holds the current `MachineState` |
+| `MachineState` | `Idle`, `Selecting`, `PaymentPending`, `Dispensing`, `Maintenance` |
+| `Beverage` / `Recipe` | name, price, `Map<Ingredient, Integer>` quantities |
+| `BeverageFactory` | `create(type)` builds a beverage from the recipe registry |
+| `Inventory` | `hasEnough(recipe)`, `deduct(recipe)` (atomic), `refill` |
+| `PaymentHandler` | Strategy: `CoinPayment`, `CardPayment`; change calculation |
+| `InventoryObserver` | Low-stock alert |
+
+```java
+class Inventory {
+    private final Map<Ingredient, Integer> stock = new EnumMap<>(Ingredient.class);
+    synchronized boolean tryDeduct(Recipe r) {
+        if (!r.needs().entrySet().stream().allMatch(e -> stock.get(e.getKey()) >= e.getValue())) return false;
+        r.needs().forEach((ing, q) -> stock.merge(ing, -q, Integer::sum));
+        return true;
+    }
+}
+```
+
+## Design decisions & trade-offs
+
+**1. Recipes as data.** Don't make `Cappuccino extends Coffee` with hard-coded quantities. A recipe registry (loaded from config) plus a Factory means a new drink is a config entry. Use a Decorator only for user add-ons (extra shot, extra sugar).
+
+**2. Check and deduct atomically.** "Check, then deduct" as two calls races if two dispense paths exist. A single `tryDeduct` under a lock is all-or-nothing.
+
+**3. When to deduct versus when to charge.** Order: confirm availability, collect payment, reserve and deduct ingredients, dispense. If dispensing fails, refund and restore ingredients. Never take money for a drink you can't make.
+
+**4. State pattern.** In `Maintenance`, selections are rejected. In `Dispensing`, cancel is rejected. Each state handles only its legal events.
+
+**5. Menu availability is derived.** Recompute which drinks are selectable from inventory after every deduct or refill, and push that to the display (Observer).
+
+## Follow-up questions
+
+1. Add **custom strength and size** options. Decorator, or parameters on the recipe?
+2. Payment succeeds, then the milk pump fails. Walk through recovery.
+3. How do you calculate change with limited coins in the machine (coin-change problem)?
+4. Support a remote fleet: machines report inventory to a server.
+5. Where would you put a "happy hour" discount?

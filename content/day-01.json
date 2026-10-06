@@ -1,0 +1,334 @@
+{
+  "day": 1,
+  "generatedAt": "2026-10-02T18:30:38+00:00",
+  "sketch": null,
+  "evaluation": null,
+  "topics": [
+    {
+      "category": "LLD",
+      "number": 1,
+      "title": "Design Chess",
+      "concepts": "OOP, inheritance, polymorphism, Strategy, State",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "player",
+            "label": "Player ×2",
+            "x": 30,
+            "y": 0,
+            "w": 140,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "game",
+            "label": "Game",
+            "x": 310,
+            "y": 0,
+            "w": 140,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "state",
+            "label": "GameState",
+            "x": 600,
+            "y": 0,
+            "w": 150,
+            "h": 50,
+            "shape": "ellipse"
+          },
+          {
+            "id": "move",
+            "label": "Move (history)",
+            "x": 30,
+            "y": 140,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "board",
+            "label": "Board 8×8",
+            "x": 310,
+            "y": 140,
+            "w": 140,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "validator",
+            "label": "MoveValidator",
+            "x": 600,
+            "y": 140,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "piece",
+            "label": "Piece ▸ K Q R B N P",
+            "x": 270,
+            "y": 270,
+            "w": 220,
+            "h": 50,
+            "shape": "rect"
+          }
+        ],
+        "edges": [
+          {
+            "from": "game",
+            "to": "player",
+            "label": "has 2"
+          },
+          {
+            "from": "game",
+            "to": "state",
+            "label": "status"
+          },
+          {
+            "from": "game",
+            "to": "move",
+            "label": "records"
+          },
+          {
+            "from": "game",
+            "to": "board",
+            "label": "owns"
+          },
+          {
+            "from": "game",
+            "to": "validator",
+            "label": "asks"
+          },
+          {
+            "from": "validator",
+            "to": "board",
+            "label": "reads"
+          },
+          {
+            "from": "board",
+            "to": "piece",
+            "label": "holds"
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nDesign a two-player game of chess as an object model in Java. The interviewer wants classes, relationships and the rule engine, not a UI or an AI opponent. The real test is whether piece behaviour, game state and move validation each live in the right place, and whether the design survives follow-ups like \"add undo\" or \"add a chess clock\".\n\n## Requirements\n\n**Functional**\n- 8×8 board, standard initial setup, two players (White moves first).\n- Validate a move for the piece type and the board state: blocking pieces, captures, and not leaving your own king in check.\n- Special moves: castling, en passant, pawn promotion.\n- Detect check, checkmate and stalemate. Also support resignation and draw by agreement.\n- Keep a move history (needed for en passant, castling rights, and undo).\n\n**Non-functional / scope**\n- Single process, in-memory. No persistence, no networking.\n- Extensible: new variants (Chess960, a different promotion rule) shouldn't need edits all over the codebase.\n\n## Key abstractions\n\n| Class / type | Responsibility |\n|---|---|\n| `Game` | Orchestrates turns, owns `GameState`, the history and the players. It is the only public entry point: `makeMove(from, to, promotion?)` |\n| `Board` | 8×8 grid of `Cell`/`Square`. Answers \"what is on square X\", `isPathClear`, `findKing(color)` and `copy()` |\n| `Position` (record) | Immutable `(file, rank)` value object with `isValid()` |\n| `Piece` (abstract) | `color`, `hasMoved`, and an abstract `List<Position> candidateMoves(Board, Position)` |\n| `King, Queen, Rook, Bishop, Knight, Pawn` | Concrete movement rules (**polymorphism**) |\n| `Move` | from, to, moved piece, captured piece, `MoveType` (NORMAL, CASTLE, EN_PASSANT, PROMOTION) and promotion piece. Has enough data to undo itself |\n| `MoveValidator` | Pseudo-legal moves from the piece, then removes any move that leaves your own king in check |\n| `GameState` (State) | `Active`, `Check`, `Checkmate`, `Stalemate`, `Resigned`, `Draw`. Decides which actions are allowed |\n| `Player` | Name and colour. Can later become a `MoveStrategy` for human or engine play |\n\n```java\npublic abstract class Piece {\n    protected final Color color;\n    protected boolean hasMoved;\n    public abstract List<Position> candidateMoves(Board board, Position from);\n}\n\npublic final class Rook extends Piece {\n    private static final int[][] DIRS = {{1,0},{-1,0},{0,1},{0,-1}};\n    @Override public List<Position> candidateMoves(Board b, Position from) {\n        return Sliding.rays(b, from, DIRS, color);   // shared helper for Rook/Bishop/Queen\n    }\n}\n```\n\n## Design decisions & trade-offs\n\n**1. Movement rules live in pieces; legality lives in a validator.**\nA piece knows its geometry (\"bishops slide diagonally\"). It can't know whether a move exposes its own king, because that depends on the whole board. Splitting this into *pseudo-legal* moves (in `Piece`) and *legal* moves (in `MoveValidator`) keeps both classes small. The validator applies the move to a board copy (or applies it and undoes it) and checks `isSquareAttacked(kingPos, opponent)`.\n\n**2. Inheritance vs. composition for pieces.**\nAn abstract `Piece` with six subclasses is the expected answer, and it's fine here because the set of piece types is closed. The stronger alternative is composition: a `Piece` holds a `MovementStrategy` list such as `Sliding(diagonals)` or `Jump(knightOffsets)`. Queen is then just Rook rays plus Bishop rays, and fairy-chess pieces need no new classes. Mention it as the **Strategy** upgrade path.\n\n**3. Game status as the State pattern.**\n`makeMove` on a `Checkmate` or `Resigned` game must be rejected. Each `GameState` implementation answers `canMove()` and `next(board, sideToMove)`. That avoids `if (status == ...)` checks spread through `Game`.\n\n**4. Special moves are `Move` types, not piece hacks.**\nCastling moves two pieces, and en passant captures a piece that isn't on the target square. Modelling them as a `MoveType` with a dedicated `apply/undo` keeps `Board` generic. Castling rights come from `hasMoved` flags. En passant reads the *last move* from history.\n\n**5. Undo via the Command pattern.**\nEach `Move` stores what it captured and the prior `hasMoved` flags, so `undo()` is exact. The history is a `Deque<Move>`. The same mechanism powers legality checks (apply, test check, undo), which is cheaper than copying the board.\n\n**6. Checkmate vs. stalemate.**\nAfter every move, compute whether the side to move has *any* legal move. If it has none, the game is checkmate when that side is in check and stalemate otherwise. It's one function with two outcomes.\n\n**Trade-off to state out loud:** board copying is simpler and safer to reason about, while apply/undo is faster with more code paths. For an interview, choose apply/undo and say why.\n\n## Follow-up questions\n\n1. How would you add **undo/redo**? What does a `Move` need to store to reverse a capture or a promotion?\n2. Add a **chess clock** (blitz, increment). Where does time live, and what ends the game on timeout? *(Hint: Observer on turn change.)*\n3. Support **Chess960**. Which classes change? *(Ideally only the initial-setup factory and castling target squares.)*\n4. Detect **threefold repetition** and the **50-move rule**. What extra state do you track? *(Position hashing, e.g. Zobrist, and a half-move counter.)*\n5. Make it **multiplayer over the network**. What becomes the source of truth, and how do you reject out-of-turn or replayed moves?\n6. Plug in a **computer opponent**. How does `Player` change? *(`MoveStrategy` interface: `HumanStrategy` and `MinimaxStrategy`.)*\n7. How would you **unit-test** move legality, especially pins and discovered checks?\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    },
+    {
+      "category": "HLD",
+      "number": 1,
+      "title": "URL Shortener",
+      "concepts": "Hashing, DB design, caching, read-heavy systems, ID generation",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "client",
+            "label": "Client",
+            "x": 0,
+            "y": 130,
+            "w": 110,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "lb",
+            "label": "Load Balancer",
+            "x": 150,
+            "y": 130,
+            "w": 130,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "api",
+            "label": "Shortener API",
+            "x": 330,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "ids",
+            "label": "ID Range Svc",
+            "x": 330,
+            "y": 0,
+            "w": 150,
+            "h": 50,
+            "shape": "ellipse"
+          },
+          {
+            "id": "cache",
+            "label": "Redis Cache",
+            "x": 580,
+            "y": 0,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "db",
+            "label": "KV DB code→url",
+            "x": 580,
+            "y": 120,
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "kafka",
+            "label": "Kafka → Analytics",
+            "x": 560,
+            "y": 250,
+            "w": 190,
+            "h": 50,
+            "shape": "rect"
+          }
+        ],
+        "edges": [
+          {
+            "from": "client",
+            "to": "lb"
+          },
+          {
+            "from": "lb",
+            "to": "api"
+          },
+          {
+            "from": "api",
+            "to": "ids",
+            "label": "lease 1M IDs"
+          },
+          {
+            "from": "api",
+            "to": "cache",
+            "label": "1. lookup"
+          },
+          {
+            "from": "api",
+            "to": "db",
+            "label": "2. on miss"
+          },
+          {
+            "from": "api",
+            "to": "kafka",
+            "label": "click event",
+            "dashed": true
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nDesign a URL shortener like bit.ly or TinyURL. Given a long URL, return a short alias such as `https://sho.rt/aZ3kQ9`. Visiting the alias redirects to the original URL. The interview usually centres on **ID generation**, **read-heavy scaling** and **data modelling**.\n\n## Requirements\n\n**Functional**\n- `POST /urls {longUrl, customAlias?, expiresAt?}` returns `shortUrl`.\n- `GET /{code}` returns an HTTP redirect to `longUrl`.\n- Optional: custom aliases, expiry, per-link click analytics, and deleting your own links.\n\n**Non-functional**\n- Very read-heavy, around **100:1** reads to writes.\n- Redirect latency of **< 50 ms p99**, and high availability (a broken short link is a broken link everywhere).\n- Codes must be unique, short, and **not trivially enumerable** if links are private.\n\n**Back-of-envelope (state assumptions out loud)**\n- 100M new URLs/month ≈ **40 writes/s** on average. At 100:1 that is **≈ 4,000 redirects/s**, with peaks around 10–20k/s.\n- 5 years × 1.2B/yr = **6B records**. At ~500 bytes each that is **≈ 3 TB**, which fits on a sharded KV store easily.\n- Code length: base62 gives 62⁶ ≈ 56.8B and 62⁷ ≈ 3.5T. **7 characters** leaves plenty of headroom.\n\n## Architecture\n\n```\nClient ─▶ CDN/Edge ─▶ Load Balancer ─▶ Shortener API ─┬─▶ Cache (Redis)\n                                                      ├─▶ KV DB (code → url)\n                                                      ├─▶ ID Generator (ranges)\n                                                      └─▶ Kafka ─▶ Analytics\n```\n\n- **Write path:** the API gets a unique ID, base62-encodes it, writes `code → {longUrl, owner, createdAt, expiresAt}`, and returns the code.\n- **Read path:** check the cache, then the DB, then return a redirect. Publish a click event to Kafka asynchronously so the redirect never waits on analytics.\n\n## Key design decisions & trade-offs\n\n**1. How to generate the code** (the core of the interview)\n\n| Approach | Pros | Cons |\n|---|---|---|\n| Hash (MD5/SHA) of the URL, take 7 chars | Stateless; the same URL can dedupe | Collisions, so you need check-and-retry; leaks a mapping |\n| Random 7 chars + uniqueness check | Not enumerable | A DB read on every write; retries rise as the space fills |\n| **Counter + base62** | No collisions, compact | Sequential, so guessable; needs a distributed counter |\n| **Range allocation** (each API node leases a block of 1M IDs from ZooKeeper/etcd or a DB row) | No per-write coordination, no collisions | A crashed node wastes its unused range, which is acceptable |\n\nRecommend **range allocation + base62**. If enumeration matters, pass the ID through a reversible permutation (e.g. a Feistel cipher or Hashids) so codes look random without needing a uniqueness check. Snowflake-style IDs are an alternative, but they're 64-bit and give longer codes.\n\n**2. Storage.** Access is a pure key lookup with no joins, so use a **KV / wide-column store** (DynamoDB or Cassandra) partitioned by `code`. That gives horizontal scale and multi-region replication. A relational DB works up to a point, and sharding by code is the same idea.\n\n**3. Caching.** The access pattern is long-tailed: a small number of links get most clicks. Use Redis with LRU and a TTL, plus the CDN for very hot links. The cache hit rate should be above 90%. Negative-cache unknown codes briefly to absorb scans.\n\n**4. 301 vs 302.** A `301 Permanent` lets browsers and CDNs cache the redirect, which cuts load but **loses analytics** and makes later edits or expiry hard. A `302/307` sends every click through you. Most commercial shorteners use 302 because analytics are the product.\n\n**5. Duplicate long URLs.** Should the same URL return the same code? It's optional. Doing it needs a secondary index `hash(longUrl) → code`. Per-user links usually *shouldn't* dedupe, because analytics are tracked per link.\n\n**6. Expiry and cleanup.** Store `expiresAt` and check it on read. Then use lazy deletion plus a background sweeper or DB TTL. Don't reuse expired codes for a long time.\n\n**7. Abuse.** Rate-limit creation per user or IP, scan target URLs against Safe Browsing, and offer a preview page for suspicious links.\n\n## Follow-up questions\n\n1. How do you guarantee uniqueness **across regions** with no cross-region call on the write path?\n2. A celebrity tweets one link and it gets **1M clicks per minute**. Walk through what happens at each layer.\n3. How would you build **real-time click analytics** (per country, per referrer) without slowing redirects?\n4. Custom aliases collide with generated codes. How do you keep the two namespaces separate?\n5. How would you **migrate** from a single Postgres to a sharded store with zero downtime?\n6. Users report that someone is **enumerating private links**. What changes?\n7. What does the system do when Redis is down? What about when the ID-range service is down?\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    },
+    {
+      "category": "AI",
+      "number": 1,
+      "title": "AI/LLM Fundamentals",
+      "concepts": "AI vs ML vs DL vs GenAI, LLMs, tokens, context window, inference",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "prompt",
+            "label": "Prompt text",
+            "x": 0,
+            "y": 40,
+            "w": 130,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "tok",
+            "label": "Tokenizer",
+            "x": 190,
+            "y": 40,
+            "w": 130,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "ctx",
+            "label": "Context window",
+            "x": 380,
+            "y": 40,
+            "w": 170,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "llm",
+            "label": "LLM weights",
+            "x": 620,
+            "y": 40,
+            "w": 140,
+            "h": 50,
+            "shape": "ellipse"
+          },
+          {
+            "id": "samp",
+            "label": "Sampler",
+            "x": 620,
+            "y": 230,
+            "w": 140,
+            "h": 50,
+            "shape": "diamond"
+          },
+          {
+            "id": "out",
+            "label": "Next token",
+            "x": 400,
+            "y": 230,
+            "w": 130,
+            "h": 50,
+            "shape": "rect"
+          }
+        ],
+        "edges": [
+          {
+            "from": "prompt",
+            "to": "tok",
+            "label": "text"
+          },
+          {
+            "from": "tok",
+            "to": "ctx",
+            "label": "tokens"
+          },
+          {
+            "from": "ctx",
+            "to": "llm",
+            "label": "prefill"
+          },
+          {
+            "from": "llm",
+            "to": "samp",
+            "label": "probabilities"
+          },
+          {
+            "from": "samp",
+            "to": "out",
+            "label": "temp / top-p"
+          },
+          {
+            "from": "out",
+            "to": "ctx",
+            "label": "append + repeat",
+            "dashed": true
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nExplain, at interview depth, what a large language model is and how it fits in the AI landscape. A strong answer separates **AI vs ML vs DL vs GenAI**, explains **tokens**, the **context window** and **inference** concretely, and links them to engineering consequences such as cost, latency and failure modes. That link is what interviewers for AI-platform roles probe.\n\n## Requirements (what you must be able to explain)\n\n- The nesting **AI ⊃ ML ⊃ Deep Learning ⊃ Generative AI / LLMs**, with one example at each level.\n- What a **token** is, why it isn't a word, and why it matters for cost and limits.\n- What the **context window** is and what happens when you exceed it.\n- How **inference** works: next-token prediction, autoregressive decoding, and why output is slower than input.\n- The difference between **training / fine-tuning** and **inference**, and between **parametric knowledge** and **context-provided knowledge**.\n- Typical **failure modes**: hallucination, knowledge cutoff and non-determinism.\n\n## Key concepts\n\n| Concept | One-line definition | Why an engineer cares |\n|---|---|---|\n| **AI** | Any technique that makes machines perform tasks needing \"intelligence\", including rules and search | Broad umbrella; a rules engine counts |\n| **ML** | Systems that learn patterns from data instead of hand-written rules | Needs data, evaluation and a retraining pipeline |\n| **Deep learning** | ML using multi-layer neural networks | Needs GPUs and lots of data; gives strong results on unstructured data |\n| **GenAI** | Models that *produce* new content (text, images, code) | The output is open-ended, so testing it is hard |\n| **LLM** | A transformer trained on huge text corpora to predict the next token | The engine behind chat, coding assistants and RAG |\n| **Token** | A sub-word unit, roughly ¾ of an English word on average | Pricing, rate limits and context size are all counted in tokens |\n| **Context window** | The maximum tokens (prompt + history + retrieved docs + output) per call | Hard ceiling, so you must truncate, summarise or retrieve |\n| **Inference** | Running a trained model to generate output | Latency and cost live here, in production |\n\n**How generation works (inference):** The prompt is tokenised, and the whole input is processed in parallel. This *prefill* step is fast per token. The model then outputs a probability distribution over the vocabulary for the *next* token. A sampler picks one using temperature and top-p, appends it, and repeats. This *decode* step happens one token at a time, which is why **output tokens cost more and dominate latency**. A KV cache avoids recomputing earlier tokens.\n\n**Knowledge:** What the model \"knows\" is frozen into its weights at training time (*parametric*), up to its knowledge cutoff. Anything newer or private has to arrive *in the context*. That one fact motivates RAG, tool calling and memory, which are topics 4, 5, 9 and 13 on your list.\n\n## Design decisions & trade-offs\n\n1. **Bigger context vs. retrieval.** Long-context models let you include whole documents. That costs more tokens, adds latency, and accuracy can drop for facts buried in the middle. Retrieval sends only the relevant chunks, but it adds a pipeline that can fail on its own.\n2. **Model size vs. latency and cost.** Large models reason better. Small models are much cheaper and faster. In production you often **route**: a small model for classification and extraction, a large one for hard reasoning.\n3. **Determinism.** Temperature 0 *reduces* variation, but it isn't a guarantee of identical outputs across runs, providers or versions. Design for tolerance with schema validation, retries and evaluation instead of exact string matching.\n4. **Fine-tuning vs. prompting/RAG.** Fine-tuning changes *behaviour and style*. It is a poor way to add frequently changing *facts*. For facts, use retrieval.\n5. **Hallucination is structural.** The model produces plausible continuations, not verified facts. Mitigate with grounding (RAG plus citations), constrained outputs, tool calls for computation, and evaluation. You can't eliminate it fully.\n\n## Follow-up questions\n\n1. Your prompt is 6k tokens and you ask for a 2k-token answer. Which part dominates latency, and why?\n2. A user pastes a 300-page PDF and it exceeds the context window. Give three strategies and their trade-offs.\n3. Why might the same prompt at temperature 0 still give different answers?\n4. When would you fine-tune instead of using RAG? Give a concrete enterprise example.\n5. How would you explain \"the model doesn't know about yesterday's trade\" to a business stakeholder, and what's the engineering fix?\n6. Estimate the monthly token cost of a chatbot with 10k users × 20 messages/day × 1.5k tokens per exchange. Which levers reduce it?\n7. What is a KV cache, and why does it matter for multi-turn chat?\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    }
+  ]
+}

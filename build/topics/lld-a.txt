@@ -1,0 +1,367 @@
+=== LLD 2 ===
+N|lot|ParkingLot|300|0|150
+N|floor|ParkingFloor|300|135|150
+N|spot|ParkingSpot|300|270|150
+N|gate|Entry/Exit Gate|0|135|150
+N|ticket|Ticket|0|270|130
+N|fee|FeeStrategy|600|135|150|ellipse
+N|alloc|SpotAllocator|600|0|150|ellipse
+E|lot|floor|has N
+E|floor|spot|has N
+E|lot|gate|has
+E|gate|ticket|issues
+E|lot|alloc|uses
+E|lot|fee|uses
+---
+## Problem
+
+Design a parking lot system in Java with multiple floors, several vehicle and spot types, ticketing at entry, and payment at exit. This tests clean entity modelling, **Factory** and **Strategy**, and whether the design stays open for change (EV charging, new vehicle types, new pricing).
+
+## Requirements
+
+**Functional**
+- Multiple floors, each with spots of type `COMPACT`, `LARGE`, `MOTORBIKE`, `EV`.
+- Vehicles: car, bike, truck. Each fits certain spot types.
+- At entry, assign a spot and issue a ticket. At exit, compute the fee, take payment and free the spot.
+- Show available spots per floor and type on a display board.
+
+**Non-functional**
+- Several gates operate at the same time, so spot assignment must be thread-safe.
+- Adding a vehicle type, spot type or pricing rule shouldn't mean rewriting existing classes.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `ParkingLot` (singleton per site) | Owns floors and gates. Facade: `park(vehicle)` and `unpark(ticket)` |
+| `ParkingFloor` | Holds spots, indexed by type into free lists |
+| `ParkingSpot` | id, `SpotType`, `occupiedBy`. `assign` and `release` |
+| `Vehicle` (abstract) → `Car, Bike, Truck` | Plate number and `VehicleType` |
+| `Ticket` | id, vehicle, spot, entry time, status |
+| `SpotAllocator` (Strategy) | `NearestFirst`, `LowestFloorFirst`, `EvPreferred` |
+| `FeeStrategy` (Strategy) | `HourlyFee`, `FlatWeekendFee`, `VehicleTypeMultiplier` |
+| `VehicleFactory` / `SpotFactory` | Build objects from type enums |
+| `Payment` | Cash, card or UPI behind a `PaymentProcessor` interface |
+
+```java
+public interface SpotAllocator {
+    Optional<ParkingSpot> allocate(List<ParkingFloor> floors, VehicleType type);
+}
+public interface FeeStrategy {
+    Money calculate(Ticket ticket, Instant exitTime);
+}
+```
+
+## Design decisions & trade-offs
+
+**1. Vehicle-to-spot compatibility as data, not `instanceof`.** Keep a `Map<VehicleType, List<SpotType>>`, for example a bike fits MOTORBIKE first, then COMPACT. A new vehicle type then means adding a map entry, not changing branching code.
+
+**2. Allocation is a Strategy.** "Nearest to the gate" vs. "fill the lowest floor first" is a business choice that changes per site. Inject it rather than hard-coding it.
+
+**3. Concurrency at assignment.** Two gates must never assign the same spot. Options:
+- `synchronized` on the floor's free list for the type. This is simple and contention is low.
+- A `ConcurrentLinkedQueue<ParkingSpot>` per type, where `poll()` is atomic. This is lock-free and the cleanest choice.
+- Spot-level CAS (`AtomicReference<Vehicle>`) if you scan instead of using free lists.
+
+**4. Pricing is a Strategy, possibly composed.** A `CompositeFee` can apply a base hourly rate, a vehicle multiplier and a weekend discount in sequence. That adds a Decorator flavour and avoids one god-method.
+
+**5. Ticket as the source of truth.** Exit uses the ticket ID, which avoids searching for the vehicle and lets you handle lost tickets with a lookup by plate.
+
+**6. Display board via Observer.** Spots publish `SpotFreed` and `SpotTaken` events. The board subscribes to them, so the lot doesn't know the display exists.
+
+## Follow-up questions
+
+1. Add **EV charging** spots billed per kWh. Which classes change?
+2. Two cars arrive at two gates and both see "1 spot left". Walk through your locking.
+3. How do you handle a **lost ticket**?
+4. Support **reservations** booked in advance. What new states does a spot have?
+5. How would this change if spots had sensors reporting occupancy?
+6. Where would you add **monthly pass** holders without special-casing everywhere?
+
+=== LLD 3 ===
+N|ctrl|ElevatorController|290|0|190
+N|req|Request Queue|0|0|150|cylinder
+N|sched|SchedulingStrategy|600|0|160|ellipse
+N|car|Elevator Car|290|150|160
+N|state|State: Idle/Up/Down|290|270|190|ellipse
+N|panel|Hall/Car Buttons|0|150|160
+N|door|Door|600|150|130
+E|panel|req|submit
+E|req|ctrl|poll
+E|ctrl|sched|choose car
+E|ctrl|car|dispatch
+E|car|state|current
+E|car|door|controls
+---
+## Problem
+
+Design an elevator system for a building with N floors and M elevators. Users press hall buttons (up or down) and car buttons (a destination floor). The system decides which elevator serves which request. This tests the **State** pattern, scheduling as **Strategy**, and **concurrency** between button events and moving cars.
+
+## Requirements
+
+**Functional**
+- Hall calls (`floor`, `direction`) and car calls (`destination`).
+- Assign hall calls to the best elevator. Each car serves its stops in an efficient order.
+- Doors open and close, with an overload check and an emergency stop.
+- Display the current floor and direction.
+
+**Non-functional**
+- Requests arrive concurrently from many buttons.
+- Swappable scheduling (rush-hour mode, energy-saving mode).
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `ElevatorController` | Receives requests and assigns hall calls through a `SchedulingStrategy` |
+| `Elevator` | id, current floor, `ElevatorState`, two stop sets (`upStops`, `downStops`) |
+| `ElevatorState` (State) | `Idle`, `MovingUp`, `MovingDown`, `DoorsOpen`, `Maintenance` |
+| `Request` | `HallRequest(floor, dir)` and `CarRequest(elevatorId, floor)` |
+| `SchedulingStrategy` | `NearestCar`, `ScanLook`, `ZoneBased` |
+| `Door`, `Display`, `WeightSensor` | Hardware abstractions |
+
+```java
+public interface SchedulingStrategy {
+    Elevator select(List<Elevator> cars, HallRequest r);
+}
+class Elevator {
+    private final TreeSet<Integer> upStops = new TreeSet<>();
+    private final TreeSet<Integer> downStops = new TreeSet<>(Comparator.reverseOrder());
+    private ElevatorState state = Idle.INSTANCE;
+}
+```
+
+## Design decisions & trade-offs
+
+**1. LOOK/SCAN inside each car.** A car keeps moving in its current direction, serving every stop on the way (`TreeSet.ceiling(currentFloor)`), and reverses only when nothing is left ahead. This avoids FCFS zig-zagging and starvation.
+
+**2. Choosing a car for a hall call.** Pick by cost: an idle car pays its distance; a car moving toward the floor in the same direction pays its distance; anything else pays a penalty. `NearestCar` is the baseline, and the Strategy interface lets you add zoning (cars 1–2 serve floors 1–20) without touching the controller.
+
+**3. State pattern for behaviour.** "Ignore movement while the doors are open" and "reject requests in Maintenance" live in state classes, not in `if` blocks inside `Elevator.step()`.
+
+**4. Concurrency model.** Button presses happen on many threads. Put them on a `BlockingQueue<Request>`. One controller thread assigns them. Each elevator runs its own loop thread with a thread-safe stop set (or confined state plus messages). Avoid one global lock around all elevators.
+
+**5. Simulation vs. real time.** Model a `tick()` per car so it's testable. Real hardware triggers events instead.
+
+## Follow-up questions
+
+1. How do you prevent **starvation** of a request on floor 1 during heavy traffic between floors 30–40?
+2. Add **VIP / fire mode**: all cars return to the lobby. Where does that logic go?
+3. Implement **destination dispatch**, where users enter their floor in the lobby.
+4. What happens if a car breaks down holding assigned hall calls?
+5. How would you unit-test the scheduler deterministically?
+
+=== LLD 4 ===
+N|user|User|0|0|120
+N|svc|BookingService|250|0|170
+N|show|Show|560|0|140
+N|seat|ShowSeat|560|150|140
+N|lock|SeatLockProvider|250|150|170|ellipse
+N|pay|PaymentService|0|150|160
+N|booking|Booking|250|280|150
+E|user|svc|select seats
+E|svc|lock|lock(seats, ttl)
+E|svc|show|for show
+E|show|seat|has N
+E|svc|pay|charge
+E|svc|booking|create
+---
+## Problem
+
+Design a movie booking system like BookMyShow: browse cities, cinemas, movies and shows, pick seats and pay. The core interview challenge is **concurrency on seat selection**: two users must never book the same seat, and seats held by an abandoned checkout must free up automatically.
+
+## Requirements
+
+**Functional**
+- Search movies by city. List shows per cinema and screen. Show a seat map.
+- Select seats, hold them for a few minutes, pay, and confirm the booking.
+- Cancel bookings (with a refund policy) and release unpaid holds after a TTL.
+
+**Non-functional**
+- No double booking, ever.
+- Seat holds must expire without a manual cleanup step.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Movie`, `Cinema`, `Screen`, `Seat` | Catalogue and static layout |
+| `Show` | movie + screen + start time. Owns `ShowSeat`s |
+| `ShowSeat` | seat for a particular show. Status: `AVAILABLE`, `LOCKED`, `BOOKED` |
+| `SeatLockProvider` | `lock(show, seats, user, ttl)`, `unlock` and `validate` |
+| `Booking` | user, show, seats, amount. State: `PENDING → CONFIRMED / CANCELLED / EXPIRED` |
+| `PaymentService` | Strategy per method, plus idempotency key |
+| `PricingStrategy` | seat category, weekday/weekend, dynamic pricing |
+
+## Design decisions & trade-offs
+
+**1. Lock then pay, not pay then lock.** Hold seats when the user selects them, with a TTL of about 5 minutes. Confirm with payment. If payment happens first, two users can both pay for the same seat.
+
+**2. Implementing the lock (in-process LLD).**
+```java
+class InMemorySeatLockProvider implements SeatLockProvider {
+    private final ConcurrentHashMap<SeatKey, SeatLock> locks = new ConcurrentHashMap<>();
+    public synchronized boolean lock(Show s, List<Seat> seats, String user, Duration ttl) {
+        if (seats.stream().anyMatch(x -> isLocked(s, x))) return false;  // all-or-nothing
+        seats.forEach(x -> locks.put(new SeatKey(s, x), new SeatLock(user, now().plus(ttl))));
+        return true;
+    }
+}
+```
+All-or-nothing matters: a user selecting 4 seats shouldn't get 3. Sort seat keys before locking if you use per-seat locks, so two threads can't deadlock.
+
+**3. Expiry.** Do a lazy check (`expiresAt < now` means it's free) plus a scheduled sweeper that moves `PENDING` bookings to `EXPIRED`. In a distributed setup this becomes Redis `SET NX PX` per seat, or a DB row with `status, locked_until` and a conditional `UPDATE … WHERE status='AVAILABLE'`.
+
+**4. Booking as a State machine.** Only `PENDING` can become `CONFIRMED`, and only if the lock is still held by this user. Re-validate the lock at confirmation time, because the TTL may have passed during a slow payment.
+
+**5. Idempotent payment callbacks.** Gateways retry. Key the confirmation on `paymentId` so a duplicate callback can't double-confirm.
+
+## Follow-up questions
+
+1. Payment succeeds but the seat lock expired a second earlier. What do you do?
+2. Scale to millions of users for a blockbuster release. Where does the lock live now?
+3. Optimistic vs. pessimistic locking for seats: when would you pick each?
+4. Add a **waitlist** that auto-assigns released seats.
+5. How do you stop bots from holding every seat?
+
+=== LLD 5 ===
+N|atm|ATM|300|0|140
+N|state|ATMState|600|0|150|ellipse
+N|card|CardReader|0|0|140
+N|bank|BankService|0|150|150
+N|tx|Transaction|300|150|150
+N|chain|Cash Dispenser Chain|300|270|200
+N|cash|2000→500→100|600|270|150|cylinder
+E|card|atm|insert
+E|atm|state|delegates to
+E|atm|tx|creates
+E|tx|bank|authorize/debit
+E|tx|chain|dispense
+E|chain|cash|split notes
+---
+## Problem
+
+Design an ATM: card insertion, PIN entry, balance check, withdrawal, deposit and cash dispensing. This is the textbook problem for the **State** pattern (what the ATM accepts depends on where you are in the flow) and **Chain of Responsibility** (splitting an amount across note denominations).
+
+## Requirements
+
+**Functional**
+- Insert card, then enter PIN (3 attempts, then the card is retained), then choose a transaction.
+- Withdraw (within limits, in multiples of the smallest note), deposit, check balance, change PIN.
+- Dispense the correct mix of notes, print a receipt, eject the card.
+
+**Non-functional**
+- Money must never be dispensed without a successful debit, and a debit must never happen without dispensing. You need a compensating action.
+- The hardware (dispenser, card reader) is unreliable.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `ATM` | Context: holds the current `ATMState` and hardware components |
+| `ATMState` | `Idle`, `CardInserted`, `Authenticated`, `TransactionSelected`, `OutOfService` |
+| `CardReader`, `Keypad`, `Screen`, `Printer` | Hardware interfaces |
+| `CashDispenser` | Chain: `Note2000Handler → Note500Handler → Note100Handler` |
+| `BankService` | `authenticate`, `getBalance`, `debit`, `credit`, `reverse` |
+| `Transaction` | `Withdrawal`, `Deposit`, `BalanceInquiry` (Command) |
+
+```java
+abstract class ATMState {
+    void insertCard(ATM atm, Card c) { throw new IllegalStateException(); }
+    void enterPin(ATM atm, String pin) { throw new IllegalStateException(); }
+    void selectTx(ATM atm, TxType t) { throw new IllegalStateException(); }
+    void ejectCard(ATM atm) { throw new IllegalStateException(); }
+}
+```
+
+## Design decisions & trade-offs
+
+**1. State pattern.** Each state overrides only the events it accepts. `Idle.insertCard` moves to `CardInserted`. `CardInserted.enterPin` either moves to `Authenticated` or counts a failure. Illegal actions fail loudly in one place.
+
+**2. Chain of Responsibility for dispensing.**
+```java
+abstract class NoteHandler {
+    NoteHandler next; int denom; int available;
+    void dispense(int amount, Map<Integer,Integer> out) {
+        int n = Math.min(amount / denom, available);
+        if (n > 0) out.put(denom, n);
+        int rest = amount - n * denom;
+        if (rest > 0) { if (next == null) throw new CannotDispense(); next.dispense(rest, out); }
+    }
+}
+```
+Do a dry run first, and only debit if the plan succeeds. Adding a ₹200 note is one new handler.
+
+**3. Debit and dispense consistency.** Order: plan the notes, then debit at the bank, then dispense. If the dispenser fails after the debit, call `bank.reverse(txId)` (a compensating transaction), and log for reconciliation. Use idempotent transaction IDs so retries don't double-debit.
+
+**4. Security.** PIN verification happens at the bank, never locally. The ATM only sends an encrypted PIN block. Lock out after 3 failures.
+
+## Follow-up questions
+
+1. The dispenser jams after the bank debits. Walk through recovery.
+2. The ATM loses network mid-transaction. What state is it in after reboot?
+3. Support **cardless withdrawal** via a phone OTP. Which states change?
+4. How would you enforce daily withdrawal limits across ATMs?
+5. Why is State better than a big `switch(status)` here, and when wouldn't it be?
+
+=== LLD 6 ===
+N|cust|Customer|0|0|130
+N|svc|RentalService|280|0|160
+N|inv|Inventory|580|0|150|cylinder
+N|veh|Vehicle|580|150|140
+N|res|Reservation|280|150|150
+N|price|PricingStrategy|0|150|160|ellipse
+N|branch|Branch|580|280|130
+E|cust|svc|search/book
+E|svc|inv|availability
+E|inv|veh|tracks
+E|svc|res|creates
+E|res|price|quote
+E|veh|branch|located at
+---
+## Problem
+
+Design a car rental system like Zoomcar or Hertz: customers search vehicles by location and date range, reserve them, pick up, return (possibly at another branch) and pay. The key challenges are **inventory availability over time ranges**, pricing as a **Strategy**, and vehicle creation with a **Factory**.
+
+## Requirements
+
+**Functional**
+- Search available vehicles by branch, type and `[from, to]` range.
+- Reserve, modify and cancel. Pick up and return, with mileage and fuel or charge recorded.
+- Price by vehicle type, duration, add-ons (GPS, insurance), late fees and one-way drop.
+
+**Non-functional**
+- No overlapping reservations for the same vehicle.
+- New vehicle categories and pricing rules plug in without changes to existing code.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Vehicle` (abstract) → `Car`, `SUV`, `Bike`, `EV` | Registration number, type, branch, status |
+| `VehicleFactory` | Creates vehicles from a type and attributes |
+| `Branch` | Location and the vehicles currently there |
+| `Inventory` | `isAvailable(vehicle, range)` and `findAvailable(branch, type, range)` |
+| `Reservation` | customer, vehicle, range, add-ons. State: `BOOKED → PICKED_UP → RETURNED / CANCELLED` |
+| `PricingStrategy` | `DailyRate`, `HourlyRate`, `SurgePricing`, decorated by `AddOnDecorator` |
+| `Invoice`, `Payment` | Final bill including damages and late fees |
+
+## Design decisions & trade-offs
+
+**1. Availability is about time ranges, not a status flag.** A car can be free today and booked next week, so `status=AVAILABLE` is wrong. Store reservations per vehicle in a `TreeMap<LocalDateTime, Reservation>` keyed by start time. To check `[from, to)`, look at `floorEntry(to)` and see whether it ends after `from`. That is O(log n).
+
+**2. Preventing double booking.** Synchronise per vehicle (lock striping with `ConcurrentHashMap<VehicleId, Object>`), then re-check overlap and insert. In a database this becomes an exclusion constraint (Postgres `tstzrange &&`) or a `SELECT … FOR UPDATE` on the vehicle row.
+
+**3. Pricing composition.** Base Strategy (daily, hourly, surge) plus Decorators for add-ons (`InsuranceAddOn(GpsAddOn(DailyRate))`). Each piece is independently testable, and new add-ons don't touch existing classes.
+
+**4. One-way rentals.** On return, the vehicle's branch changes. That affects future availability by location, so search must consider where the vehicle *will be* at `from`, not where it is now. Keep it simple: a vehicle is searchable at the branch of its last reservation's drop-off.
+
+**5. Reservation as a State machine.** You can only pick up a `BOOKED` reservation within the grace window. Late return moves to `RETURNED` with a late-fee line item.
+
+## Follow-up questions
+
+1. A customer extends the rental, but the car is booked right after. What happens?
+2. Model **damage inspection** at return and its effect on the invoice.
+3. How do you rebalance fleet between branches after many one-way trips?
+4. Support **"any car in this category"** bookings instead of a specific vehicle.
+5. What changes for EVs (charge level, charging time between rentals)?

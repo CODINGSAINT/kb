@@ -1,0 +1,431 @@
+=== HLD 2 ===
+N|client|Clients|0|130|120
+N|gw|API Gateway + limiter|200|130|190
+N|redis|Redis Cluster (counters)|500|0|200|cylinder
+N|rules|Rules Config|500|250|160|cylinder
+N|svc|Backend Services|500|130|180
+N|local|Local cache fallback|200|270|190|ellipse
+E|client|gw|request
+E|gw|redis|Lua: check+incr
+E|gw|svc|allowed
+E|gw|rules|limits per key
+E|gw|local|Redis down?
+---
+## Problem
+
+Design a distributed rate limiter that protects APIs across a fleet of gateway or service instances: limit each user, API key or IP to N requests per window, consistently, no matter which instance a request hits. The LLD algorithms (token bucket and friends) are assumed. Here the questions are **where state lives**, **atomicity across nodes**, **latency**, and **failure behaviour**.
+
+## Requirements
+
+**Functional**
+- Per-key and per-endpoint limits, configurable by tier. Respond `429` with `Retry-After` and `X-RateLimit-Remaining`.
+- Multiple rules per request (per-user and per-IP and global).
+
+**Non-functional**
+- Adds < 1–2 ms p99 to every request. Highly available.
+- Approximately accurate is acceptable (a few % over the limit under races), but no unbounded leaks.
+
+**Scale:** 1M req/s peak across 200 gateway nodes, and 50M active keys at ~100 bytes of state each, which is 5 GB. That fits a Redis cluster.
+
+## Architecture
+
+- The limiter runs **in the gateway** (or as a sidecar). There's no extra network hop to a separate limiter service.
+- State is in a **Redis cluster** sharded by key. The check runs as a **Lua script** (atomic per key): read the bucket, refill, decrement, set the TTL, and return allowed plus remaining.
+- Rules come from a config service, cached in each gateway and hot-reloaded.
+
+```lua
+-- KEYS[1]=bucket  ARGV: capacity, refill_per_ms, now_ms
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or tonumber(ARGV[1]); local ts = tonumber(b[2]) or tonumber(ARGV[3])
+tokens = math.min(tonumber(ARGV[1]), tokens + (tonumber(ARGV[3]) - ts) * tonumber(ARGV[2]))
+local ok = tokens >= 1; if ok then tokens = tokens - 1 end
+redis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', ARGV[3]); redis.call('PEXPIRE', KEYS[1], 60000)
+return {ok and 1 or 0, math.floor(tokens)}
+```
+
+## Key design decisions & trade-offs
+
+**1. Centralised vs. local counters.** A central store (Redis) is accurate but costs a network round-trip per request. Local-only counters (limit/N per node) are fast but inaccurate when traffic is skewed across nodes. The **hybrid**: each node holds a local token allowance leased from Redis in batches (take 10 tokens at a time), syncing asynchronously. That trades a bit of accuracy for far fewer Redis calls.
+
+**2. Race conditions.** `GET` then `INCR` from two nodes over-admits. Use atomic Lua, or `INCR` plus `EXPIRE` for fixed windows. Never do read-modify-write from the client.
+
+**3. Algorithm choice at scale.** A sliding-window counter (two fixed-window counts, weighted) is O(1) memory and avoids boundary bursts. The token bucket allows bursts. A sliding log is too memory-heavy at 50M keys.
+
+**4. Failure mode: fail open or closed?** If Redis is unreachable, most public APIs **fail open** with a local in-memory fallback limit, because availability matters more than precise limits. Payment or abuse-sensitive endpoints may fail closed. State it per endpoint.
+
+**5. Hot keys.** A single abusive key hammers one Redis shard. A local pre-filter (deny keys already over limit for the rest of the window, cached in-process) protects Redis.
+
+**6. Multi-region.** Global limits across regions need either a per-region quota split (simple and slightly inaccurate) or async CRDT counter replication. Exact global limits would add cross-region latency, which is rarely worth it.
+
+## Follow-up questions
+
+1. Redis latency spikes to 50 ms. What happens to your API, and what's the mitigation?
+2. How do you enforce one global limit for a customer whose traffic spans 3 regions?
+3. Design limits by **cost units** (one query = 10 units).
+4. A DDoS sends 10M req/s from random IPs. Is the rate limiter the right layer?
+5. How do you roll out a new, stricter limit without breaking customers?
+
+=== HLD 3 ===
+N|client|App Servers|0|130|140
+N|lib|Client lib (hash ring)|200|130|190
+N|n1|Cache Node A|520|0|150|cylinder
+N|n2|Cache Node B|520|130|150|cylinder
+N|n3|Cache Node C|520|260|150|cylinder
+N|cfg|Membership (ZK/etcd)|200|270|190|ellipse
+E|client|lib|get/set
+E|lib|n1|hash(key)
+E|lib|n2
+E|n2|n3|replicate
+E|cfg|lib|ring updates
+---
+## Problem
+
+Design a distributed in-memory cache like Memcached or Redis Cluster: a key-value store spread over many nodes, with sub-millisecond reads, that scales horizontally, survives node failures and evicts data when memory fills. The key topics are **partitioning with consistent hashing**, **replication**, **eviction**, and **cache patterns** with their consistency problems.
+
+## Requirements
+
+**Functional**
+- `get(key)`, `set(key, value, ttl)`, `delete(key)`. Values up to ~1 MB.
+- TTL expiry and LRU/LFU eviction under memory pressure.
+
+**Non-functional**
+- p99 < 1 ms within a datacentre. 1M+ ops/s. Add or remove nodes with minimal data movement.
+- Survive a node failure without a thundering herd on the database.
+
+**Scale:** 10 TB of hot data at 64 GB per node is roughly 160 nodes (plus replicas). At ~100k ops/s per node, 1M ops/s needs only about 10 nodes for throughput, so **memory drives the node count**.
+
+## Architecture
+
+- **Partitioning:** a consistent hash ring with ~100–200 **virtual nodes** per physical node, which smooths the distribution. Adding a node moves only ~1/N of the keys.
+- **Routing:** a smart client library holds the ring (as in Memcached clients or Redis Cluster's slot map), or a proxy (twemproxy, Envoy). The client avoids a hop; the proxy simplifies clients.
+- **Replication:** each shard has a primary plus 1–2 async replicas. Failover is promoted by a membership service (Sentinel, ZooKeeper or etcd).
+- **Node internals:** a hash table plus an LRU doubly linked list (or Redis's approximated LRU by sampling). A single-threaded event loop per shard, or sharded locks.
+
+## Key design decisions & trade-offs
+
+**1. Consistent hashing vs. hash slots.** Redis Cluster uses 16,384 fixed slots assigned to nodes. Rebalancing moves whole slots, which is easier to reason about and migrate. A virtual-node ring is equivalent in spirit. Both beat `hash % N`, which reshuffles almost everything when N changes.
+
+**2. Cache-aside vs. read-through vs. write-through vs. write-behind.**
+- *Cache-aside* (the app reads the cache, falls back to the DB, then fills the cache) is the most common. Stale data is possible, so you need a TTL plus invalidation.
+- *Write-through* keeps the cache fresh but adds write latency. *Write-behind* is fast but risks data loss.
+
+**3. Invalidation races.** A read fills the cache with an old value right after a writer deletes it. Mitigations: delete after the DB commit, a short TTL, versioned values, or "delete twice" (delayed double delete). Facebook's *leases* stop stale sets and thundering herds.
+
+**4. Thundering herd / stampede.** A hot key expires and 10k requests hit the DB. Use request coalescing (single-flight), probabilistic early refresh, and serve stale while revalidating.
+
+**5. Hot keys.** One key on one node gets 200k req/s. Replicate hot keys to several nodes (key#1..k), or add a small in-process L1 cache in front.
+
+**6. Consistency on failover.** With async replication, recent writes can be lost on promotion. For a cache, that's usually acceptable: the DB is the source of truth.
+
+## Follow-up questions
+
+1. A node dies. Walk through what clients see and how the herd on the DB is avoided.
+2. Why virtual nodes? What happens without them with 5 physical nodes?
+3. How would you implement LRU in O(1)? And LFU?
+4. Your cache shows stale prices after updates. Diagnose and fix.
+5. Should sessions live in this cache? What changes if they must never be lost?
+
+=== HLD 4 ===
+N|prod|Producers (services)|0|0|180
+N|api|Notification API|0|150|170
+N|kafka|Kafka topics|260|110|150|cylinder
+N|workers|Channel Workers|480|115|160
+N|vendors|APNs/FCM/SES/SMS|480|250|180|ellipse
+N|dlq|Retry + DLQ|260|258|150|cylinder
+N|prefs|Prefs/Template DB|480|0|170|cylinder
+E|prod|kafka|events
+E|api|kafka|enqueue
+E|kafka|workers|consume
+E|workers|prefs|lookup
+E|workers|vendors|send
+E|workers|dlq|fail
+---
+## Problem
+
+Design a notification platform that many internal services use to send email, SMS, push and in-app notifications to millions of users: transactional (OTP, order shipped) and bulk (campaigns). It must be reliable, respect preferences and rate limits, retry failures and never block the callers. The topics are **queues and fan-out**, **retries and DLQ**, **priority isolation**, and **multi-channel delivery**.
+
+## Requirements
+
+**Functional**
+- `POST /notify {userIds|segment, template, data, channels?, priority}`.
+- Per-user preferences, opt-outs, quiet hours, localisation, templates.
+- Delivery status tracking (sent, delivered, opened), and a campaign scheduler.
+
+**Non-functional**
+- At-least-once delivery with deduplication, so users see effectively-once.
+- OTP latency < 5 s even during a 50M-user campaign.
+
+**Scale:** 1B notifications per day is ~12k/s average and 100k/s peak during campaigns. A campaign to a segment fans out 1 request into 50M messages.
+
+## Architecture
+
+1. The **Notification API** validates, assigns a `notificationId` and writes to **Kafka**, with separate topics per priority (`critical`, `transactional`, `bulk`).
+2. A **fan-out service** expands segments into per-user messages (paged from the user DB) for bulk campaigns.
+3. **Channel workers** (separate consumer groups per channel) load preferences and the template, render, apply per-user rate limits and dedup, then call the vendor.
+4. Failures go to a **retry topic** with exponential backoff, then a **DLQ** after N attempts for inspection and replay.
+5. Vendor callbacks (delivered, bounced) update the **status store** (Cassandra/DynamoDB keyed by notificationId and by userId+time).
+
+## Key design decisions & trade-offs
+
+**1. Queue between producers and senders.** It decouples callers from vendor latency and outages, absorbs spikes, and makes retry and replay possible. Kafka gives ordering per partition plus replay; SQS/RabbitMQ are simpler for per-message ack and delay.
+
+**2. Priority isolation.** Separate topics and worker pools per priority stop a campaign from starving OTPs. Bulk workers get a hard cap on vendor throughput.
+
+**3. Idempotency.** Workers may process a message twice (at-least-once). Record `notificationId` in a dedup store with a TTL before sending, and pass an idempotency key to vendors that support one.
+
+**4. Retries done right.** Exponential backoff with jitter. Classify errors (4xx permanent vs. 5xx or timeout transient). Use per-vendor **circuit breakers** and failover vendors (SES down, so SendGrid).
+
+**5. Rate limits both ways.** Per-user (no spamming) and per-vendor (respect provider quotas). Token buckets in Redis.
+
+**6. Templates and preferences cached** in workers with short TTLs. Each is read for every message, so this is where the database load comes from.
+
+## Follow-up questions
+
+1. A 50M-user campaign and an OTP spike happen together. Walk through isolation.
+2. How do you guarantee a user doesn't receive the same push twice?
+3. FCM is down for 30 minutes. What happens to queued messages?
+4. Design the "user unsubscribed 1 second ago" race.
+5. How would you measure end-to-end delivery latency per channel?
+
+=== HLD 5 ===
+N|post|New Post|0|0|130
+N|fan|Fan-out Service|240|0|160
+N|feedc|Feed Cache (per user)|540|0|200|cylinder
+N|client|Client|0|200|120
+N|feed|Feed Service|240|200|150
+N|celeb|Celebrity posts (pull)|540|130|200|cylinder
+N|rank|Ranking|540|260|150|ellipse
+E|post|fan|on write
+E|fan|feedc|push ids to followers
+E|client|feed|GET /feed
+E|feed|feedc|read
+E|feed|celeb|merge at read
+E|feed|rank|score
+---
+## Problem
+
+Design a social news feed (like Facebook, X or LinkedIn): users post, follow others, and see a ranked, reasonably fresh feed of posts from people they follow, at a scale where some accounts have millions of followers. The classic discussion is **fan-out on write vs. fan-out on read**, **ranking**, **caching** and **pagination**.
+
+## Requirements
+
+**Functional**
+- Create posts (text or media). Follow and unfollow.
+- `GET /feed?cursor=` returns a ranked feed, paginated, with new posts appearing within seconds.
+
+**Non-functional**
+- Feed reads are p99 < 200 ms and read-heavy (≈ 100 reads per post).
+- A celebrity posting must not cause a write storm that degrades everything.
+
+**Scale:** 300M DAU, each opening the feed 10 times a day, is 3B feed reads/day ≈ 35k/s (peak ~100k/s). 50M posts/day ≈ 600 writes/s. Average 200 followers per user means **fan-out ≈ 120k feed inserts/s**.
+
+## Architecture
+
+- **Post service** writes the post to a posts store (sharded by postId) and emits `PostCreated` to Kafka.
+- **Fan-out service** consumes the event, reads the author's followers (graph store), and pushes `postId` into each follower's **feed cache** (a Redis list or sorted set capped at ~800 IDs).
+- **Feed service** reads the user's precomputed IDs, merges in posts from followed celebrities (pull), hydrates the posts (cache plus batch get), ranks, and paginates.
+
+## Key design decisions & trade-offs
+
+**1. Push (fan-out on write).** Reads are fast (precomputed). The cost is write amplification: a 10M-follower account means 10M inserts per post, plus wasted work for inactive followers.
+
+**2. Pull (fan-out on read).** No write amplification. The cost is expensive reads: merging hundreds of followees' timelines on each request.
+
+**3. Hybrid (the expected answer).** Push for normal users. Pull for accounts above a follower threshold (e.g. 100k) and merge their recent posts at read time. Also skip pushing to inactive users and rebuild their feed on next login.
+
+**4. Ranking.** Reverse-chronological is simplest. Ranked feeds score a candidate set (precomputed IDs plus celebrity posts, a few hundred items) with features such as recency, affinity, engagement and content type. Two-stage: cheap candidate generation, then a heavier ranker on the top few hundred.
+
+**5. Pagination.** Use **cursor-based** (last seen score or ID), not offset. New posts arriving at the top don't shift pages, and it's O(1) to resume.
+
+**6. Storage.** Feed cache in Redis holds IDs only (small). Posts are hydrated from a post cache. The follow graph lives in a sharded store with both `followers(user)` and `following(user)` indexes.
+
+## Follow-up questions
+
+1. A celebrity with 50M followers posts. Trace both the write and the read path.
+2. User A unfollows B. How do B's posts disappear from A's feed?
+3. How do you handle edits and deletes of a post already fanned out?
+4. How would you inject ads or "suggested posts" into the ranked feed?
+5. The feed cache cluster is lost. How do you rebuild feeds without melting the DB?
+
+=== HLD 6 ===
+N|a|Sender app|0|0|130
+N|ws|WebSocket Gateway|230|0|180
+N|chat|Chat Service|230|140|150
+N|store|Message Store (Cassandra)|500|140|220|cylinder
+N|presence|Presence (Redis)|500|0|170|cylinder
+N|push|Push (APNs/FCM)|500|270|170|ellipse
+N|b|Receiver app|0|140|130
+E|a|ws|send(msg)
+E|ws|chat|route
+E|chat|store|persist seq
+E|chat|presence|online?
+E|chat|ws|deliver
+E|chat|push|if offline
+---
+## Problem
+
+Design a chat system like WhatsApp: 1:1 and group messaging, real-time delivery, delivery and read receipts (✓✓), online presence, offline delivery, and history on multiple devices. The core topics are **persistent connections (WebSockets)**, **message ordering**, **delivery guarantees** and **presence**.
+
+## Requirements
+
+**Functional**
+- 1:1 and group chat (≤ 1024 members). Text plus media (via object storage).
+- Sent ✓, delivered ✓✓ and read receipts. Last seen and online status.
+- Offline users receive messages on reconnect, plus a push notification.
+
+**Non-functional**
+- Delivery latency < 200 ms when both users are online. No message loss. Per-chat ordering.
+
+**Scale:** 500M DAU and 50B messages/day ≈ 600k msgs/s average, more at peak. Around 100M concurrent connections; at ~100k per gateway box, that's ~1,000+ gateway servers.
+
+## Architecture
+
+- **Connection gateways** hold WebSocket (or MQTT) connections. A **session registry** (Redis: `userId → gatewayId`) tracks where each user is connected.
+- **Chat service** receives a message, assigns a per-conversation **sequence number**, persists it, then routes it to the recipient's gateway (looked up in the registry) via an internal pub/sub or RPC.
+- **Message store:** Cassandra/HBase partitioned by `conversationId`, clustered by `seq`. Efficient "messages after seq X" queries.
+- **Offline path:** if the recipient isn't connected, the message waits in the store or an inbox, plus a push notification. On reconnect, the client syncs from its last acked seq.
+- **Media:** upload to object storage via a pre-signed URL. The message carries the URL (and an encryption key in E2E designs).
+
+## Key design decisions & trade-offs
+
+**1. WebSocket vs. long-polling.** WebSockets give bidirectional, low-overhead messaging, which suits chat. Long-polling is a fallback. Gateways are stateful, so you need draining on deploy and reconnect with resume.
+
+**2. Ordering.** Global ordering is unnecessary and expensive. Order **per conversation** with a server-assigned monotonic seq (a counter per conversation, or a Snowflake ID plus tiebreak). Clients sort by seq, not by device clock.
+
+**3. Delivery guarantees.** Client sends with a `clientMsgId` (for dedup on retry). Server persists, then acks "sent ✓". The recipient's device acks, giving "delivered ✓✓". Read acks travel the same way. That's at-least-once plus idempotent IDs, which gives effectively-once.
+
+**4. Groups.** Fan-out on write to each member's gateway or inbox for small groups. For large groups, write once to the group log and have members pull by seq.
+
+**5. Presence.** Heartbeats every ~30 s update `lastSeen` in Redis with a TTL. Fan presence changes out only to contacts who are currently viewing that chat, to avoid presence storms.
+
+**6. Multi-device.** Each device keeps its own cursor (last seq) and syncs independently.
+
+## Follow-up questions
+
+1. A gateway server crashes with 100k connections. What happens to in-flight messages?
+2. How exactly do you guarantee per-chat ordering when two users send at the same millisecond?
+3. Design read receipts for a 500-member group without a receipt storm.
+4. How does end-to-end encryption change what the server can store and do?
+5. A user comes back after 2 weeks offline with 10k messages. How does sync work?
+
+=== HLD 7 ===
+N|creator|Uploader|0|0|130
+N|upload|Upload Svc (resumable)|200|0|200
+N|raw|Raw Object Store|520|0|180|cylinder
+N|queue|Transcode Queue|520|130|170|cylinder
+N|trans|Transcoder Workers|200|130|190
+N|cdn|CDN (HLS/DASH)|200|270|170|ellipse
+N|meta|Metadata DB|520|270|160|cylinder
+E|creator|upload|chunks
+E|upload|raw|store
+E|raw|queue|job
+E|queue|trans|consume
+E|trans|cdn|renditions
+E|trans|meta|ready
+---
+## Problem
+
+Design YouTube: creators upload videos, which get transcoded into multiple resolutions and formats, and viewers worldwide stream them smoothly with adaptive bitrate. The discussion centres on the **upload and transcoding pipeline**, **object storage**, **CDN delivery** and the **metadata/view-count** systems.
+
+## Requirements
+
+**Functional**
+- Upload large videos (GBs) reliably, including resuming after a network drop.
+- Transcode to 144p–4K in several codecs. Generate thumbnails.
+- Stream with adaptive bitrate. Search, view counts, likes, comments.
+
+**Non-functional**
+- Playback starts in < 2 s, with minimal rebuffering, at global scale.
+- Uploads must never be lost. Processing can take minutes.
+
+**Scale:** 500 hours uploaded per minute ≈ 30k hours/hour. At ~1 GB per hour of raw video × ~3 for renditions, that's **≈ 2–3 PB of new storage per day**. Views of billions per day are served mostly by the CDN.
+
+## Architecture
+
+**Upload path:**
+1. The client gets a **pre-signed, resumable upload URL** and uploads chunks directly to object storage (S3/GCS), bypassing app servers.
+2. Upload complete triggers an event, which enqueues a **transcode job** (DAG: split, then encode per resolution/codec in parallel, then package as HLS/DASH segments, plus thumbnails, content-ID scan).
+3. Workers write the segments to object storage, update the **metadata DB** (`video → status, renditions, manifest URL`), and the video becomes public.
+
+**Playback path:** the client fetches the manifest from the API, then the segments from the **CDN**. The player switches bitrate per segment based on measured bandwidth (ABR).
+
+## Key design decisions & trade-offs
+
+**1. Direct-to-storage uploads.** App servers never proxy video bytes. Resumable chunked upload (tus or S3 multipart) survives flaky mobile networks.
+
+**2. Parallel transcoding.** Split the video into GOP-aligned chunks and encode them in parallel across workers, then stitch. A 1-hour video finishes in minutes instead of hours. The queue plus idempotent jobs (keyed by `videoId + rendition`) allows safe retries.
+
+**3. Adaptive bitrate.** HLS/DASH segments (2–6 s) per rendition plus a manifest. Shorter segments adapt faster but mean more requests and less efficient caching.
+
+**4. CDN strategy.** Popular videos are cached at edge PoPs worldwide. The long tail is served from regional origin caches (most videos are rarely watched). Pre-warm the CDN for big launches.
+
+**5. Storage tiers.** Hot renditions on standard storage. Old, rarely watched videos move to cheaper tiers, and some renditions (4K of an unwatched video) can be dropped and regenerated on demand.
+
+**6. View counts.** Don't update a DB row per view. Stream view events to Kafka, aggregate (with dedup and fraud filtering) and flush periodically. Counts are eventually consistent.
+
+## Follow-up questions
+
+1. A 4 GB upload fails at 90% on mobile. What does the client do?
+2. How would you prioritise transcoding for a channel with 50M subscribers?
+3. Why does the player sometimes drop to 360p, and how does ABR decide?
+4. Design the view counter so it's accurate within a minute and fraud-resistant.
+5. How do you take a video down globally within minutes (copyright claim)?
+
+=== HLD 8 ===
+N|client|Netflix Client|0|130|150
+N|api|API / Playback Svc|230|0|180
+N|steer|Steering (best OCA)|230|130|180|ellipse
+N|oca|Open Connect (ISP edge)|520|130|210|cylinder
+N|origin|Origin + Encoding|520|0|180|cylinder
+N|reco|Recommendations|230|270|170
+N|events|Viewing events|520|270|160|cylinder
+E|client|api|play(title)
+E|api|steer|pick CDN
+E|client|oca|stream segments
+E|origin|oca|pre-position nightly
+E|client|events|heartbeats
+E|events|reco|train
+---
+## Problem
+
+Design Netflix: a subscription streaming service with a fixed, curated catalogue (unlike YouTube's user uploads), delivering high-quality video to ~250M members on every device, with personalised recommendations and extreme availability. The focus is **CDN design**, **adaptive streaming**, **recommendation** and **resilience**.
+
+## Requirements
+
+**Functional**
+- Browse a personalised home page, search, play with resume across devices, profiles, downloads.
+- Multiple audio and subtitle tracks, adaptive quality up to 4K HDR.
+
+**Non-functional**
+- Very high availability for playback start. Smooth streaming with minimal rebuffering.
+- Netflix is a big share of peak internet traffic, so delivery cost and ISP-friendliness matter.
+
+**Scale:** 250M members and ~100M concurrent streams at peak. At ~5 Mbps average that's on the order of **hundreds of Tbps** at the edge. It can't be served from a few datacentres.
+
+## Architecture
+
+- **Control plane (cloud):** API gateway, auth, catalogue and metadata, the playback service (licence/DRM, manifest, choosing the CDN node), recommendations, billing. Microservices with bulkheads.
+- **Data plane (Open Connect CDN):** Netflix's own cache appliances placed **inside ISPs** and at IXPs. Content is **pre-positioned overnight** based on predicted popularity, so peak traffic stays inside the ISP network.
+- **Encoding:** per-title and per-shot encoding ladders (the bitrate/resolution set chosen per content complexity), many codecs (H.264, HEVC, AV1), packaged for DASH/HLS.
+- **Client:** ABR algorithm with a buffer, picking the bitrate per segment, and a **steering** service that returns a ranked list of nearby healthy caches.
+
+## Key design decisions & trade-offs
+
+**1. Own CDN vs. a commercial CDN.** At this volume, owning the edge (free appliances for ISPs) cuts cost and improves quality. YouTube-like long-tail catalogues benefit less from pre-positioning, while Netflix's catalogue is fixed and predictable.
+
+**2. Pre-positioning vs. pull-through caching.** Netflix knows what will be popular tomorrow, so it fills caches off-peak and avoids cache misses during peak.
+
+**3. Per-title encoding.** An animated show looks great at a low bitrate; an action film needs more. Tailored ladders save bandwidth for the same perceived quality.
+
+**4. Recommendations.** Viewing events go through Kafka into a data lake, then offline model training (collaborative filtering plus deep models). Results are precomputed per profile and cached, with real-time context re-ranking. Even artwork is personalised.
+
+**5. Resilience.** Multi-region active-active. Circuit breakers, timeouts, fallbacks (if recommendations are down, show popular titles). **Chaos engineering** proves it. Playback must keep working even when the home page degrades.
+
+**6. Resume across devices.** Heartbeat events write the playback position to a fast KV store keyed by profile and title.
+
+## Follow-up questions
+
+1. A new season of a hit show drops at midnight worldwide. How do you prepare?
+2. An ISP's Open Connect box fails mid-stream. What does the client do?
+3. Compare Netflix's CDN approach with YouTube's. Why are they different?
+4. How would you A/B test a new ABR algorithm safely?
+5. Design "Continue Watching" so it's correct across a phone and a TV.

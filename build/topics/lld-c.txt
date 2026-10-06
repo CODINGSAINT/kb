@@ -1,0 +1,358 @@
+=== LLD 12 ===
+N|cart|ShoppingCart|300|0|150
+N|item|CartItem|0|0|130
+N|product|Product|0|150|130
+N|engine|PricingEngine|300|150|160
+N|rules|PromotionRule ×N|600|150|160|ellipse
+N|checkout|Checkout|300|280|140
+N|inv|Inventory|600|280|130|cylinder
+E|cart|item|has N
+E|item|product|refers
+E|cart|engine|price()
+E|engine|rules|apply in order
+E|cart|checkout|place order
+E|checkout|inv|reserve
+---
+## Problem
+
+Design the shopping cart and pricing engine of an e-commerce site: add or remove items, change quantities, apply promotions (coupons, BOGO, category discounts, cart-value thresholds) and compute the final price, then check out. The real test is a **pricing rules engine** that's extensible and gives predictable results when multiple promotions apply.
+
+## Requirements
+
+**Functional**
+- Add, update and remove items. The cart persists for logged-in users and merges with the guest cart on login.
+- Promotions: percentage or flat off on an item or category, buy X get Y, cart-level "₹200 off above ₹1500", coupon codes, free shipping.
+- Show a price breakdown: subtotal, each discount line, tax, shipping, total.
+- At checkout, validate stock and prices again, then create an order.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Product`, `Category` | Catalogue (price comes from a `PriceService`, not cached in the cart) |
+| `Cart`, `CartItem` | productId, quantity, `addedAt` |
+| `PricingEngine` | Runs a pipeline of `PromotionRule`s and produces a `PriceBreakdown` |
+| `PromotionRule` (Strategy) | `isApplicable(ctx)`, `apply(ctx)`, `priority()`, `stackable()` |
+| `PricingContext` | Line items with running prices, applied promos, user, coupon |
+| `Coupon` | Code, validity, usage limits, eligibility (Specification pattern) |
+| `CheckoutService` | Re-price, reserve inventory, create `Order` |
+
+```java
+interface PromotionRule {
+    int priority();                      // item-level before cart-level
+    boolean isApplicable(PricingContext ctx);
+    void apply(PricingContext ctx);      // adds DiscountLine(s) to ctx
+}
+```
+
+## Design decisions & trade-offs
+
+**1. Rules are Strategies in an ordered pipeline.** Apply item-level rules first, then category, then cart-level, then shipping. Order matters: 10% off then ₹200 off is not the same as ₹200 off then 10% off. Make the order explicit with `priority()` rather than relying on insertion order.
+
+**2. Stacking and exclusivity.** Mark rules `stackable` or put them in an exclusive group. For exclusive groups, either pick the best discount for the customer (evaluate each and keep the max) or the first by priority. State which business rule you're assuming.
+
+**3. Never trust cached prices.** The cart stores product IDs and quantities. Price is computed at view time and **recomputed at checkout**. If the price changed, show it before payment.
+
+**4. Eligibility as Specification.** `MinCartValue(1500).and(CategoryIn("shoes")).and(FirstOrder())` composes conditions without one huge `if`.
+
+**5. Explainable output.** Return a `PriceBreakdown` with a line per discount. That's needed for the UI, for refunds on partial returns (allocate discounts per line), and for debugging.
+
+**6. Inventory at checkout, not at add-to-cart.** Reserving on add-to-cart lets carts hog stock. Reserve with a TTL during checkout.
+
+## Follow-up questions
+
+1. A customer returns one item from a BOGO order. How much do you refund?
+2. Two coupons both say "best discount wins". How do you compute that efficiently?
+3. Merge a guest cart into a user cart that already has the same item.
+4. A flash sale ends while the user is at the payment page. What price do they get?
+5. How would you let marketing add new promotion types without a deploy?
+
+=== LLD 13 ===
+N|api|NotificationService|280|0|190
+N|tmpl|TemplateEngine|0|0|150
+N|pref|User Preferences|0|150|160|cylinder
+N|factory|ChannelFactory|280|150|160
+N|email|Email|600|0|120
+N|sms|SMS|600|120|120
+N|push|Push|600|240|120
+E|api|tmpl|render
+E|api|pref|channels?
+E|api|factory|get sender
+E|factory|email|creates
+E|factory|sms|creates
+E|factory|push|creates
+---
+## Problem
+
+Design a notification system (as an in-process library or service) that sends messages over email, SMS, push and in-app channels, respects user preferences, renders templates, retries failures and is easy to extend with new channels. It's an extensibility problem: **Strategy** per channel, **Factory** to create senders, and **Observer** to decouple producers from delivery.
+
+## Requirements
+
+**Functional**
+- `send(userId, eventType, payload)`. The system picks channels from user preferences and event priority.
+- Template per event and channel, with variables and localisation.
+- Retry with backoff. Fallback (push fails, so use SMS for critical events).
+- Rate-limit per user. Respect quiet hours. Deduplicate.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `NotificationService` | Facade: resolve channels, render, dispatch |
+| `NotificationChannel` (Strategy) | `EmailChannel`, `SmsChannel`, `PushChannel`, `InAppChannel`; `send(Message)` |
+| `ChannelFactory` | `get(ChannelType)` (registry map, so new channels self-register) |
+| `TemplateEngine` | `render(templateId, locale, vars)` |
+| `PreferenceService` | Per-user, per-event channel opt-ins and quiet hours |
+| `Notification` | id, user, event, channel, status (PENDING, SENT, FAILED, RETRYING) |
+| `RetryPolicy` | Exponential backoff with jitter, max attempts |
+| Filters (Chain of Responsibility) | `DedupFilter → RateLimitFilter → QuietHoursFilter` |
+
+```java
+public interface NotificationChannel {
+    ChannelType type();
+    DeliveryResult send(RenderedMessage msg);
+}
+```
+
+## Design decisions & trade-offs
+
+**1. Open/closed via registry.** Adding WhatsApp is one class implementing `NotificationChannel`, registered with the factory. No `switch` to edit. Vendor adapters (SES vs. SendGrid) sit behind each channel as a second Strategy level.
+
+**2. Pre-send filters as a chain.** Dedup, rate limit, quiet hours and preference checks are independent rules. A chain lets you reorder them and add new ones, and each filter can short-circuit (drop or delay).
+
+**3. Async dispatch.** Producers call `send`, which enqueues work (`BlockingQueue`, or Kafka in HLD). A worker pool delivers. Producers never block on a slow SMS gateway.
+
+**4. Retries and idempotency.** Keep a notification ID through retries so vendors or your dedup can drop duplicates. Classify failures: transient (timeout, 5xx) gets retried; permanent (invalid number) fails fast.
+
+**5. Priority.** OTPs and security alerts skip quiet hours and use a separate high-priority queue, so a marketing blast can't delay them.
+
+## Follow-up questions
+
+1. Add a new channel (WhatsApp). List exactly which files change.
+2. A user should get at most 3 promotional notifications a day. Where is that enforced?
+3. How do you guarantee an OTP isn't sent twice when a retry races the original?
+4. Batch digest emails: collect events for an hour and send one email.
+5. How would you track delivered/opened status from vendor callbacks?
+
+=== LLD 14 ===
+N|client|Client Request|0|0|150
+N|limiter|RateLimiter|290|0|150
+N|registry|Per-key Buckets|590|0|170|cylinder
+N|algo|Algorithm (Strategy)|290|150|190|ellipse
+N|tb|Token Bucket|0|280|150
+N|sw|Sliding Window|290|280|160
+N|fw|Fixed Window|600|280|150
+E|client|limiter|tryAcquire(key)
+E|limiter|registry|lookup
+E|limiter|algo|delegates
+E|algo|tb|impl
+E|algo|sw|impl
+E|algo|fw|impl
+---
+## Problem
+
+Design a rate limiter class in Java (the LLD version, inside one JVM): `boolean allow(String key)` limits each user or API key to N requests per time window. You must implement the algorithms correctly, make them **thread-safe**, and make the algorithm swappable (**Strategy**).
+
+## Requirements
+
+**Functional**
+- Per-key limits (user ID, IP, API key), with different limits per tier or endpoint.
+- Algorithms: fixed window, sliding window log, sliding window counter, token bucket, leaky bucket.
+- Return allowed or denied, plus metadata (remaining requests, retry-after).
+
+**Non-functional**
+- O(1) per call where possible, safe under many concurrent threads, and bounded memory (evict idle keys).
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `RateLimiter` | Facade: `allow(key)`; looks up the key's limiter |
+| `RateLimitAlgorithm` (Strategy) | `allow()` on one key's state |
+| `TokenBucket`, `SlidingWindowLog`, `SlidingWindowCounter`, `FixedWindow` | Implementations |
+| `RateLimitConfig` | capacity, refill rate or window, per tier |
+| `LimiterRegistry` | `ConcurrentHashMap<String, RateLimitAlgorithm>` plus idle eviction |
+| `Clock` | Injected time source, so tests are deterministic |
+
+```java
+final class TokenBucket implements RateLimitAlgorithm {
+    private final long capacity; private final double refillPerNano;
+    private double tokens; private long last;
+    public synchronized boolean allow() {
+        long now = clock.nanoTime();
+        tokens = Math.min(capacity, tokens + (now - last) * refillPerNano);
+        last = now;
+        if (tokens >= 1) { tokens -= 1; return true; }
+        return false;
+    }
+}
+```
+
+## Design decisions & trade-offs
+
+| Algorithm | Pros | Cons |
+|---|---|---|
+| Fixed window | Tiny state, simple | Up to 2× burst at window edges |
+| Sliding log | Exact | O(N) memory per key |
+| Sliding counter | ~Exact, O(1) memory (weighted previous window) | Approximation |
+| Token bucket | Allows controlled bursts, smooth refill | Two params to tune |
+| Leaky bucket | Smooths output rate | Queues add latency |
+
+**1. Lazy refill.** Never use a background thread to add tokens. Compute the refill from elapsed time on each call. That's O(1) and scales to millions of keys.
+
+**2. Thread safety.** `synchronized` per bucket means contention only on the same key, which is usually fine. For a lock-free version, pack state into an `AtomicLong` or use `AtomicReference<State>` with a CAS loop. `computeIfAbsent` on the registry avoids creating duplicate buckets.
+
+**3. Memory.** Evict keys idle longer than the window (a Caffeine cache with `expireAfterAccess`, or a periodic sweep).
+
+**4. Testability.** Inject a `Clock`. Never call `System.currentTimeMillis()` inside the algorithm.
+
+**5. Distributed version (preview of HLD #2).** State moves to Redis, and the logic runs atomically as a Lua script.
+
+## Follow-up questions
+
+1. Show the fixed-window boundary burst with an example, and fix it.
+2. Make the token bucket lock-free.
+3. Support "100/min **and** 1000/hour" on the same key.
+4. How would you rate-limit by cost (expensive endpoints use 5 tokens)?
+5. What should the HTTP response include when a request is limited?
+
+=== LLD 15 ===
+N|user|User|0|0|110
+N|wallet|WalletService|250|0|160
+N|idem|Idempotency Store|560|0|180|cylinder
+N|acct|Wallet Account|250|150|160
+N|ledger|Ledger Entries|560|150|160|cylinder
+N|gw|PaymentGateway|0|150|160|ellipse
+N|txn|Txn State|250|280|150|ellipse
+E|user|wallet|transfer(key)
+E|wallet|idem|check key
+E|wallet|acct|lock & update
+E|acct|ledger|append debit/credit
+E|wallet|gw|top-up
+E|wallet|txn|transitions
+---
+## Problem
+
+Design a digital wallet like Paytm or PhonePe: users top up from a bank or card, pay merchants, transfer to other users, and see a history. Money moves must be **atomic**, **idempotent** and **auditable**. This combines a transaction **State machine**, **Strategy** for payment instruments, and careful concurrency.
+
+## Requirements
+
+**Functional**
+- Create a wallet, top up via a gateway, pay a merchant, P2P transfer, withdraw to a bank, view the statement.
+- Limits (per-transaction, daily, KYC tier). Refunds and reversals.
+
+**Non-functional**
+- Never lose or create money. Balances must match the ledger exactly.
+- Client retries must not double-charge. Concurrent transfers must not overdraw.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Wallet` | id, user, `balance` (derived or cached), status, version |
+| `LedgerEntry` | Immutable: txnId, walletId, `DEBIT/CREDIT`, amount, balanceAfter |
+| `Transaction` | id, type, amount, from, to, `TxnState`, idempotencyKey |
+| `TxnState` | `INITIATED → PROCESSING → SUCCESS / FAILED → REVERSED` |
+| `PaymentInstrument` (Strategy) | `Card`, `UPI`, `NetBanking` for top-ups |
+| `IdempotencyStore` | key → result (first result wins) |
+| `LimitPolicy` | Chain of checks: KYC tier, daily cap, velocity |
+
+## Design decisions & trade-offs
+
+**1. Double-entry ledger as the source of truth.** Each transfer writes two entries (debit A, credit B) that sum to zero, in one transaction. A balance is the sum of entries. Cache it on the wallet row for speed, but you can always rebuild and reconcile it.
+
+**2. Atomic transfer without deadlocks.**
+```java
+void transfer(Wallet a, Wallet b, Money amt) {
+    Wallet first = a.id().compareTo(b.id()) < 0 ? a : b, second = first == a ? b : a;
+    synchronized (first) { synchronized (second) {
+        if (a.balance().lt(amt)) throw new InsufficientFunds();
+        a.debit(amt); b.credit(amt); ledger.append(/* two entries */);
+    }}
+}
+```
+Lock in a global order (by ID) to avoid A→B / B→A deadlock. In a DB: `SELECT … FOR UPDATE` in ID order, or a conditional `UPDATE wallet SET balance = balance - :x WHERE id=:a AND balance >= :x`.
+
+**3. Idempotency.** The client sends `Idempotency-Key`. The first request stores `key → PROCESSING`, then the result. Retries return the stored result. The key's insert must be atomic (unique constraint).
+
+**4. External top-ups are a State machine.** Gateway calls are slow and may time out with an unknown outcome. Mark the transaction `PROCESSING`, credit the wallet only on a confirmed webhook or status poll, and reconcile pending ones on a schedule.
+
+**5. Reversal, never deletion.** A refund is a new transaction with opposite entries. The ledger is append-only for audit.
+
+## Follow-up questions
+
+1. The gateway times out: did the money move? How do you find out and fix it?
+2. Why is double-entry better than `UPDATE balance` alone?
+3. Two transfers out of the same wallet hit at once with just enough for one. Walk through it.
+4. Implement daily limits that are correct under concurrency.
+5. How do you produce an end-of-day reconciliation report?
+
+=== LLD 16 ===
+N|game|Game|300|0|130
+N|board|Board N×N|300|150|140
+N|player|Player ×2|0|0|130
+N|strat|MoveStrategy|0|150|150|ellipse
+N|win|WinChecker|600|150|140
+N|state|GameState|600|0|140|ellipse
+E|game|player|turns
+E|player|strat|uses
+E|game|board|place(r,c)
+E|game|win|after move
+E|win|board|O(1) counters
+E|game|state|status
+---
+## Problem
+
+Design tic-tac-toe for two players on an N×N board, with win detection in **O(1) per move**, and an architecture that lets you swap a human for a bot or change the board size or win rule. It looks trivial, so interviewers grade it on clean OOP and that O(1) trick.
+
+## Requirements
+
+- N×N board (default 3), two players with symbols, alternate turns.
+- Reject invalid moves (occupied cell, out of bounds, wrong turn).
+- Detect a win (a full row, column or diagonal) or a draw.
+- Players can be human or computer. Optionally, support undo.
+
+## Key abstractions
+
+| Type | Responsibility |
+|---|---|
+| `Game` | Turn order, `makeMove(row, col)`, status |
+| `Board` | Grid of `Cell`/`Symbol`; `place`, `isFull`, `isValid` |
+| `Player` | name, symbol, `MoveStrategy` |
+| `MoveStrategy` | `HumanInput`, `RandomBot`, `MinimaxBot` |
+| `WinningStrategy` / `WinChecker` | Row/col/diagonal counters (pluggable) |
+| `GameStatus` | `IN_PROGRESS`, `WON`, `DRAW` |
+| `Move` | player, row, col (for history and undo) |
+
+```java
+class WinChecker {
+    private final int n; private final int[] rows, cols; private int diag, anti;
+    boolean record(int r, int c, int playerSign) {      // +1 for X, -1 for O
+        rows[r] += playerSign; cols[c] += playerSign;
+        if (r == c) diag += playerSign;
+        if (r + c == n - 1) anti += playerSign;
+        int t = n * playerSign;
+        return rows[r] == t || cols[c] == t || diag == t || anti == t;
+    }
+}
+```
+
+## Design decisions & trade-offs
+
+**1. O(1) win detection.** Scanning the board after every move is O(N²). Keep running sums per row, column and both diagonals (+1 for X, −1 for O). A sum of ±N means a win. Draw is `moves == N*N` with no win.
+
+**2. Strategy for players.** `Game` calls `player.nextMove(board)` and never knows whether a human or a bot is playing. Minimax is just another implementation.
+
+**3. Strategy for win rules too.** "K in a row on an N×N board" (gomoku-style) needs a different checker. With `WinningStrategy` as an interface, `Game` doesn't change.
+
+**4. Undo.** Keep a `Deque<Move>`. Undo clears the cell and subtracts the sign from the counters. That's exact because the counters are additive.
+
+**5. Separation from I/O.** No `System.out` in `Game`. A console or web UI is an adapter, which keeps the core unit-testable.
+
+## Follow-up questions
+
+1. Extend to K-in-a-row on a 15×15 board. Do the counters still work?
+2. Implement an unbeatable bot. What's minimax's complexity on 3×3, and what about alpha-beta?
+3. Support 3+ players with different symbols.
+4. Make it multiplayer over the network: where does validation live?
+5. How do you test every win line without writing 8 near-identical tests?

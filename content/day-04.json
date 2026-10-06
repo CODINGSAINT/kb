@@ -1,0 +1,324 @@
+{
+  "day": 4,
+  "generatedAt": "2026-10-04T06:22:07.158Z",
+  "sketch": null,
+  "evaluation": null,
+  "topics": [
+    {
+      "category": "LLD",
+      "number": 4,
+      "title": "Design BookMyShow / Movie Booking",
+      "concepts": "Seat locking, concurrency, transactions, State",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "user",
+            "label": "User",
+            "x": 0,
+            "y": 0,
+            "w": 120,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "svc",
+            "label": "BookingService",
+            "x": 250,
+            "y": 0,
+            "w": 170,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "show",
+            "label": "Show",
+            "x": 560,
+            "y": 0,
+            "w": 140,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "seat",
+            "label": "ShowSeat",
+            "x": 560,
+            "y": 150,
+            "w": 140,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "lock",
+            "label": "SeatLockProvider",
+            "x": 250,
+            "y": 150,
+            "w": 170,
+            "h": 50,
+            "shape": "ellipse"
+          },
+          {
+            "id": "pay",
+            "label": "PaymentService",
+            "x": 0,
+            "y": 150,
+            "w": 160,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "booking",
+            "label": "Booking",
+            "x": 250,
+            "y": 280,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          }
+        ],
+        "edges": [
+          {
+            "from": "user",
+            "to": "svc",
+            "label": "select seats"
+          },
+          {
+            "from": "svc",
+            "to": "lock",
+            "label": "lock(seats, ttl)"
+          },
+          {
+            "from": "svc",
+            "to": "show",
+            "label": "for show"
+          },
+          {
+            "from": "show",
+            "to": "seat",
+            "label": "has N"
+          },
+          {
+            "from": "svc",
+            "to": "pay",
+            "label": "charge"
+          },
+          {
+            "from": "svc",
+            "to": "booking",
+            "label": "create"
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nDesign a movie booking system like BookMyShow: browse cities, cinemas, movies and shows, pick seats and pay. The core interview challenge is **concurrency on seat selection**: two users must never book the same seat, and seats held by an abandoned checkout must free up automatically.\n\n## Requirements\n\n**Functional**\n- Search movies by city. List shows per cinema and screen. Show a seat map.\n- Select seats, hold them for a few minutes, pay, and confirm the booking.\n- Cancel bookings (with a refund policy) and release unpaid holds after a TTL.\n\n**Non-functional**\n- No double booking, ever.\n- Seat holds must expire without a manual cleanup step.\n\n## Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Movie`, `Cinema`, `Screen`, `Seat` | Catalogue and static layout |\n| `Show` | movie + screen + start time. Owns `ShowSeat`s |\n| `ShowSeat` | seat for a particular show. Status: `AVAILABLE`, `LOCKED`, `BOOKED` |\n| `SeatLockProvider` | `lock(show, seats, user, ttl)`, `unlock` and `validate` |\n| `Booking` | user, show, seats, amount. State: `PENDING → CONFIRMED / CANCELLED / EXPIRED` |\n| `PaymentService` | Strategy per method, plus idempotency key |\n| `PricingStrategy` | seat category, weekday/weekend, dynamic pricing |\n\n## Design decisions & trade-offs\n\n**1. Lock then pay, not pay then lock.** Hold seats when the user selects them, with a TTL of about 5 minutes. Confirm with payment. If payment happens first, two users can both pay for the same seat.\n\n**2. Implementing the lock (in-process LLD).**\n```java\nclass InMemorySeatLockProvider implements SeatLockProvider {\n    private final ConcurrentHashMap<SeatKey, SeatLock> locks = new ConcurrentHashMap<>();\n    public synchronized boolean lock(Show s, List<Seat> seats, String user, Duration ttl) {\n        if (seats.stream().anyMatch(x -> isLocked(s, x))) return false;  // all-or-nothing\n        seats.forEach(x -> locks.put(new SeatKey(s, x), new SeatLock(user, now().plus(ttl))));\n        return true;\n    }\n}\n```\nAll-or-nothing matters: a user selecting 4 seats shouldn't get 3. Sort seat keys before locking if you use per-seat locks, so two threads can't deadlock.\n\n**3. Expiry.** Do a lazy check (`expiresAt < now` means it's free) plus a scheduled sweeper that moves `PENDING` bookings to `EXPIRED`. In a distributed setup this becomes Redis `SET NX PX` per seat, or a DB row with `status, locked_until` and a conditional `UPDATE … WHERE status='AVAILABLE'`.\n\n**4. Booking as a State machine.** Only `PENDING` can become `CONFIRMED`, and only if the lock is still held by this user. Re-validate the lock at confirmation time, because the TTL may have passed during a slow payment.\n\n**5. Idempotent payment callbacks.** Gateways retry. Key the confirmation on `paymentId` so a duplicate callback can't double-confirm.\n\n## Follow-up questions\n\n1. Payment succeeds but the seat lock expired a second earlier. What do you do?\n2. Scale to millions of users for a blockbuster release. Where does the lock live now?\n3. Optimistic vs. pessimistic locking for seats: when would you pick each?\n4. Add a **waitlist** that auto-assigns released seats.\n5. How do you stop bots from holding every seat?\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    },
+    {
+      "category": "HLD",
+      "number": 4,
+      "title": "Notification System",
+      "concepts": "Kafka, queues, fan-out, retries, DLQ, multi-channel delivery",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "prod",
+            "label": "Producers (services)",
+            "x": 0,
+            "y": 0,
+            "w": 180,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "api",
+            "label": "Notification API",
+            "x": 0,
+            "y": 150,
+            "w": 170,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "kafka",
+            "label": "Kafka topics",
+            "x": 260,
+            "y": 110,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "workers",
+            "label": "Channel Workers",
+            "x": 480,
+            "y": 115,
+            "w": 160,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "vendors",
+            "label": "APNs/FCM/SES/SMS",
+            "x": 480,
+            "y": 250,
+            "w": 180,
+            "h": 50,
+            "shape": "ellipse"
+          },
+          {
+            "id": "dlq",
+            "label": "Retry + DLQ",
+            "x": 260,
+            "y": 258,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "prefs",
+            "label": "Prefs/Template DB",
+            "x": 480,
+            "y": 0,
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
+          }
+        ],
+        "edges": [
+          {
+            "from": "prod",
+            "to": "kafka",
+            "label": "events"
+          },
+          {
+            "from": "api",
+            "to": "kafka",
+            "label": "enqueue"
+          },
+          {
+            "from": "kafka",
+            "to": "workers",
+            "label": "consume"
+          },
+          {
+            "from": "workers",
+            "to": "prefs",
+            "label": "lookup"
+          },
+          {
+            "from": "workers",
+            "to": "vendors",
+            "label": "send"
+          },
+          {
+            "from": "workers",
+            "to": "dlq",
+            "label": "fail"
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nDesign a notification platform that many internal services use to send email, SMS, push and in-app notifications to millions of users: transactional (OTP, order shipped) and bulk (campaigns). It must be reliable, respect preferences and rate limits, retry failures and never block the callers. The topics are **queues and fan-out**, **retries and DLQ**, **priority isolation**, and **multi-channel delivery**.\n\n## Requirements\n\n**Functional**\n- `POST /notify {userIds|segment, template, data, channels?, priority}`.\n- Per-user preferences, opt-outs, quiet hours, localisation, templates.\n- Delivery status tracking (sent, delivered, opened), and a campaign scheduler.\n\n**Non-functional**\n- At-least-once delivery with deduplication, so users see effectively-once.\n- OTP latency < 5 s even during a 50M-user campaign.\n\n**Scale:** 1B notifications per day is ~12k/s average and 100k/s peak during campaigns. A campaign to a segment fans out 1 request into 50M messages.\n\n## Architecture\n\n1. The **Notification API** validates, assigns a `notificationId` and writes to **Kafka**, with separate topics per priority (`critical`, `transactional`, `bulk`).\n2. A **fan-out service** expands segments into per-user messages (paged from the user DB) for bulk campaigns.\n3. **Channel workers** (separate consumer groups per channel) load preferences and the template, render, apply per-user rate limits and dedup, then call the vendor.\n4. Failures go to a **retry topic** with exponential backoff, then a **DLQ** after N attempts for inspection and replay.\n5. Vendor callbacks (delivered, bounced) update the **status store** (Cassandra/DynamoDB keyed by notificationId and by userId+time).\n\n## Key design decisions & trade-offs\n\n**1. Queue between producers and senders.** It decouples callers from vendor latency and outages, absorbs spikes, and makes retry and replay possible. Kafka gives ordering per partition plus replay; SQS/RabbitMQ are simpler for per-message ack and delay.\n\n**2. Priority isolation.** Separate topics and worker pools per priority stop a campaign from starving OTPs. Bulk workers get a hard cap on vendor throughput.\n\n**3. Idempotency.** Workers may process a message twice (at-least-once). Record `notificationId` in a dedup store with a TTL before sending, and pass an idempotency key to vendors that support one.\n\n**4. Retries done right.** Exponential backoff with jitter. Classify errors (4xx permanent vs. 5xx or timeout transient). Use per-vendor **circuit breakers** and failover vendors (SES down, so SendGrid).\n\n**5. Rate limits both ways.** Per-user (no spamming) and per-vendor (respect provider quotas). Token buckets in Redis.\n\n**6. Templates and preferences cached** in workers with short TTLs. Each is read for every message, so this is where the database load comes from.\n\n## Follow-up questions\n\n1. A 50M-user campaign and an OTP spike happen together. Walk through isolation.\n2. How do you guarantee a user doesn't receive the same push twice?\n3. FCM is down for 30 minutes. What happens to queued messages?\n4. Design the \"user unsubscribed 1 second ago\" race.\n5. How would you measure end-to-end delivery latency per channel?\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    },
+    {
+      "category": "AI",
+      "number": 4,
+      "title": "Embeddings & Semantic Search",
+      "concepts": "Embeddings, cosine similarity, semantic retrieval",
+      "notes": "",
+      "diagram": {
+        "nodes": [
+          {
+            "id": "docs",
+            "label": "Text / Docs",
+            "x": 0,
+            "y": 0,
+            "w": 130,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "emb",
+            "label": "Embedding Model",
+            "x": 220,
+            "y": 0,
+            "w": 170,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "vec",
+            "label": "Vectors [0.12, -0.4, ...]",
+            "x": 470,
+            "y": 0,
+            "w": 230,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "q",
+            "label": "Query",
+            "x": 0,
+            "y": 200,
+            "w": 110,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "qemb",
+            "label": "Query vector",
+            "x": 220,
+            "y": 200,
+            "w": 160,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "sim",
+            "label": "Cosine top-k",
+            "x": 470,
+            "y": 200,
+            "w": 160,
+            "h": 50,
+            "shape": "ellipse"
+          }
+        ],
+        "edges": [
+          {
+            "from": "docs",
+            "to": "emb",
+            "label": "embed"
+          },
+          {
+            "from": "emb",
+            "to": "vec",
+            "label": "store"
+          },
+          {
+            "from": "q",
+            "to": "qemb",
+            "label": "embed"
+          },
+          {
+            "from": "qemb",
+            "to": "sim",
+            "label": "compare"
+          },
+          {
+            "from": "vec",
+            "to": "sim",
+            "label": "nearest"
+          }
+        ]
+      },
+      "markdown": "## Problem\n\nExplain embeddings and semantic search: how text becomes vectors, why similar meanings land close together, how cosine similarity and nearest-neighbour search work, and how this differs from keyword search. It's the foundation for RAG, recommendations, dedup and clustering.\n\n## Requirements\n\n- What an embedding is (a dense vector of fixed dimension from a model) and what dimensions mean.\n- Cosine similarity vs. dot product vs. Euclidean distance.\n- Semantic vs. lexical search: strengths and failure modes of each.\n- Exact vs. approximate nearest neighbour (HNSW, IVF).\n- Practical concerns: model choice, normalisation, chunk size, re-embedding on model change.\n\n## Key concepts\n\n| Concept | Explanation |\n|---|---|\n| **Embedding** | `f(text) → ℝⁿ` (e.g. n = 768–3072) learned so semantically similar texts have nearby vectors |\n| **Cosine similarity** | `a·b / (‖a‖‖b‖)`: angle-based; 1 = same direction. With normalised vectors it equals the dot product |\n| **Semantic search** | Embed the query, find nearest document vectors |\n| **Lexical search (BM25)** | Exact term matching; great for IDs, codes, rare words |\n| **ANN index** | HNSW graph or IVF clusters: sub-linear search with slight recall loss |\n| **Recall@k** | Fraction of truly relevant docs found in the top k, the metric to tune |\n\n```java\nfloat[] q = embeddingModel.embed(\"How do I reset my password?\");\nList<Document> hits = vectorStore.similaritySearch(\n    SearchRequest.builder().query(\"How do I reset my password?\")\n        .topK(5).similarityThreshold(0.75).build());\n```\n\n## Design decisions & trade-offs\n\n1. **Semantic vs. keyword.** Embeddings find \"forgot login credentials\" for \"reset password\", which keyword search misses. But they're weak on exact identifiers (\"error ORA-01555\", SKU codes) and negation. **Hybrid search** (BM25 + vectors, fused with Reciprocal Rank Fusion) is the production default (topic 11).\n2. **Use the same model for queries and documents.** Vectors from different models live in different spaces. Changing the model means re-embedding the whole corpus, so plan for versioned indexes.\n3. **Chunk size affects meaning.** A whole 40-page document embedded into one vector blurs everything. Chunks that are too tiny lose context. 200–800 tokens with overlap is a common start (topic 5).\n4. **Exact vs. ANN.** Brute-force cosine is fine for < 100k vectors. Beyond that, HNSW gives ~95–99% recall at millisecond latency. Tune `ef_search` / `M` for recall vs. speed.\n5. **Similarity thresholds are model-specific.** A 0.8 cutoff for one model isn't comparable to another. Calibrate on labelled examples.\n6. **Cost and storage.** 10M chunks × 1,536 dims × 4 bytes ≈ 61 GB before index overhead. Consider smaller dimensions or quantisation.\n\n## Follow-up questions\n\n1. Why might semantic search fail for \"invoice INV-2024-0042\"? What's the fix?\n2. Cosine vs. dot product: when are they equivalent?\n3. You switch embedding models. What's your migration plan?\n4. How do you measure whether your semantic search is good?\n5. Explain HNSW at a high level and its tuning knobs.\n",
+      "userAnswer": "",
+      "answerEvaluation": null,
+      "answerEvaluatedAt": null
+    }
+  ]
+}

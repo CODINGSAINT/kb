@@ -1,0 +1,362 @@
+=== HLD 9 ===
+N|driver|Driver app|0|0|130
+N|loc|Location Svc|230|0|150
+N|geo|Geo Index (H3 cells)|500|0|200|cylinder
+N|rider|Rider app|0|150|130
+N|match|Matching Svc|230|150|150
+N|trip|Trip Svc + DB|500|150|170|cylinder
+N|pricing|Surge Pricing|230|280|150|ellipse
+E|driver|loc|GPS every 4s
+E|loc|geo|update cell
+E|rider|match|request
+E|match|geo|nearby drivers
+E|match|trip|create trip
+E|match|pricing|quote
+---
+## Problem
+
+Design Uber's backend for matching riders with nearby drivers in real time: ingest millions of driver location updates, find the best nearby available driver within seconds, handle offers and acceptance, track trips, and price dynamically. The focus is **geo-indexing**, **high-frequency location updates**, **matching** and **distributed consistency** (one driver, one trip).
+
+## Requirements
+
+**Functional**
+- Drivers publish location every ~4 s while online. Riders request a ride and get an ETA and a price.
+- Match within a few seconds. The driver accepts or declines. Live tracking for both parties.
+- Trip lifecycle, fare calculation, payments.
+
+**Non-functional**
+- Matching p99 < a few seconds. Location writes are high-volume but each one is cheap and short-lived.
+- A driver must never be double-assigned.
+
+**Scale:** 5M online drivers ÷ 4 s ≈ **1.25M location writes/s**. Ride requests are only ~10k/s, but each queries nearby drivers.
+
+## Architecture
+
+- **Location service:** stateless ingest (WebSocket or UDP-ish) that updates an **in-memory geo index** sharded by region or cell. Latest position only; history goes asynchronously to Kafka for analytics and ETA models.
+- **Geo index:** a hexagonal grid (Uber's **H3**) or geohash. `cell → set of available drivers`. Nearby search queries the rider's cell plus k-ring neighbours and widens if needed.
+- **Matching (dispatch) service:** gets candidates, computes the real ETA (road network, not straight-line distance), picks the best, and **atomically reserves** the driver (CAS on driver state in Redis or the owning shard) before sending the offer.
+- **Trip service:** a durable state machine in a transactional DB, publishing events for tracking, notifications and billing.
+
+## Key design decisions & trade-offs
+
+**1. Geohash vs. quadtree vs. H3.** Geohash is simple string prefixes but has edge distortions and cells of unequal neighbour distance. A quadtree adapts to density but is harder to shard. **H3 hexagons** have uniform neighbour distances, which makes them good for k-ring search and surge zones.
+
+**2. Don't put 1.25M writes/s in a database.** Location is ephemeral: keep the latest position in memory (Redis GEO or custom sharded in-memory services) and replicate for failover. Losing a few seconds of positions is fine, because drivers will send the next update.
+
+**3. Sharding by geography.** City or region shards keep matching local and cache-friendly. Hot spots (an airport at a concert's end) need finer cells or dynamic splitting.
+
+**4. Reserving the driver.** Matching might pick the same driver for two riders concurrently. A CAS from `AVAILABLE` to `DISPATCHING` on the owning shard ensures one winner. Offer timeouts release the driver.
+
+**5. Batched matching.** Instead of greedily matching each request immediately, collect requests over a ~1–2 s window and solve a bipartite assignment that minimises total ETA. That gives better global outcomes and is what large platforms do.
+
+**6. Surge pricing.** Compute the supply/demand ratio per cell every minute from streaming counts, smooth it, and lock the quoted price for the rider for a few minutes.
+
+## Follow-up questions
+
+1. How do you find drivers within 2 km efficiently, and widen the search if there are none?
+2. A region's location shard crashes. What happens to matching there?
+3. Compare greedy nearest-driver with batched matching. When does batching win?
+4. How do you compute an accurate ETA (not straight-line distance)?
+5. Design live trip tracking for the rider: push frequency, transport and cost.
+
+=== HLD 10 ===
+N|client|Desktop/Mobile client|0|0|190
+N|meta|Metadata Svc|280|0|150
+N|db|Metadata DB (files, versions)|520|0|240|cylinder
+N|block|Block Svc (dedup)|280|150|160
+N|s3|Object Store (chunks)|520|150|190|cylinder
+N|notify|Sync Notifier|0|200|160|ellipse
+E|client|meta|commit file version
+E|meta|db|txn
+E|client|block|upload changed chunks
+E|block|s3|by hash
+E|meta|notify|changed
+E|notify|client|long-poll/WS
+---
+## Problem
+
+Design Google Drive or Dropbox: users store files in the cloud, sync them across devices automatically, share with others and see version history. The key topics are **chunking and deduplication**, **metadata vs. blob separation**, **sync protocol** and **conflict resolution**.
+
+## Requirements
+
+**Functional**
+- Upload, download, delete and move files and folders. Files up to tens of GB.
+- Auto-sync changes across a user's devices within seconds. Share with permissions.
+- Version history and restore. Offline edits that sync later.
+
+**Non-functional**
+- Never lose data (11 nines durability). Efficient bandwidth: only changed parts upload.
+- Strong consistency for metadata (a folder listing must be correct after a move).
+
+**Scale:** 500M users × 15 GB average ≈ 7.5 EB logical, much less after dedup. Metadata covers billions of file rows. Sync requests: tens of thousands per second.
+
+## Architecture
+
+- **Client** watches the local file system, splits files into **chunks** (~4 MB, or content-defined chunking), hashes each one (SHA-256), and asks the server which hashes are new.
+- **Block service** uploads only missing chunks to **object storage**, keyed by hash. Identical chunks across users or versions are stored once (dedup).
+- **Metadata service** commits a new file version = an ordered list of chunk hashes, in a **transactional DB** (sharded by user or namespace): files, folders, versions, sharing ACLs and a per-namespace **journal** (change log with a monotonically increasing cursor).
+- **Notification service:** clients long-poll or keep a WebSocket. On change, they fetch journal entries after their cursor and download the needed chunks.
+
+## Key design decisions & trade-offs
+
+**1. Separate metadata and blobs.** Metadata needs transactions and fast listing. Blobs need cheap, durable bulk storage. Mixing them breaks both.
+
+**2. Chunking.** Fixed-size chunks are simple, but inserting one byte at the start shifts every chunk. **Content-defined chunking** (rolling hash, as in rsync or LBFS) keeps boundaries stable, so small edits upload one or two chunks.
+
+**3. Dedup trade-off.** Cross-user dedup saves huge storage, but it leaks information ("does anyone have this file?") and complicates deletion (reference counting and GC). Many systems dedup per user only.
+
+**4. Sync with a journal cursor.** Every change appends to the namespace journal. Clients store the last cursor, so sync is "give me changes after X". It's idempotent, resumable and works after being offline.
+
+**5. Conflicts.** Two devices edit the same file offline. The server accepts the first commit (based on version `v5`). The second commit, also based on `v5`, is a conflict, so keep both ("file (conflicted copy).docx"). Automatic merging is only possible for structured formats (Google Docs uses OT/CRDT for its own docs).
+
+**6. Durability.** Object storage replicated or erasure-coded across zones. Metadata DB with synchronous replicas and point-in-time backups.
+
+## Follow-up questions
+
+1. A user edits 1 byte in a 2 GB video. What gets uploaded?
+2. How do you garbage-collect chunks no longer referenced by any version?
+3. A shared folder with 10k members changes. How are all clients notified efficiently?
+4. Design version history retention (30 days) without exploding storage.
+5. How does "move a folder with 1M files" stay fast and atomic?
+
+=== HLD 11 ===
+N|crawler|Crawlers|0|0|130
+N|frontier|URL Frontier|0|140|150|cylinder
+N|docs|Doc Store|240|0|140|cylinder
+N|indexer|Indexer (MapReduce)|240|140|180
+N|inv|Inverted Index shards|500|140|200|cylinder
+N|query|Query Svc (scatter-gather)|500|0|230
+N|rank|Ranking (BM25+ML)|500|270|180|ellipse
+E|frontier|crawler|next URLs
+E|crawler|docs|pages
+E|docs|indexer|parse
+E|indexer|inv|postings
+E|query|inv|fan-out
+E|query|rank|top-k
+---
+## Problem
+
+Design web search like Google at a high level: crawl billions of pages, build an index, and answer keyword queries in ~100–200 ms with relevant ranked results. The building blocks are **crawling**, **inverted indexes**, **distributed search (scatter-gather)** and **ranking**.
+
+## Requirements
+
+**Functional**
+- Crawl the web politely, re-crawling pages according to how often they change.
+- Index text, titles, links. Answer free-text queries with ranked results and snippets.
+- Spelling correction and autocomplete (bonus).
+
+**Non-functional**
+- Query latency p99 ~200 ms. Huge read QPS (~100k/s). Freshness from minutes (news) to weeks.
+
+**Scale:** 50B pages × ~100 KB ≈ 5 PB raw. A compressed index is still hundreds of TB, so it must be **sharded** across thousands of machines.
+
+## Architecture
+
+**Crawl:** a **URL frontier** (prioritised queues per host, for politeness and priority) feeds distributed **crawler** workers. They fetch (respecting robots.txt), deduplicate content (simhash), extract links back into the frontier, and store pages in a doc store.
+
+**Index:** batch plus incremental pipelines tokenise and normalise text and build an **inverted index**: `term → posting list [(docId, positions, tf)]`, sorted by docId and compressed (delta plus varint). Also compute static signals: PageRank, spam score, freshness.
+
+**Serve:** the index is **document-partitioned** into shards, each replicated. A query goes to a root aggregator, which scatters to every shard. Each shard returns its local top-k by a cheap score. The aggregator merges, then a re-ranker (ML) refines the top few hundred, and snippets come from a doc server.
+
+## Key design decisions & trade-offs
+
+**1. Document vs. term partitioning.** *Document-partitioned:* every shard holds the full index for a subset of docs, so a query hits all shards (fan-out). It's simple, load-balanced and tolerant: a missing shard just means slightly fewer results. *Term-partitioned:* a query only touches the shards for its terms, but multi-term intersections cross the network and hot terms create hotspots. Real engines use document partitioning.
+
+**2. Tail latency with fan-out.** With 1,000 shards, a p99 query sees the p99.9 of shards. Mitigations: replicas plus **hedged requests**, early termination (tiered indexes with the best docs first), and partial results under a deadline.
+
+**3. Ranking layers.** Lexical relevance (BM25), query-independent quality (PageRank), freshness, and learned ranking on the candidate set. Cheap-to-expensive cascades keep latency bounded.
+
+**4. Freshness.** A small, fast **real-time index** for recent and news pages, merged with the large batch index at query time.
+
+**5. Caching.** Query result caches catch the head (a large share of traffic is repeated queries). Posting-list caches handle hot terms.
+
+## Follow-up questions
+
+1. Walk through answering "best pizza near me" end to end.
+2. Why document-partitioning, and how do you deal with one slow shard?
+3. How does the crawler avoid hammering a single site and traps (infinite calendars)?
+4. How would you detect near-duplicate pages at web scale?
+5. Design autocomplete for the search box.
+
+=== HLD 12 ===
+N|client|Client|0|130|110
+N|gw|API Gateway|180|130|140
+N|catalog|Catalog + Search|400|0|170
+N|cart|Cart Svc|400|130|140
+N|order|Order Svc (saga)|620|130|150
+N|inv|Inventory|620|0|140|cylinder
+N|pay|Payment|620|270|130
+E|client|gw|HTTPS
+E|gw|catalog|browse
+E|gw|cart|add
+E|cart|order|checkout
+E|order|inv|reserve
+E|order|pay|charge
+---
+## Problem
+
+Design an Amazon-scale e-commerce platform: product catalogue and search, cart, checkout, order processing, inventory, payments and fulfilment, all built as cooperating services with traffic spikes like Prime Day. The interview focus is **service decomposition**, **data ownership**, **event-driven workflows (sagas)** and **inventory correctness**.
+
+## Requirements
+
+**Functional**
+- Browse and search products, product pages with price and availability, reviews.
+- Cart, checkout, payment, order tracking, cancellations, returns.
+- Sellers manage listings and stock.
+
+**Non-functional**
+- Browse is read-heavy with very low latency (cache and CDN friendly). Checkout must be correct (no overselling, no double charging).
+- Survive 10× flash spikes. High availability for browse even if ordering degrades.
+
+**Scale:** 300M products, 100M DAU, ~100k browse req/s, ~5k orders/s at peak.
+
+## Architecture
+
+Services own their data:
+- **Catalog** (document store) plus **Search** (Elasticsearch, fed by change events). Product pages are mostly served from cache and CDN.
+- **Pricing** and **Inventory** (strongly consistent per SKU per warehouse) are fetched separately, because they change often.
+- **Cart** in a KV store (DynamoDB or Redis), keyed by user, highly available.
+- **Order service** orchestrates checkout as a **saga**: create order (PENDING), reserve inventory, authorise payment, confirm, then emit `OrderPlaced` to Kafka.
+- **Fulfilment, notifications, analytics, recommendations** consume events asynchronously.
+
+## Key design decisions & trade-offs
+
+**1. Saga instead of a distributed transaction.** Each step has a compensation: payment fails, so release inventory; inventory fails, so cancel the order. Orchestration (a central order service) is easier to reason about; choreography (pure events) is more decoupled but harder to trace. Persist saga state so it survives crashes.
+
+**2. Inventory: no overselling.** A conditional decrement, `UPDATE stock SET qty = qty - :n WHERE sku=:s AND qty >= :n`, or a reservation table with TTL. For flash sales, **pre-allocate stock into tokens** in Redis (atomic `DECR`) and queue buyers, so the DB never sees the stampede.
+
+**3. Availability vs. consistency per domain.** The cart favours availability (Dynamo's original use case: always writable, merge on conflict). Payment and inventory favour consistency. Catalogue reads can be eventually consistent.
+
+**4. Idempotency everywhere.** Checkout carries an idempotency key. Retried "place order" calls return the same order. Payment calls use the order ID as the key.
+
+**5. Cache layers.** CDN for static and media, edge-cached product HTML fragments, Redis for hot product data. Price and stock are fetched live or with very short TTLs.
+
+**6. Spike readiness.** Autoscaling, load shedding, queue-based checkout (waiting room) for flash sales, and graceful degradation (hide recommendations before failing checkout).
+
+## Follow-up questions
+
+1. 10,000 users try to buy 100 discounted units at the same second. Design it.
+2. Payment is authorised but the order service crashes before confirming. Recover.
+3. How do you keep search results consistent with price and stock changes?
+4. Split a monolith's `orders` table into services without downtime.
+5. What would you degrade first under extreme load, and how?
+
+=== HLD 13 ===
+N|user|User|0|0|110
+N|show|Show/Seat-map Svc|200|0|190
+N|cache|Seat-map Cache|500|0|170|cylinder
+N|lock|Seat Hold (Redis NX + TTL)|200|150|220|cylinder
+N|book|Booking Svc|500|150|150
+N|db|Bookings DB (unique seat)|500|280|220|cylinder
+N|pay|Payment GW|200|280|150|ellipse
+E|user|show|view seats
+E|show|cache|read
+E|user|lock|hold seats
+E|lock|book|on pay
+E|book|pay|charge
+E|book|db|confirm
+---
+## Problem
+
+Design BookMyShow at the HLD level: millions of users browse shows across cities, and on popular releases tens of thousands compete for the same seats within seconds. The LLD covered seat locking in one process. Here: **distributed locking**, **inventory consistency**, **transactions with payment** and **concurrency under spikes**.
+
+## Requirements
+
+**Functional**
+- Browse movies, cinemas and shows by city. View a live seat map.
+- Hold seats for ~8 minutes, pay, confirm and issue a ticket. Release holds on timeout or failure.
+
+**Non-functional**
+- Zero double bookings. The seat map is near-real-time. Survive opening-day spikes (e.g. 1M users for one show).
+
+**Scale:** 10k cinemas × ~20 shows/day × 200 seats ≈ 40M seat-inventory rows per day. Browse traffic ~50k req/s. Booking writes ~5k/s at peak, concentrated on a few hot shows.
+
+## Architecture
+
+- **Catalogue/search** (movies, cinemas, shows): read-heavy, cached, CDN for posters.
+- **Seat map service:** reads seat states from cache, with the DB as the source of truth.
+- **Hold:** `SET seat:{showId}:{seatId} userId NX PX 480000` for each requested seat in **Redis** (a Lua script makes multi-seat holds all-or-nothing).
+- **Booking service:** on payment success, verifies the holds are still owned by the user, then writes the booking in the **SQL DB** in one transaction with a **unique constraint on (showId, seatId)**. The DB is the final guard.
+- **Payment** via gateway with an idempotency key; the webhook confirms the booking.
+
+## Key design decisions & trade-offs
+
+**1. Two-layer protection.** Redis holds give fast, expiring, user-friendly locks. The DB unique constraint guarantees correctness even if Redis loses a key (failover). Never rely on the Redis lock alone for money.
+
+**2. Optimistic vs. pessimistic.** Pessimistic (`SELECT … FOR UPDATE` on seat rows) serialises contention in the DB and causes lock storms on hot shows. Optimistic (conditional update `WHERE status='AVAILABLE'`, or insert plus unique constraint) fails fast and lets the user pick another seat. Prefer optimistic plus Redis holds.
+
+**3. Hot shows and the waiting room.** For mega releases, put users in a **virtual queue** and admit them at a rate the booking path can handle. It's fairer and protects every downstream system.
+
+**4. Seat map freshness.** Push hold and release events via WebSocket or SSE to viewers of that show, or poll every few seconds. A stale map only causes a failed hold, never a double booking.
+
+**5. Payment edge cases.** The hold expired during a slow payment but the money was captured. Try to re-acquire the seats; if they're taken, auto-refund. Reconcile pending payments periodically.
+
+## Follow-up questions
+
+1. Redis fails over and loses recent holds. Can two users now book the same seat?
+2. Design the virtual waiting room. How do you keep it fair and abuse-resistant?
+3. Why not hold seats in the SQL DB directly with a status column?
+4. How do you partition data so one blockbuster doesn't hurt other shows?
+5. Payment webhook arrives twice, 10 minutes apart. What happens?
+
+=== HLD 14 ===
+N|merchant|Merchant/Client|0|0|160
+N|api|Payment API (idempotent)|240|0|210
+N|ledger|Ledger DB (double-entry)|540|0|220|cylinder
+N|psp|PSP / Card networks|540|150|190|ellipse
+N|webhook|Webhook Handler|240|150|170
+N|recon|Reconciliation (daily)|240|280|200
+N|outbox|Outbox → Kafka|540|280|170|cylinder
+E|merchant|api|pay(key)
+E|api|ledger|PENDING
+E|api|psp|authorize
+E|psp|webhook|async result
+E|webhook|ledger|finalize
+E|recon|psp|settlement files
+E|ledger|outbox|events
+---
+## Problem
+
+Design a payment system like Stripe's core or an internal payments platform: accept payments via cards, UPI and wallets through external payment service providers (PSPs), record every movement accurately, notify merchants, and reconcile with bank settlement files. Everything revolves around **correctness**: **idempotency**, **transactions/state machines**, **retries**, **webhooks** and **reconciliation**.
+
+## Requirements
+
+**Functional**
+- Create a payment (authorise, then capture), refunds (full or partial), payouts to merchants.
+- Merchant webhooks on status changes. Dashboard and reports.
+
+**Non-functional**
+- Never charge twice, never lose a transaction, a full audit trail.
+- Availability matters, but **correctness beats latency**. External PSPs are slow and unreliable.
+
+**Scale:** modest QPS compared with social apps (~1–10k TPS), but every request is high-value and multi-step.
+
+## Architecture
+
+1. `POST /payments` with an **Idempotency-Key**. The API stores the key plus a request hash atomically. Retries return the saved response.
+2. Create a payment record `CREATED`, call the PSP (with *its* idempotency key = our payment ID), and move to `AUTHORIZED / FAILED / PENDING_UNKNOWN`.
+3. PSP **webhooks** (and polling for unknowns) drive final states. Every money movement is written as **double-entry ledger** entries in the same DB transaction as the state change.
+4. An **outbox table** in the same transaction, then Kafka, then merchant webhooks (with retries plus signatures), analytics and notifications.
+5. A **reconciliation** job compares the internal ledger with PSP/bank settlement files daily and flags mismatches.
+
+## Key design decisions & trade-offs
+
+**1. Idempotency end to end.** Client to us (Idempotency-Key), us to PSP (payment ID as their key), PSP to us (dedupe webhooks by event ID). Every hop can be retried safely.
+
+**2. Unknown outcomes are normal.** A timeout to the PSP doesn't mean failure. Mark `PENDING_UNKNOWN`, never retry with a *new* charge, and resolve by status query or webhook. This is the most-probed point in interviews.
+
+**3. Double-entry ledger.** An immutable, append-only set of debits and credits summing to zero per transaction. Balances are derived. That makes audits, refunds (reverse entries) and reconciliation tractable.
+
+**4. Transactional outbox.** State change and event in one local transaction. A relay publishes to Kafka. That avoids the "DB committed but event lost" (or the reverse) dual-write problem.
+
+**5. SQL for the core.** Strong consistency and transactions (Postgres/MySQL, sharded by merchant or account). Analytics live in separate stores fed by events.
+
+**6. Webhooks to merchants.** At-least-once with exponential backoff, signed payloads, and event IDs merchants can dedupe on. Merchants must be able to fetch the current state too, so webhooks are hints rather than the source of truth.
+
+## Follow-up questions
+
+1. The PSP call times out. Walk through every possible real outcome and your handling.
+2. Why double-entry instead of a `balance` column?
+3. Design partial refunds and their ledger entries.
+4. Reconciliation finds the bank settled ₹10 less than our ledger. What next?
+5. How do you migrate PSPs without double-charging anyone?
