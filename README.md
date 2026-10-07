@@ -238,6 +238,10 @@ The same goes for verdicts and doubt answers. Reload the page to see changes mad
 - **Verdict**: **Evaluate with AI**, or **Re-evaluate** once a verdict exists. Any unsaved edits are saved first.
 - **Discuss with the AI tutor**: a streaming chat for each topic. The tutor sees the write-up, your answer and your verdict.
   Quick prompts include *Quiz me like an interviewer* and *What's weakest in my answer?* **Clear** starts the conversation over.
+- **Diagrams**: paste (`Ctrl+V`), drag in, or use the toolbar's image button to add a screenshot, an Excalidraw/draw.io export, or a phone photo of a whiteboard.
+  Images are saved as files in `content/images/`, and **the AI looks at them** when it evaluates, chats or answers doubts, comparing them against your text.
+  This works with Claude, GPT-5 and vision models in Ollama (such as `gemma4`). If a model can't read images, the evaluation still runs and the verdict notes that the diagrams were skipped.
+  PNG, JPEG, GIF and WebP are supported, at most 6 images per answer and 5 MB each.
 - **Notes & doubts**: free-form notes. Put `#doubt your question` on its own line, then click **Answer with AI**.
   The reply is written under it as `#doubt-answer …`.
 - **AI chip** (top bar): shows the connected provider and model. Click it to change settings.
@@ -251,6 +255,7 @@ Everything is stored in this folder. There's no database and no cloud storage.
 | What | Where | In git? |
 |---|---|---|
 | AI provider, model, API key | `kb.config.json` (created by `kb setup` or the site's settings) | **No**, it's git-ignored |
+| Images in your answers | `content/images/` (file names are content hashes) | Yes |
 | Answers, verdicts, notes and chats for `lld N`, `hld N`, `ai N` | `content/day-NN.json` (e.g. `lld 1`, `hld 1` and `ai 1` are all in `day-01.json`) | Yes |
 | Same for `dsa N` | `content/dsa.json` | Yes |
 | Theme, sidebar state, practice mode | browser localStorage | — |
@@ -258,7 +263,7 @@ Everything is stored in this folder. There's no database and no cloud storage.
 Inside each topic, the fields are `userAnswer`, `answerEvaluation` and `answerEvaluatedAt`, `notes`, and `chat`.
 `AUTHORING.md` documents the format.
 
-**What leaves your machine:** only when you use an AI feature. Each request sends that topic's write-up, your answer,
+**What leaves your machine:** only when you use an AI feature. Each request sends that topic's write-up, your answer (including its images),
 the verdict and the recent chat (last 24 messages) to your chosen provider. With Ollama, nothing leaves your machine.
 
 **Security:** the server listens only on `127.0.0.1`, because its AI routes spend your credit. Set `HOST=0.0.0.0` only if you
@@ -320,6 +325,7 @@ bin/kb.js                the `kb` command
 lib/store.js             read/write content JSON; addresses like "lld 1"
 lib/ai.js                provider layer (Claude, OpenAI-compatible, Ollama), streaming, kb.config.json
 lib/tutor.js             evaluate / clarify / doubts, with the prompts, shared by the CLI and the server
+lib/images.js            answer images: save to content/images, attach to prompts as real image inputs
 public/                  index.html, app.js, diagram.js (rough.js renderer), styles.css, vendor/
 content/day-NN.json      3 topics per file (LLD, HLD, AI): write-up, diagram, your answer, verdict, notes, chat
 content/dsa.json         SDE sheet, regrouped by topic

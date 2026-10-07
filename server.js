@@ -10,7 +10,7 @@ const CONTENT = path.join(__dirname, "content");
 const DSA_FILE = path.join(CONTENT, "dsa.json");
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "25mb" })); // older answers may still carry inline base64 images
 
 // Global no-store: API *and* static assets.
 app.use((req, res, next) => {
@@ -28,6 +28,14 @@ app.use(
 );
 // User-provided sketches live under content/sketches.
 app.use("/sketches", express.static(path.join(CONTENT, "sketches"), { etag: false, lastModified: false, cacheControl: false }));
+// Images pasted or dropped into answers. Files are content-addressed, so they can be cached.
+const images = require("./lib/images");
+app.use("/images", (req, res, next) => { res.set("Cache-Control", "public, max-age=31536000, immutable"); next(); },
+  express.static(images.IMG_DIR, { etag: false, lastModified: false, cacheControl: false }));
+app.post("/api/images", express.raw({ type: Object.keys(images.TYPES), limit: images.MAX_UPLOAD }), (req, res) => {
+  try { res.json({ url: images.saveImage(req.body, String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase()) }); }
+  catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
 
 // ---------- file helpers ----------
 const dayFile = (n) => path.join(CONTENT, `day-${String(n).padStart(2, "0")}.json`);
@@ -96,7 +104,7 @@ function updateDayTopic(field, transform) {
     if (!t) return res.status(400).json({ error: "bad topicIndex" });
     const val = req.body[field];
     if (typeof val !== "string") return res.status(400).json({ error: `${field} must be a string` });
-    t[field] = val;
+    t[field] = field === "userAnswer" ? images.externalize(val) : val;
     if (transform) transform(t);
     writeJson(p.f, day);
     res.json({ ok: true, topic: t });
@@ -115,7 +123,7 @@ function updateDsaProblem(field, transform) {
     if (!prob) return res.status(400).json({ error: "bad topicIndex/problemIndex" });
     const val = req.body[field];
     if (typeof val !== "string") return res.status(400).json({ error: `${field} must be a string` });
-    prob[field] = val;
+    prob[field] = field === "userAnswer" ? images.externalize(val) : val;
     if (transform) transform(prob);
     writeJson(DSA_FILE, dsa);
     res.json({ ok: true, problem: prob });
@@ -161,6 +169,10 @@ app.get("/api/ai/config", (req, res) => {
 });
 app.post("/api/ai/config", (req, res) => {
   try { ai.saveConfig(req.body || {}); res.json(ai.publicConfig()); } catch (e) { res.status(400).json({ error: e.message }); }
+});
+app.get("/api/ai/ollama-models", async (req, res) => {
+  const base = typeof req.query.baseUrl === "string" && /^https?:\/\//.test(req.query.baseUrl) ? req.query.baseUrl : undefined;
+  res.json({ models: await ai.listOllamaModels(base) });
 });
 app.post("/api/ai/test", async (req, res) => {
   try {

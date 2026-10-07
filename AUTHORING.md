@@ -49,3 +49,9 @@ as context. Hand edits are fine, as long as roles alternate user → assistant.
 
 Evaluations and doubt answers made with `kb evaluate`, `kb doubts` or the site's AI buttons follow sections 2 and 3 above exactly,
 so hand-written and AI-written verdicts look the same.
+
+## 6. Images in answers
+
+Images live in `content/images/<hash>.<ext>` and are referenced from `userAnswer` as `![alt](/images/<file>)`.
+Don't inline `data:` base64 images. The site converts them to files when an answer is saved, and `kb answer` does the same.
+When evaluating, chatting or answering doubts, each image is replaced in the prompt text by `[Image N: alt — attached]` and sent as a real image input.

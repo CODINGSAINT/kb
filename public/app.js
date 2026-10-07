@@ -50,11 +50,12 @@
   document.addEventListener("keydown", (e) => {
     const typing = /input|textarea/i.test(e.target.tagName) || e.target.isContentEditable;
     if (e.key === "\\" && !typing) { e.preventDefault(); toggleSidebar(); }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
-      e.preventDefault();
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "s") {
+      // Capture phase + stopPropagation: the editor binds Ctrl+S to strikethrough, which would insert "~~~~".
+      e.preventDefault(); e.stopPropagation();
       document.querySelectorAll("[data-save]").forEach((b) => !b.disabled && b.click());
     }
-  });
+  }, true);
   window.addEventListener("beforeunload", (e) => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
   // ---------- AI settings ----------
@@ -75,8 +76,17 @@
     openAiSettings("Connect an AI provider first. It takes a minute.");
     return false;
   }
-  function openAiSettings(msg) {
-    if (!aiCfg) return;
+  async function openAiSettings(msg) {
+    if (!aiCfg) await loadAi();
+    const dlg = $("#aiDialog");
+    if (!aiCfg) {
+      // Usually: the page is new but the server process was started before the AI update.
+      dlg.classList.add("no-server");
+      setSave($("#aiMsg"), "err", "");
+      if (!dlg.open) dlg.showModal();
+      return;
+    }
+    dlg.classList.remove("no-server");
     dlgProvider = aiCfg.providers[aiCfg.provider] ? aiCfg.provider : "anthropic";
     renderDlg();
     setSave($("#aiMsg"), msg ? "dirty" : "", msg || "");
@@ -88,6 +98,7 @@
       `<button type="button" role="radio" aria-checked="${id === dlgProvider}" class="seg-btn${id === dlgProvider ? " on" : ""}" data-prov="${id}">${esc(x.name)}${!x.needsKey || x.keySet ? '<span class="ok-dot" title="Ready"></span>' : ""}</button>`).join("");
     $("#aiModel").value = p.model;
     $("#aiModels").innerHTML = p.models.map((m) => `<option value="${esc(m)}"></option>`).join("");
+    $("#aiModelHint").textContent = "Pick a suggestion or type any model your account can use.";
     $("#aiKeyRow").hidden = !p.needsKey;
     $("#aiKey").value = "";
     $("#aiKey").placeholder = p.keyFromEnv ? `Using the environment variable (${p.keyHint})` : p.keySet ? `Saved (${p.keyHint}). Leave blank to keep it` : "Paste your API key";
@@ -95,7 +106,25 @@
     $("#aiUrlRow").hidden = !p.baseUrl;
     $("#aiUrl").value = p.baseUrl || "";
     $("#aiOllamaHelp").hidden = dlgProvider !== "ollama";
+    if (dlgProvider === "ollama") loadOllamaModels();
   }
+  // Suggest the models actually installed in Ollama (exact names, with their ":tag").
+  async function loadOllamaModels() {
+    const hint = $("#aiModelHint");
+    hint.textContent = "Checking which models Ollama has installed…";
+    try {
+      const { models } = await api.get("/api/ai/ollama-models?baseUrl=" + encodeURIComponent($("#aiUrl").value || ""));
+      if (dlgProvider !== "ollama") return;
+      if (models.length) {
+        $("#aiModels").innerHTML = models.map((m) => `<option value="${esc(m)}"></option>`).join("");
+        hint.innerHTML = "Installed: " + models.map((m) => `<button type="button" class="chip" data-model="${esc(m)}">${esc(m)}</button>`).join(" ");
+        if (!models.includes($("#aiModel").value) && models.length === 1) $("#aiModel").value = models[0];
+      } else {
+        hint.innerHTML = "Couldn't find any installed models. Is Ollama running? Download one with <code>ollama pull gemma4:12b</code>.";
+      }
+    } catch (e) { hint.textContent = "Couldn't reach the server to list Ollama models."; }
+  }
+  $("#aiModelHint").addEventListener("click", (e) => { const b = e.target.closest("[data-model]"); if (b) $("#aiModel").value = b.dataset.model; });
   $("#aiProviders").addEventListener("click", (e) => {
     const b = e.target.closest("[data-prov]");
     if (b) { dlgProvider = b.dataset.prov; renderDlg(); setSave($("#aiMsg"), "", ""); }
@@ -232,7 +261,7 @@
         <h2>My answer <span class="spacer"></span><span class="save-state" id="ansState"></span>
           <button class="btn primary" id="ansSave" data-save disabled>Save answer</button></h2>
         <div id="ansEditor"></div>
-        <p class="muted small" style="margin:10px 0 0">Saved as Markdown. Saving a changed answer clears any earlier verdict. <kbd>Ctrl/⌘ S</kbd> saves.</p>
+        <p class="muted small" style="margin:10px 0 0">Saved as Markdown. For code, put <code>\`\`\`java</code> on its own line before it and <code>\`\`\`</code> after it. <kbd>Tab</kbd> indents and <kbd>Shift</kbd>+<kbd>Tab</kbd> outdents. Paste or drag in a diagram image (a screenshot, an Excalidraw export or a whiteboard photo). The AI looks at it when evaluating. Use <b>Preview</b> to check the result. Saving a changed answer clears any earlier verdict. <kbd>Ctrl/⌘ S</kbd> saves.</p>
       </section>
       <section class="card" id="verdictCard"></section>
       <section class="card tutor" id="tutorCard">
@@ -258,18 +287,37 @@
     const ansState = $("#ansState"), ansSave = $("#ansSave");
     const editor = new toastui.Editor({
       el: $("#ansEditor"),
-      height: "380px",
-      initialEditType: "wysiwyg",
-      hideModeSwitch: true,
+      // Markdown mode by default: ```java fences, Tab indents, Enter keeps indentation.
+      // The switch at the bottom flips to WYSIWYG; the choice is remembered.
+      height: "auto",
+      minHeight: "380px",
+      initialEditType: store.get("kb-editor-mode", "markdown"),
+      hideModeSwitch: false,
       previewStyle: "tab",
       usageStatistics: false,
       autofocus: false,
       theme: isDark() ? "dark" : "light",
       initialValue: item.userAnswer || "",
       placeholder: ctx.placeholder,
-      toolbarItems: [["heading", "bold", "italic", "strike"], ["hr", "quote"], ["ul", "ol", "task"], ["table", "link"], ["code", "codeblock"]],
+      toolbarItems: [["heading", "bold", "italic", "strike"], ["hr", "quote"], ["ul", "ol", "task"], ["table", "image", "link"], ["code", "codeblock"]],
+      // Pasted/dropped/inserted images are uploaded to content/images and referenced by URL,
+      // instead of being inlined as base64 text (which the AI can't see and which bloats prompts).
+      hooks: {
+        addImageBlobHook: async (blob, done) => {
+          setSave(ansState, "", "Uploading image…");
+          try {
+            const r = await fetch("/api/images", { method: "POST", headers: { "Content-Type": blob.type || "application/octet-stream" }, body: blob });
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(j.error || r.statusText);
+            const alt = (blob.name && !/^image\.(png|jpe?g)$/i.test(blob.name) ? blob.name.replace(/\.\w+$/, "") : "diagram");
+            done(j.url, alt);
+            setSave(ansState, "dirty", "Image added. Save to keep it");
+          } catch (e) { setSave(ansState, "err", "Image upload failed: " + e.message); }
+        },
+      },
     });
     state.editors.push(editor);
+    editor.on("changeMode", (mode) => store.set("kb-editor-mode", mode));
     let savedAns = editor.getMarkdown();
     let ansDirty = false, notesDirty = false;
     const syncDirty = () => { state.dirty = ansDirty || notesDirty; };
@@ -514,7 +562,7 @@
       address: { topicIndex: idx },
       addr: { track: t.category, number: Number(t.number) },
       cli: `${t.category.toLowerCase()} ${Number(t.number)}`,
-      placeholder: "Your design: requirements, key classes/components, trade-offs…",
+      placeholder: "Your design: requirements, key classes/components, trade-offs…\n\nCode: type ```java on its own line, then your code, then ``` to close it.",
     });
     document.title = `${t.title} — KB`;
   }
@@ -536,7 +584,7 @@
       address: { topicIndex: ti, problemIndex: pi },
       addr: { track: "DSA", number: Number(p.number) },
       cli: `dsa ${Number(p.number)}`,
-      placeholder: "Approach, complexity, edge cases — and code (use a code block).",
+      placeholder: "Approach, complexity, edge cases…\n\nCode: type ```java on its own line, then your code, then ``` to close it.",
     });
     document.title = `${p.title} — KB`;
   }

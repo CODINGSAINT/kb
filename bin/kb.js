@@ -6,6 +6,7 @@ const readline = require("readline");
 const store = require("../lib/store");
 const ai = require("../lib/ai");
 const tutor = require("../lib/tutor");
+const images = require("../lib/images");
 
 const tty = process.stdout.isTTY && !process.env.NO_COLOR;
 const c = (code) => (s) => (tty ? `\x1b[${code}m${s}\x1b[0m` : String(s));
@@ -21,7 +22,7 @@ ${bold("Setup")}
 ${bold("Study")}
   kb list [lld|hld|ai|dsa]         topics with status   ${dim("○ untouched  ◐ attempted  ● evaluated")}
   kb show lld 1 [--writeup]        your answer and verdict (add --writeup for the reference)
-  kb answer lld 1 <file.md>        save an answer from a file ("-" reads stdin)
+  kb answer lld 1 <file.md>        save an answer from a file ("-" reads stdin); ![](diagram.png) images come along
 
 ${bold("AI")}
   kb evaluate lld 1                grade your saved answer and save the verdict   ${dim("(alias: eval)")}
@@ -85,7 +86,13 @@ const commands = {
     if (!provider) { rl.close(); throw new Error("Not a valid choice."); }
     const p = cur.providers[provider];
     const patch = { provider, [provider]: {} };
-    const model = (await prompt(rl, `Model ${dim("(e.g. " + p.models.join(", ") + ")")} [${p.model}]: `)).trim();
+    let suggestions = p.models;
+    if (provider === "ollama") {
+      const installed = await ai.listOllamaModels(p.baseUrl);
+      if (installed.length) { suggestions = installed; console.log(`Installed in Ollama: ${bold(installed.join(", "))}`); }
+      else console.log(yellow("Couldn't list Ollama models. Is Ollama running? Download one with: ollama pull gemma4:12b"));
+    }
+    const model = (await prompt(rl, `Model ${dim("(exact name, e.g. " + suggestions.slice(0, 4).join(", ") + ")")} [${p.model}]: `)).trim();
     if (model) patch[provider].model = model;
     if (p.baseUrl && provider !== "anthropic") {
       const url = (await prompt(rl, `Base URL [${p.baseUrl}]: `)).trim();
@@ -144,7 +151,9 @@ const commands = {
     const { addr, rest } = takeAddress(args);
     const src = rest[0];
     if (!src) throw new Error("kb answer lld 1 <file.md>   (or - to read stdin)");
-    const md = src === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(path.resolve(src), "utf8");
+    const raw = src === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(path.resolve(src), "utf8");
+    // Images referenced by relative path (e.g. ![](sketch.png)) are copied into content/images.
+    const md = images.externalize(images.importLocal(raw, src === "-" ? process.cwd() : path.dirname(path.resolve(src))));
     store.updateItem(addr, (t) => {
       if (t.userAnswer !== md) { t.answerEvaluation = null; t.answerEvaluatedAt = null; }
       t.userAnswer = md;
