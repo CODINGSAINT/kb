@@ -17,7 +17,7 @@ you choose: **Claude**, **OpenAI** (or any OpenAI-compatible endpoint), or **Oll
 ## A quick tour
 
 The study loop is **read the fundamentals, attempt the topic, get it graded, discuss it with the tutor, then compare with the reference**.
-(The screenshots use a sample answer to *Design Parking Lot*.)
+(The screenshots use a sample answer to *Design Parking Lot*, in dark mode.)
 
 ### 1. Home: see where you are
 The sidebar lists every track: **Read first** fundamentals, LLD, HLD, AI and DSA patterns. A dot marks each item's state: hollow is not started, cyan is attempted, blue is evaluated or read.
@@ -74,15 +74,13 @@ Click the AI badge in the top bar to pick **Claude**, **OpenAI** or **Ollama** (
 
 ![AI tutor settings](docs/screenshots/10-settings.png)
 
-### 10. Terminal, dark mode and phone
-Everything also works from the `kb` command: status, lists, reading, evaluating and chatting. The sun/moon button switches to dark mode.
+### 10. Terminal and phone
+Everything also works from the `kb` command: status, lists, reading, evaluating and chatting. The sun/moon button in the top bar switches between dark and light themes.
 With `npm start`, phones and tablets on the same Wi-Fi can open the site too.
 
-![The kb command line](docs/screenshots/13-cli.png)
+![The kb command line](docs/screenshots/12-cli.png)
 
-![Dark mode](docs/screenshots/11-dark.png)
-
-<img src="docs/screenshots/12-phone.png" alt="KB on a phone" width="300">
+<img src="docs/screenshots/11-phone.png" alt="KB on a phone" width="300">
 
 
 ---
