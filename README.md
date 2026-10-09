@@ -1,23 +1,90 @@
-# KB: Study Practice Site
+<p align="center">
+  <img src="docs/banner.png" alt="KB: practise system design like the real interview, graded by AI" width="100%">
+</p>
 
-A local study site for interview prep: **20 LLD, 20 HLD and 20 AI / Spring AI** design topics,
-each with a write-up and a sketch diagram, plus **304 DSA problems organised by coding-interview pattern**, each pattern with a guide page.
-Write your own answers, then have an AI grade them and talk them through with an AI tutor.
-You can do this on the site or from the `kb` command line.
+<h1 align="center">KB · your private AI interview coach</h1>
 
-Everything runs on your machine. Content is flat JSON in `content/`. The only network calls are to the AI provider
-you choose: **Claude**, **OpenAI** (or any OpenAI-compatible endpoint), or **Ollama** for a free, fully local model.
+<p align="center">
+  <b>Practise LLD, HLD, AI system design and DSA the way interviews actually work:<br>
+  commit to a design, get it graded, then defend it.</b>
+</p>
 
-**Contents:** [A quick tour](#a-quick-tour) · [Quick start](#quick-start) · [Full setup guide](#full-setup-guide) · [Using the `kb` command](#using-the-kb-command) ·
-[Using the site](#using-the-site) · [Where your data is saved](#where-your-data-is-saved) · [Publishing to git](#publishing-to-git) ·
-[Troubleshooting](#troubleshooting) · [Project layout](#project-layout)
+<p align="center">
+  <a href="https://github.com/CODINGSAINT/kb/stargazers"><img src="https://img.shields.io/github/stars/CODINGSAINT/kb?style=flat&logo=github&color=1c39bb" alt="GitHub stars"></a>
+  <img src="https://img.shields.io/badge/Node.js-18%2B-1c39bb?logo=node.js&logoColor=white" alt="Node 18+">
+  <img src="https://img.shields.io/badge/AI-Claude%20%7C%20OpenAI%20%7C%20Ollama-0e7490" alt="Claude, OpenAI or Ollama">
+  <img src="https://img.shields.io/badge/runs-100%25%20on%20your%20machine-0e7490" alt="Runs locally">
+  <img src="https://img.shields.io/badge/PRs-welcome-1c39bb" alt="PRs welcome">
+</p>
+
+<p align="center">
+  <a href="#quick-start-60-seconds">Quick start</a> ·
+  <a href="#a-quick-tour">Tour</a> ·
+  <a href="#whats-inside">What's inside</a> ·
+  <a href="#using-the-kb-command">CLI</a> ·
+  <a href="#faq">FAQ</a> ·
+  <a href="#full-setup-guide">Full setup guide</a>
+</p>
+
+> ⭐ **If KB helps your prep, please star the repo.** It's the easiest way to help other engineers find it.
+
+---
+
+## Why KB?
+
+Most interview prep is passive: you read a solution, nod along, and feel ready. Real interviews aren't like that.
+KB makes you **commit to your own design before you see any answer**, then gives you the kind of feedback a senior interviewer would.
+
+| | |
+|---|---|
+| 🧠 **Attempt first** | Each topic shows only the problem and requirements. The reference design, abstractions and trade-offs stay hidden behind an *"Are you sure?"* until you've tried. |
+| ✅ **A real verdict** | One click grades your answer: **Strong / Solid / Partial / Needs work**, what you got right, the gaps, and what to study next. It reads your diagrams too. |
+| 💬 **A tutor that pushes back** | Chat about your answer with an AI that knows the topic, your attempt and its verdict. *"Quiz me like an interviewer"* is one click away, and it won't spoil the design before you've tried. |
+| 📚 **Fundamentals, done properly** | 37 in-depth chapters (caching, sharding, consensus, SOLID, design patterns, concurrency…), each linked from the problems that need it. |
+| 🧩 **DSA by pattern** | 304 problems in 32 patterns, each with a guide and a Java template. The grader checks whether you used the pattern, not just whether the code works. |
+| 🔒 **Private and yours** | Plain JSON files on your machine. No account, no tracking. Bring your own Claude or OpenAI key, or run **free and offline** with Ollama. |
+| ⌨️ **Site or terminal** | Everything also works from the `kb` command: `kb evaluate lld 2`, `kb clarify hld 7 "why Kafka here?"`, `kb pending --run`. |
+
+---
+
+## What's inside
+
+| Track | Count | Examples |
+|---|---|---|
+| **Low-level design** | 20 | Chess, Parking Lot, Elevator, BookMyShow, Splitwise, Rate Limiter, Wallet, Calendar |
+| **High-level design** | 20 | URL Shortener, Chat/WhatsApp, YouTube, Netflix, Uber, Dropbox, Payments, API Gateway |
+| **AI / Spring AI** | 20 | RAG, embeddings, ChatClient, tool calling, agents, MCP, multi-agent, AI security, evaluation |
+| **Read-first chapters** | 37 | Approach & estimation, caching, sharding, replication, CAP, consensus, messaging, SOLID, design patterns, concurrency |
+| **DSA problems** | 304 | 32 patterns: two pointers, sliding window, binary search, trees, graphs, DP, tries, design… |
+
+Every design topic comes with a reference write-up and a diagram, revealed only when you ask.
+
+---
+
+## Quick start (60 seconds)
+
+You need [Node.js 18+](https://nodejs.org) and git.
+
+```bash
+git clone https://github.com/CODINGSAINT/kb.git
+cd kb
+npm install
+npm link        # adds the `kb` command (or use: node bin/kb.js <command>)
+kb setup        # pick Claude, OpenAI or Ollama
+kb serve        # open http://localhost:4321
+```
+
+**No API key?** Install [Ollama](https://ollama.com), run `ollama pull gemma4`, and choose Ollama in `kb setup`. It's free and nothing leaves your machine.
+
+Then open **LLD → Design Parking Lot**, write your design, and click **Evaluate with AI**.
+The [full setup guide](#full-setup-guide) covers every step, including Windows tips and opening KB from your phone.
 
 ---
 
 ## A quick tour
 
-The study loop is **read the fundamentals, attempt the topic, get it graded, discuss it with the tutor, then compare with the reference**.
-(The screenshots use a sample answer to *Design Parking Lot*, in dark mode.)
+One study loop: **read the fundamentals → attempt the topic → get graded → argue with the tutor → compare with the reference.**
+(Screenshots use a sample answer to *Design Parking Lot*.)
 
 ### 1. Home: see where you are
 The sidebar lists every track: **Read first** fundamentals, LLD, HLD, AI and DSA patterns. A dot marks each item's state: hollow is not started, cyan is attempted, blue is evaluated or read.
@@ -82,24 +149,6 @@ With `npm start`, phones and tablets on the same Wi-Fi can open the site too.
 
 <img src="docs/screenshots/11-phone.png" alt="KB on a phone" width="300">
 
-
----
-
-## Quick start
-
-For someone who already has Node and git:
-
-```bash
-git clone <repo-url> studykb
-cd studykb
-npm install
-npm link          # makes `kb` a command (or use: node bin/kb.js <command>)
-kb setup          # pick Claude / OpenAI / Ollama, paste your API key
-kb serve          # open http://localhost:4321
-```
-
-The full guide below covers every step in detail.
-
 ---
 
 ## Full setup guide
@@ -119,8 +168,8 @@ On Windows, keep **"Add to PATH"** ticked in the Node installer, then open a *ne
 Clone it:
 
 ```bash
-git clone <repo-url> studykb
-cd studykb
+git clone https://github.com/CODINGSAINT/kb.git
+cd kb
 ```
 
 If you were given a zip instead, unzip it and `cd` into the folder that contains `package.json`.
@@ -267,7 +316,7 @@ You should see something like:
 
 ```
 AI       Claude (Anthropic) · claude-sonnet-5-5 · ready
-Progress 0/249 attempted · 0/249 evaluated
+Progress 0/401 attempted · 0/401 evaluated
 Nothing pending.
 ```
 
@@ -331,7 +380,7 @@ The same goes for verdicts and doubt answers. Reload the page to see changes mad
 
 ## Using the site
 
-- **Sidebar** (toggle with `\`): grouped LLD / HLD / AI / DSA. Status dots: hollow = untouched, orange = attempted, green = evaluated.
+- **Sidebar** (toggle with `\`): grouped LLD / HLD / AI / DSA. Status dots: hollow = untouched, cyan = attempted, blue = evaluated (or read).
 - **Reference design**: the diagram, abstractions or architecture, and trade-offs stay hidden behind a confirmation until you choose to compare.
 - **My answer**: a rich editor that saves as Markdown. `Ctrl/⌘ S` saves. Changing a saved answer clears its old verdict.
 - **Verdict**: **Evaluate with AI**, or **Re-evaluate** once a verdict exists. Any unsaved edits are saved first.
@@ -381,7 +430,7 @@ git init
 git add .
 git commit -m "KB study site"
 git branch -M main
-git remote add origin https://github.com/<you>/studykb.git
+git remote add origin https://github.com/<you>/kb.git
 git push -u origin main
 ```
 
@@ -439,7 +488,7 @@ kb.config.example.json   example AI settings file
 ### Rebuilding content and the editor
 
 - `npm run build:content` rebuilds `content/day-*.json` from `build/topics/*.txt`. It keeps your answers, notes, verdicts and chats.
-- - `npm run build:editor` re-bundles the vendored Toast UI editor. The raw npm `dist` file breaks in a plain `<script>` tag, so it's bundled with esbuild.
+- `npm run build:editor` re-bundles the vendored Toast UI editor. The raw npm `dist` file breaks in a plain `<script>` tag, so it's bundled with esbuild.
 
 ## How topic pages work (attempt first)
 
@@ -479,3 +528,47 @@ Bits → Trie → Strings → Matrix & Math → Design.
 - `node build/make-dsa-patterns.js` rebuilds `content/dsa.json` from `build/dsa/`. Each problem's pattern is set in that script's `MAP`, and its guide in `build/dsa/guides/<pattern>.md`.
   Your answers, verdicts, notes and chats are carried over by a stable `key` (the LeetCode slug, or `classic-<name>`).
 - DSA numbers (`kb evaluate dsa 29`) follow pattern order and run from 1 to 304.
+
+---
+
+## Who it's for
+
+- **Engineers preparing for senior / staff interviews** who want to practise designing, not just read designs.
+- **Java and Spring developers.** Examples, templates and the reference designs are Java-first, and the AI track is built around Spring AI.
+- **Anyone learning AI engineering.** Twenty topics take you from embeddings and RAG to tool calling, agents, MCP and production AI architecture.
+- **Interviewers and mentors** who want a ready-made question bank with reference designs and a grader.
+
+## FAQ
+
+**Is it free?**
+The code is free. AI features use your own provider account, so Claude or OpenAI bill you per use (a typical evaluation costs cents). With Ollama it's completely free.
+
+**Does my work leave my computer?**
+Only when you use an AI feature, and only to the provider you chose: that topic's write-up, your answer and the recent chat. With Ollama nothing leaves your machine. There's no KB server, account or analytics.
+
+**Do I have to answer in Java?**
+No. Write in any language or in plain prose with diagrams. The reference material is Java-flavoured, but the grader judges the design.
+
+**Can I add my own questions?**
+Yes. Content is plain JSON and Markdown. [AUTHORING.md](AUTHORING.md) documents the format, and the build scripts keep your answers when you rebuild.
+
+**Can I use it on my phone?**
+Yes. `npm start` serves it to devices on your home Wi-Fi (never the internet). Open `http://<your-computer's-IP>:4321`.
+
+## Contributing
+
+Contributions are welcome, especially:
+- new LLD / HLD / AI topics with a reference design,
+- improvements to the fundamentals chapters and DSA pattern guides,
+- bug fixes and UI polish.
+
+Open an issue to discuss an idea, or send a pull request. Please run `kb reset --yes` on your copy before committing, so your personal answers stay out of the PR.
+
+## Support the project
+
+If KB helped you prepare:
+- ⭐ **Star this repo**, so more people find it.
+- 🔁 **Share it** with a friend who's preparing for interviews.
+- 📺 For Java, Spring Boot, microservices and Spring AI, see **[Coding Saint on YouTube](https://www.youtube.com/@codingsaint)**.
+
+<p align="center">Built by <b>Pallav</b> · Java &amp; AI architect · <a href="https://www.youtube.com/@codingsaint">Coding Saint</a></p>
