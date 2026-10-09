@@ -9,6 +9,10 @@
 // chats) is carried over by a stable `key`, so re-running this never loses work.
 //   node build/make-dsa-patterns.js
 const fs = require("fs");
+// Personal fields belong in the data folder; keep empty ones out of content/ (legacy values are kept
+// until the app moves them).
+const { FIELDS: PERSONAL } = require("../lib/userdata");
+const prune = (o) => { for (const k of PERSONAL) if (o[k] == null || o[k] === "" || (Array.isArray(o[k]) && !o[k].length)) delete o[k]; return o; };
 const path = require("path");
 
 const ROOT = path.join(__dirname, "..");
@@ -247,7 +251,7 @@ const topics = PATTERNS.map(([id, name]) => {
       if (Array.isArray(u.chat) && u.chat.length) p.chat = u.chat;
       if (!p.premium) delete p.premium;
       saved.delete(it.key);
-      return p;
+      return prune(p);
     }),
   };
 });

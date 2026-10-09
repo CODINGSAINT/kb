@@ -55,7 +55,8 @@ app.use("/sketches", express.static(path.join(CONTENT, "sketches"), { etag: fals
 // Images pasted or dropped into answers. Files are content-addressed, so they can be cached.
 const images = require("./lib/images");
 app.use("/images", (req, res, next) => { res.set("Cache-Control", "public, max-age=31536000, immutable"); next(); },
-  express.static(images.IMG_DIR, { etag: false, lastModified: false, cacheControl: false }));
+  express.static(images.IMG_DIR, { etag: false, lastModified: false, cacheControl: false }),
+  express.static(images.LEGACY_DIR, { etag: false, lastModified: false, cacheControl: false }));
 app.post("/api/images", express.raw({ type: Object.keys(images.TYPES), limit: images.MAX_UPLOAD }), (req, res) => {
   try { res.json({ url: images.saveImage(req.body, String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase()) }); }
   catch (e) { res.status(e.status || 400).json({ error: e.message }); }
@@ -63,12 +64,8 @@ app.post("/api/images", express.raw({ type: Object.keys(images.TYPES), limit: im
 
 // ---------- file helpers ----------
 const dayFile = (n) => path.join(CONTENT, `day-${String(n).padStart(2, "0")}.json`);
-const readJson = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
-function writeJson(f, data) {
-  const tmp = f + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  fs.renameSync(tmp, f); // atomic replace
-}
+// Shared with the CLI: reads merge in your data folder, writes split your work back out to it.
+const { readJson, writeJson } = require("./lib/store");
 function listDays() {
   if (!fs.existsSync(CONTENT)) return [];
   return fs
@@ -199,6 +196,12 @@ app.get("/api/progress", (req, res) => {
 // ---------- AI: evaluate, chat, doubts, settings ----------
 // Provider keys stay on this machine (kb.config.json or env vars) and never reach the browser.
 const store = require("./lib/store");
+// Your work lives in the data folder (lib/userdata.js). Older installs kept it inside content/: move it once.
+try {
+  const moved = store.migrateLegacy();
+  if (moved.length) console.log(`Moved your answers, verdicts, notes and chats from content/ into your data folder (${moved.join(", ")}). Backups are in content/backups/.`);
+} catch (e) { console.error(`Couldn't move your saved work into the data folder: ${e.message}`); }
+console.log(`Your data folder: ${store.userdata.DATA_DIR}`);
 const ai = require("./lib/ai");
 const tutor = require("./lib/tutor");
 
@@ -247,12 +250,30 @@ app.post("/api/ai/chat", async (req, res) => {
   res.flushHeaders();
   const send = (o) => res.write(JSON.stringify(o) + "\n");
   try {
-    await tutor.clarify(addr, req.body.message, { signal: ctrl.signal, onToken: (t) => send({ t }) });
+    await tutor.clarify(addr, req.body.message, { signal: ctrl.signal, onToken: (t) => send({ t }), voice: !!req.body.voice });
     send({ done: true });
   } catch (e) {
     if (!ctrl.signal.aborted) send({ error: e.message, code: e.code || null });
   }
   res.end();
+});
+
+// ---------- optional OpenAI voice (speech-to-text, text-to-speech) ----------
+const voice = require("./lib/voice");
+app.post("/api/voice/transcribe", express.raw({ type: () => true, limit: "25mb" }), async (req, res) => {
+  try {
+    if (!req.body || !req.body.length) return res.status(400).json({ error: "No audio received." });
+    const text = await voice.transcribe(req.body, req.get("Content-Type") || "audio/webm", req.query.lang);
+    res.json({ text });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message, code: e.code || null }); }
+});
+app.post("/api/voice/speak", async (req, res) => {
+  try {
+    const r = await voice.speak(req.body && req.body.text, req.body && req.body.voice);
+    res.set("Content-Type", r.headers.get("content-type") || "audio/mpeg");
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.end(buf);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message, code: e.code || null }); }
 });
 
 // Default: every network interface, but only local-network addresses are answered (see

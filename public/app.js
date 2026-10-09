@@ -275,13 +275,20 @@
       <section class="card tutor" id="tutorCard">
         <h2>${esc(ctx.tutorTitle || "Discuss with the AI tutor")} <span class="spacer"></span>
           <span class="muted small" id="tutorModel"></span>
+          <span class="voice-tools">
+            <button type="button" class="vbtn" id="vRead" aria-pressed="false" title="Read the tutor's replies aloud">${KBVoice.ICON.speaker}<span>Read aloud</span></button>
+            <button type="button" class="vbtn" id="vTalk" aria-pressed="false" title="Hands-free: talk, hear the reply, then it listens again">${KBVoice.ICON.mic}<span>Talk mode</span></button>
+            <button type="button" class="vbtn icon" id="vGear" title="Voice settings">${KBVoice.ICON.gear}</button>
+          </span>
           <button class="btn small" id="chatClear" title="Start a fresh conversation">Clear</button></h2>
         <div class="chat" id="chatLog" aria-live="polite"></div>
         <div class="chips" id="chatChips"></div>
         <form class="chat-input" id="chatForm">
           <textarea id="chatText" rows="2" placeholder="${esc(ctx.chatPlaceholder || "Ask about this topic or your answer…  (Enter sends · Shift+Enter for a new line)")}"></textarea>
+          <button type="button" class="mic" id="chatMic" title="Speak your question (click again to stop)" aria-label="Speak your question">${KBVoice.ICON.mic}</button>
           <button class="btn primary" id="chatSend" type="submit">Send</button>
         </form>
+        <div class="voice-status" id="voiceStatus" hidden></div>
         <div class="cli-hint muted small">Same conversation from a terminal: <code>${esc(clarifyCmd)}</code> ${copyButton(clarifyCmd)}</div>
       </section>`);
     const chatLog = $("#chatLog"), chatText = $("#chatText"), chatSend = $("#chatSend");
@@ -290,9 +297,10 @@
     function appendMsg(role, content, raw) {
       const el = document.createElement("div");
       el.className = "msg " + role;
-      el.innerHTML = `<div class="who">${role === "user" ? "You" : "Tutor"}</div><div class="body"></div>`;
+      el.innerHTML = `<div class="who">${role === "user" ? "You" : "Tutor"}${role === "assistant" ? ` <button type="button" class="listen" title="Read this reply aloud">${KBVoice.ICON.speaker}</button>` : ""}</div><div class="body"></div>`;
       chatLog.appendChild(el);
       const body = el.querySelector(".body");
+      el._md = content;
       if (role === "assistant" && !raw) viewer(body, content); else body.textContent = content;
       return body;
     }
@@ -311,10 +319,81 @@
     $("#chatChips").addEventListener("click", (e) => { const b = e.target.closest(".chip"); if (b) sendChat(b.textContent); });
 
     let sending = false;
-    async function sendChat(text) {
+    // ----- voice -----
+    const V = KBVoice, vStatus = $("#voiceStatus"), micBtn = $("#chatMic");
+    let talkMode = false, speaker = null;
+    const readAloud = () => talkMode || V.get().readAloud;
+    const status = (msg, cls) => { vStatus.hidden = !msg; vStatus.className = "voice-status " + (cls || ""); vStatus.innerHTML = msg || ""; };
+    function syncVoiceButtons() {
+      $("#vRead").setAttribute("aria-pressed", String(V.get().readAloud));
+      $("#vTalk").setAttribute("aria-pressed", String(talkMode));
+      $("#vRead").disabled = talkMode;
+    }
+    const offVoice = V.onChange(syncVoiceButtons);
+    state.voiceCleanup = () => { offVoice(); talkMode = false; V.cancelListening(); if (speaker) speaker.stop(); V.stopSpeaking(); };
+    syncVoiceButtons();
+    const listeningMsg = () => `<span class="dot"></span> Listening… take your time. Pause for ${(V.get().pauseMs / 1000).toFixed(V.get().pauseMs % 1000 ? 1 : 0)}s or click the mic when you're done`;
+    async function startListening() {
+      if (V.isListening()) { V.stopListening(); return; }
+      if (speaker) { speaker.stop(); speaker = null; }
+      V.stopSpeaking();
+      const before = chatText.value;
+      try {
+        const text = await V.listen({
+          onInterim: (t) => { chatText.value = (before ? before + " " : "") + t; },
+          onCountdown: (sec) => {
+            if (sec) status(`<span class="dot"></span> Sending in ${sec}s… keep talking to add more, or click the mic to send now`, "live");
+            else if (V.isListening()) status(listeningMsg(), "live");
+          },
+          onState: (st, detail) => {
+            micBtn.classList.toggle("on", st === "listening");
+            micBtn.classList.toggle("busy", st === "transcribing" || st === "loading");
+            if (st === "listening") status(listeningMsg(), "live");
+            else if (st === "transcribing") status("Turning your speech into text…");
+            else if (st === "loading") status(esc(detail || "Loading Whisper…"));
+            else status("");
+          },
+        });
+        const full = ((before ? before + " " : "") + (text || "")).trim();
+        chatText.value = full;
+        if (!text) { if (talkMode) status("Didn't catch that. Click the mic or say something.", "warn"); return; }
+        if (talkMode || V.get().autoSend) sendChat(full, { voice: true });
+        else chatText.focus();
+      } catch (e) {
+        status(esc(e.message), "err");
+        if (e.code === "NO_KEY") openAiSettings(e.message);
+        if (talkMode) { talkMode = false; syncVoiceButtons(); }
+      }
+    }
+    micBtn.addEventListener("click", startListening);
+    $("#vRead").addEventListener("click", () => { const on = !V.get().readAloud; V.set({ readAloud: on }); if (!on) { if (speaker) speaker.stop(); V.stopSpeaking(); } });
+    $("#vTalk").addEventListener("click", () => {
+      talkMode = !talkMode; syncVoiceButtons();
+      if (talkMode) { if (V.get().output === "off") V.set({ output: "browser" }); if (!sending) startListening(); }
+      else { V.cancelListening(); if (speaker) speaker.stop(); V.stopSpeaking(); status(""); }
+    });
+    $("#vGear").addEventListener("click", () => V.openSettings());
+    chatLog.addEventListener("click", (e) => {
+      const b = e.target.closest(".listen"); if (!b) return;
+      const msg = b.closest(".msg");
+      if (b.classList.contains("on")) { V.stopSpeaking(); return; }
+      chatLog.querySelectorAll(".listen.on").forEach((x) => x.classList.remove("on"));
+      b.classList.add("on");
+      V.speakNow(msg._md || msg.querySelector(".body").innerText, { onIdle: () => b.classList.remove("on"), onError: (er) => { b.classList.remove("on"); status(esc(er.message), "err"); } });
+    });
+
+    async function sendChat(text, opts = {}) {
       text = String(text || "").trim();
       if (!text || sending) return;
-      if (!ensureAi()) return;
+      if (!ensureAi()) { if (talkMode) { talkMode = false; syncVoiceButtons(); } return; }
+      if (speaker) { speaker.stop(); speaker = null; }
+      V.stopSpeaking();
+      // Spoken question -> spoken answer by default; typed questions are spoken only with Read aloud / Talk mode.
+      const speak = (readAloud() || (opts.voice && V.get().replyByVoice)) && V.get().output !== "off";
+      const spk = speak ? (speaker = V.createSpeaker({
+        onIdle: () => { if (speaker === spk) speaker = null; setTimeout(() => { if (talkMode && !sending && !V.isListening()) startListening(); }, 60); },
+        onError: (er) => status(esc(er.message), "err"),
+      })) : null;
       sending = true; chatSend.disabled = true;
       chatLog.querySelector(".chat-empty")?.remove();
       appendMsg("user", text);
@@ -325,7 +404,7 @@
       let acc = "", started = false;
       const ctrl = new AbortController(); state.chatAbort = ctrl;
       try {
-        const r = await fetch("/api/ai/chat", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...ctx.addr, message: text }), signal: ctrl.signal });
+        const r = await fetch("/api/ai/chat", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...ctx.addr, message: text, voice: !!(opts.voice || speak) }), signal: ctrl.signal });
         if (!r.ok) { const j = await r.json().catch(() => ({})); throw Object.assign(new Error(j.error || r.statusText), { code: j.code }); }
         const reader = r.body.getReader(), dec = new TextDecoder();
         let buf = "";
@@ -342,23 +421,29 @@
             if (ev.t) {
               if (!started) { body.textContent = ""; body.classList.add("streaming"); started = true; }
               acc += ev.t; body.textContent = acc; scrollChat();
+              if (spk) spk.feed(ev.t);
             }
           }
         }
         if (!acc.trim()) throw new Error("The model returned an empty reply.");
         body.classList.remove("streaming"); body.textContent = "";
         viewer(body, acc);
+        body.closest(".msg")._md = acc;
+        if (spk) spk.end();
         item.chat = [...(item.chat || []), { role: "user", content: text }, { role: "assistant", content: acc.trim() }];
         $("#chatClear").hidden = false;
         scrollChat();
       } catch (e) {
+        if (spk) spk.stop();
         if (e.name === "AbortError") return;
+        if (talkMode) { talkMode = false; syncVoiceButtons(); }
         body.classList.remove("streaming");
         body.innerHTML = `<p class="err">${esc(e.message)}</p><p class="muted small">Your message wasn't saved. It's back in the box so you can retry.</p>`;
         chatText.value = text;
         if (e.code === "NO_KEY") openAiSettings(e.message);
       } finally {
         sending = false; chatSend.disabled = false;
+        if (talkMode && !spk) startListening();
         if (state.chatAbort === ctrl) state.chatAbort = null;
       }
     }
@@ -380,6 +465,7 @@
     root.insertAdjacentHTML("beforeend", `
       <section class="card" id="answerCard">
         <h2>My answer <span class="spacer"></span><span class="save-state" id="ansState"></span>
+          <button type="button" class="vbtn dictate" id="ansMic" title="Dictate into your answer (click again to stop)">${KBVoice.ICON.mic}<span>Dictate</span></button>
           <button class="btn primary" id="ansSave" data-save disabled>Save answer</button></h2>
         <div id="ansEditor"></div>
         <p class="muted small" style="margin:10px 0 0">Saved as Markdown. For code, put <code>\`\`\`java</code> on its own line before it and <code>\`\`\`</code> after it. <kbd>Tab</kbd> indents and <kbd>Shift</kbd>+<kbd>Tab</kbd> outdents. Paste or drag in a diagram image (a screenshot, an Excalidraw export or a whiteboard photo). The AI looks at it when evaluating. Use <b>Preview</b> to check the result. Saving a changed answer clears any earlier verdict. <kbd>Ctrl/⌘ S</kbd> saves.</p>
@@ -387,6 +473,7 @@
       <section class="card" id="verdictCard"></section>
       <section class="card">
         <h2>Notes &amp; doubts <span class="spacer"></span><span class="save-state" id="notesState"></span>
+          <button type="button" class="vbtn dictate" id="notesMic" title="Dictate into your notes (click again to stop)">${KBVoice.ICON.mic}<span>Dictate</span></button>
           <button class="btn" id="notesSave" data-save disabled>Save notes</button></h2>
         <textarea class="notes" id="notes" placeholder="Free-form notes. Ask a question on its own line:\n#doubt why is the Board a separate class from Game?"></textarea>
         <div class="doubts" id="doubts"></div>
@@ -448,6 +535,7 @@
       } catch (e) { ansSave.disabled = false; setSave(ansState, "err", "Save failed: " + e.message); return false; }
     }
     ansSave.addEventListener("click", saveAnswer);
+    dictation($("#ansMic"), ansState, (t) => { editor.focus(); editor.insertText(t); });
 
     // ----- verdict -----
     let evaluating = false;
@@ -536,6 +624,34 @@
     });
     let doubtTimer = null;
     notesSave.addEventListener("click", saveNotes);
+    dictation($("#notesMic"), notesState, (t) => {
+      const a = notes.selectionStart ?? notes.value.length, b = notes.selectionEnd ?? a;
+      notes.value = notes.value.slice(0, a) + t + notes.value.slice(b);
+      notes.selectionStart = notes.selectionEnd = a + t.length;
+      notes.dispatchEvent(new Event("input"));
+    });
+  }
+
+  // Mic button that keeps listening until clicked again (or a long pause), then inserts the text.
+  function dictation(btn, stateEl, insert) {
+    btn.addEventListener("click", async () => {
+      if (KBVoice.isListening()) { KBVoice.stopListening(); return; }
+      try {
+        const text = await KBVoice.listen({
+          continuous: true,
+          onState: (st, detail) => {
+            btn.classList.toggle("on", st === "listening");
+            btn.classList.toggle("busy", st === "transcribing" || st === "loading");
+            btn.querySelector("span").textContent = st === "listening" ? "Stop" : st === "idle" ? "Dictate" : "…";
+            if (st === "listening") setSave(stateEl, "dirty", "Listening… click Stop when done");
+            else if (st === "transcribing") setSave(stateEl, "", "Turning speech into text…");
+            else if (st === "loading") setSave(stateEl, "", detail || "Loading Whisper…");
+          },
+        });
+        if (text) insert(text.replace(/\s+$/, "") + " ");
+        else setSave(stateEl, "", "Didn't catch anything.");
+      } catch (e) { setSave(stateEl, "err", e.message); }
+    });
   }
 
   async function refreshMeta() {
@@ -781,6 +897,7 @@
     }
     state.dirty = false; lastHash = location.hash;
     if (state.chatAbort) { state.chatAbort.abort(); state.chatAbort = null; }
+    if (state.voiceCleanup) { state.voiceCleanup(); state.voiceCleanup = null; }
     state.onAiChange = null;
     destroyEditors();
     const h = location.hash.replace(/^#\/?/, "").split("/");

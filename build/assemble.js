@@ -12,6 +12,10 @@
 // Existing user data (notes, userAnswer, answerEvaluation, chat, sketch, evaluation) is preserved.
 // A topic with no authored block keeps whatever markdown/diagram is already on disk.
 const fs = require("fs");
+// Personal fields belong in the data folder; keep empty ones out of content/ (legacy values are kept
+// until the app moves them).
+const { FIELDS: PERSONAL } = require("../lib/userdata");
+const prune = (o) => { for (const k of PERSONAL) if (o[k] == null || o[k] === "" || (Array.isArray(o[k]) && !o[k].length)) delete o[k]; return o; };
 const path = require("path");
 const { parseStudy } = require("../scripts/study-parser");
 
@@ -60,7 +64,7 @@ for (let n = 1; n <= count; n++) {
     const prev = old?.topics?.find((t) => t.category === cat) || {};
     const a = authored[`${cat}-${n}`];
     if (!a && !prev.markdown) missing.push(`${cat} ${n}`);
-    return {
+    return prune({
       category: cat, number: n, title: row.title, concepts: row.concepts,
       notes: prev.notes || "",
       diagram: a ? a.diagram : prev.diagram || { nodes: [], edges: [] },
@@ -69,7 +73,7 @@ for (let n = 1; n <= count; n++) {
       answerEvaluation: prev.answerEvaluation ?? null,
       answerEvaluatedAt: prev.answerEvaluatedAt ?? null,
       ...(prev.chat?.length ? { chat: prev.chat } : {}),
-    };
+    });
   });
   const day = { day: n, generatedAt: old?.generatedAt || new Date().toISOString(), sketch: old?.sketch ?? null, evaluation: old?.evaluation ?? null, topics };
   fs.writeFileSync(file, JSON.stringify(day, null, 2) + "\n");

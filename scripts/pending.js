@@ -4,7 +4,8 @@
 // ("handle these") or feed it to generate-day.sh's evaluate mode.
 const fs = require("fs");
 const path = require("path");
-const dir = path.join(__dirname, "..", "content");
+const store = require("../lib/store"); // merges in your data folder
+const dir = store.CONTENT;
 
 function openDoubts(notes) {
   const out = []; const lines = String(notes || "").split(/\r?\n/);
@@ -18,7 +19,7 @@ function openDoubts(notes) {
 }
 const rows = [];
 for (const f of fs.readdirSync(dir).filter((f) => /^day-\d+\.json$/.test(f)).sort()) {
-  const d = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+  const d = store.readJson(path.join(dir, f));
   d.topics.forEach((t, i) => {
     const where = `${f} topics[${i}] ${t.category} #${t.number} "${t.title}"`;
     if (!t.markdown) rows.push(`WRITE-UP MISSING  ${where}`);
@@ -26,7 +27,7 @@ for (const f of fs.readdirSync(dir).filter((f) => /^day-\d+\.json$/.test(f)).sor
     openDoubts(t.notes).forEach((q) => rows.push(`OPEN DOUBT        ${where}: ${q}`));
   });
 }
-const dsa = JSON.parse(fs.readFileSync(path.join(dir, "dsa.json"), "utf8"));
+const dsa = store.readJson(path.join(dir, "dsa.json"));
 dsa.topics.forEach((tp, ti) => tp.problems.forEach((p, pi) => {
   const where = `dsa.json topics[${ti}].problems[${pi}] ${tp.name} #${p.number} "${p.title}"`;
   if (p.userAnswer?.trim() && !p.answerEvaluation) rows.push(`NEEDS EVALUATION  ${where}`);

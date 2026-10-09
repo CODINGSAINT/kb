@@ -5,6 +5,10 @@
 //   node build/make-fundamentals.js
 // Re-running keeps what you've saved: read status, notes and tutor chats.
 const fs = require("fs");
+// Personal fields belong in the data folder; keep empty ones out of content/ (legacy values are kept
+// until the app moves them).
+const { FIELDS: PERSONAL } = require("../lib/userdata");
+const prune = (o) => { for (const k of PERSONAL) if (o[k] == null || o[k] === "" || (Array.isArray(o[k]) && !o[k].length)) delete o[k]; return o; };
 const path = require("path");
 
 const ROOT = path.join(__dirname, "..");
@@ -116,7 +120,7 @@ const groups = TRACKS.map(([track, name]) => ({
     const item = { number: ++n, id: a.id, title: a.title, summary: a.summary, markdown: a.markdown, usedBy,
       readAt: s.readAt ?? null, notes: s.notes || "" };
     if (Array.isArray(s.chat) && s.chat.length) item.chat = s.chat;
-    return item;
+    return prune(item);
   }),
 }));
 

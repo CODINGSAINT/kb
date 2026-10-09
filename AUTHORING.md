@@ -52,6 +52,14 @@ so hand-written and AI-written verdicts look the same.
 
 ## 6. Images in answers
 
-Images live in `content/images/<hash>.<ext>` and are referenced from `userAnswer` as `![alt](/images/<file>)`.
+Images live in the data folder's `images/<hash>.<ext>` (older copies: `content/images/`) and are referenced from `userAnswer` as `![alt](/images/<file>)`.
 Don't inline `data:` base64 images. The site converts them to files when an answer is saved, and `kb answer` does the same.
 When evaluating, chatting or answering doubts, each image is replaced in the prompt text by `[Image N: alt — attached]` and sent as a real image input.
+
+## Where personal fields live
+
+`userAnswer`, `answerEvaluation`, `answerEvaluatedAt`, `notes`, `chat` and `readAt` are **not** stored in `content/`.
+They live in the learner's data folder (`../kb-data/progress/<id>.json`, see `lib/userdata.js`), one file per item:
+`lld-02.json`, `hld-07.json`, `ai-20.json`, `dsa-<problem key>.json`, `read-<fundamental id>.json`.
+Read and write through `lib/store.js` (`readJson` / `writeJson` / `updateItem`), which merges them in and splits them back out.
+Don't add these fields to files under `content/` by hand.

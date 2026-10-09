@@ -35,11 +35,12 @@
 Most interview prep is passive: you read a solution, nod along, and feel ready. Real interviews aren't like that.
 KB makes you **commit to your own design before you see any answer**, then gives you the kind of feedback a senior interviewer would.
 
-| | |
+| What you get | How it works |
 |---|---|
 | 🧠 **Attempt first** | Each topic shows only the problem and requirements. The reference design, abstractions and trade-offs stay hidden behind an *"Are you sure?"* until you've tried. |
 | ✅ **A real verdict** | One click grades your answer: **Strong / Solid / Partial / Needs work**, what you got right, the gaps, and what to study next. It reads your diagrams too. |
 | 💬 **A tutor that pushes back** | Chat about your answer with an AI that knows the topic, your attempt and its verdict. *"Quiz me like an interviewer"* is one click away, and it won't spoil the design before you've tried. |
+| 🎙️ **Talk instead of type** | Ask the tutor out loud and hear its answers. *Talk mode* is a hands-free spoken conversation, and you can dictate your answer too. Works with Ollama, Claude and OpenAI, and can run fully offline. |
 | 📚 **Fundamentals, done properly** | 37 in-depth chapters (caching, sharding, consensus, SOLID, design patterns, concurrency…), each linked from the problems that need it. |
 | 🧩 **DSA by pattern** | 304 problems in 32 patterns, each with a guide and a Java template. The grader checks whether you used the pattern, not just whether the code works. |
 | 🔒 **Private and yours** | Plain JSON files on your machine. No account, no tracking. Bring your own Claude or OpenAI key, or run **free and offline** with Ollama. |
@@ -320,13 +321,11 @@ Progress 0/401 attempted · 0/401 evaluated
 Nothing pending.
 ```
 
-### Step 8 (optional) — Start from a clean slate
+### Step 8 (optional) — Keep your progress in a private repo
 
-If you cloned someone else's copy, it may contain their answers and chats. Wipe them, keeping all the write-ups:
-
-```bash
-kb reset --yes
-```
+Your answers, verdicts, notes, chats and read status are saved in a **data folder next to the repo**
+(`../kb-data` by default), never inside it. Run `kb data` to see where it is and how to make it a private git repo,
+so your progress is backed up and follows you to other computers. See [Where your data is saved](#where-your-data-is-saved).
 
 ### Your first session, end to end
 
@@ -368,6 +367,7 @@ Topics are addressed by track and number: `lld 1`–`lld 20`, `hld 1`–`hld 20`
 | `kb setup` | Chooses the provider, model and key, then tests the connection |
 | `kb status` | Shows the AI settings, progress and pending items |
 | `kb serve` | Starts the site |
+| `kb data` | Shows your data folder and how to back it up as a private repo |
 | `kb reset --yes` | Wipes all answers, verdicts, notes and chats (write-ups stay) |
 
 **One run on a different model:** add `--provider openai`, `--provider ollama` or `--model claude-opus-5-5` to any AI command.
@@ -387,29 +387,65 @@ The same goes for verdicts and doubt answers. Reload the page to see changes mad
 - **Discuss with the AI tutor**: a streaming chat for each topic. The tutor sees the write-up, your answer and your verdict.
   Quick prompts include *Quiz me like an interviewer* and *What's weakest in my answer?* **Clear** starts the conversation over.
 - **Diagrams**: paste (`Ctrl+V`), drag in, or use the toolbar's image button to add a screenshot, an Excalidraw/draw.io export, or a phone photo of a whiteboard.
-  Images are saved as files in `content/images/`, and **the AI looks at them** when it evaluates, chats or answers doubts, comparing them against your text.
+  Images are saved as files in your data folder's `images/`, and **the AI looks at them** when it evaluates, chats or answers doubts, comparing them against your text.
   This works with Claude, GPT-5 and vision models in Ollama (such as `gemma4`). If a model can't read images, the evaluation still runs and the verdict notes that the diagrams were skipped.
   PNG, JPEG, GIF and WebP are supported, at most 6 images per answer and 5 MB each.
 - **Notes & doubts**: free-form notes. Put `#doubt your question` on its own line, then click **Answer with AI**.
   The reply is written under it as `#doubt-answer …`.
+- **Voice**: in any tutor chat, click the **mic** to ask a question out loud. Take your time: it waits for a 4-second pause (adjustable) before sending, shows a countdown, and clicking the mic sends straight away.
+  Questions you *speak* are answered out loud automatically. **Read aloud** also speaks replies to typed questions, and **Talk mode** makes it a hands-free conversation:
+  you talk, it answers out loud, then listens again. **Dictate** buttons on *My answer* and *Notes* turn speech into text.
+  The ⚙ button next to them opens Voice settings, with these choices:
+  - *Speech to text*: the browser's built-in recognition (free, instant; Chrome sends the audio to Google), **Whisper running in the page** (free, fully offline after a one-time download of about 40–250 MB), or OpenAI transcription (uses your OpenAI key).
+  - *Reading aloud*: pick any of your computer's voices (free, offline; ★ marks natural-sounding ones, and Edge has many) or one of OpenAI's ten voices. Choosing a voice plays a preview.
+  The chat model only ever sees text, so voice works the same with Ollama, Claude and OpenAI. The mic only works on `http://localhost` (or HTTPS); browsers block it on plain `http://<IP>` from another device.
 - **AI chip** (top bar): shows the connected provider and model. Click it to change settings.
 
 ---
 
 ## Where your data is saved
 
-Everything is stored in this folder. There's no database and no cloud storage.
+KB keeps **shared material** and **your own work** apart, so you can publish or update the app without ever exposing your answers.
 
-| What | Where | In git? |
+```
+<any folder>/
+├── kb/                  ← this repo (public): app, topics, write-ups, DSA lists, fundamentals
+│   └── kb.config.json   ← your AI provider and key (git-ignored, never committed)
+└── kb-data/             ← your data folder (private): created automatically on first save
+    ├── progress/        ← one small JSON file per item you've worked on, e.g. lld-02.json, dsa-two-sum.json, read-hld-caching.json
+    ├── images/          ← diagrams and photos pasted into your answers
+    └── README.md
+```
+
+| What | Where | In the public repo? |
 |---|---|---|
-| AI provider, model, API key | `kb.config.json` (created by `kb setup` or the site's settings) | **No**, it's git-ignored |
-| Images in your answers | `content/images/` (file names are content hashes) | Yes |
-| Answers, verdicts, notes and chats for `lld N`, `hld N`, `ai N` | `content/day-NN.json` (e.g. `lld 1`, `hld 1` and `ai 1` are all in `day-01.json`) | Yes |
-| Same for `dsa N` | `content/dsa.json` | Yes |
-| Theme, sidebar state, revealed reference designs | browser localStorage | — |
+| Topics, write-ups, diagrams, DSA lists, pattern guides, fundamentals | `content/` | Yes |
+| Your answers, AI verdicts, notes, tutor chats, read status | `kb-data/progress/` | **No** |
+| Images in your answers | `kb-data/images/` | **No** |
+| AI provider, model, API key | `kb.config.json` | **No**, it's git-ignored |
+| Theme, sidebar state, voice settings, revealed reference designs | browser localStorage | — |
 
-Inside each topic, the fields are `userAnswer`, `answerEvaluation` and `answerEvaluatedAt`, `notes`, and `chat`.
-`AUTHORING.md` documents the format.
+**Choosing the location.** By default the data folder is `kb-data` next to the repo folder. To put it somewhere else (a synced drive, another disk),
+set `"dataDir": "D:/study/kb-data"` in `kb.config.json`, or the `KB_DATA` environment variable, and move the folder there. `kb data` shows which location is in use.
+
+**Back it up as a private repo** (recommended). Create an empty **private** repository on GitHub, then:
+
+```bash
+cd ../kb-data
+git init
+git add .
+git commit -m "KB progress"
+git branch -M main
+git remote add origin https://github.com/<you>/kb-data.git
+git push -u origin main
+```
+
+Commit and push whenever you like. On another computer, clone the app repo and your private data repo side by side, and KB picks your progress up automatically.
+
+**Upgrading from an older copy.** Older versions kept answers inside `content/`. The first time the new version runs, it moves them into the data folder automatically
+and leaves a backup of each changed file in `content/backups/` (git-ignored).
+
+Each progress file holds `userAnswer`, `answerEvaluation`, `answerEvaluatedAt`, `notes`, `chat` and `readAt` for one item. `AUTHORING.md` documents the format.
 
 **What leaves your machine:** only when you use an AI feature. Each request sends that topic's write-up, your answer (including its images),
 the verdict and the recent chat (last 24 messages) to your chosen provider. With Ollama, nothing leaves your machine.
@@ -417,7 +453,7 @@ the verdict and the recent chat (last 24 messages) to your chosen provider. With
 **Security:** the server answers only this computer and private local-network addresses (anything else gets 403), because its AI routes spend your credit.
 Run `npm run start:local` to restrict it to this computer only. API keys are never sent to the browser; the settings dialog only shows the last 4 characters.
 
-**Backups:** copy the `content/` folder. Committing to a private git repo also works as a backup.
+**Backups:** your data folder is everything personal. A private git repo for it (above) is the easiest backup.
 
 ---
 
@@ -436,8 +472,8 @@ git push -u origin main
 
 Before pushing, run `git status` and confirm `kb.config.json` is **not** listed.
 
-Your answers and chats live in `content/`, so they get committed too. That's fine for a private repo.
-For a public repo, publish from a separate copy where you've run `kb reset --yes`, so others start clean and your work stays private.
+Your answers, verdicts, notes and chats are **not** in this repo: they're in your data folder (`../kb-data`), so the app repo can be public
+and everyone who clones it starts clean. Keep the data folder in its own private repo (see [Where your data is saved](#where-your-data-is-saved)).
 
 `.gitattributes` keeps every file on LF line endings, so the JSON diffs stay readable across Windows and macOS.
 
@@ -473,8 +509,10 @@ bin/kb.js                the `kb` command
 lib/store.js             read/write content JSON; addresses like "lld 1"
 lib/ai.js                provider layer (Claude, OpenAI-compatible, Ollama), streaming, kb.config.json
 lib/tutor.js             evaluate / clarify / doubts, with the prompts, shared by the CLI and the server
-lib/images.js            answer images: save to content/images, attach to prompts as real image inputs
-public/                  index.html, app.js, diagram.js (rough.js renderer), styles.css, vendor/
+lib/voice.js             optional OpenAI speech-to-text / text-to-speech for the voice features
+lib/userdata.js          your data folder (../kb-data): answers, verdicts, notes, chats, read status kept outside the repo
+lib/images.js            answer images: save to the data folder, attach to prompts as real image inputs
+public/                  index.html, app.js, voice.js (mic, read-aloud, talk mode), diagram.js (rough.js renderer), styles.css, vendor/
 content/day-NN.json      3 topics per file (LLD, HLD, AI): write-up, diagram, your answer, verdict, notes, chat
 content/dsa.json         DSA problems grouped by pattern, with guides and your answers
 content/fundamentals.json  the read-first chapters, built from build/fundamentals/*.md
@@ -543,6 +581,9 @@ Bits → Trie → Strings → Matrix & Math → Design.
 **Is it free?**
 The code is free. AI features use your own provider account, so Claude or OpenAI bill you per use (a typical evaluation costs cents). With Ollama it's completely free.
 
+**Where are my answers stored? Will they end up on GitHub?**
+In a data folder next to the repo (`../kb-data`), never inside it, so the public repo never contains them. You can keep that folder as its own private repo to back it up and sync it between computers.
+
 **Does my work leave my computer?**
 Only when you use an AI feature, and only to the provider you chose: that topic's write-up, your answer and the recent chat. With Ollama nothing leaves your machine. There's no KB server, account or analytics.
 
@@ -562,7 +603,7 @@ Contributions are welcome, especially:
 - improvements to the fundamentals chapters and DSA pattern guides,
 - bug fixes and UI polish.
 
-Open an issue to discuss an idea, or send a pull request. Please run `kb reset --yes` on your copy before committing, so your personal answers stay out of the PR.
+Open an issue to discuss an idea, or send a pull request. Your own answers live in your data folder outside the repo, so they never end up in a PR.
 
 ## Support the project
 

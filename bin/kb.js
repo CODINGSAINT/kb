@@ -37,10 +37,11 @@ ${bold("AI")}
   kb doubts [lld 1]                answer open "#doubt" lines in notes (all topics if none given)
   kb pending [--run]               list what's waiting; --run evaluates and answers all of it
 
-${bold("Housekeeping")}
+${bold("Your data")}   ${dim("answers, verdicts, notes, chats and read status live outside the repo")}
+  kb data                          where your data folder is, and how to back it up privately
   kb reset --yes                   wipe all answers, verdicts, notes and chats (write-ups stay)
 
-${bold("Addresses")}   lld 1-20 · hld 1-20 · ai 1-20 · dsa 1-304 · read 1-34     ${dim('("lld1", "LLD-1" also work)')}
+${bold("Addresses")}   lld 1-20 · hld 1-20 · ai 1-20 · dsa 1-304 · read 1-37     ${dim('("lld1", "LLD-1" also work)')}
 ${bold("Options")}     --provider anthropic|openai|ollama   --model <name>   (one run only)
 `;
 
@@ -126,6 +127,7 @@ const commands = {
     const items = store.listItems();
     const n = items.length, a = items.filter((i) => i.answered).length, e = items.filter((i) => i.evaluated).length;
     console.log(`${bold("Progress")} ${a}/${n} attempted · ${e}/${n} evaluated`);
+    console.log(`${bold("Data")}     ${store.userdata.DATA_DIR}`);
     commands.pending(o);
   },
 
@@ -313,18 +315,32 @@ const commands = {
       console.log(`This wipes ${bold("all")} saved answers, verdicts, notes and conversations (the write-ups stay).\nRun ${bold("kb reset --yes")} to confirm. Handy after cloning someone else's copy.`);
       return;
     }
-    const wipe = (t) => { t.userAnswer = ""; t.answerEvaluation = null; t.answerEvaluatedAt = null; t.notes = ""; delete t.chat; };
-    let n = 0;
-    for (const f of store.dayFiles()) {
-      const d = store.readJson(f);
-      (d.topics || []).forEach((t) => { wipe(t); n++; });
-      d.sketch = null; d.evaluation = null;
+    const before = store.userdata.stats().items;
+    // Also strip anything an old copy left inside content/, then empty the data folder.
+    const wipe = (t) => { for (const k of store.userdata.FIELDS) delete t[k]; };
+    for (const f of [...store.dayFiles(), store.DSA_FILE, store.FUND_FILE].filter((f) => fs.existsSync(f))) {
+      const d = store.readRaw(f);
+      for (const [, it] of store.userdata.itemsOf(f, d)) wipe(it);
+      if (d.sketch !== undefined) d.sketch = null;
+      if (d.evaluation !== undefined) d.evaluation = null;
       store.writeJson(f, d);
     }
-    const dsa = store.readJson(store.DSA_FILE);
-    dsa.topics.forEach((tp) => tp.problems.forEach((p) => { wipe(p); n++; }));
-    store.writeJson(store.DSA_FILE, dsa);
-    console.log(green(`Reset ${n} topics and problems to a clean slate.`));
+    store.userdata.clearAll();
+    console.log(green(`Cleared ${before} saved item(s) from ${store.userdata.DATA_DIR}. Write-ups and answer images were kept.`));
+  },
+
+  data() {
+    const s = store.userdata.stats();
+    console.log(`${bold("Data folder")}  ${s.dir}`);
+    console.log(`${dim("set by")}       ${s.from}`);
+    console.log(`${bold("Saved")}        ${s.items} item(s) with answers, verdicts, notes, chats or read status · ${s.images} image(s)`);
+    console.log(`${bold("Git")}          ${s.git ? green("this folder is a git repository") : yellow("not a git repository yet")}`);
+    console.log(`\nThis folder is yours alone: the public repo never contains it.`);
+    if (!s.git) {
+      console.log(`To back it up privately, create an empty ${bold("private")} repo on GitHub, then:\n`);
+      console.log(dim(`  cd "${s.dir}"\n  git init\n  git add .\n  git commit -m "KB progress"\n  git branch -M main\n  git remote add origin https://github.com/<you>/kb-data.git\n  git push -u origin main`));
+    }
+    console.log(`\nTo move it, set ${bold('"dataDir"')} in kb.config.json (or the KB_DATA environment variable) and move the folder there.`);
   },
 
   serve(o) { if (o.lan) process.env.KB_LAN = "1"; if (o.local) process.env.KB_LOCAL = "1"; require("../server"); },
@@ -342,6 +358,10 @@ function printTurn(m) {
   const { opts, rest } = parseArgs(argv);
   if (!commands[cmd]) { console.error(red(`Unknown command "${cmdRaw}".`) + "\n"); console.log(HELP); process.exit(1); }
   if (opts.help) return commands.help();
+  if (cmd !== "help" && cmd !== "serve") {
+    try { const moved = store.migrateLegacy(); if (moved.length) console.log(dim(`Moved your saved work from content/ into ${store.userdata.DATA_DIR}. Backups are in content/backups/.\n`)); }
+    catch (e) { console.error(red(`Couldn't move your saved work into the data folder: ${e.message}`)); }
+  }
   try { await commands[cmd](opts, rest); }
   catch (e) { console.error("\n" + red(e.message)); process.exit(1); }
 })();
