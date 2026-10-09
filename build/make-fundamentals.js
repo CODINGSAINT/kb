@@ -84,7 +84,7 @@ for (const f of fs.readdirSync(SRC).filter((f) => f.endsWith(".md")).sort((a, b)
     const [id, track, title] = parts[i].split("|").map((s) => s.trim());
     if (!id || !track || !title) throw new Error(`${f}: bad header "${parts[i]}"`);
     const body = parts[i + 1].trim();
-    const summary = (body.split(/\n\s*\n/)[0] || "").replace(/`/g, "").replace(/\s+/g, " ").trim();
+    const summary = (body.split(/\n\s*\n/)[0] || "").replace(/[`*]/g, "").replace(/\s+/g, " ").trim();
     articles.push({ id, track, title, summary, markdown: body + "\n" });
   }
 }

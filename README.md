@@ -8,9 +8,82 @@ You can do this on the site or from the `kb` command line.
 Everything runs on your machine. Content is flat JSON in `content/`. The only network calls are to the AI provider
 you choose: **Claude**, **OpenAI** (or any OpenAI-compatible endpoint), or **Ollama** for a free, fully local model.
 
-**Contents:** [Quick start](#quick-start) · [Full setup guide](#full-setup-guide) · [Using the `kb` command](#using-the-kb-command) ·
+**Contents:** [A quick tour](#a-quick-tour) · [Quick start](#quick-start) · [Full setup guide](#full-setup-guide) · [Using the `kb` command](#using-the-kb-command) ·
 [Using the site](#using-the-site) · [Where your data is saved](#where-your-data-is-saved) · [Publishing to git](#publishing-to-git) ·
 [Troubleshooting](#troubleshooting) · [Project layout](#project-layout)
+
+---
+
+## A quick tour
+
+The study loop is **read the fundamentals, attempt the topic, get it graded, discuss it with the tutor, then compare with the reference**.
+(The screenshots use a sample answer to *Design Parking Lot*.)
+
+### 1. Home: see where you are
+The sidebar lists every track: **Read first** fundamentals, LLD, HLD, AI and DSA patterns. A dot marks each item's state: hollow is not started, cyan is attempted, blue is evaluated or read.
+The home page shows overall progress. Press `\` to hide or show the sidebar, and use the filter box to find a topic by name.
+
+![Home page with progress cards and the sidebar](docs/screenshots/01-home.png)
+
+### 2. Open a topic: problem and requirements only
+A topic page starts with its **Read first** card, the fundamentals worth reading before you attempt it, each with a short summary and your read status.
+Below that you see only the **problem statement and the functional / non-functional requirements**. Nothing that hints at the design.
+
+![Topic page showing Read first and the problem](docs/screenshots/02-topic.png)
+
+### 3. Read the fundamentals first
+Each fundamentals chapter is a long, interview-focused article: concepts, how it works, trade-off tables, Java examples, real systems, pitfalls, interview questions and a cheat sheet.
+Use **On this page** to jump between sections, the chips at the top to open the topics it prepares you for, and **Mark as read** at the bottom. Every article has its own tutor chat too.
+
+![A fundamentals chapter with its contents list](docs/screenshots/07-fundamental.png)
+
+### 4. Write your answer
+Write in **Markdown**: headings, lists, and code fenced with ```` ```java ````. Use **Preview** to check it. Paste or drag in a diagram image (Excalidraw export, whiteboard photo);
+the AI looks at images when it grades. `Ctrl+S` saves.
+
+![The answer editor with a Java code block](docs/screenshots/04-answer.png)
+
+### 5. Evaluate with AI
+Click **Evaluate with AI** (or run `kb evaluate lld 2`). You get a verdict (Strong / Solid / Partial / Needs work) with what you got right, the gaps, and what to study next.
+Editing your answer afterwards clears the verdict, so **Re-evaluate** always grades the latest version.
+
+![An AI verdict with strengths, gaps and next steps](docs/screenshots/05-verdict.png)
+
+### 6. Discuss it with the tutor
+Ask follow-ups in the chat, or click a suggestion chip such as *Quiz me like an interviewer*. The tutor sees the topic, your answer and the verdict.
+Until your answer has been evaluated, it coaches without giving away the design. The same conversation is available from a terminal with `kb clarify lld 2 "…"`.
+
+![The AI tutor chat](docs/screenshots/06-tutor.png)
+
+### 7. Reveal the reference design, only when you're ready
+The diagram, key abstractions and trade-offs are hidden behind a confirmation, because they are hints. After you've attempted the topic, compare your design with them.
+
+![The reference-design confirmation](docs/screenshots/03-gate.png)
+
+### 8. DSA by pattern
+Problems are grouped into 32 coding-interview patterns, ordered so earlier patterns build towards later ones. Each pattern has a **guide** (how to spot it, the core idea, a Java template, pitfalls) and its problems listed easy → hard.
+
+![A DSA pattern page](docs/screenshots/08-pattern.png)
+
+On a problem page, open it on LeetCode, expand the pattern guide if you need it, and write your approach and code. Evaluation and the tutor work exactly as for design topics, and the evaluator also checks whether you applied the pattern.
+
+![A DSA problem page](docs/screenshots/09-dsa.png)
+
+### 9. Choose your AI
+Click the AI badge in the top bar to pick **Claude**, **OpenAI** or **Ollama** (local and free), set the model, and paste a key. Keys are saved in `kb.config.json` on your machine (git-ignored) and never sent to the browser.
+
+![AI tutor settings](docs/screenshots/10-settings.png)
+
+### 10. Terminal, dark mode and phone
+Everything also works from the `kb` command: status, lists, reading, evaluating and chatting. The sun/moon button switches to dark mode.
+With `npm start`, phones and tablets on the same Wi-Fi can open the site too.
+
+![The kb command line](docs/screenshots/13-cli.png)
+
+![Dark mode](docs/screenshots/11-dark.png)
+
+<img src="docs/screenshots/12-phone.png" alt="KB on a phone" width="300">
+
 
 ---
 
@@ -286,7 +359,7 @@ Everything is stored in this folder. There's no database and no cloud storage.
 | Images in your answers | `content/images/` (file names are content hashes) | Yes |
 | Answers, verdicts, notes and chats for `lld N`, `hld N`, `ai N` | `content/day-NN.json` (e.g. `lld 1`, `hld 1` and `ai 1` are all in `day-01.json`) | Yes |
 | Same for `dsa N` | `content/dsa.json` | Yes |
-| Theme, sidebar state, practice mode | browser localStorage | — |
+| Theme, sidebar state, revealed reference designs | browser localStorage | — |
 
 Inside each topic, the fields are `userAnswer`, `answerEvaluation` and `answerEvaluatedAt`, `notes`, and `chat`.
 `AUTHORING.md` documents the format.
@@ -357,6 +430,8 @@ lib/images.js            answer images: save to content/images, attach to prompt
 public/                  index.html, app.js, diagram.js (rough.js renderer), styles.css, vendor/
 content/day-NN.json      3 topics per file (LLD, HLD, AI): write-up, diagram, your answer, verdict, notes, chat
 content/dsa.json         DSA problems grouped by pattern, with guides and your answers
+content/fundamentals.json  the read-first chapters, built from build/fundamentals/*.md
+docs/screenshots/        images used in this README
 build/                   assemble.js + topics/*.txt (all 60 write-ups); make-dsa-patterns.js + dsa/ (problem list, pattern map, guides); toastui-entry.js
 scripts/                 new-day.js, study-parser.js, generate-day.sh (older Claude Code CLI workflow), pending.js
 AUTHORING.md             the JSON contract, for anyone (or any assistant) editing content by hand
