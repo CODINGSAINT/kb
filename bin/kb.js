@@ -17,11 +17,15 @@ const HELP = `${bold("kb")} — study from the terminal. The site and the CLI sh
 ${bold("Setup")}
   kb setup                         pick Claude / OpenAI / Ollama, model and API key
   kb status                        AI settings, progress and what's waiting
-  kb serve                         start the site at http://localhost:4321
+  kb serve                         start the site: this computer + your Wi-Fi (local network only), port 4321
+  kb serve --lan                   same on port 80: http://kb / http://kb.local
+  kb serve --local                 this computer only
 
 ${bold("Study")}
   kb list [lld|hld|ai|dsa]         topics with status   ${dim("○ untouched  ◐ attempted  ● evaluated")}
   kb show lld 1 [--writeup]        your answer and verdict (add --writeup for the reference)
+  kb read [n|name] [--done]        read-first fundamentals (OOP, SOLID, sharding, caching…)
+  kb pattern [n|name]              DSA patterns; with a name/number, its guide and problems
   kb answer lld 1 <file.md>        save an answer from a file ("-" reads stdin); ![](diagram.png) images come along
 
 ${bold("AI")}
@@ -36,7 +40,7 @@ ${bold("AI")}
 ${bold("Housekeeping")}
   kb reset --yes                   wipe all answers, verdicts, notes and chats (write-ups stay)
 
-${bold("Addresses")}   lld 1-20 · hld 1-20 · ai 1-20 · dsa 1-189     ${dim('("lld1", "LLD-1" also work)')}
+${bold("Addresses")}   lld 1-20 · hld 1-20 · ai 1-20 · dsa 1-304 · read 1-34     ${dim('("lld1", "LLD-1" also work)')}
 ${bold("Options")}     --provider anthropic|openai|ollama   --model <name>   (one run only)
 `;
 
@@ -47,7 +51,9 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--provider" || a === "--model") opts[a.slice(2)] = argv[++i];
     else if (a.startsWith("--provider=") || a.startsWith("--model=")) { const [k, v] = a.slice(2).split("="); opts[k] = v; }
-    else if (["--writeup", "--run", "--yes", "-h", "--help"].includes(a)) opts[a.replace(/^-+/, "")] = true;
+    else if (a === "--lan") opts.lan = true;
+    else if (a === "--local") opts.local = true;
+    else if (["--writeup", "--run", "--yes", "--done", "-h", "--help"].includes(a)) opts[a.replace(/^-+/, "")] = true;
     else rest.push(a);
   }
   return { opts, rest };
@@ -55,7 +61,7 @@ function parseArgs(argv) {
 // Accepts ["lld","1", ...rest] or ["lld1", ...rest]. Returns { addr, rest }.
 function takeAddress(args) {
   if (!args.length) throw new Error("Which topic? e.g. lld 1");
-  if (/^(lld|hld|ai|dsa)$/i.test(args[0]) && args[1] && /^\d+$/.test(args[1])) return { addr: store.parseAddress(args.slice(0, 2)), rest: args.slice(2) };
+  if (/^(lld|hld|ai|dsa|read)$/i.test(args[0]) && args[1] && /^\d+$/.test(args[1])) return { addr: store.parseAddress(args.slice(0, 2)), rest: args.slice(2) };
   return { addr: store.parseAddress(args[0]), rest: args.slice(1) };
 }
 const aiOpts = (o) => ({ provider: o.provider, model: o.model });
@@ -125,12 +131,12 @@ const commands = {
 
   list(o, args) {
     const tr = args[0];
-    if (tr && !/^(lld|hld|ai|dsa)$/i.test(tr)) throw new Error("kb list [lld|hld|ai|dsa]");
+    if (tr && !/^(lld|hld|ai|dsa|read)$/i.test(tr)) throw new Error("kb list [lld|hld|ai|dsa|read]");
     let group = null;
     for (const it of store.listItems(tr)) {
-      const g = it.track === "DSA" ? `DSA — ${it.group}` : it.track;
+      const g = it.track === "DSA" ? `DSA — ${it.group}` : it.track === "READ" ? `Fundamentals — ${it.group}` : it.track;
       if (g !== group) { group = g; console.log("\n" + bold(g)); }
-      const mark = it.evaluated ? green("●") : it.answered ? yellow("◐") : dim("○");
+      const mark = it.track === "READ" ? (it.read ? green("●") : dim("○")) : it.evaluated ? green("●") : it.answered ? yellow("◐") : dim("○");
       const extra = [it.chatCount ? dim(`${it.chatCount / 2 | 0} chat`) : "", it.openDoubts ? yellow(`${it.openDoubts} doubt`) : ""].filter(Boolean).join(" ");
       console.log(`  ${mark} ${String(it.number).padStart(3)}  ${it.title} ${extra}`);
     }
@@ -163,6 +169,7 @@ const commands = {
 
   async evaluate(o, args) {
     const { addr } = takeAddress(args);
+    if (addr.track === "READ") throw new Error(`Fundamentals articles have nothing to evaluate. Ask about one instead: kb clarify read ${addr.number} "your question"`);
     const it = store.getItem(addr);
     header(it);
     if (!it.userAnswer.trim()) throw new Error(`No answer saved for ${store.addrLabel(addr)} yet. Write one on the site, or: kb answer ${addr.track.toLowerCase()} ${addr.number} my-answer.md`);
@@ -253,6 +260,54 @@ const commands = {
     }
   },
 
+  read(o, args) {
+    const file = store.FUND_FILE;
+    if (!fs.existsSync(file)) throw new Error("No fundamentals yet. Run: node build/make-fundamentals.js");
+    const doc = store.readJson(file);
+    const all = doc.groups.flatMap((g) => g.items.map((it) => ({ ...it, group: g.name })));
+    const q = args.join(" ").trim().toLowerCase();
+    if (!q) {
+      let group = null;
+      for (const it of all) {
+        if (it.group !== group) { group = it.group; console.log("\n" + bold(group)); }
+        console.log(`  ${it.readAt ? green("●") : dim("○")} ${String(it.number).padStart(2)}  ${it.title}`);
+      }
+      return console.log(dim("\nkb read <n|name> prints an article · kb read <n> --done marks it read · kb clarify read <n> \"…\" asks the tutor"));
+    }
+    const it = /^\d+$/.test(q) ? all.find((x) => x.number === Number(q)) : all.find((x) => x.id === q || x.title.toLowerCase().includes(q));
+    if (!it) throw new Error(`No fundamentals article "${q}". Run kb read to see the list.`);
+    if (o.done) {
+      store.updateItem({ track: "READ", number: it.number }, (x) => { x.readAt = new Date().toISOString(); });
+      return console.log(green(`Marked "${it.title}" as read.`));
+    }
+    console.log(bold(`#${it.number} ${it.title}`) + dim(`  (${it.group})\n`));
+    console.log(it.markdown.trim());
+    if (it.usedBy?.length) console.log("\n" + dim("Read before: " + it.usedBy.map((u) => `${u.key.toLowerCase().replace("-", " ")} ${u.title}`).join(" · ")));
+  },
+
+  pattern(o, args) {
+    const dsa = store.readJson(store.DSA_FILE);
+    const tps = dsa.topics || [];
+    const q = args.join(" ").trim().toLowerCase();
+    if (!q) {
+      console.log(bold("DSA coding patterns") + dim("  (kb pattern <number|name> for the guide and problems)\n"));
+      tps.forEach((tp, i) => {
+        const a = tp.problems.filter((p) => (p.userAnswer || "").trim()).length;
+        console.log(`  ${String(i + 1).padStart(2)}. ${tp.name.padEnd(36)} ${dim(`${a}/${tp.problems.length}`)}`);
+      });
+      return;
+    }
+    const tp = /^\d+$/.test(q) ? tps[Number(q) - 1] : tps.find((t) => t.id === q || t.name.toLowerCase().includes(q));
+    if (!tp) throw new Error(`No pattern "${q}". Run kb pattern to see the list.`);
+    console.log((tp.guide || `# ${tp.name}\n(no guide yet)`).trim() + "\n");
+    console.log(cyan("── Practice problems (easy → hard) ──"));
+    for (const p of tp.problems) {
+      const mark = p.answerEvaluation ? green("●") : (p.userAnswer || "").trim() ? yellow("◐") : dim("○");
+      console.log(`  ${mark} ${String(p.number).padStart(3)}  ${p.title} ${dim(p.difficulty || "")}`);
+    }
+    console.log(dim(`\nkb show dsa <n> · kb clarify dsa <n> "…"`));
+  },
+
   reset(o, args) {
     if (!args.includes("--yes") && !o.yes) {
       console.log(`This wipes ${bold("all")} saved answers, verdicts, notes and conversations (the write-ups stay).\nRun ${bold("kb reset --yes")} to confirm. Handy after cloning someone else's copy.`);
@@ -272,9 +327,9 @@ const commands = {
     console.log(green(`Reset ${n} topics and problems to a clean slate.`));
   },
 
-  serve() { require("../server"); },
+  serve(o) { if (o.lan) process.env.KB_LAN = "1"; if (o.local) process.env.KB_LOCAL = "1"; require("../server"); },
 };
-const aliases = { eval: "evaluate", ask: "clarify", ls: "list", "-h": "help", "--help": "help", start: "serve", config: "setup" };
+const aliases = { patterns: "pattern", eval: "evaluate", ask: "clarify", ls: "list", "-h": "help", "--help": "help", start: "serve", config: "setup" };
 
 function printTurn(m) {
   const who = m.role === "user" ? bold(cyan("you › ")) : bold(green("tutor › "));

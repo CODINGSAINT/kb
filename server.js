@@ -5,11 +5,35 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 
-const PORT = process.env.PORT || 4321;
+// Modes (all of them refuse anything outside your local network):
+//   npm start             this computer + your Wi-Fi/LAN   http://localhost:4321, http://<lan-ip>:4321
+//   npm run start:lan     same, on port 80                 http://kb (Windows), http://kb.local (phones, Macs)
+//   npm run start:local   this computer only               http://localhost:4321
+const LOCAL_ONLY = process.argv.includes("--local") || process.env.KB_LOCAL === "1";
+const LAN = !LOCAL_ONLY;
+const PORT80 = process.argv.includes("--lan") || process.env.KB_LAN === "1";
+const PORT = Number(process.env.PORT) || (PORT80 ? 80 : 4321);
 const CONTENT = path.join(__dirname, "content");
 const DSA_FILE = path.join(CONTENT, "dsa.json");
 
 const app = express();
+
+// LAN mode: answer only devices on the local network (private and link-local ranges).
+// Anything else, for example a request forwarded from the internet by a router, gets 403.
+function isLocalAddress(ip) {
+  const a = String(ip || "").replace(/^::ffff:/, "");
+  if (a === "::1" || a.startsWith("127.")) return true;
+  if (/^(10\.|192\.168\.|169\.254\.)/.test(a)) return true;
+  const m = /^172\.(\d+)\./.exec(a);
+  if (m && +m[1] >= 16 && +m[1] <= 31) return true;
+  return /^(fe8|fe9|fea|feb|fc|fd)/i.test(a); // IPv6 link-local and unique-local
+}
+if (LAN) {
+  app.use((req, res, next) => {
+    if (isLocalAddress(req.socket.remoteAddress)) return next();
+    res.status(403).type("text").send("KB is only available on the local network.");
+  });
+}
 app.use(express.json({ limit: "25mb" })); // older answers may still carry inline base64 images
 
 // Global no-store: API *and* static assets.
@@ -89,6 +113,23 @@ app.get("/api/tracks", (req, res) => {
 });
 
 app.get("/api/dsa", (req, res) => res.json(readDsa()));
+
+// Read-first fundamentals (content/fundamentals.json, built by build/make-fundamentals.js).
+const FUND_FILE = path.join(CONTENT, "fundamentals.json");
+app.get("/api/fundamentals", (req, res) => {
+  if (!fs.existsSync(FUND_FILE)) return res.json({ groups: [], prereqs: {} });
+  res.json(readJson(FUND_FILE));
+});
+app.post("/api/fundamentals/read", (req, res) => {
+  const { id, read } = req.body || {};
+  if (!fs.existsSync(FUND_FILE)) return res.status(404).json({ error: "no fundamentals" });
+  const doc = readJson(FUND_FILE);
+  const it = (doc.groups || []).flatMap((g) => g.items || []).find((x) => x.id === id);
+  if (!it) return res.status(400).json({ error: "unknown article" });
+  it.readAt = read ? new Date().toISOString() : null;
+  writeJson(FUND_FILE, doc);
+  res.json({ ok: true, readAt: it.readAt });
+});
 
 app.get("/api/days/:day", (req, res) => {
   const p = parseDay(req, res);
@@ -214,10 +255,28 @@ app.post("/api/ai/chat", async (req, res) => {
   res.end();
 });
 
-// Localhost only by default: the AI routes spend your API credit. HOST=0.0.0.0 to expose on your LAN.
-const HOST = process.env.HOST || "127.0.0.1";
-app.listen(PORT, HOST, () => {
+// Default: every network interface, but only local-network addresses are answered (see
+// isLocalAddress above), so the AI routes that spend your credit never face the internet.
+// --local restricts it to this computer.
+const HOST = process.env.HOST || (LAN ? "0.0.0.0" : "127.0.0.1");
+const server = app.listen(PORT, HOST, () => {
   let ai = "";
-  try { const c = require("./lib/ai").publicConfig(); ai = c.ready ? ` · AI: ${c.provider} (${c.model})` : " · AI: not set up (gear icon on the site, or `kb setup`)"; } catch (e) {}
-  console.log(`KB running at http://localhost:${PORT}${ai}`);
+  try { const c = require("./lib/ai").publicConfig(); ai = c.ready ? `AI: ${c.provider} (${c.model})` : "AI: not set up (gear icon on the site, or `kb setup`)"; } catch (e) {}
+  const port = PORT === 80 ? "" : `:${PORT}`;
+  if (!LAN) return console.log(`KB running at http://localhost${port} · ${ai}`);
+  const os = require("os");
+  const name = os.hostname().toLowerCase();
+  const ips = Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === "IPv4" && !i.internal).map((i) => i.address);
+  console.log(`KB running on your local network · ${ai}`);
+  console.log(`  This computer:        http://localhost${port}`);
+  console.log(`  Windows PCs:          http://${name}${port}`);
+  console.log(`  Phones, iPads, Macs:  http://${name}.local${port}`);
+  if (ips.length) console.log(`  By IP (changes):      ${ips.map((ip) => `http://${ip}${port}`).join("  ")}`);
+  console.log(`  Only devices on your local network can connect. Press Ctrl+C to stop.`);
+});
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") console.error(`Port ${PORT} is already in use. Stop the other program, or use another port: run  $env:PORT=8080; npm start  (PowerShell).`);
+  else if (e.code === "EACCES") console.error(`Not allowed to use port ${PORT}. Use another port: run  $env:PORT=8080; npm start  (PowerShell).`);
+  else console.error(e.message);
+  process.exit(1);
 });

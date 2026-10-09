@@ -1,7 +1,7 @@
 # KB: Study Practice Site
 
 A local study site for interview prep: **20 LLD, 20 HLD and 20 AI / Spring AI** design topics,
-each with a write-up and a sketch diagram, plus **Striver's SDE Sheet (189 DSA problems)** grouped by topic.
+each with a write-up and a sketch diagram, plus **304 DSA problems organised by coding-interview pattern**, each pattern with a guide page.
 Write your own answers, then have an AI grade them and talk them through with an AI tutor.
 You can do this on the site or from the `kb` command line.
 
@@ -147,16 +147,44 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 kb serve        # or: npm start
 ```
 
-Open **http://localhost:4321**. The terminal shows which AI is connected:
+Open **http://localhost:4321** on this computer, or **http://<this-computer's-IP>:4321** (e.g. `http://192.168.1.53:4321`) from another device on the same Wi-Fi. The terminal prints the exact addresses and which AI is connected:
 
 ```
-KB running at http://localhost:4321 · AI: anthropic (claude-sonnet-5-5)
+KB running on your local network · AI: anthropic (claude-sonnet-5-5)
+  This computer:        http://localhost:4321
+  By IP (changes):      http://192.168.1.53:4321
 ```
 
 Keep that terminal open while you study, and press `Ctrl+C` to stop the site. You don't need to restart it after editing files,
 because every request reads the JSON fresh.
 
 To use a different port, set `PORT` first: `$env:PORT=5000; npm start` in PowerShell, or `PORT=5000 npm start` in bash.
+
+### Open KB from your phone or tablet on the same Wi-Fi (optional)
+
+KB has three start modes:
+
+| Command | Who can open it | Address |
+|---|---|---|
+| `npm start` (or `kb serve`), the default | this computer and devices on your local network | `http://localhost:4321`, `http://<IP>:4321` |
+| `npm run start:lan` (or `kb serve --lan`) | the same, on port 80 | `http://kb` on Windows PCs, `http://kb.local` on phones, iPads and Macs |
+| `npm run start:local` (or `kb serve --local`) | only this computer | `http://localhost:4321` |
+
+Every mode refuses any request that doesn't come from a private (home or office network) address, so nothing is reachable from the internet.
+The IP address can change when you switch Wi-Fi; port-80 mode lets you use the computer's name instead, which keeps working.
+
+One-time Windows setup (run PowerShell **as administrator**):
+
+```powershell
+Rename-Computer -NewName "KB" -Restart        # the name other devices will type; restarts the PC
+New-NetFirewallRule -DisplayName "KB study site" -Direction Inbound -Protocol TCP -LocalPort 80,4321 -Action Allow -Profile Private
+```
+
+Then, under Settings → Network & internet → Wi-Fi → your network, set **Network profile type** to **Private**.
+The firewall rule only opens ports 80 and 4321 on networks marked Private, never on public Wi-Fi.
+
+To use a computer name other than KB, the addresses become `http://<name>` and `http://<name>.local`; the startup message prints them.
+If port 80 is taken, use the default `npm start` and open `http://kb:4321`.
 
 ### Step 7 — Check everything works
 
@@ -182,11 +210,11 @@ kb reset --yes
 
 ### Your first session, end to end
 
-1. On the site, open **LLD → 1 Design Chess** and turn on **Practice mode** in the top bar so the write-up stays hidden.
+1. On the site, open **LLD → 1 Design Chess** and work through its **Read first** articles. The page shows only the problem and requirements; the reference design stays hidden.
 2. Write your design in **My answer** and save it with `Ctrl+S`.
 3. Click **Evaluate with AI**. After 10–40 seconds the verdict appears: *Strong / Solid / Partial / Needs work*, followed by what you got right, the gaps and what to study next.
 4. Ask a follow-up in **Discuss with the AI tutor**, such as *"Why should Board be separate from Game?"*, or click **Quiz me like an interviewer**.
-5. Click **Reveal write-up** to compare your answer with the reference.
+5. At the bottom, click **Show reference design…** and confirm, to compare your answer with the reference.
 
 The same session from a terminal:
 
@@ -201,7 +229,7 @@ kb chat lld 1                      # back-and-forth; /exit to leave
 
 ## Using the `kb` command
 
-Topics are addressed by track and number: `lld 1`–`lld 20`, `hld 1`–`hld 20`, `ai 1`–`ai 20`, `dsa 1`–`dsa 189`.
+Topics are addressed by track and number: `lld 1`–`lld 20`, `hld 1`–`hld 20`, `ai 1`–`ai 20`, `dsa 1`–`dsa 304`, and `read 1`–`read 37` for the fundamentals.
 `lld1` and `LLD-1` also work. Run `kb list` to see every number.
 
 | Command | What it does |
@@ -233,7 +261,7 @@ The same goes for verdicts and doubt answers. Reload the page to see changes mad
 ## Using the site
 
 - **Sidebar** (toggle with `\`): grouped LLD / HLD / AI / DSA. Status dots: hollow = untouched, orange = attempted, green = evaluated.
-- **Practice mode**: hides the diagram and write-up until you click Reveal, so you can attempt a topic cold.
+- **Reference design**: the diagram, abstractions or architecture, and trade-offs stay hidden behind a confirmation until you choose to compare.
 - **My answer**: a rich editor that saves as Markdown. `Ctrl/⌘ S` saves. Changing a saved answer clears its old verdict.
 - **Verdict**: **Evaluate with AI**, or **Re-evaluate** once a verdict exists. Any unsaved edits are saved first.
 - **Discuss with the AI tutor**: a streaming chat for each topic. The tutor sees the write-up, your answer and your verdict.
@@ -266,8 +294,8 @@ Inside each topic, the fields are `userAnswer`, `answerEvaluation` and `answerEv
 **What leaves your machine:** only when you use an AI feature. Each request sends that topic's write-up, your answer (including its images),
 the verdict and the recent chat (last 24 messages) to your chosen provider. With Ollama, nothing leaves your machine.
 
-**Security:** the server listens only on `127.0.0.1`, because its AI routes spend your credit. Set `HOST=0.0.0.0` only if you
-deliberately want other devices on your network to reach it. API keys are never sent to the browser; the settings dialog only shows the last 4 characters.
+**Security:** the server answers only this computer and private local-network addresses (anything else gets 403), because its AI routes spend your credit.
+Run `npm run start:local` to restrict it to this computer only. API keys are never sent to the browser; the settings dialog only shows the last 4 characters.
 
 **Backups:** copy the `content/` folder. Committing to a private git repo also works as a backup.
 
@@ -328,8 +356,8 @@ lib/tutor.js             evaluate / clarify / doubts, with the prompts, shared b
 lib/images.js            answer images: save to content/images, attach to prompts as real image inputs
 public/                  index.html, app.js, diagram.js (rough.js renderer), styles.css, vendor/
 content/day-NN.json      3 topics per file (LLD, HLD, AI): write-up, diagram, your answer, verdict, notes, chat
-content/dsa.json         SDE sheet, regrouped by topic
-build/                   assemble.js + topics/*.txt (source for all 60 write-ups), make-dsa.py, toastui-entry.js
+content/dsa.json         DSA problems grouped by pattern, with guides and your answers
+build/                   assemble.js + topics/*.txt (all 60 write-ups); make-dsa-patterns.js + dsa/ (problem list, pattern map, guides); toastui-entry.js
 scripts/                 new-day.js, study-parser.js, generate-day.sh (older Claude Code CLI workflow), pending.js
 AUTHORING.md             the JSON contract, for anyone (or any assistant) editing content by hand
 kb.config.example.json   example AI settings file
@@ -338,11 +366,43 @@ kb.config.example.json   example AI settings file
 ### Rebuilding content and the editor
 
 - `npm run build:content` rebuilds `content/day-*.json` from `build/topics/*.txt`. It keeps your answers, notes, verdicts and chats.
-- `build/make-dsa.py` regenerates `dsa.json` and **wipes DSA answers**.
-- `npm run build:editor` re-bundles the vendored Toast UI editor. The raw npm `dist` file breaks in a plain `<script>` tag, so it's bundled with esbuild.
+- - `npm run build:editor` re-bundles the vendored Toast UI editor. The raw npm `dist` file breaks in a plain `<script>` tag, so it's bundled with esbuild.
 
-## About the DSA list
+## How topic pages work (attempt first)
 
-It was reconstructed from knowledge of Striver's SDE Sheet (189 problems), not copied from the live sheet.
-LeetCode links are given only where a confident 1:1 match exists (123 of 189). The rest are GFG, Coding Ninjas,
-or classic algorithm exercises with no exact LeetCode equivalent, and have no link. Numbering is global (1–189) in topic order.
+Each LLD, HLD and AI topic page shows only the brief: **Problem** and **Requirements** (functional and non-functional for LLD/HLD).
+Everything that would steer your design (the diagram, key abstractions or architecture, design decisions and trade-offs, follow-up questions)
+sits in a **Reference design** card at the bottom. It's hidden until you click it and confirm, and the confirmation tells you whether you've saved and evaluated an attempt yet.
+Your choice is remembered per topic (*Hide again* puts it back).
+
+The AI tutor follows the same rule. Until your attempt has been evaluated, it coaches with questions and hints instead of giving away the reference design.
+If you explicitly ask for the solution, it gives it.
+
+## Read-first fundamentals
+
+37 in-depth chapters (roughly 2,500–4,000 words each) to read before attempting topics, written for this site. Each covers the concepts, how it works, trade-off tables, Java/Spring or config examples, real systems, where it shows up in the interview topics, pitfalls, interview questions and a cheat sheet. Long chapters open with an *On this page* contents list.
+- **LLD (10):** approach, OOP, UML relationships, SOLID, creational, structural and behavioral patterns, concurrency, modelling details (money, time, IDs).
+- **HLD (25):** approach, estimation, scalability, networking (DNS, TCP/UDP, HTTP, TLS, proxies), load balancing, caching, CDN and object storage, SQL vs NoSQL, indexes, replication, sharding,
+  consistent hashing, CAP/PACELC, consensus, messaging, batch and stream processing, idempotency, distributed transactions, API design, real-time, rate limiting, IDs and probabilistic structures, geospatial indexing, observability and resilience, security (authn/authz, OAuth2/JWT, TLS/mTLS, secrets).
+- **AI (2):** approaching AI system design, and Spring Boot/Reactor essentials for Spring AI.
+
+Every topic page starts with a **Read first** card listing its prerequisites, with read status. Each article lists the topics it prepares you for,
+has a *Mark as read* button, and has its own tutor chat. From the terminal, `kb read` lists the articles, `kb read sharding` prints one, `kb read 21 --done` marks one read,
+and `kb clarify read 21 "…"` asks about it. Sources live in `build/fundamentals/*.md`, and the topic → prerequisite map lives in `build/make-fundamentals.js`.
+`node build/make-fundamentals.js` rebuilds `content/fundamentals.json` and keeps your read status and chats.
+
+## About the DSA track
+
+DSA is organised by **coding-interview pattern** rather than by data structure, in learning order:
+Arrays & Hashing → Two Pointers → Sliding Window → Prefix Sum → Fast & Slow Pointers → Merge Intervals → Cyclic Sort →
+Linked List → Stack → Modified Binary Search → Divide & Conquer → Tree BFS → Tree DFS → BST → Two Heaps → Top K → K-way Merge →
+Subsets → Backtracking → Graphs → Topological Sort → Union-Find → Shortest Paths/MST → Greedy → DP (1-D, Knapsack, 2-D) →
+Bits → Trie → Strings → Matrix & Math → Design.
+
+- **Pattern guide pages** (sidebar ◆ *Pattern guide*, or `kb pattern <n>`): how to spot the pattern, the core idea, a Java template, complexity and pitfalls.
+  The AI tutor gets the guide when it evaluates or discusses a problem from that pattern, and it checks whether you applied the pattern.
+- **Problems**: 304, listed in `build/dsa/problems.json`. Each problem belongs to one primary pattern and is listed easy → hard.
+  Most link to LeetCode; 66 are classics (e.g. *Aggressive Cows*, *Dijkstra*) with no exact LeetCode match, so they have no link or difficulty.
+- `node build/make-dsa-patterns.js` rebuilds `content/dsa.json` from `build/dsa/`. Each problem's pattern is set in that script's `MAP`, and its guide in `build/dsa/guides/<pattern>.md`.
+  Your answers, verdicts, notes and chats are carried over by a stable `key` (the LeetCode slug, or `classic-<name>`).
+- DSA numbers (`kb evaluate dsa 29`) follow pattern order and run from 1 to 304.

@@ -1,4 +1,4 @@
-// Sketchy diagram renderer: {nodes, edges} JSON -> hand-drawn SVG via rough.js.
+// Diagram renderer: {nodes, edges} JSON -> clean SVG (rounded boxes, datastores, labelled arrows).
 // Node: {id, label, x, y, w, h, shape: "rect"|"ellipse"|"diamond"|"cylinder"}
 // Edge: {from, to, label?, dashed?}
 (function () {
@@ -67,10 +67,10 @@
   }
 
   function render(container, spec, seedKey = "") {
-    // Re-render once the handwriting font has loaded so label metrics are right.
+    // Re-render once the UI font has loaded so label metrics are right.
     if (document.fonts && document.fonts.status !== "loaded" && !container._fontWait) {
       container._fontWait = true;
-      document.fonts.load('16px "Kalam"').then(() => container.isConnected && render(container, spec, seedKey));
+      document.fonts.load('16px "Inter Variable"').then(() => container.isConnected && render(container, spec, seedKey));
     }
     container.innerHTML = "";
     if (!spec || !Array.isArray(spec.nodes) || !spec.nodes.length) {
@@ -78,7 +78,6 @@
       return;
     }
     const ink = css("--ink"), paper = css("--paper"), soft = css("--text-soft"), bg = css("--bg-elev");
-    const accents = [css("--accent"), css("--info"), css("--ok"), css("--lld")];
     const nodes = spec.nodes.map((n) => ({ w: 140, h: 50, shape: "rect", ...n }));
     const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
 
@@ -93,63 +92,60 @@
     svg.setAttribute("role", "img");
     svg.setAttribute("aria-label", "Diagram: " + nodes.map((n) => n.label).join(", "));
     container.appendChild(svg);
-    const rc = rough.svg(svg);
+    // Clean, flat style: rounded boxes in pale Persian blue, datastores in pale cyan,
+    // thin slate connectors with solid arrowheads.
+    const accent = css("--accent"), accentSoft = css("--accent-soft"), sub = css("--sub"), subSoft = css("--sub-soft"), text_ = css("--text");
+    const el = (tag, attrs, parent = svg) => {
+      const e = document.createElementNS(NS, tag);
+      for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+      parent.appendChild(e);
+      return e;
+    };
+    const defs = el("defs", {});
+    const markerId = "kb-arrow-" + Math.abs(hash(seedKey + "m"));
+    const m = el("marker", { id: markerId, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, defs);
+    el("path", { d: "M0,0 L10,5 L0,10 z", fill: soft }, m);
 
     // Edges first so nodes sit on top.
-    (spec.edges || []).forEach((e, i) => {
+    (spec.edges || []).forEach((e) => {
       const a = byId[e.from], b = byId[e.to];
       if (!a || !b) return;
-      const seed = hash(seedKey + "e" + i);
       const [x1, y1] = clip(a, b.x + b.w / 2, b.y + b.h / 2);
       const [x2, y2] = clip(b, a.x + a.w / 2, a.y + a.h / 2);
-      const o = { stroke: ink, strokeWidth: 1.6, roughness: 1.3, bowing: 1.5, seed };
-      if (e.dashed) o.strokeLineDash = [7, 6];
-      svg.appendChild(rc.line(x1, y1, x2, y2, o));
-      const ang = Math.atan2(y2 - y1, x2 - x1), len = 13, spread = 0.45;
-      for (const s of [-spread, spread]) {
-        svg.appendChild(rc.line(x2, y2, x2 - len * Math.cos(ang + s), y2 - len * Math.sin(ang + s), { ...o, strokeLineDash: undefined, roughness: 0.8 }));
-      }
+      const ln = el("line", { x1, y1, x2, y2, stroke: soft, "stroke-width": 1.6, "marker-end": `url(#${markerId})`, "stroke-linecap": "round" });
+      if (e.dashed) ln.setAttribute("stroke-dasharray", "6 5");
       if (e.label) {
         let mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
-        const w = Math.max(30, String(e.label).length * 7.2 + 12);
+        const w = Math.max(30, String(e.label).length * 6.6 + 14);
         // Edge too short to hold its label inline: lift the label above the line.
         if (Math.hypot(x2 - x1, y2 - y1) < w + 24) {
           const nx = -(y2 - y1), ny = x2 - x1, nl = Math.hypot(nx, ny) || 1;
-          const s = ny > 0 ? -1 : 1;
-          mx += (s * nx / nl) * 20; my += (s * ny / nl) * 20;
+          const sgn = ny > 0 ? -1 : 1;
+          mx += (sgn * nx / nl) * 20; my += (sgn * ny / nl) * 20;
         }
-        const r = document.createElementNS(NS, "rect");
-        Object.entries({ x: mx - w / 2, y: my - 11, width: w, height: 22, rx: 6, fill: bg, opacity: 0.92 }).forEach(([k, v]) => r.setAttribute(k, v));
-        svg.appendChild(r);
-        text(svg, mx, my, e.label, { size: 13, color: soft });
+        el("rect", { x: mx - w / 2, y: my - 11, width: w, height: 22, rx: 11, fill: bg, stroke: css("--border"), "stroke-width": 1 });
+        text(svg, mx, my, e.label, { size: 12, color: soft, weight: 500 });
       }
     });
 
-    nodes.forEach((n, i) => {
-      const seed = hash(seedKey + n.id);
-      const o = { stroke: ink, strokeWidth: 1.8, roughness: 1.4, fill: paper, fillStyle: "solid", seed };
-      const accent = accents[i % accents.length];
-      const hachure = { stroke: "none", fill: accent, fillStyle: "hachure", hachureGap: 7, fillWeight: 0.9, roughness: 1.6, seed: seed + 1 };
+    nodes.forEach((n) => {
       const { x, y, w, h } = n;
+      const store = n.shape === "cylinder";
+      const stroke = store ? sub : accent, fill = store ? subSoft : accentSoft;
+      const o = { fill, stroke, "stroke-width": 1.6 };
       if (n.shape === "ellipse") {
-        svg.appendChild(rc.ellipse(x + w / 2, y + h / 2, w, h, o));
-        svg.appendChild(rc.ellipse(x + w / 2, y + h / 2, w, h, { ...hachure, fill: accent + "55" }));
+        el("ellipse", { cx: x + w / 2, cy: y + h / 2, rx: w / 2, ry: h / 2, ...o });
       } else if (n.shape === "diamond") {
-        const pts = [[x + w / 2, y], [x + w, y + h / 2], [x + w / 2, y + h], [x, y + h / 2]];
-        svg.appendChild(rc.polygon(pts, o));
-      } else if (n.shape === "cylinder") {
-        const ry = Math.min(10, h / 5);
-        svg.appendChild(rc.rectangle(x, y + ry, w, h - 2 * ry, { ...o, stroke: "none" }));
-        svg.appendChild(rc.line(x, y + ry, x, y + h - ry, o));
-        svg.appendChild(rc.line(x + w, y + ry, x + w, y + h - ry, o));
-        svg.appendChild(rc.ellipse(x + w / 2, y + h - ry, w, 2 * ry, o));
-        svg.appendChild(rc.ellipse(x + w / 2, y + ry, w, 2 * ry, o));
+        el("polygon", { points: `${x + w / 2},${y} ${x + w},${y + h / 2} ${x + w / 2},${y + h} ${x},${y + h / 2}`, ...o });
+      } else if (store) {
+        const ry = Math.min(9, h / 5);
+        el("path", { d: `M${x},${y + ry} L${x},${y + h - ry} A${w / 2},${ry} 0 0 0 ${x + w},${y + h - ry} L${x + w},${y + ry}`, ...o });
+        el("ellipse", { cx: x + w / 2, cy: y + ry, rx: w / 2, ry, ...o });
       } else {
-        svg.appendChild(rc.rectangle(x, y, w, h, o));
-        svg.appendChild(rc.rectangle(x + 3, y + h - 9, w - 6, 6, { ...hachure, fill: accent + "88" }));
+        el("rect", { x, y, width: w, height: h, rx: 10, ...o });
       }
-      const maxChars = Math.max(6, Math.floor(w / 8.5));
-      text(svg, x + w / 2, y + h / 2 - (n.shape === "rect" ? 2 : 0), n.label, { size: 16, weight: 700, color: ink, maxChars });
+      const maxChars = Math.max(6, Math.floor(w / 8));
+      text(svg, x + w / 2, y + h / 2 + (store ? 4 : 0), n.label, { size: 14.5, weight: 650, color: store ? sub : text_, maxChars });
     });
   }
 

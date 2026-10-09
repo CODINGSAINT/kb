@@ -43,9 +43,6 @@
     store.set("kb-sidebar-collapsed", document.body.classList.contains("sidebar-collapsed"));
   };
   $("#sidebarToggle").addEventListener("click", toggleSidebar);
-  const practice = $("#practiceMode");
-  practice.checked = store.get("kb-practice", false);
-  practice.addEventListener("change", () => { store.set("kb-practice", practice.checked); state.renderCanon && state.renderCanon(); });
 
   document.addEventListener("keydown", (e) => {
     const typing = /input|textarea/i.test(e.target.tagName) || e.target.isContentEditable;
@@ -164,18 +161,37 @@
 
   // ---------- sidebar ----------
   async function loadNav() {
-    const [tracks, dsa] = await Promise.all([api.get("/api/tracks"), api.get("/api/dsa")]);
-    state.tracks = tracks; state.dsa = dsa;
+    const [tracks, dsa, fund] = await Promise.all([api.get("/api/tracks"), api.get("/api/dsa"), api.get("/api/fundamentals").catch(() => null)]);
+    state.tracks = tracks; state.dsa = dsa; state.fund = fund;
     renderNav();
   }
   const statusDot = (it) => `<span class="status ${it.evaluated ? "evaluated" : it.answered ? "answered" : ""}" title="${it.evaluated ? "Evaluated" : it.answered ? "Attempted" : "Not attempted"}"></span>`;
   const isAnswered = (p) => !!(p.userAnswer && p.userAnswer.trim());
+  // The page header already shows the pattern's name and summary: drop them from the guide body.
+  const guideBody = (md) => String(md || "").replace(/^#\s.*\n+(?:[^#\n][^\n]*\n)+\n*/, "");
+  const diffChip = (d, long) => d ? `<span class="diff ${esc(d[0])}" title="${esc(d)}">${long ? esc(d) : esc(d[0])}</span>` : "";
 
   function renderNav() {
     const open = store.get("kb-open", { LLD: true, HLD: true, AI: true, DSA: true });
     const q = $("#filter").value.trim().toLowerCase();
     const match = (s) => !q || String(s).toLowerCase().includes(q);
     let html = "";
+    const fgroups = state.fund?.groups || [];
+    if (fgroups.length) {
+      const fall = fgroups.flatMap((g) => g.items);
+      html += `<details class="track" data-key="FUND" ${open.FUND !== false || q ? "open" : ""}>
+        <summary>${CHEV}<span class="track-dot" style="background:var(--sub)"></span>Read first: fundamentals<span class="count">${fall.filter((x) => x.readAt).length}/${fall.length}</span></summary>`;
+      for (const g of fgroups) {
+        const items = g.items.filter((x) => match(x.title) || match(g.name));
+        if (!items.length) continue;
+        const k = "FUND:" + g.track;
+        html += `<details class="subtrack" data-key="${esc(k)}" ${open[k] || q ? "open" : ""}>
+          <summary>${CHEV}${esc(g.name)}<span class="count">${g.items.filter((x) => x.readAt).length}/${g.items.length}</span></summary>
+          <ul class="items">${items.map((x) => `<li><a href="#/read/${esc(x.id)}" data-href="#/read/${esc(x.id)}"><span class="num">${x.number}</span><span class="t">${esc(x.title)}</span>${statusDot({ evaluated: !!x.readAt })}</a></li>`).join("")}</ul>
+        </details>`;
+      }
+      html += `</details>`;
+    }
     for (const tr of TRACKS) {
       const items = (state.tracks[tr.key] || []).filter((it) => match(it.title) || match(it.concepts));
       const done = (state.tracks[tr.key] || []).filter((it) => it.answered).length;
@@ -189,15 +205,15 @@
     const dsaTotal = dsaTopics.reduce((s, t) => s + t.problems.length, 0);
     const dsaDone = dsaTopics.reduce((s, t) => s + t.problems.filter(isAnswered).length, 0);
     html += `<details class="track" data-key="DSA" ${open.DSA || q ? "open" : ""}>
-      <summary>${CHEV}<span class="track-dot" style="background:var(--dsa)"></span>DSA — Striver SDE Sheet<span class="count">${dsaDone}/${dsaTotal}</span></summary>`;
+      <summary>${CHEV}<span class="track-dot" style="background:var(--dsa)"></span>DSA — Coding Patterns<span class="count">${dsaDone}/${dsaTotal}</span></summary>`;
     dsaTopics.forEach((tp, ti) => {
       const probs = tp.problems.map((p, pi) => ({ p, pi })).filter(({ p }) => match(p.title) || match(tp.name));
       if (!probs.length) return;
       const key = "DSA:" + tp.name;
       const d = tp.problems.filter(isAnswered).length;
       html += `<details class="subtrack" data-key="${esc(key)}" ${open[key] || q ? "open" : ""}>
-        <summary>${CHEV}${esc(tp.name)}<span class="count">${d}/${tp.problems.length}</span></summary>
-        <ul class="items">${probs.map(({ p, pi }) => `<li><a href="#/dsa/${ti}/${pi}" data-href="#/dsa/${ti}/${pi}"><span class="num">${p.number}</span><span class="t">${esc(p.title)}</span>${statusDot({ answered: isAnswered(p), evaluated: !!p.answerEvaluation })}</a></li>`).join("")}</ul>
+        <summary>${CHEV}<span class="pnum">${ti + 1}</span>${esc(tp.name)}<span class="count">${d}/${tp.problems.length}</span></summary>
+        <ul class="items">${tp.guide ? `<li><a class="guide-link" href="#/pattern/${ti}" data-href="#/pattern/${ti}"><span class="num">◆</span><span class="t">Pattern guide</span></a></li>` : ""}${probs.map(({ p, pi }) => `<li><a href="#/dsa/${ti}/${pi}" data-href="#/dsa/${ti}/${pi}"><span class="num">${p.number}</span><span class="t">${esc(p.title)}</span>${diffChip(p.difficulty)}${statusDot({ answered: isAnswered(p), evaluated: !!p.answerEvaluation })}</a></li>`).join("")}</ul>
       </details>`;
     });
     html += `</details>`;
@@ -252,10 +268,115 @@
     navigator.clipboard?.writeText(b.dataset.copy).then(() => { b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1200); });
   });
 
+  // The "Discuss with the AI tutor" card, inserted after `anchor`. Used by topic, DSA and fundamentals pages.
+  function tutorCard(anchor, item, ctx) {
+    const clarifyCmd = `kb clarify ${ctx.cli} "your question"`;
+    anchor.insertAdjacentHTML("afterend", `
+      <section class="card tutor" id="tutorCard">
+        <h2>${esc(ctx.tutorTitle || "Discuss with the AI tutor")} <span class="spacer"></span>
+          <span class="muted small" id="tutorModel"></span>
+          <button class="btn small" id="chatClear" title="Start a fresh conversation">Clear</button></h2>
+        <div class="chat" id="chatLog" aria-live="polite"></div>
+        <div class="chips" id="chatChips"></div>
+        <form class="chat-input" id="chatForm">
+          <textarea id="chatText" rows="2" placeholder="${esc(ctx.chatPlaceholder || "Ask about this topic or your answer…  (Enter sends · Shift+Enter for a new line)")}"></textarea>
+          <button class="btn primary" id="chatSend" type="submit">Send</button>
+        </form>
+        <div class="cli-hint muted small">Same conversation from a terminal: <code>${esc(clarifyCmd)}</code> ${copyButton(clarifyCmd)}</div>
+      </section>`);
+    const chatLog = $("#chatLog"), chatText = $("#chatText"), chatSend = $("#chatSend");
+    const showModel = () => { $("#tutorModel").textContent = aiCfg && aiCfg.ready ? `${shortName(aiCfg.provider)} · ${aiCfg.model}` : "AI not set up"; };
+    state.onAiChange = showModel; showModel();
+    function appendMsg(role, content, raw) {
+      const el = document.createElement("div");
+      el.className = "msg " + role;
+      el.innerHTML = `<div class="who">${role === "user" ? "You" : "Tutor"}</div><div class="body"></div>`;
+      chatLog.appendChild(el);
+      const body = el.querySelector(".body");
+      if (role === "assistant" && !raw) viewer(body, content); else body.textContent = content;
+      return body;
+    }
+    const scrollChat = () => { chatLog.scrollTop = chatLog.scrollHeight; };
+    function renderChat() {
+      const msgs = item.chat || [];
+      chatLog.innerHTML = msgs.length ? "" : `<div class="chat-empty">Ask about trade-offs, edge cases, or why the write-up does something a certain way. Ask for a quiz to practise interview questions. The tutor already has this topic's write-up, your saved answer and its verdict.</div>`;
+      msgs.forEach((m) => appendMsg(m.role, m.content));
+      $("#chatClear").hidden = !msgs.length;
+      scrollChat();
+    }
+    const CHIPS = ctx.chips || (isAnswered(item) || item.answerEvaluation
+      ? ["What's weakest in my answer?", "Quiz me like an interviewer", "Explain the key trade-offs simply", "What follow-ups would an interviewer ask?"]
+      : ["Explain this topic in 5 bullet points", "Quiz me like an interviewer", "What do interviewers look for here?", "Common mistakes on this one?"]);
+    $("#chatChips").innerHTML = CHIPS.map((c) => `<button type="button" class="chip">${esc(c)}</button>`).join("");
+    $("#chatChips").addEventListener("click", (e) => { const b = e.target.closest(".chip"); if (b) sendChat(b.textContent); });
+
+    let sending = false;
+    async function sendChat(text) {
+      text = String(text || "").trim();
+      if (!text || sending) return;
+      if (!ensureAi()) return;
+      sending = true; chatSend.disabled = true;
+      chatLog.querySelector(".chat-empty")?.remove();
+      appendMsg("user", text);
+      chatText.value = "";
+      const body = appendMsg("assistant", "", true);
+      body.innerHTML = `<div class="thinking"><i></i><i></i><i></i></div>`;
+      scrollChat();
+      let acc = "", started = false;
+      const ctrl = new AbortController(); state.chatAbort = ctrl;
+      try {
+        const r = await fetch("/api/ai/chat", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...ctx.addr, message: text }), signal: ctrl.signal });
+        if (!r.ok) { const j = await r.json().catch(() => ({})); throw Object.assign(new Error(j.error || r.statusText), { code: j.code }); }
+        const reader = r.body.getReader(), dec = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, i); buf = buf.slice(i + 1);
+            if (!line.trim()) continue;
+            const ev = JSON.parse(line);
+            if (ev.error) throw Object.assign(new Error(ev.error), { code: ev.code });
+            if (ev.t) {
+              if (!started) { body.textContent = ""; body.classList.add("streaming"); started = true; }
+              acc += ev.t; body.textContent = acc; scrollChat();
+            }
+          }
+        }
+        if (!acc.trim()) throw new Error("The model returned an empty reply.");
+        body.classList.remove("streaming"); body.textContent = "";
+        viewer(body, acc);
+        item.chat = [...(item.chat || []), { role: "user", content: text }, { role: "assistant", content: acc.trim() }];
+        $("#chatClear").hidden = false;
+        scrollChat();
+      } catch (e) {
+        if (e.name === "AbortError") return;
+        body.classList.remove("streaming");
+        body.innerHTML = `<p class="err">${esc(e.message)}</p><p class="muted small">Your message wasn't saved. It's back in the box so you can retry.</p>`;
+        chatText.value = text;
+        if (e.code === "NO_KEY") openAiSettings(e.message);
+      } finally {
+        sending = false; chatSend.disabled = false;
+        if (state.chatAbort === ctrl) state.chatAbort = null;
+      }
+    }
+    $("#chatForm").addEventListener("submit", (e) => { e.preventDefault(); sendChat(chatText.value); });
+    chatText.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(chatText.value); }
+    });
+    $("#chatClear").addEventListener("click", async () => {
+      if (!confirm("Clear this topic's conversation? This can't be undone.")) return;
+      try { await api.post("/api/ai/chat/clear", ctx.addr); item.chat = []; renderChat(); } catch (e) { alert(e.message); }
+    });
+    renderChat();
+
+  }
+
   // Builds the "My answer" + "Verdict" + "AI tutor" + "Notes & doubts" cards. `ctx` supplies save URLs/addresses.
   function practiceSections(root, item, ctx) {
     const evalCmd = `kb evaluate ${ctx.cli}`;
-    const clarifyCmd = `kb clarify ${ctx.cli} "your question"`;
     root.insertAdjacentHTML("beforeend", `
       <section class="card" id="answerCard">
         <h2>My answer <span class="spacer"></span><span class="save-state" id="ansState"></span>
@@ -264,18 +385,6 @@
         <p class="muted small" style="margin:10px 0 0">Saved as Markdown. For code, put <code>\`\`\`java</code> on its own line before it and <code>\`\`\`</code> after it. <kbd>Tab</kbd> indents and <kbd>Shift</kbd>+<kbd>Tab</kbd> outdents. Paste or drag in a diagram image (a screenshot, an Excalidraw export or a whiteboard photo). The AI looks at it when evaluating. Use <b>Preview</b> to check the result. Saving a changed answer clears any earlier verdict. <kbd>Ctrl/⌘ S</kbd> saves.</p>
       </section>
       <section class="card" id="verdictCard"></section>
-      <section class="card tutor" id="tutorCard">
-        <h2>Discuss with the AI tutor <span class="spacer"></span>
-          <span class="muted small" id="tutorModel"></span>
-          <button class="btn small" id="chatClear" title="Start a fresh conversation">Clear</button></h2>
-        <div class="chat" id="chatLog" aria-live="polite"></div>
-        <div class="chips" id="chatChips"></div>
-        <form class="chat-input" id="chatForm">
-          <textarea id="chatText" rows="2" placeholder="Ask about this topic or your answer…  (Enter sends · Shift+Enter for a new line)"></textarea>
-          <button class="btn primary" id="chatSend" type="submit">Send</button>
-        </form>
-        <div class="cli-hint muted small">Same conversation from a terminal: <code>${esc(clarifyCmd)}</code> ${copyButton(clarifyCmd)}</div>
-      </section>
       <section class="card">
         <h2>Notes &amp; doubts <span class="spacer"></span><span class="save-state" id="notesState"></span>
           <button class="btn" id="notesSave" data-save disabled>Save notes</button></h2>
@@ -375,94 +484,7 @@
     }
     renderVerdict();
 
-    // ----- AI tutor chat -----
-    const chatLog = $("#chatLog"), chatText = $("#chatText"), chatSend = $("#chatSend");
-    const showModel = () => { $("#tutorModel").textContent = aiCfg && aiCfg.ready ? `${shortName(aiCfg.provider)} · ${aiCfg.model}` : "AI not set up"; };
-    state.onAiChange = showModel; showModel();
-    function appendMsg(role, content, raw) {
-      const el = document.createElement("div");
-      el.className = "msg " + role;
-      el.innerHTML = `<div class="who">${role === "user" ? "You" : "Tutor"}</div><div class="body"></div>`;
-      chatLog.appendChild(el);
-      const body = el.querySelector(".body");
-      if (role === "assistant" && !raw) viewer(body, content); else body.textContent = content;
-      return body;
-    }
-    const scrollChat = () => { chatLog.scrollTop = chatLog.scrollHeight; };
-    function renderChat() {
-      const msgs = item.chat || [];
-      chatLog.innerHTML = msgs.length ? "" : `<div class="chat-empty">Ask about trade-offs, edge cases, or why the write-up does something a certain way. Ask for a quiz to practise interview questions. The tutor already has this topic's write-up, your saved answer and its verdict.</div>`;
-      msgs.forEach((m) => appendMsg(m.role, m.content));
-      $("#chatClear").hidden = !msgs.length;
-      scrollChat();
-    }
-    const CHIPS = isAnswered(item) || item.answerEvaluation
-      ? ["What's weakest in my answer?", "Quiz me like an interviewer", "Explain the key trade-offs simply", "What follow-ups would an interviewer ask?"]
-      : ["Explain this topic in 5 bullet points", "Quiz me like an interviewer", "What do interviewers look for here?", "Common mistakes on this one?"];
-    $("#chatChips").innerHTML = CHIPS.map((c) => `<button type="button" class="chip">${esc(c)}</button>`).join("");
-    $("#chatChips").addEventListener("click", (e) => { const b = e.target.closest(".chip"); if (b) sendChat(b.textContent); });
-
-    let sending = false;
-    async function sendChat(text) {
-      text = String(text || "").trim();
-      if (!text || sending) return;
-      if (!ensureAi()) return;
-      sending = true; chatSend.disabled = true;
-      chatLog.querySelector(".chat-empty")?.remove();
-      appendMsg("user", text);
-      chatText.value = "";
-      const body = appendMsg("assistant", "", true);
-      body.innerHTML = `<div class="thinking"><i></i><i></i><i></i></div>`;
-      scrollChat();
-      let acc = "", started = false;
-      const ctrl = new AbortController(); state.chatAbort = ctrl;
-      try {
-        const r = await fetch("/api/ai/chat", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...ctx.addr, message: text }), signal: ctrl.signal });
-        if (!r.ok) { const j = await r.json().catch(() => ({})); throw Object.assign(new Error(j.error || r.statusText), { code: j.code }); }
-        const reader = r.body.getReader(), dec = new TextDecoder();
-        let buf = "";
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          let i;
-          while ((i = buf.indexOf("\n")) >= 0) {
-            const line = buf.slice(0, i); buf = buf.slice(i + 1);
-            if (!line.trim()) continue;
-            const ev = JSON.parse(line);
-            if (ev.error) throw Object.assign(new Error(ev.error), { code: ev.code });
-            if (ev.t) {
-              if (!started) { body.textContent = ""; body.classList.add("streaming"); started = true; }
-              acc += ev.t; body.textContent = acc; scrollChat();
-            }
-          }
-        }
-        if (!acc.trim()) throw new Error("The model returned an empty reply.");
-        body.classList.remove("streaming"); body.textContent = "";
-        viewer(body, acc);
-        item.chat = [...(item.chat || []), { role: "user", content: text }, { role: "assistant", content: acc.trim() }];
-        $("#chatClear").hidden = false;
-        scrollChat();
-      } catch (e) {
-        if (e.name === "AbortError") return;
-        body.classList.remove("streaming");
-        body.innerHTML = `<p class="err">${esc(e.message)}</p><p class="muted small">Your message wasn't saved. It's back in the box so you can retry.</p>`;
-        chatText.value = text;
-        if (e.code === "NO_KEY") openAiSettings(e.message);
-      } finally {
-        sending = false; chatSend.disabled = false;
-        if (state.chatAbort === ctrl) state.chatAbort = null;
-      }
-    }
-    $("#chatForm").addEventListener("submit", (e) => { e.preventDefault(); sendChat(chatText.value); });
-    chatText.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(chatText.value); }
-    });
-    $("#chatClear").addEventListener("click", async () => {
-      if (!confirm("Clear this topic's conversation? This can't be undone.")) return;
-      try { await api.post("/api/ai/chat/clear", ctx.addr); item.chat = []; renderChat(); } catch (e) { alert(e.message); }
-    });
-    renderChat();
+    tutorCard($("#verdictCard"), item, ctx);
 
     // ----- notes & doubts -----
     const notes = $("#notes"), notesSave = $("#notesSave"), notesState = $("#notesState");
@@ -521,50 +543,153 @@
   }
 
   // ---------- views ----------
+  // Topic write-ups are split by "## " heading. Problem + Requirements are the brief you design from;
+  // everything else (abstractions/architecture, decisions & trade-offs, follow-ups, diagram) is the
+  // reference design, hidden until you confirm, because it gives the answer away.
+  const BRIEF_RE = /^(problem|requirements)/i;
+  function splitSections(md) {
+    return String(md || "").split(/^(?=## )/m).filter((x) => x.trim()).map((x) => ({ title: (/^##\s+(.+)/.exec(x) || [, ""])[1].trim(), md: x.trim() }));
+  }
+  const revealed = {
+    has: (k) => store.get("kb-revealed", []).includes(k),
+    set(k, on) { const l = store.get("kb-revealed", []).filter((x) => x !== k); if (on) l.push(k); store.set("kb-revealed", l); },
+  };
+  function topicHref(key) {
+    const [cat, num] = key.split("-");
+    const it = (state.tracks?.[cat] || []).find((x) => Number(x.number) === Number(num));
+    return it ? `#/t/${it.day}/${it.topicIndex}` : null;
+  }
+  function fundItems() { return (state.fund?.groups || []).flatMap((g) => g.items.map((it) => ({ ...it, track: g.track }))); }
+
+  function readFirstCard(key) {
+    const ids = state.fund?.prereqs?.[key] || [];
+    if (!ids.length) return "";
+    const all = fundItems();
+    const items = ids.map((id) => all.find((x) => x.id === id)).filter(Boolean);
+    const done = items.filter((x) => x.readAt).length;
+    return `<section class="card readfirst"><h2>Read first <span class="spacer"></span><span class="muted small">${done} of ${items.length} read</span></h2>
+      <ul class="rf-list">${items.map((x) => `<li><a href="#/read/${esc(x.id)}">${statusDot({ evaluated: !!x.readAt })}<span class="rf-t">${esc(x.title)}</span></a><span class="rf-s">${esc(x.summary)}</span></li>`).join("")}</ul></section>`;
+  }
+
   async function viewTopic(day, idx) {
     const root = $("#content");
     const d = await api.get(`/api/days/${day}`);
     const t = d.topics[idx];
     if (!t) throw new Error("Topic not found");
-    const key = `t${day}-${idx}`;
+    const key = `${t.category}-${Number(t.number)}`;
+    const dkey = `t${day}-${idx}`;
+    const secs = splitSections(t.markdown);
+    const brief = secs.filter((x) => BRIEF_RE.test(x.title));
+    const ref = secs.filter((x) => !BRIEF_RE.test(x.title));
     const pills = String(t.concepts || "").split(/,\s*/).filter(Boolean).map((c) => `<span class="pill">${esc(c)}</span>`).join("");
     root.innerHTML = `
       <div class="topic-head">
-        <div class="crumbs"><span class="badge ${esc(t.category)}">${esc(t.category)}</span><span>#${t.number}</span><span>·</span><span>Day ${d.day}</span>
-          ${d.generatedAt ? `<span>·</span><span>generated ${esc(stamp(d.generatedAt))}</span>` : ""}</div>
+        <div class="crumbs"><span class="badge ${esc(t.category)}">${esc(t.category)}</span><span>#${t.number}</span><span>·</span><span>Day ${d.day}</span></div>
         <h1 class="title">${esc(t.title)}</h1>
         <div class="pill-row">${pills}</div>
       </div>
-      <div id="canon"></div>`;
-    const canon = $("#canon");
-    state.renderCanon = () => {
-      // Re-renders only the canonical section, so an in-progress answer is never lost.
-      const hidden = practice.checked && !state.revealed.has(key);
-      canon.innerHTML = hidden
-        ? `<section class="card"><div class="reveal"><div>Practice mode: diagram and write-up are hidden so you can attempt it cold.</div><button class="btn" id="revealBtn">Reveal write-up</button></div></section>`
-        : `<section class="card"><h2>Diagram</h2><div class="diagram" id="diagram" data-diagram="${key}"></div></section>
-           <section class="card"><h2>Write-up</h2><div id="writeup"></div></section>`;
-      if (hidden) { $("#revealBtn").addEventListener("click", () => { state.revealed.add(key); state.renderCanon(); }); return; }
-      const dg = $("#diagram"); dg._spec = t.diagram; KBDiagram.render(dg, t.diagram, key);
-      if (t.markdown) viewer($("#writeup"), t.markdown);
-      else $("#writeup").innerHTML = '<p class="muted">Write-up not generated yet.</p>';
+      ${readFirstCard(key)}
+      <section class="card" id="briefCard"><div id="brief"></div></section>`;
+    if (brief.length) viewer($("#brief"), brief.map((x) => x.md).join("\n\n"));
+    else $("#brief").innerHTML = '<p class="muted">No problem statement yet.</p>';
+
+    practiceSections(root, t, {
+      answerUrl: `/api/days/${day}/answer`, notesUrl: `/api/days/${day}/notes`,
+      address: { topicIndex: idx },
+      addr: { track: t.category, number: Number(t.number) },
+      cli: `${t.category.toLowerCase()} ${Number(t.number)}`,
+      placeholder: t.category === "LLD"
+        ? "Your design: entities and classes, relationships, key interfaces, patterns, concurrency, extensibility…\n\nCode: type ```java on its own line, then your code, then ``` to close it."
+        : t.category === "HLD"
+          ? "Your design: estimates, APIs, data model, high-level architecture, deep dives, trade-offs…\n\nPaste or drag in a diagram image if you drew one."
+          : "Your answer: explain each requirement in your own words, with Spring AI code where it helps…",
+    });
+
+    // Reference design: below everything, hidden until confirmed.
+    root.insertAdjacentHTML("beforeend", '<div id="refZone"></div><div id="dayExtra"></div>');
+    const refNames = [...(t.diagram?.nodes?.length ? ["diagram"] : []), ...ref.map((x) => x.title.toLowerCase())];
+    const renderRef = (asking) => {
+      const zone = $("#refZone");
+      if (!ref.length && !t.diagram?.nodes?.length) { zone.innerHTML = ""; return; }
+      if (revealed.has(key)) {
+        zone.innerHTML = `<section class="card"><h2>Reference design <span class="spacer"></span><button class="btn small" id="refHide">Hide again</button></h2>
+            ${t.diagram?.nodes?.length ? `<div class="diagram" id="diagram" data-diagram="${dkey}"></div>` : ""}<div id="writeup"></div></section>`;
+        if (t.diagram?.nodes?.length) { const dg = $("#diagram"); dg._spec = t.diagram; KBDiagram.render(dg, t.diagram, dkey); }
+        viewer($("#writeup"), ref.map((x) => x.md).join("\n\n"));
+        $("#refHide").addEventListener("click", () => { revealed.set(key, false); renderRef(); });
+        return;
+      }
+      const answered = isAnswered(t), evaluated = !!t.answerEvaluation;
+      const warn = evaluated
+        ? "You've written an answer and it's been evaluated, so this is a good time to compare."
+        : answered
+          ? "You've saved an answer but haven't had it evaluated yet. Evaluating first gives you an honest score before you see the reference."
+          : "You haven't saved an answer yet. Seeing the reference first turns the exercise into reading. Try writing your own design first, even a rough one.";
+      zone.innerHTML = `<section class="card gate">
+        <h2>Reference design <span class="spacer"></span><span class="muted small">hidden</span></h2>
+        <p class="muted" style="margin-top:0">Contains the ${esc(refNames.join(", "))}. These are hints towards the design, so attempt it yourself first.</p>
+        ${asking
+          ? `<div class="confirm"><p><b>Are you sure you want to see it?</b> ${esc(warn)}</p>
+               <div class="row"><button class="btn ${answered ? "primary" : ""}" id="refYes">${answered ? "Yes, show the reference" : "Show it anyway"}</button>
+               <button class="btn ${answered ? "" : "primary"}" id="refNo">${answered ? "Not now" : "I'll attempt it first"}</button></div></div>`
+          : `<button class="btn" id="refAsk">Show reference design…</button>`}
+      </section>`;
+      if (asking) {
+        $("#refYes").addEventListener("click", () => { revealed.set(key, true); renderRef(); });
+        $("#refNo").addEventListener("click", () => renderRef(false));
+      } else $("#refAsk").addEventListener("click", () => renderRef(true));
     };
-    state.renderCanon();
-    canon.insertAdjacentHTML("afterend", '<div id="dayExtra"></div>');
+    renderRef();
     if (d.sketch || d.evaluation) {
       $("#dayExtra").insertAdjacentHTML("beforeend", `<section class="card"><h2>Day ${d.day} sketch review</h2>
         ${d.sketch ? `<img src="${esc(d.sketch)}" alt="Your design sketch for day ${d.day}" style="max-width:100%;border-radius:8px;border:1px solid var(--border)">` : ""}
         <div id="dayEval"></div></section>`);
       if (d.evaluation) viewer($("#dayEval"), d.evaluation);
     }
-    practiceSections(root, t, {
-      answerUrl: `/api/days/${day}/answer`, notesUrl: `/api/days/${day}/notes`,
-      address: { topicIndex: idx },
-      addr: { track: t.category, number: Number(t.number) },
-      cli: `${t.category.toLowerCase()} ${Number(t.number)}`,
-      placeholder: "Your design: requirements, key classes/components, trade-offs…\n\nCode: type ```java on its own line, then your code, then ``` to close it.",
-    });
     document.title = `${t.title} — KB`;
+  }
+
+  async function viewRead(id) {
+    const root = $("#content");
+    const fund = await api.get("/api/fundamentals");
+    state.fund = fund;
+    const all = fund.groups.flatMap((g) => g.items.map((it) => ({ it, g })));
+    const i = all.findIndex((x) => x.it.id === id);
+    if (i < 0) throw new Error("Article not found");
+    const { it, g } = all[i];
+    const prev = all[i - 1], next = all[i + 1];
+    const used = (it.usedBy || []).map((u) => { const h = topicHref(u.key); return h ? `<a class="pill link" href="${h}">${esc(u.key.replace("-", " "))} · ${esc(u.title)}</a>` : ""; }).join("");
+    root.innerHTML = `
+      <div class="topic-head">
+        <div class="crumbs"><span class="badge ${esc(g.track)}">${esc(g.track)}</span><span>Fundamentals</span><span>·</span><span>#${it.number}</span></div>
+        <h1 class="title">${esc(it.title)}</h1>
+        <p class="lede">${esc(it.summary)}</p>
+        ${used ? `<div class="pill-row"><span class="muted small" style="align-self:center">Read before:</span>${used}</div>` : ""}
+      </div>
+      <nav class="card toc" id="toc" hidden><div class="toc-title">On this page</div><ol id="tocList"></ol></nav>
+      <section class="card" id="articleCard"><div id="article"></div>
+        <div class="row" style="margin-top:18px"><button class="btn ${it.readAt ? "" : "primary"}" id="markRead">${it.readAt ? "✓ Read · mark as unread" : "Mark as read"}</button>
+          <span class="muted small">${it.readAt ? "read " + esc(stamp(it.readAt)) : ""}</span></div>
+      </section>
+      <div class="pager">${prev ? `<a class="btn" href="#/read/${esc(prev.it.id)}">← ${esc(prev.it.title)}</a>` : "<span></span>"}${next ? `<a class="btn" href="#/read/${esc(next.it.id)}">${esc(next.it.title)} →</a>` : ""}</div>`;
+    viewer($("#article"), it.markdown.replace(/^[^\n]*(\n[^\n#][^\n]*)*\n*/, ""));   // first paragraph is the lede above
+    // Contents list: one entry per "##" heading; clicks scroll (hash routing owns the URL).
+    const heads = [...$("#article").querySelectorAll("h2")];
+    if (heads.length > 2) {
+      $("#tocList").innerHTML = heads.map((h, k) => `<li><button type="button" data-k="${k}">${esc(h.textContent)}</button></li>`).join("");
+      $("#tocList").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) heads[+b.dataset.k].scrollIntoView({ behavior: "smooth", block: "start" }); });
+      $("#toc").hidden = false;
+    }
+    $("#markRead").addEventListener("click", async () => {
+      try { await api.post("/api/fundamentals/read", { id: it.id, read: !it.readAt }); await loadNav(); viewRead(id); } catch (e) { alert(e.message); }
+    });
+    tutorCard($("#articleCard"), it, {
+      addr: { track: "READ", number: it.number }, cli: `read ${it.number}`,
+      tutorTitle: "Ask the tutor about this",
+      chatPlaceholder: "Ask anything about this concept…  (Enter sends · Shift+Enter for a new line)",
+      chips: ["Explain it with a real-world example", "Quiz me on this", "What do interviewers ask about this?", "Common misconceptions?"],
+    });
+    document.title = `${it.title} — KB`;
   }
 
   async function viewDsa(ti, pi) {
@@ -573,20 +698,55 @@
     const tp = dsa.topics[ti];
     const p = tp?.problems[pi];
     if (!p) throw new Error("Problem not found");
+    const link = p.leetcodeUrl
+      ? `<a href="${esc(p.leetcodeUrl)}" target="_blank" rel="noopener">Open on LeetCode ↗</a>${p.premium ? ' <span class="muted small">(LeetCode Premium)</span>' : ""}`
+      : `<span class="muted">Classic problem with no exact LeetCode match. Search the title on GeeksforGeeks or your preferred judge.</span>`;
     root.innerHTML = `
       <div class="topic-head">
-        <div class="crumbs"><span class="badge DSA">DSA</span><span>${esc(tp.name)}</span><span>·</span><span>#${p.number}</span></div>
+        <div class="crumbs"><span class="badge DSA">DSA</span><a href="#/pattern/${ti}">${esc(tp.name)}</a><span>·</span><span>#${p.number}</span>${diffChip(p.difficulty, true)}</div>
         <h1 class="title">${esc(p.title)}</h1>
-        <div class="dsa-link">${p.leetcodeUrl ? `<a href="${esc(p.leetcodeUrl)}" target="_blank" rel="noopener">Open on LeetCode ↗</a>` : `<span class="muted">No confident LeetCode match — search the title on your preferred judge.</span>`}</div>
-      </div>`;
+        <div class="dsa-link">${link}</div>
+      </div>
+      ${tp.guide ? `<details class="card guide-card" id="guideCard"><summary><h2>Pattern guide: ${esc(tp.name)}</h2><span class="muted small">${esc(tp.summary || "")}</span></summary><div id="guideBody"></div></details>` : ""}`;
+    const gc = $("#guideCard");
+    if (gc) gc.addEventListener("toggle", () => { if (gc.open && !gc._done) { gc._done = true; viewer($("#guideBody"), guideBody(tp.guide)); } });
     practiceSections(root, p, {
       answerUrl: "/api/dsa/answer", notesUrl: "/api/dsa/notes",
       address: { topicIndex: ti, problemIndex: pi },
       addr: { track: "DSA", number: Number(p.number) },
       cli: `dsa ${Number(p.number)}`,
-      placeholder: "Approach, complexity, edge cases…\n\nCode: type ```java on its own line, then your code, then ``` to close it.",
+      placeholder: "Which pattern applies and why, then approach, complexity, edge cases…\n\nCode: type ```java on its own line, then your code, then ``` to close it.",
     });
     document.title = `${p.title} — KB`;
+  }
+
+  async function viewPattern(ti) {
+    const root = $("#content");
+    const dsa = await api.get("/api/dsa");
+    const tp = dsa.topics[ti];
+    if (!tp) throw new Error("Pattern not found");
+    const done = tp.problems.filter(isAnswered).length, evald = tp.problems.filter((p) => p.answerEvaluation).length;
+    const prev = dsa.topics[ti - 1], next = dsa.topics[ti + 1];
+    root.innerHTML = `
+      <div class="topic-head">
+        <div class="crumbs"><span class="badge DSA">DSA</span><span>Pattern ${ti + 1} of ${dsa.topics.length}</span><span>·</span><span>${tp.problems.length} problems</span><span>·</span><span>${done} attempted, ${evald} evaluated</span></div>
+        <h1 class="title">${esc(tp.name)}</h1>
+        ${tp.summary ? `<p class="lede">${esc(tp.summary)}</p>` : ""}
+      </div>
+      <section class="card"><h2>Practice problems <span class="spacer"></span><span class="muted small">easy → hard</span></h2>
+        <table class="ptable"><tbody>${tp.problems.map((p, pi) => `
+          <tr data-go="#/dsa/${ti}/${pi}">
+            <td class="n">${p.number}</td>
+            <td class="t"><a href="#/dsa/${ti}/${pi}">${esc(p.title)}</a>${p.premium ? ' <span class="muted small">Premium</span>' : ""}</td>
+            <td>${diffChip(p.difficulty, true)}</td>
+            <td class="st">${statusDot({ answered: isAnswered(p), evaluated: !!p.answerEvaluation })}</td>
+          </tr>`).join("")}</tbody></table>
+      </section>
+      ${tp.guide ? `<section class="card"><h2>Guide</h2><div id="guideBody"></div></section>` : ""}
+      <div class="pager">${prev ? `<a class="btn" href="#/pattern/${ti - 1}">← ${esc(prev.name)}</a>` : "<span></span>"}${next ? `<a class="btn" href="#/pattern/${ti + 1}">${esc(next.name)} →</a>` : ""}</div>`;
+    if (tp.guide) viewer($("#guideBody"), guideBody(tp.guide));
+    root.querySelectorAll("tr[data-go]").forEach((tr) => tr.addEventListener("click", (e) => { if (!e.target.closest("a")) location.hash = tr.dataset.go; }));
+    document.title = `${tp.name} — KB`;
   }
 
   async function viewHome() {
@@ -603,7 +763,8 @@
           <div class="stat"><div class="k">Attempted</div><div class="v">${p.answeredPct}%</div><div class="bar"><span class="fill answered" style="width:${p.answeredPct}%"></span></div><div class="muted small">${p.answered} of ${p.totalTopics}</div></div>
           <div class="stat"><div class="k">Evaluated</div><div class="v">${p.evaluatedPct}%</div><div class="bar"><span class="fill evaluated" style="width:${p.evaluatedPct}%"></span></div><div class="muted small">${p.evaluated} of ${p.totalTopics}</div></div>
           <div class="stat"><div class="k">Days generated</div><div class="v">${days.size}</div><div class="muted small">${gen} design topics</div></div>
-          <div class="stat"><div class="k">DSA problems</div><div class="v">${dsaN}</div><div class="muted small">${(state.dsa?.topics || []).length} topics</div></div>
+          <div class="stat"><div class="k">DSA problems</div><div class="v">${dsaN}</div><div class="muted small">${(state.dsa?.topics || []).length} patterns</div></div>
+          ${state.fund ? (() => { const f = state.fund.groups.flatMap((g) => g.items); const r = f.filter((x) => x.readAt).length; return `<div class="stat"><div class="k">Fundamentals read</div><div class="v">${r}/${f.length}</div><div class="bar"><span class="fill evaluated" style="width:${f.length ? (r * 100 / f.length) : 0}%"></span></div><div class="muted small"><a href="#/read/${esc(f[0].id)}">Start reading</a></div></div>`; })() : ""}
         </div>
         ${aiCfg && !aiCfg.ready ? `<section class="card"><h2>Connect an AI tutor</h2><p style="margin-top:0">Evaluate answers and chat about any topic with Claude, OpenAI, or a free local model through Ollama. Your key stays on this machine.</p><button class="btn primary" id="homeAi">Set up AI</button></section>` : ""}
         ${gen ? "" : `<section class="card"><h2>No day content yet</h2><p style="margin:0">Put your <code>study.md</code> in the project root, then generate day 1 — ask in chat (“generate day 1”) or run <code>node scripts/new-day.js 1</code> to scaffold it.</p></section>`}
@@ -622,12 +783,13 @@
     if (state.chatAbort) { state.chatAbort.abort(); state.chatAbort = null; }
     state.onAiChange = null;
     destroyEditors();
-    state.renderCanon = null;
     const h = location.hash.replace(/^#\/?/, "").split("/");
     $("#content").scrollTop = 0;
     try {
       if (h[0] === "t") await viewTopic(Number(h[1]), Number(h[2]));
       else if (h[0] === "dsa") await viewDsa(Number(h[1]), Number(h[2]));
+      else if (h[0] === "pattern") await viewPattern(Number(h[1]));
+      else if (h[0] === "read") await viewRead(decodeURIComponent(h[1] || ""));
       else await viewHome();
     } catch (e) {
       $("#content").innerHTML = `<section class="card"><h2>Couldn't load this</h2><p class="muted">${esc(e.message)}</p><a href="#/">Home</a></section>`;
