@@ -15,9 +15,11 @@
   <img src="https://img.shields.io/badge/AI-Claude%20%7C%20OpenAI%20%7C%20Ollama-0e7490" alt="Claude, OpenAI or Ollama">
   <img src="https://img.shields.io/badge/runs-100%25%20on%20your%20machine-0e7490" alt="Runs locally">
   <img src="https://img.shields.io/badge/PRs-welcome-1c39bb" alt="PRs welcome">
+  <a href="https://codingsaint.github.io/kb/"><img src="https://img.shields.io/badge/live%20demo-open-0e7490" alt="Live demo"></a>
 </p>
 
 <p align="center">
+  <a href="https://codingsaint.github.io/kb/"><b>Live demo</b></a> ·
   <a href="#quick-start-60-seconds">Quick start</a> ·
   <a href="#a-quick-tour">Tour</a> ·
   <a href="#whats-inside">What's inside</a> ·
@@ -240,7 +242,7 @@ This writes the same `kb.config.json` that `kb setup` does.
 
 #### Using environment variables instead of a saved key
 
-If you'd rather not keep the key in a file, set it in your environment. Environment variables take priority over `kb.config.json`.
+If you'd rather not keep the key in a file, set it in your environment. A key or base URL saved in `kb.config.json` wins; the environment variable is used only when nothing is saved there (so an `OPENAI_API_KEY` meant for OpenAI never gets sent to Groq or another OpenAI-compatible service). `KB_PROVIDER` and `KB_MODEL` always override.
 
 | Variable | Purpose |
 |---|---|
@@ -515,6 +517,7 @@ lib/ai.js                provider layer (Claude, OpenAI-compatible, Ollama), str
 lib/tutor.js             evaluate / clarify / doubts, with the prompts, shared by the CLI and the server
 lib/voice.js             optional OpenAI speech-to-text / text-to-speech for the voice features
 lib/library.js, libgen.js  your own libraries: reading them, and planning/writing them with the AI (kb add)
+build/make-site.js       builds the read-only demo website into site/ (published to GitHub Pages by .github/workflows/pages.yml)
 lib/userdata.js          your data folder (../kb-data): answers, verdicts, notes, chats, read status kept outside the repo
 lib/images.js            answer images: save to the data folder, attach to prompts as real image inputs
 public/                  index.html, app.js, voice.js (mic, read-aloud, talk mode), diagram.js (rough.js renderer), styles.css, vendor/
@@ -598,6 +601,16 @@ Bits → Trie → Strings → Matrix & Math → Design.
 
 ---
 
+## Live demo
+
+**[codingsaint.github.io/kb](https://codingsaint.github.io/kb/)** is a read-only copy of the site: browse every design topic (and reveal its
+reference design), all 37 read-first chapters and the 304 DSA problems with their pattern guides. Writing answers, AI grading, the tutor,
+voice and progress tracking need the app running on your own machine (see [Quick start](#quick-start-60-seconds)).
+
+It's built from `content/` by `npm run build:site` and published by a GitHub Action on every push to `main`
+(`.github/workflows/pages.yml`). The build never reads your data folder and refuses to publish if any answer, verdict, note, chat or
+read status slips into it. To publish your own fork: Settings → Pages → Source: **GitHub Actions**.
+
 ## Who it's for
 
 - **Engineers preparing for senior / staff interviews** who want to practise designing, not just read designs.
@@ -633,6 +646,12 @@ Contributions are welcome, especially:
 - bug fixes and UI polish.
 
 Open an issue to discuss an idea, or send a pull request. Your own answers live in your data folder outside the repo, so they never end up in a PR.
+
+## Licence
+
+- **Code:** [MIT](LICENSE).
+- **Study content** (chapters, topic write-ups, DSA guides, problem selection, images):
+  [CC BY-NC-SA 4.0](LICENSE-CONTENT.md). Share and adapt it for non-commercial use with credit; ask first for commercial use.
 
 ## Support the project
 

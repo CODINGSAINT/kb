@@ -6,6 +6,15 @@
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
   };
+  // Read-only demo (GitHub Pages build): set by demo.js, which serves content from static files.
+  const DEMO = window.KB_DEMO || null;
+  if (DEMO) document.body.classList.add("demo");
+  const demoCard = (what) => `<section class="card demo-card"><h2>Practise this for real</h2>
+    <p style="margin-top:0">This is a read-only demo. ${esc(what)} Run KB on your own machine: it's free, takes two minutes, and your answers stay on your computer.</p>
+    <pre><code>git clone ${esc(DEMO.repo)}.git
+cd kb && npm install && npm start</code></pre>
+    <p class="muted small" style="margin-bottom:0">Works with Claude, OpenAI, Groq/Gemini (free tiers) or a free local Ollama model. <a href="${esc(DEMO.repo)}" target="_blank" rel="noopener">Setup guide on GitHub ↗</a></p></section>`;
+
   const api = {
     async get(url) {
       const r = await fetch(url, { cache: "no-store" });
@@ -60,6 +69,7 @@
   let aiCfg = null, dlgProvider = null;
   const shortName = (id) => ({ anthropic: "Claude", openai: "OpenAI", ollama: "Ollama", mock: "Mock" }[id] || id);
   async function loadAi() {
+    if (DEMO) { aiCfg = { ready: false, demo: true, providers: {} }; return aiCfg; }
     try { aiCfg = await api.get("/api/ai/config"); } catch (e) { aiCfg = null; }
     const chip = $("#aiButton");
     chip.dataset.state = aiCfg && aiCfg.ready ? "on" : "off";
@@ -288,6 +298,7 @@
 
   // The "Discuss with the AI tutor" card, inserted after `anchor`. Used by topic, DSA and fundamentals pages.
   function tutorCard(anchor, item, ctx) {
+    if (DEMO) return; // no AI in the read-only demo
     const clarifyCmd = `kb clarify ${ctx.cli} "your question"`;
     anchor.insertAdjacentHTML("afterend", `
       <section class="card tutor" id="tutorCard">
@@ -479,6 +490,7 @@
 
   // Builds the "My answer" + "Verdict" + "AI tutor" + "Notes & doubts" cards. `ctx` supplies save URLs/addresses.
   function practiceSections(root, item, ctx) {
+    if (DEMO) { root.insertAdjacentHTML("beforeend", demoCard("In the full app you write your answer here, get it graded by AI, and discuss it with a tutor that knows the topic.")); return; }
     const evalCmd = `kb evaluate ${ctx.cli}`;
     root.insertAdjacentHTML("beforeend", `
       <section class="card" id="answerCard">
@@ -804,8 +816,8 @@
       </div>
       <nav class="card toc" id="toc" hidden><div class="toc-title">On this page</div><ol id="tocList"></ol></nav>
       <section class="card" id="articleCard"><div id="article"></div>
-        <div class="row" style="margin-top:18px"><button class="btn ${it.readAt ? "" : "primary"}" id="markRead">${it.readAt ? "✓ Read · mark as unread" : "Mark as read"}</button>
-          <span class="muted small">${it.readAt ? "read " + esc(stamp(it.readAt)) : ""}</span></div>
+        ${DEMO ? "" : `<div class="row" style="margin-top:18px"><button class="btn ${it.readAt ? "" : "primary"}" id="markRead">${it.readAt ? "✓ Read · mark as unread" : "Mark as read"}</button>
+          <span class="muted small">${it.readAt ? "read " + esc(stamp(it.readAt)) : ""}</span></div>`}
       </section>
       <div class="pager">${prev ? `<a class="btn" href="#/read/${esc(prev.it.id)}">← ${esc(prev.it.title)}</a>` : "<span></span>"}${next ? `<a class="btn" href="#/read/${esc(next.it.id)}">${esc(next.it.title)} →</a>` : ""}</div>`;
     viewer($("#article"), it.markdown.replace(/^[^\n]*(\n[^\n#][^\n]*)*\n*/, ""));   // first paragraph is the lede above
@@ -819,7 +831,7 @@
       $("#tocList").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) heads[+b.dataset.k].scrollIntoView({ behavior: "smooth", block: "start" }); });
       $("#toc").hidden = false;
     }
-    $("#markRead").addEventListener("click", async () => {
+    $("#markRead")?.addEventListener("click", async () => {
       try { await api.post("/api/fundamentals/read", { id: it.id, read: !it.readAt }); await loadNav(); viewRead(id); } catch (e) { alert(e.message); }
     });
     tutorCard($("#articleCard"), it, {
@@ -891,7 +903,30 @@
     document.title = `${tp.name} — KB`;
   }
 
+  function viewDemoHome() {
+    const t = state.tracks || {};
+    const n = (k) => (t[k] || []).length;
+    const dsaN = (state.dsa?.topics || []).reduce((s, x) => s + x.problems.length, 0);
+    const f = (state.fund?.groups || []).flatMap((g) => g.items);
+    $("#content").innerHTML = `
+      <div class="home">
+        <h1>KB · your private AI interview coach</h1>
+        <p class="lede" style="margin-top:0">Practise LLD, HLD, AI system design and DSA the way interviews work: commit to a design, get it graded, then defend it.
+          This live demo lets you browse everything. Pick a topic from the sidebar.</p>
+        <div class="grid">
+          <div class="stat"><div class="k">Low-level design</div><div class="v">${n("LLD")}</div><div class="muted small"><a href="#/t/2/0">Try: Parking Lot</a></div></div>
+          <div class="stat"><div class="k">High-level design</div><div class="v">${n("HLD")}</div><div class="muted small">URL shortener to payments</div></div>
+          <div class="stat"><div class="k">AI / Spring AI</div><div class="v">${n("AI")}</div><div class="muted small">RAG, agents, MCP</div></div>
+          <div class="stat"><div class="k">Read-first chapters</div><div class="v">${f.length}</div><div class="muted small">${f[0] ? `<a href="#/read/${esc(f[0].id)}">Start reading</a>` : ""}</div></div>
+          <div class="stat"><div class="k">DSA problems</div><div class="v">${dsaN}</div><div class="muted small">${(state.dsa?.topics || []).length} patterns, <a href="#/pattern/0">see one</a></div></div>
+        </div>
+        ${demoCard("Answers, AI grading, the tutor chat, voice and progress tracking are switched off here.")}
+      </div>`;
+    document.title = "KB — demo";
+  }
+
   async function viewHome() {
+    if (DEMO) return viewDemoHome();
     const p = (await loadProgress()) || { totalTopics: 0, answered: 0, evaluated: 0, answeredPct: 0, evaluatedPct: 0 };
     const t = state.tracks || {};
     const gen = TRACKS.reduce((s, tr) => s + (t[tr.key] || []).length, 0);
@@ -946,6 +981,6 @@
     await loadAi();
     try { await loadNav(); } catch (e) { $("#nav").innerHTML = `<div class="empty-note">Couldn't reach the server.</div>`; }
     await route(true);
-    loadProgress();
+    if (!DEMO) loadProgress();
   })();
 })();
