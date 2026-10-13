@@ -1,167 +1,282 @@
 === hld-rate-limiting | HLD | Rate limiting and load shedding ===
-Rate limiting caps how much work a single caller can push into your system, while load shedding decides what to drop when the system as a whole is over capacity. Together they protect availability, enforce fair use between tenants and keep costs predictable. This chapter covers the five classic algorithms with their math, distributed enforcement with Redis and Lua, where limits belong, the client contract, and adaptive concurrency limits.
+Rate limiting caps how much work one caller can send you, and load shedding decides what to drop when the whole system is over capacity. This chapter walks through the five classic limiting algorithms, how to share a limit across many servers with Redis, where the limit belongs, what a throttled client should see, and how to shed load gracefully. Each idea comes with a small "what goes wrong" scenario and a better version.
 
-## Why limit at all
-- **Abuse and attacks:** credential stuffing, scraping, brute-forcing OTPs, application-layer DDoS.
-- **Fairness:** one noisy tenant must not starve the others in a multi-tenant SaaS.
-- **Protecting dependencies:** a downstream payment provider or legacy mainframe may only accept 200 TPS no matter how many callers you have.
-- **Cost control:** every request to an LLM API, SMS gateway or third-party geocoder costs money.
-- **Commercial tiers:** free plans get 100 requests/minute, enterprise gets 10,000.
+## 1. Why limit at all
 
-Two different questions hide here. *"Is this caller exceeding its allowance?"* is rate limiting (per key). *"Is the server itself overloaded right now?"* is load shedding (per resource). A healthy system needs both, because a thousand well-behaved callers can still overload you together.
+**Definition:** A rate limit is a rule like "at most 100 requests per minute per API key"; requests above it are rejected.
 
-## The five algorithms
-### Token bucket
-A bucket holds up to `b` tokens (burst capacity) and refills at `r` tokens per second. Each request removes one token (or `cost` tokens for expensive calls); if the bucket is empty, the request is rejected. You never run a timer: store `tokens` and `lastRefill`, and refill lazily on each request.
+Think of a nightclub bouncer: he does not care if the club is full right now, he only checks that each group is not pushing in too fast. Limits protect you from abuse (password guessing, scraping), stop one noisy tenant from starving others, protect fragile dependencies (a partner API that only accepts 200 calls per second), and control cost (every SMS or LLM call costs money).
 
+### The problem
+
+```text
+Tenant A script bug: 20,000 req/s  --\
+Tenant B normal:        300 req/s  ----> Order service (capacity 5,000 req/s)
+Tenant C normal:        200 req/s  --/
 ```
-elapsed = now - lastRefill
-tokens  = min(b, tokens + elapsed * r)
-if tokens >= cost: tokens -= cost; allow
-else: reject, retryAfter = (cost - tokens) / r
+
+The service saturates. Tenants B and C time out even though they did nothing wrong.
+
+### Better design
+
+```text
+Tenant A: 20,000 req/s -> limiter (1,000/s per tenant) -> 1,000 pass, 19,000 get 429
+Tenant B:    300 req/s -> limiter                      ->   300 pass
+Tenant C:    200 req/s -> limiter                      ->   200 pass
 ```
-Long-run throughput is bounded by `r`, while a caller that was idle can burst up to `b` instantly. That matches how real clients behave (a page load fires 20 calls, then nothing), which is why AWS API Gateway, Stripe and most gateways default to it.
 
-### Leaky bucket
-Requests enter a FIFO queue of size `b` that drains at a constant rate `r`. Output is perfectly smooth, which is ideal in front of a dependency that cannot tolerate bursts (a printer, a legacy system, an SMTP relay). The cost is latency: bursts wait in the queue, and when it is full they are dropped. "Leaky bucket as a meter" (without the queue) is mathematically equivalent to a token bucket; "leaky bucket as a queue" is the shaping variant. NGINX `limit_req` is a leaky bucket with an optional `burst` queue.
+Each tenant gets a fair slice, and the bug hurts only the tenant that caused it.
 
-### Fixed window counter
-Key `user:42:202610091405` (the current minute), `INCR`, set `EXPIRE 60`, reject if count > limit. One counter, one round trip, trivially cheap. The flaw is the **boundary burst**: with a limit of 100/min, a client can send 100 at 12:00:59 and 100 at 12:01:00, which is 200 requests in two seconds. In the worst case a fixed window admits **2x the limit** in any rolling window.
+**Trade-offs:**
+- Every request pays a small check cost (often a network hop to a shared store).
+- Limits set too low reject real customers.
 
-### Sliding window log
-Store the timestamp of every accepted request (a Redis sorted set with score = timestamp). On each request, remove entries older than `now - window`, count what remains, and admit if count < limit. It is exact, but memory is O(limit) per key: a limit of 10,000/hour across a million keys is ten billion entries. Use it only for low limits where precision matters, such as "5 login attempts per 15 minutes".
+**Key takeaway:** Rate limiting answers "is this caller sending too much?" It does not answer "is my server overloaded?" (that is load shedding, section 10).
 
-### Sliding window counter
-Keep the fixed-window counts for the current and previous windows and weight the previous one by how much of it still overlaps the rolling window:
+---
 
-```
-window = 60s, limit = 100
-now is 15s into the current minute -> overlap of previous window = (60 - 15) / 60 = 0.75
-estimate = prev_count * 0.75 + curr_count
-           = 80 * 0.75 + 30 = 90  -> allow (90 < 100)
-```
-It assumes requests in the previous window were evenly spread, so it is an approximation, but Cloudflare measured it at well under 1% error against real traffic while using only two counters per key. It is the best general-purpose trade-off when you want "100 per minute" semantics without boundary bursts.
+## 2. Token bucket
 
-### Comparison
-| Algorithm | Memory per key | Burst behaviour | Accuracy | Typical use |
-|---|---|---|---|---|
-| Token bucket | 2 numbers | Allows bursts up to `b` | Exact for its model | Public APIs, gateways (default choice) |
-| Leaky bucket (queue) | Queue of size `b` | Smooths bursts into constant rate | Exact | Shaping traffic to a fragile dependency |
-| Fixed window | 1 counter | Up to 2x at window edges | Poor at edges | Quotas, cheap coarse limits |
-| Sliding log | O(limit) timestamps | None | Exact | Low limits: logins, OTPs |
-| Sliding window counter | 2 counters | Very little | ~99% | High-volume per-user limits |
+**Definition:** A bucket holds up to `b` tokens and refills at `r` tokens per second; each request spends one token, and an empty bucket means reject.
 
-## A Java token bucket
-A lock-free, thread-safe single-node implementation. Note the use of `System.nanoTime()` (monotonic) rather than wall-clock time, so an NTP adjustment never mints or destroys tokens.
+It is like a prepaid travel card that is topped up automatically every second but can never hold more than a fixed amount. A caller who was idle can spend the stored tokens in a burst; over the long run they can never exceed `r`. You do not need a timer: store `tokens` and `lastRefill`, and top up lazily when a request arrives.
+
+### The problem
+
+A mobile app opens a screen that fires 20 API calls at once, then goes quiet for a minute. A strict "1 request every 100 ms" rule rejects most of them, and the screen breaks even though the average rate is tiny.
+
+### Better design
 
 ```java
-public final class TokenBucket {
-    private final long capacity;          // b
-    private final double refillPerNano;   // r per nanosecond
-    private final AtomicReference<State> state;
-
-    private record State(double tokens, long lastRefillNanos) {}
-
-    public TokenBucket(long capacity, double tokensPerSecond) {
-        this.capacity = capacity;
-        this.refillPerNano = tokensPerSecond / 1_000_000_000d;
-        this.state = new AtomicReference<>(new State(capacity, System.nanoTime()));
-    }
-
-    /** Returns 0 if allowed, otherwise the nanos to wait before retrying. */
-    public long tryAcquire(int cost) {
-        while (true) {
-            State cur = state.get();
-            long now = System.nanoTime();
-            double refilled = Math.min(capacity,
-                    cur.tokens() + (now - cur.lastRefillNanos()) * refillPerNano);
-            if (refilled < cost) {
-                return (long) Math.ceil((cost - refilled) / refillPerNano);
-            }
-            State next = new State(refilled - cost, now);
-            if (state.compareAndSet(cur, next)) return 0;
-            // lost the CAS race to another thread, retry with fresh state
-        }
-    }
+synchronized boolean tryAcquire() {
+    long now = System.nanoTime();                       // monotonic clock
+    double elapsedSec = (now - lastRefillNanos) / 1e9;
+    tokens = Math.min(capacity, tokens + elapsedSec * refillPerSec);
+    lastRefillNanos = now;
+    if (tokens < 1) return false;                       // reject
+    tokens -= 1;
+    return true;
 }
 ```
-For many keys, keep buckets in a Caffeine cache with `expireAfterAccess` so idle callers are evicted. In production you would usually use Bucket4j (supports local, Redis, Hazelcast and JCache backends) or Resilience4j `RateLimiter`, but interviewers like seeing that you know the lazy refill trick.
 
-## Distributed rate limiting
-With 50 gateway instances behind a load balancer, a per-instance bucket of 100/min actually allows 5,000/min. Counters must be shared, and the read-modify-write must be **atomic**, otherwise two instances read "99", both allow, and both write "100".
+With `capacity = 50` and `refillPerSec = 10`, the 20-call burst passes, and sustained traffic is held to 10 per second. Most API gateways (AWS API Gateway, Stripe's API, Spring Cloud Gateway's Redis limiter) use this model.
 
-### Redis + Lua (atomic token bucket)
-Redis executes a Lua script as a single atomic operation, so the refill-check-decrement sequence cannot interleave.
+**Trade-offs:**
+- Bursts of up to `b` reach the backend all at once, so the backend must tolerate them.
+
+**Key takeaway:** Token bucket is the default answer: two numbers per key, bursts allowed, average rate enforced.
+
+---
+
+## 3. Leaky bucket
+
+**Definition:** Requests enter a fixed-size queue that drains at a constant rate; when the queue is full, new requests are dropped.
+
+Picture a bucket with a small hole: water pours in unevenly but drips out steadily. The output is perfectly smooth, which suits a dependency that cannot handle bursts, such as an SMTP relay or a legacy mainframe.
+
+### The problem
+
+A notification service receives 5,000 password-reset emails in one second after a marketing campaign. The email provider allows 100 sends per second and blocks the account for an hour.
+
+### Better design
+
+```text
+5,000 emails -> [ queue, max 10,000 ] -> drain at 100/s -> email provider
+                 (full? drop or spill to Kafka)
+```
+
+The provider sees a steady 100 per second; the last email goes out after about 50 seconds.
+
+**Trade-offs:**
+- Bursts turn into waiting time (latency), not instant success.
+- A full queue still has to drop or spill somewhere.
+
+**Key takeaway:** Use a leaky bucket to *shape* traffic into a fragile dependency.
+
+### Token bucket vs. leaky bucket
+
+- **Token bucket** lets a burst through immediately, up to `b`; it limits the average.
+- **Leaky bucket (queue)** smooths a burst into a constant output rate; callers wait.
+- Pick token bucket for public APIs, leaky bucket in front of outbound dependencies.
+
+---
+
+## 4. Fixed window counter
+
+**Definition:** Count requests per caller in fixed clock windows (for example each calendar minute) and reject once the count passes the limit.
+
+It is the simplest possible limiter: one counter per key per window, which disappears when the window ends.
+
+### The problem
+
+```text
+Limit 100 per minute.
+12:00:59  -> 100 requests (window 12:00, count 100, allowed)
+12:01:00  -> 100 requests (window 12:01, count 100, allowed)
+= 200 requests inside 2 seconds
+```
+
+At the window boundary a caller can get **twice the limit** in a short burst.
+
+### Better design
+
+Keep fixed windows only where that edge burst is harmless, such as daily or monthly quotas ("5 million calls per month"). In Redis this is just `INCR rl:42:202610131405` followed by an `EXPIRE` of 60 seconds. For strict per-minute limits, move to a sliding window (sections 5 and 6).
+
+**Trade-offs:**
+- Cheapest option, but inaccurate at the edges.
+
+**Key takeaway:** Fixed windows are fine for coarse quotas; say "2x at the boundary" when you reject them for strict limits.
+
+---
+
+## 5. Sliding window log
+
+**Definition:** Store the timestamp of every accepted request and, on each new request, count only timestamps from the last window.
+
+It is exact: the rule "100 in any 60 seconds" is never broken. In Redis you use a sorted set with the timestamp as score: remove old entries with `ZREMRANGEBYSCORE`, count with `ZCARD`, then add.
+
+### The problem
+
+A login endpoint allows 5 attempts per 15 minutes. With a fixed window, an attacker can make 5 attempts at 12:14:59 and 5 more at 12:15:00, doubling their guesses.
+
+### Better design
+
+```text
+key: login:alice    sorted set of attempt timestamps
+new attempt at t:   drop entries < t - 15min, count remaining
+count < 5  -> allow and add t
+count >= 5 -> reject
+```
+
+No boundary trick works, because the window moves with every request.
+
+**Trade-offs:**
+- Memory is one entry per request. A limit of 10,000 per hour across a million users is up to ten billion entries.
+
+**Key takeaway:** Use the log only for small, security-sensitive limits such as logins and OTPs.
+
+---
+
+## 6. Sliding window counter
+
+**Definition:** Keep counts for the current and previous fixed windows and estimate the rolling count by weighting the previous window by how much of it still overlaps.
+
+It gives near-sliding accuracy at the cost of just two counters per key.
+
+### The problem
+
+You need "100 per minute" for millions of users. Fixed windows allow 2x bursts; a sliding log needs too much memory.
+
+### Better design
+
+```text
+Limit 100/min. Now is 15 s into the current minute.
+previous minute count = 80, current minute count = 30
+overlap of previous window = (60 - 15) / 60 = 0.75
+estimate = 80 * 0.75 + 30 = 90  -> 90 < 100, allow
+```
+
+It assumes the previous minute's requests were spread evenly, so it is an approximation. Cloudflare, which uses this approach at its edge, has reported that the error is very small on real traffic.
+
+| Algorithm | Memory per key | Bursts | Best use |
+|---|---|---|---|
+| Token bucket | 2 numbers | Up to `b` allowed | Public APIs (default) |
+| Leaky bucket | A queue | Smoothed | Outbound to fragile services |
+| Fixed window | 1 counter | Up to 2x at edges | Daily or monthly quotas |
+| Sliding log | 1 entry per request | None | Logins, OTPs |
+| Sliding counter | 2 counters | Very small | High-volume per-user limits |
+
+**Key takeaway:** Sliding window counter is the best "N per window" choice when you have many keys.
+
+---
+
+## 7. Distributed limiting with Redis and Lua
+
+**Definition:** All gateway instances share one counter per caller in a central store, and the read-update-write runs as a single atomic step.
+
+Redis runs a Lua script without interleaving other commands, so the whole "refill, check, spend" sequence is one atomic operation.
+
+### The problem
+
+```text
+50 gateway instances, each with a local limit of 100/min
+-> one caller spread across them can do 50 x 100 = 5,000/min
+
+Shared Redis, but non-atomic:
+gw-1: GET count -> 99        gw-2: GET count -> 99
+gw-1: SET count 100, allow   gw-2: SET count 100, allow   (101 allowed)
+```
+
+Local limits multiply by the number of instances, and a plain `GET` then `SET` races.
+
+### Better design
 
 ```lua
--- KEYS[1] = bucket key, ARGV: capacity, refill_per_sec, now_ms, cost
-local capacity = tonumber(ARGV[1])
-local rate     = tonumber(ARGV[2])
-local now      = tonumber(ARGV[3])
-local cost     = tonumber(ARGV[4])
-
-local data   = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
-local tokens = tonumber(data[1]) or capacity
-local ts     = tonumber(data[2]) or now
-
-tokens = math.min(capacity, tokens + (math.max(0, now - ts) / 1000.0) * rate)
+-- KEYS[1] = bucket key; ARGV = capacity, refill_per_sec, now_ms
+local cap, rate, now = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local d = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(d[1]) or cap
+local ts = tonumber(d[2]) or now
+tokens = math.min(cap, tokens + math.max(0, now - ts) / 1000 * rate)
 local allowed = 0
-local retry_ms = 0
-if tokens >= cost then
-  tokens = tokens - cost
-  allowed = 1
-else
-  retry_ms = math.ceil((cost - tokens) / rate * 1000)
-end
+if tokens >= 1 then tokens = tokens - 1; allowed = 1 end
 redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
-redis.call('PEXPIRE', KEYS[1], math.ceil(capacity / rate * 1000) + 1000)
-return { allowed, math.floor(tokens), retry_ms }
+redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate * 1000) + 1000)
+return allowed
 ```
-Design notes:
-- **Time source:** pass `now` from the caller, or better call `redis.call('TIME')` inside the script so all gateways share one clock (requires script effects replication, the default since Redis 5).
-- **Expiry:** the TTL equals the time to refill fully, so idle keys disappear on their own.
-- **Sharding:** Redis Cluster shards by key hash; one key per caller spreads load naturally. Use hash tags (`{tenant42}:user7`) only if you need several keys in one script.
-- **Latency:** one round trip (~0.3–1 ms in-region). Use `EVALSHA` to avoid re-sending the script.
-- **Sliding window counter in Redis:** two `INCR`ed keys (`rl:42:{minute}` and the previous minute) read in the same script.
 
-### Local + global hybrid
-A Redis call on every request can be too expensive at 1M RPS, and Redis becomes a single point of failure. Options:
-1. **Local pre-check:** each instance keeps a local bucket sized `limit / N` and only consults Redis when the local bucket is near empty. Accurate enough when traffic is evenly balanced.
-2. **Token leasing:** an instance takes a batch of tokens (say 50) from the global bucket in one call and spends them locally. Fewer round trips, slight over-admission if the instance dies with unused tokens.
-3. **Async sync:** count locally, push deltas to Redis every 100 ms, and read back the global total. Allows brief overshoot (bounded by sync interval × traffic), which is fine for fairness limits but not for hard billing limits.
-4. **Sticky routing:** consistent-hash callers to gateway instances so each key lives on one node; no shared state needed until a node fails.
+One round trip (about a millisecond in the same region), no race, and idle keys expire on their own. Use one key per caller so Redis Cluster spreads keys across shards. Spring Cloud Gateway's `RequestRateLimiter` filter runs a script very much like this one.
 
-### Failure policy
-Decide explicitly what happens when the limiter store is down:
-- **Fail open** (allow traffic) for user-facing APIs where availability matters more than precision. Fall back to a conservative local bucket so you are not completely unprotected.
-- **Fail closed** (reject) for limits that guard money or security: OTP sends, password attempts, paid third-party calls.
+**Trade-offs:**
+- Redis becomes a dependency on the hot path. Decide the failure policy: **fail open** (allow) for normal APIs, **fail closed** (reject) for money or security limits such as OTP sends.
+- At very high rates, add a local pre-check or lease tokens in batches (take 50 at a time), accepting slight overshoot.
 
-## Where to enforce
+**Key takeaway:** Shared store, one key per caller, atomic script, TTL for cleanup, and an explicit fail-open or fail-closed decision.
+
+---
+
+## 8. Where to enforce
+
+**Definition:** The enforcement point is the layer that checks the limit: client, edge (CDN or WAF), API gateway, service, or outbound client.
+
+Cheap, coarse limits belong early; precise, business-aware limits belong late. The *key* matters as much as the layer: IP for anonymous traffic, user ID after login, API key for developer platforms, tenant for B2B.
+
+### The problem
+
+A team limits only by IP address at the gateway. A whole office behind one NAT gateway gets throttled together, while a botnet with 10,000 IPs sails through.
+
+### Better design
+
+```text
+Client      -> backoff, debounce (advisory only, never trusted)
+CDN / WAF   -> per IP, bot score: cheap rejection far from origin
+API gateway -> per API key / user / route / plan tier
+Service     -> business rules: "3 password resets per hour per account"
+Outbound    -> partner quota: "SMS provider max 100 TPS"
 ```
-Client SDK ──> CDN / WAF ──> API Gateway ──> Service ──> Dependency client
- (backoff,     (per IP,       (per API key,    (per tenant,   (per downstream
-  local         geo, bot       user, route,     per endpoint,  quota, e.g.
-  throttle)     score)         plan tier)       concurrency)   Twilio 100 TPS)
-```
-| Layer | Good for | Limitations |
-|---|---|---|
-| Client | Good citizenship, smoothing retries | Untrusted; advisory only |
-| Edge / CDN / WAF | Volumetric attacks, per-IP limits, cheap rejection far from origin | Knows little about users or tenants |
-| API gateway | Per API key, user, route and plan; central config | Doesn't know the cost of each operation |
-| Service | Business-aware limits ("3 password resets per hour"), per-endpoint costs | Request already consumed some resources |
-| Outbound client | Respecting partners' quotas | Must queue or fail gracefully |
 
-Layer them: cheap coarse limits early, precise business limits late.
+Each layer uses the key it actually understands.
 
-### Choosing the key
-- **IP address:** for anonymous traffic and login endpoints; beware NAT (a whole office or mobile carrier behind one IP) and IPv6 (limit per /64 prefix, not per address).
-- **User ID:** after authentication; the fairest unit for consumer apps.
-- **API key / client ID:** for developer platforms; tied to a billing plan.
-- **Tenant / org:** for B2B SaaS, often combined with a per-user sub-limit so one script in a tenant can't consume the whole tenant allowance.
-- **Composite:** `(tenant, endpoint)` with different limits for `GET /search` (cheap) and `POST /reports` (expensive). Some systems use **cost-based** limits where each request deducts its weight (GitHub GraphQL "points").
+**Trade-offs:**
+- More layers mean more configuration to keep consistent.
 
-## The client contract
-```
+**Key takeaway:** Layer limits, and choose the key (IP, user, API key, tenant) that matches who you want to be fair to.
+
+---
+
+## 9. 429 and rate-limit headers
+
+**Definition:** HTTP `429 Too Many Requests` tells a caller it exceeded its allowance; headers tell it when to try again.
+
+A good response turns throttling into a conversation. The client learns its limit, what is left, and how long to wait.
+
+### The problem
+
+The server returns a bare `500` when limited. Clients treat it as a crash and retry immediately, all at the same moment, creating a retry storm that keeps them throttled.
+
+### Better design
+
+```http
 HTTP/1.1 429 Too Many Requests
 Retry-After: 12
 X-RateLimit-Limit: 100
@@ -169,233 +284,246 @@ X-RateLimit-Remaining: 0
 X-RateLimit-Reset: 1760012345
 Content-Type: application/problem+json
 
-{"type":"https://api.example.com/errors/rate-limited","title":"Rate limit exceeded",
- "detail":"100 requests per minute allowed on the Free plan"}
+{"title":"Rate limit exceeded","detail":"100 requests per minute on the Free plan"}
 ```
-- `429` is for "you, the caller, sent too much". `503 Service Unavailable` (with `Retry-After`) is for "the server is overloaded" (load shedding).
-- The IETF `RateLimit-Policy` / `RateLimit` headers standardise the `X-RateLimit-*` family; mention either.
-- Return remaining quota on *successful* responses too, so well-behaved clients can pace themselves.
-- Clients must retry with **exponential backoff plus jitter**, honouring `Retry-After`; otherwise every throttled client retries in lockstep and you get a thundering herd.
 
-## Quotas vs rate limits
-| | Rate limit | Quota |
-|---|---|---|
-| Window | Seconds to minutes | Day, month, billing cycle |
-| Purpose | Protect capacity, smooth bursts | Commercial entitlement, cost control |
-| Storage | Fast, ephemeral (Redis, in-memory) | Durable (DB), auditable, often reconciled for billing |
-| Exceeding | 429, retry shortly | 429/403 until reset or upgrade; notify the customer |
-| Accuracy | Approximate is fine | Should be exact or reconciled |
+The client waits 12 seconds, then retries with exponential backoff plus random jitter so clients do not retry in lockstep. Send the remaining-quota headers on successful responses too, so good clients can pace themselves. (An IETF draft standardises these as `RateLimit` headers.)
 
-A typical plan: "1,000 requests/minute burst limit and 5 million requests/month quota." Track the quota with counters aggregated from usage events (Kafka → aggregator → DB), not by hammering a DB row per request.
+**Key takeaway:** Always return 429 with `Retry-After`; clients must back off with jitter.
 
-## Load shedding and adaptive concurrency
-Rate limits are static numbers; overload is dynamic. A deploy, a slow database or a GC storm can drop capacity by half, and a fixed "1,000 RPS" limit no longer protects you.
+### 429 vs. 503
 
-### Concurrency limits beat rate limits for protection
-Little's Law: `in-flight = throughput × latency`. If latency doubles at constant throughput, in-flight work doubles, threads and connections run out and the service collapses. Limiting **concurrent in-flight requests** (a semaphore) adapts automatically: when latency rises, fewer requests fit.
+- **429:** *you* (this caller) sent too much. Other callers are fine.
+- **503 Service Unavailable:** the *server* is overloaded or down, for everyone. Used by load shedding.
+- Both can carry `Retry-After`.
 
-### Adaptive limits
-Netflix's `concurrency-limits` library applies TCP congestion-control ideas to services: start with a limit, increase it additively while latency stays near the observed minimum, and cut it multiplicatively (AIMD) or by gradient when latency grows. Envoy's adaptive concurrency filter and gRPC's similar mechanisms do the same. The service finds its own capacity without hand-tuned numbers.
+---
 
-### Prioritised shedding
-When you must drop, drop the least valuable traffic first:
-1. Classify requests by **criticality**: `CRITICAL` (checkout, login), `DEFAULT`, `SHEDDABLE` (prefetch, analytics beacons, recommendations).
-2. Under pressure, reject sheddable traffic at the edge with 503; keep critical traffic flowing.
-3. Prefer rejecting **new** work over abandoning work already in progress (which wastes the resources already spent).
-4. Drop requests whose **deadline has already passed** (propagated via a `grpc-timeout` or custom deadline header); the caller has given up, so serving them is pure waste.
-5. Use **LIFO queueing** or a short bounded queue under overload: with FIFO, every request waits behind stale ones and all of them time out.
+## 10. Load shedding
 
-Google's SRE practice combines these with client-side **adaptive throttling**: clients track their own accept ratio and probabilistically drop requests locally before sending, so an overloaded backend doesn't even have to spend CPU rejecting them.
+**Definition:** Load shedding means deliberately rejecting some work when the server itself is over capacity, so the rest can still succeed.
 
-### Back-pressure
-In asynchronous pipelines, the equivalent of shedding is back-pressure: bounded queues, Kafka consumer lag as a signal, reactive streams `request(n)`, and producers that slow down or spill to durable storage instead of growing memory without bound.
+Rate limits are fixed numbers, but capacity changes: a slow database or a bad deploy can halve it. A hospital emergency room does triage: when overwhelmed, it treats the critical cases first and asks others to wait.
 
-## Spring example: gateway limiting
-Spring Cloud Gateway ships a Redis token bucket filter that runs a Lua script like the one above:
+### The problem
 
-```yaml
-spring:
-  cloud:
-    gateway:
-      routes:
-        - id: orders
-          uri: lb://order-service
-          predicates: [ Path=/api/orders/** ]
-          filters:
-            - name: RequestRateLimiter
-              args:
-                redis-rate-limiter.replenishRate: 50     # r tokens/sec
-                redis-rate-limiter.burstCapacity: 100    # b
-                redis-rate-limiter.requestedTokens: 1
-                key-resolver: "#{@apiKeyResolver}"
+```text
+Normal:   1,000 req/s x  50 ms latency =  50 requests in flight
+DB slows: 1,000 req/s x 500 ms latency = 500 requests in flight
+Thread pool size = 200  -> queue grows, every request times out
 ```
+
+This is Little's Law: in-flight work equals throughput times latency. When latency rises, the server collapses even though the request rate never changed.
+
+### Better design
+
 ```java
-@Bean
-KeyResolver apiKeyResolver() {
-    return exchange -> Mono.justOrEmpty(
-            exchange.getRequest().getHeaders().getFirst("X-API-Key"))
-        .switchIfEmpty(Mono.just(
-            exchange.getRequest().getRemoteAddress().getAddress().getHostAddress()));
+private final Semaphore inFlight = new Semaphore(150);
+
+public Response handle(Request req) {
+    if (!inFlight.tryAcquire()) {
+        return Response.status(503).header("Retry-After", "2").build();
+    }
+    try { return process(req); }
+    finally { inFlight.release(); }
 }
 ```
-Inside a service, Resilience4j provides `@RateLimiter(name = "partnerApi")` for outbound calls and `@Bulkhead` for concurrency caps.
 
-## Real-world systems
-- **Stripe:** token bucket per account, plus concurrent-request limiters and a load shedder that reserves capacity for critical requests (charges over list calls).
-- **GitHub:** 5,000 REST requests/hour per token; GraphQL uses a point-cost model; secondary limits on concurrency and content creation.
-- **Cloudflare:** sliding window counter at the edge across hundreds of PoPs, with counts kept per data centre.
-- **AWS API Gateway:** token bucket with account-level and per-method throttles plus usage-plan quotas.
-- **Envoy:** local rate limit filter per proxy and a global rate limit service (gRPC, Redis-backed) for shared limits.
+A concurrency limit adapts automatically: when latency rises, fewer requests fit, and the extra ones fail fast instead of piling up. Go further by shedding by priority (drop analytics and recommendations before checkout and login), dropping requests whose deadline has already passed, and using adaptive limits (Netflix's concurrency-limits library, Envoy's adaptive concurrency filter) that raise or lower the cap based on observed latency.
 
-## How it shows up in interview problems
-- **Design a rate limiter:** the whole chapter. Requirements (per user/IP/key, rules config, low latency, distributed), token bucket or sliding window counter in Redis via Lua, rules service with cached config, 429 headers, fail-open policy, hybrid local+global for scale.
-- **API gateway:** per-key limits by plan, quotas from usage events, concurrency limits per backend.
-- **URL shortener:** per-IP limits on creation to stop spam; reads are CDN-cached and barely limited.
-- **Notification system:** outbound limits per provider (APNs, Twilio, SES) and per user ("max 3 marketing pushes per day"), with a leaky-bucket queue shaping sends.
-- **Payments:** idempotency plus strict fail-closed limits on card attempts to block card testing.
-- **BookMyShow / flash sales / seat reservation:** a virtual waiting room (queue with admission rate) is load shedding applied to humans.
-- **Chat:** per-user message rate to fight spam; per-connection limits on the WebSocket gateway.
-- **Search / autocomplete:** debounce on the client, per-user limits at the gateway, and shedding of low-priority suggestions under load.
-- **LLM/AI platforms:** token-based (not request-based) limits per tenant, using cost-weighted buckets.
+**Trade-offs:**
+- Some users get an error by design; you must decide which ones.
+- Priority classes need to be tagged on requests up front.
 
-## Common pitfalls
-- Non-atomic `GET` then `SET` in Redis, which allows races between instances.
-- Using wall-clock time from every gateway, so skew changes the refill rate; use Redis `TIME` or monotonic local clocks.
-- Fixed windows for strict limits (2x boundary burst).
-- Limiting only per IP, which punishes NATed users and is trivially bypassed by botnets.
-- Forgetting the failure mode when Redis is unreachable.
-- Clients retrying immediately without jitter, turning a 429 into a storm.
-- Static rate limits as the only overload protection; capacity changes, so add concurrency limits and shedding.
-- Hot keys: one huge tenant's bucket on a single Redis shard; split with local leasing.
+**Key takeaway:** Limit concurrency, not just rate, and shed the least valuable work first with a fast 503.
 
-## Interview questions
-1. **Token bucket vs sliding window counter: which and why?** Token bucket when bursts are acceptable and you want smooth average rate (most APIs); sliding window counter when you want "N per window" semantics with no boundary bursts. Both cost two numbers per key.
-2. **Why does a fixed window allow 2x the limit?** A client can use the full limit at the end of one window and again at the start of the next, all within a short interval spanning the boundary.
-3. **How do you make a distributed limiter atomic?** Run the read-refill-decrement in a single Redis Lua script (or use `INCR` semantics for counters), keyed per caller, with TTLs for cleanup.
-4. **Redis adds 1 ms per request and is a SPOF. What now?** Local buckets with token leasing or periodic sync to a global store, accepting bounded overshoot; fail open with a conservative local fallback.
-5. **What's the difference between 429 and 503?** 429: this caller exceeded its allowance. 503: the service is overloaded or unavailable regardless of caller. Both can carry `Retry-After`.
-6. **How do you protect a service whose capacity varies?** Concurrency limits (Little's Law), adaptive limits that react to latency, deadline-aware dropping and priority-based shedding.
-7. **Rate limit vs quota?** Rate limits are short-window capacity protection stored ephemerally; quotas are long-window entitlements stored durably and reconciled for billing.
-8. **How would you rate-limit login attempts?** Per username and per IP (and per device fingerprint), sliding log with small limits, fail closed, exponential lockout, CAPTCHA after a threshold.
+---
 
-## Cheat sheet
-- Token bucket (r, b): lazy refill, bursts allowed; default for APIs.
-- Leaky bucket: constant output rate; shape traffic into fragile dependencies.
-- Fixed window: cheap, 2x edge burst. Sliding log: exact, O(limit) memory. Sliding counter: `prev × overlap + curr`, ~99% accurate.
-- Distributed: Redis + Lua, one key per caller, TTL = time to refill, Redis `TIME`.
-- Scale: local + global (leases, async sync, sticky routing); decide fail open vs closed.
-- Enforce in layers: edge (IP), gateway (key/plan), service (business), outbound (partner quotas).
-- Contract: 429 + Retry-After + RateLimit headers; clients back off with jitter.
-- Overload: concurrency limits, adaptive AIMD, shed by priority, drop expired deadlines, 503.
+## In an HLD interview
+
+- **Rate Limiter:** token bucket or sliding window counter in Redis via a Lua script, rules cached from a config service, 429 with headers, fail-open policy, local pre-check for very high scale.
+- **API Gateway:** per-API-key limits by plan tier, monthly quotas counted from usage events, concurrency limits per backend.
+- **Notification System:** leaky-bucket queues per provider (APNs, email, SMS) and per-user caps ("max 3 marketing pushes a day").
+- **BookMyShow / flash sales / Payment System:** a virtual waiting room is load shedding for humans; card attempts are limited fail-closed to stop card testing.
+- **What to say:** "I'll use a token bucket per API key in Redis with an atomic Lua script, return 429 with Retry-After, and add a concurrency limit so the service sheds load with 503 if a dependency slows down."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
+|---|---|---|
+| Why limit | Fairness, abuse, cost, fragile dependencies | Who could overwhelm this system? |
+| Token bucket | Refill rate `r`, burst `b` | Are short bursts acceptable? |
+| Leaky bucket | Constant output rate | Does the downstream need smooth traffic? |
+| Fixed window | One counter per window | Is a 2x edge burst harmless here? |
+| Sliding log | Exact, one entry per request | Is the limit small and security-critical? |
+| Sliding counter | Weighted previous + current | Do I need "N per minute" for millions of keys? |
+| Redis + Lua | Atomic shared counter | What happens when Redis is down? |
+| Where to enforce | Coarse early, precise late | Which key matches the fairness I want? |
+| 429 + headers | Tell clients when to retry | Will clients back off with jitter? |
+| Load shedding | Drop work when overloaded | What do I drop first? |
+
+## Final memory aid
+
+- **Token bucket:** default for APIs, bursts allowed
+- **Leaky bucket:** smooth traffic into fragile dependencies
+- **Fixed window:** cheap, 2x at the boundary
+- **Sliding log:** exact, memory heavy
+- **Sliding counter:** `prev x overlap + curr`
+- **Distributed:** Redis + Lua, TTL, fail open or closed
+- **Contract:** 429 + Retry-After; 503 for overload
+- **Shedding:** concurrency limits and priorities
 
 === hld-probabilistic-ids | HLD | Unique IDs and probabilistic data structures ===
-Almost every design needs globally unique identifiers, and many need to answer "have I seen this?", "how many distinct?" or "what is most frequent?" over enormous streams. The first problem is solved by ID schemes that avoid a central bottleneck, such as Snowflake and UUIDv7; the second by probabilistic structures that trade a small, quantifiable error for orders of magnitude less memory. This chapter covers both with the math you need to size them in an interview.
+Almost every design needs unique IDs, and many need to answer "have I seen this?", "how many distinct?" or "how often?" over huge streams. The first problem is solved by ID schemes that avoid a central bottleneck, such as Snowflake and UUIDv7; the second by probabilistic structures that accept a small, known error in exchange for tiny memory. This chapter explains each option, what breaks without it, and when to use it.
 
-## What we want from an ID
-- **Uniqueness** across all nodes, regions and time, without coordination on every ID.
-- **Sortability:** roughly time-ordered IDs keep B-tree inserts at the right edge (no page splits), make "latest N" queries cheap and allow cursor pagination by ID.
-- **Compactness:** 64-bit integers fit in a `BIGINT`, index well and are cheap to compare; 128-bit is acceptable; 36-character strings are wasteful.
-- **Opacity:** sequential IDs leak business volume ("order 10,452 today, 10,980 tomorrow") and invite enumeration attacks (`/invoices/1001`, `/invoices/1002`).
-- **Availability:** generating an ID should never require a network hop to a single server.
+## 1. Database auto-increment
 
-## The options
-### Database auto-increment
-Simple and dense, but the database becomes a bottleneck and single point of failure for writes, IDs are guessable, and sharding breaks it. Multi-master workarounds (`auto_increment_increment = 2`, offset 1 and 2) let two servers interleave odd and even IDs but make adding a third server painful. Fine for a single-database system; say so and move on.
+**Definition:** The database assigns the next integer (1, 2, 3...) to each new row.
 
-### Ticket servers and range allocation
-A central service (Flickr's ticket server used a MySQL `REPLACE INTO` trick) or a DB row hands out **blocks** of IDs: a node asks for 1,000 at a time (`UPDATE seq SET next = next + 1000 RETURNING next`) and serves them from memory. One network call per thousand IDs, dense integers, and the allocator can be made HA with two servers handing out disjoint ranges. Restarted nodes waste their unused block, which is harmless. This is the natural choice for URL shorteners that want short, dense codes.
+It is simple, compact (a 64-bit `BIGINT`) and naturally ordered. For a single-database system it is the right answer, so say so and move on.
 
-### UUID v4 vs v7
-| | UUIDv4 | UUIDv7 |
-|---|---|---|
-| Layout | 122 random bits | 48-bit Unix ms timestamp + 74 random bits (+ version/variant) |
-| Ordering | Random | Time-ordered (k-sortable) |
-| Index impact | Random inserts across the B-tree: page splits, poor cache locality, write amplification | Appends at the right edge, like auto-increment |
-| Coordination | None | None |
-| Leaks | Nothing | Creation time (millisecond) |
-| Collision odds | Need ~2^61 IDs for a 50% chance | Per millisecond, 74 random bits; effectively never |
+### The problem
 
-UUIDv7 (RFC 9562, 2024) is the modern default when 128 bits are acceptable: no coordination, sortable, and supported natively in PostgreSQL 18 (`uuidv7()`) and in libraries such as `java-uuid-generator`. ULID is the earlier equivalent with a Crockford base32 text form. Store UUIDs as `uuid`/`BINARY(16)`, never as `VARCHAR(36)`.
-
-### Snowflake (64-bit, time-ordered)
-Twitter's Snowflake packs an ID into a signed 64-bit long:
-
+```text
+Shard A: orders 1, 2, 3 ...
+Shard B: orders 1, 2, 3 ...   <- duplicates once you shard
+Public URL: /invoices/1001 -> try /invoices/1002 (enumeration)
 ```
- 0 | 41 bits: ms since custom epoch | 10 bits: worker ID | 12 bits: sequence
- ^sign  (~69.7 years of range)        (1024 workers)       (4096 IDs/ms/worker)
-```
-- 41 bits of milliseconds = 2^41 ms ≈ 69.7 years from your custom epoch (pick a recent epoch like 2024-01-01 to maximise range).
-- 10 bits of worker ID = 1,024 generators; often split into 5 bits datacenter + 5 bits machine.
-- 12 bits of sequence = 4,096 IDs per millisecond per worker, so about 4 million IDs/sec per worker.
-- IDs are **k-sorted**: ordered by time across workers to within clock skew, and strictly increasing per worker.
 
-Variants: Instagram uses 41 bits time + 13 bits logical shard ID + 10 bits per-shard sequence generated inside PostgreSQL; Discord and Mastodon use Snowflake-like IDs; Sonyflake uses 10 ms units and a 16-bit machine ID for longer life and more machines.
+Once you shard, each database counts on its own and IDs collide. Sequential IDs also leak business volume and invite people to guess other records.
+
+### Better design
+
+Keep auto-increment for internal tables in one database. For sharded or public-facing data, generate IDs outside the database with a scheme from the next sections. Never rely on "the ID is unguessable" as your only security; always check ownership too.
+
+**Trade-offs:**
+- Every insert depends on one database; it does not shard.
+
+**Key takeaway:** Auto-increment is fine until you have more than one writer or the IDs are visible to users.
+
+---
+
+## 2. UUID v4 vs. v7
+
+**Definition:** A UUID is a 128-bit ID that any server can generate without coordination; v4 is fully random, v7 starts with a timestamp.
+
+UUIDv4 has 122 random bits, so collisions are practically impossible (you would need around 2^61 IDs for a 50% chance). UUIDv7 (RFC 9562, 2024) puts a 48-bit millisecond Unix timestamp first and fills the rest with random bits, so new IDs sort after old ones.
+
+### The problem
+
+```text
+Primary key = UUIDv4 (random) in a B-tree index
+insert 3f9a... -> lands in the middle of the tree
+insert a07c... -> lands somewhere else
+-> page splits, poor cache use, bigger index, slower writes
+```
+
+Random keys scatter inserts across the whole index. In MySQL InnoDB, where rows are physically stored in primary-key order, this hurts badly.
+
+### Better design
+
+```text
+UUIDv7 = [ 48-bit ms timestamp ][ version ][ random ... ]
+019a1c2e-7b10-7xxx-...   <- each new ID is larger than the last (roughly)
+-> inserts append at the right edge of the index, like auto-increment
+```
+
+You keep coordination-free generation and gain ordering. PostgreSQL 18 has a built-in `uuidv7()`, and Java libraries such as `java-uuid-generator` support it. Store UUIDs as `uuid` or `BINARY(16)`, never `VARCHAR(36)`.
+
+**Trade-offs:**
+- 128 bits is twice the size of a `BIGINT`.
+- UUIDv7 reveals the creation time to the millisecond.
+
+**Key takeaway:** UUIDv7 is the modern default when 128 bits is acceptable; avoid UUIDv4 as a clustered primary key.
+
+---
+
+## 3. Ticket server (range allocation)
+
+**Definition:** A central allocator hands out *blocks* of numbers (say 1,000 at a time), and each app server spends its block from memory.
+
+It is like a bank giving each cashier a roll of numbered tickets rather than asking head office for every ticket. One network call per thousand IDs, and the IDs stay dense and short.
+
+### The problem
+
+A URL shortener calls a central counter on every create. At 10,000 creates per second the counter database is the bottleneck and a single point of failure.
+
+### Better design
+
+```sql
+-- each app server grabs a range when its current block runs out
+UPDATE id_ranges SET next_start = next_start + 1000
+WHERE name = 'short_url'
+RETURNING next_start - 1000 AS block_start;   -- serve block_start .. +999 locally
+```
+
+10,000 creates per second become 10 allocator calls per second. If a server restarts, its unused numbers are wasted, which is harmless. Flickr ran a ticket server for years on the same idea.
+
+**Trade-offs:**
+- IDs are only roughly time-ordered across servers.
+- The allocator still needs high availability (for example two allocators handing out disjoint ranges).
+
+**Key takeaway:** Range allocation gives dense, short numbers at scale; ideal for short codes.
+
+---
+
+## 4. Snowflake
+
+**Definition:** Snowflake is Twitter's 64-bit ID that packs a timestamp, a worker ID and a per-millisecond sequence into one `long`.
+
+Every worker generates IDs locally, so there is no network call, and IDs sort roughly by time.
+
+### The problem
+
+A chat service needs 64-bit, time-ordered message IDs from hundreds of servers. UUIDs are too big for its `BIGINT` columns, and a central counter is too slow.
+
+### Better design
+
+```text
+| 1 bit | 41 bits                      | 10 bits    | 12 bits     |
+| sign  | ms since custom epoch        | worker ID  | sequence    |
+          2^41 ms ~ 69.7 years           1,024        4,096 per ms per worker
+```
 
 ```java
-public final class SnowflakeIdGenerator {
-    private static final long EPOCH = 1704067200000L; // 2024-01-01T00:00:00Z
-    private static final int WORKER_BITS = 10, SEQ_BITS = 12;
-    private static final long MAX_WORKER = (1L << WORKER_BITS) - 1;
-    private static final long SEQ_MASK = (1L << SEQ_BITS) - 1;
-    private static final long MAX_BACKWARD_MS = 5;
-
-    private final long workerId;
-    private long lastMs = -1L;
-    private long sequence = 0L;
-
-    public SnowflakeIdGenerator(long workerId) {
-        if (workerId < 0 || workerId > MAX_WORKER) throw new IllegalArgumentException("workerId");
-        this.workerId = workerId;
-    }
-
-    public synchronized long nextId() {
-        long now = System.currentTimeMillis();
-        if (now < lastMs) {                         // clock moved backwards
-            long drift = lastMs - now;
-            if (drift > MAX_BACKWARD_MS) {
-                throw new IllegalStateException("Clock moved back " + drift + " ms; refusing");
-            }
-            now = waitUntil(lastMs);                // small skew: wait it out
-        }
-        if (now == lastMs) {
-            sequence = (sequence + 1) & SEQ_MASK;
-            if (sequence == 0) now = waitUntil(lastMs + 1); // 4096 used this ms
-        } else {
-            sequence = 0;
-        }
-        lastMs = now;
-        return ((now - EPOCH) << (WORKER_BITS + SEQ_BITS))
-             | (workerId << SEQ_BITS)
-             | sequence;
-    }
-
-    private long waitUntil(long targetMs) {
-        long t = System.currentTimeMillis();
-        while (t < targetMs) { Thread.onSpinWait(); t = System.currentTimeMillis(); }
-        return t;
-    }
-}
+long id = ((nowMs - EPOCH) << 22) | (workerId << 12) | sequence;
 ```
 
-### Clock skew and worker IDs
-- **Clock going backwards** (NTP step, VM migration, leap-second smearing done badly) can produce duplicates. Strategies: wait if the drift is small; refuse and alert if large; or keep the "last timestamp" logical and keep incrementing from it (a hybrid logical clock style), accepting IDs that run slightly ahead of real time. Configure NTP/chrony to **slew** rather than step.
-- **Persist the last timestamp** periodically so a restart after a clock reset can detect it.
-- **Worker ID assignment** must be unique among live generators: static config, a ZooKeeper/etcd ephemeral sequential node, a Kubernetes StatefulSet ordinal, or a lease in Redis/DB with TTL. Two processes with the same worker ID will generate duplicates silently, which is the most common real failure.
+Each worker can produce 4,096 IDs per millisecond (about 4 million per second). `ORDER BY id DESC` replaces a timestamp index for "latest messages", and IDs double as pagination cursors. Instagram and Discord use similar layouts.
 
-### Comparison
-| Scheme | Size | Sortable | Coordination | Notes |
-|---|---|---|---|---|
-| Auto-increment | 64 bit | Yes, dense | Every insert | Single DB only; guessable |
-| Range allocation | 64 bit | Mostly | Once per block | Dense; great for short codes |
-| UUIDv4 | 128 bit | No | None | Index fragmentation |
-| UUIDv7 / ULID | 128 bit | Yes (ms) | None | Modern default when 128 bits is fine |
-| Snowflake | 64 bit | Yes (k-sorted) | Worker ID assignment | Clock-skew sensitive; fits BIGINT |
+**Trade-offs:**
+- **Clock going backwards** (NTP step, VM migration) can create duplicates. Wait out small drifts, refuse and alert on large ones.
+- **Worker IDs must be unique** among live generators (assign via ZooKeeper/etcd, a Kubernetes StatefulSet ordinal, or a leased row). Two pods with the same worker ID silently create duplicates; this is the most common real failure.
 
-## Short codes: base62 and URL shorteners
-Base62 (`0-9a-zA-Z`) packs about 5.95 bits per character: 62^6 ≈ 56.8 billion codes, 62^7 ≈ 3.5 trillion. Seven characters cover any realistic shortener.
+**Key takeaway:** Snowflake gives compact, sortable, coordination-free IDs; guard the clock and the worker ID.
+
+### Snowflake vs. UUIDv7
+
+- **Snowflake:** 64 bits, fits `BIGINT`, needs worker ID assignment.
+- **UUIDv7:** 128 bits, needs no setup at all.
+- Both are time-ordered and index-friendly.
+
+---
+
+## 5. Base62 short codes
+
+**Definition:** Base62 writes a number using the 62 characters `0-9a-zA-Z`, which keeps codes short and URL-safe.
+
+Seven base62 characters give 62^7, about 3.5 trillion codes; six give about 56.8 billion. That covers any realistic URL shortener.
+
+### The problem
+
+```text
+Snowflake ID 1849203381722013696 in base62 -> 11 characters (too long)
+Sequential counter 1000, 1001, 1002 -> codes "g8", "g9", "ga" (guessable)
+```
+
+Big IDs make long codes, and plain counters let anyone walk through every short link.
+
+### Better design
 
 ```java
-private static final char[] ALPHABET =
+static final char[] ALPHABET =
     "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".toCharArray();
 
 static String toBase62(long n) {
@@ -405,123 +533,134 @@ static String toBase62(long n) {
     return sb.reverse().toString();
 }
 ```
-Two strategies:
-| | Counter / range + base62 | Hash + handle collisions |
+
+Take a dense number from a range allocator, scramble it with a reversible shuffle (for example a small Feistel cipher) so codes are not sequential, then encode in base62. The alternative is to hash the long URL, take 7 base62 characters, and retry with a salt if the unique constraint reports a collision.
+
+**Trade-offs:**
+- Counter approach: no collisions, but the same URL gets different codes unless you add a lookup.
+- Hash approach: the same URL gives the same code, but collisions grow as the table fills.
+
+**Key takeaway:** Range allocator + scramble + base62 gives 7-character, collision-free, non-guessable codes.
+
+---
+
+## 6. Bloom filter
+
+**Definition:** A Bloom filter is a bit array plus `k` hash functions that answers "is X in the set?" with either "definitely not" or "probably yes".
+
+To add X, set the `k` bits its hashes point to. To check X, look at those bits: any 0 means definitely absent; all 1s means probably present. There are no false negatives, only false positives, and you cannot delete.
+
+### The problem
+
+A cache sits in front of a database. Attackers request millions of product IDs that do not exist. Every request misses the cache and hits the database (this is called **cache penetration**).
+
+### Better design
+
+```text
+request id -> Bloom filter of all real product IDs
+  "definitely not" -> return 404 immediately (no DB call)
+  "probably yes"   -> cache -> DB as normal (about 1% of fakes slip through)
+```
+
+Sizing: about 9.6 bits per item and 7 hash functions give a 1% false-positive rate. One billion items need about 1.2 GB, far less than storing the keys themselves. Cassandra and RocksDB keep a Bloom filter per data file so reads skip files that cannot contain a key; web crawlers use one for "already seen this URL".
+
+**Trade-offs:**
+- False positives grow sharply once you insert more items than you sized for.
+- No deletes (a counting Bloom filter or a cuckoo filter supports them, at more memory).
+
+**Key takeaway:** Bloom filter = cheap "definitely not here" check in front of something expensive.
+
+---
+
+## 7. HyperLogLog
+
+**Definition:** HyperLogLog (HLL) estimates how many *distinct* items a stream contains, in a fixed few kilobytes of memory.
+
+The intuition: hash every item; a hash that starts with many zero bits is rare, so the longest run of leading zeros hints at how many distinct items you have seen. HLL keeps many such registers and averages them to reduce noise.
+
+### The problem
+
+"Unique viewers per video per day" for hundreds of millions of videos. An exact set of 8-byte user IDs for one popular video can be hundreds of megabytes, per video, per day.
+
+### Better design
+
+```text
+PFADD viewers:vid42:2026-10-13 user_8812     # Redis HyperLogLog
+PFCOUNT viewers:vid42:2026-10-13             # ~0.81% standard error
+PFMERGE viewers:vid42:week d1 d2 d3 ...      # weekly uniques, no re-scan
+```
+
+Redis uses 16,384 registers in about 12 KB per key, with a standard error of about 0.81%, whether you count a thousand items or a billion. HLLs merge by taking the maximum of each register, so per-shard or per-day counts combine cheaply.
+
+**Trade-offs:**
+- It is an estimate; never use it where you need an exact count, such as "one free trial per user".
+
+**Key takeaway:** HyperLogLog = distinct counts in 12 KB with under 1% error, and it merges.
+
+---
+
+## 8. Count-Min Sketch
+
+**Definition:** A Count-Min Sketch estimates how often each item appears, using a small grid of counters with one hash function per row.
+
+To add X, increment one counter per row. To read X, take the *minimum* across rows. Collisions only ever add, so the minimum is the least-polluted guess: it may overestimate, never underestimate.
+
+### The problem
+
+"Top 10 trending hashtags in the last hour" over billions of events. A counter per hashtag means millions of keys in memory, most of them seen once.
+
+### Better design
+
+```text
+width w = ceil(e / eps), depth d = ceil(ln(1 / delta))
+eps = 0.001, delta = 0.01  ->  w = 2,719, d = 5  (~13,600 counters, ~54 KB)
+estimate <= true count + eps * N   with probability 1 - delta
+
+per event: update sketch; if estimate beats the smallest in a top-K min-heap, push it
+```
+
+Keep one sketch per minute and sum the last 60 for "this hour". It is accurate for heavy hitters and meaningless for rare items.
+
+| Structure | Question | Memory | Error |
+|---|---|---|---|
+| Bloom filter | Is X in the set? | ~10 bits per item for 1% | False positives only |
+| HyperLogLog | How many distinct? | ~12 KB fixed | ~0.8% |
+| Count-Min Sketch | How often did X occur? | `w x d` counters | Overestimates only |
+
+**Trade-offs:**
+- Approximate counts are not acceptable for billing; reconcile with an exact batch job.
+
+**Key takeaway:** Count-Min Sketch + heap = top-K in fixed memory. Always state the exact solution first, then the approximation and its error.
+
+---
+
+## In an HLD interview
+
+- **URL Shortener:** range allocator + scramble + base62 (7 characters), or hash with collision retry; a Bloom filter for "custom alias taken?".
+- **Chat/WhatsApp, News Feed:** Snowflake IDs give time order, so `ORDER BY id` and ID cursors replace timestamp indexes.
+- **Distributed Cache:** a Bloom filter in front of the database to stop cache penetration.
+- **YouTube, Metrics, Logging/Monitoring:** HyperLogLog for unique viewers or users; Count-Min Sketch + heap for trending items, reconciled by a batch job.
+- **What to say:** "I'll use UUIDv7 or Snowflake so IDs are generated without coordination and stay index-friendly; for unique counts I'd use HyperLogLog and accept under 1% error, since exact sets would cost hundreds of megabytes."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
 |---|---|---|
-| How | Unique number (range allocator or Snowflake) encoded in base62 | `base62(first 43 bits of SHA-256(longUrl + salt))`, insert with unique constraint, retry with new salt on collision |
-| Collisions | Impossible | Probability grows with fill (birthday bound) |
-| Same URL → same code | No (unless you add a lookup) | Yes, naturally deduplicates |
-| Predictability | Sequential codes are enumerable; scramble with a bijective shuffle (e.g. multiply by an odd constant mod 2^n, or Feistel cipher) | Unpredictable |
-| Length | Grows slowly with count | Fixed |
-A Snowflake ID in base62 is 11 characters, too long for a "short" URL, so shorteners usually use range allocation for dense counters.
+| Auto-increment | DB hands out the next integer | Is there only one writer and are IDs private? |
+| UUID v4 vs v7 | Random vs time-first 128-bit | Will random keys hurt my index? |
+| Ticket server | Hand out blocks of numbers | Do I need dense, short numbers? |
+| Snowflake | Time + worker + sequence in 64 bits | Who assigns worker IDs, and what if the clock jumps? |
+| Base62 | 62 characters per digit | How many characters, and are codes guessable? |
+| Bloom filter | "Definitely not" or "maybe" | What expensive lookup can I skip? |
+| HyperLogLog | Distinct count in 12 KB | Is ~1% error acceptable? |
+| Count-Min Sketch | Frequency, overestimates only | Am I tracking heavy hitters, not rare items? |
 
-## Probabilistic data structures
-These answer questions about huge sets or streams in fixed, small memory, with bounded error. Always state the exact solution first, then the probabilistic one and its error.
+## Final memory aid
 
-### Bloom filter (membership)
-A bit array of `m` bits and `k` independent hash functions. Insert: set the `k` bits at `h_i(x) mod m`. Query: if any of those bits is 0, the element is **definitely not** present; if all are 1, it is **probably** present. No false negatives, tunable false positives, no deletes.
-
-**Math** (n elements inserted):
-```
-False positive rate      p ≈ (1 - e^(-k·n/m))^k
-Optimal hash count       k = (m/n) · ln 2  ≈ 0.693 · m/n
-Bits needed for target p m = -n · ln(p) / (ln 2)^2  ≈ 1.44 · n · log2(1/p)
-```
-| Target p | Bits per element (m/n) | Optimal k |
-|---|---|---|
-| 10% | 4.8 | 3 |
-| 1% | 9.6 | 7 |
-| 0.1% | 14.4 | 10 |
-| 0.01% | 19.2 | 13 |
-
-Example: 1 billion URLs at 1% false positives needs about 9.6 Gbit ≈ 1.2 GB, compared with ~50+ GB to store the URLs themselves. Each extra 4.8 bits per element divides the error by ten. In practice, use double hashing (`h_i = h1 + i·h2`) from one 128-bit Murmur3 hash rather than k separate hash functions. Guava provides `BloomFilter.create(Funnels.stringFunnel(UTF_8), 1_000_000_000L, 0.01)`; Redis has `BF.ADD`/`BF.EXISTS` in Redis Stack.
-
-Bloom filters fill up: past the designed `n`, the error rate climbs sharply. Scalable Bloom filters chain new, larger filters as you grow.
-
-### Counting Bloom filter and cuckoo filter
-- **Counting Bloom filter:** replace each bit with a 4-bit counter; insert increments, delete decrements. Supports deletion at 4x memory, and counters can overflow.
-- **Cuckoo filter:** stores short fingerprints (8–16 bits) in a cuckoo hash table with two candidate buckets per item. Supports deletion, has better lookup locality (two memory accesses), and uses less space than a Bloom filter for false positive rates below ~3%. Inserts can fail when the table is ~95% full, and deleting an item never inserted can remove someone else's fingerprint.
-
-### HyperLogLog (count distinct)
-Hash each element; the number of leading zeros in the hash is a clue to cardinality (seeing a hash starting with 20 zeros suggests roughly 2^20 distinct values). HLL splits hashes into `m = 2^p` registers by their first `p` bits and keeps the maximum leading-zero run per register, then combines them with a harmonic mean and bias correction.
-- Standard error ≈ **1.04 / √m**. With p = 14 (16,384 registers of 6 bits ≈ 12 KB), error ≈ 0.81%.
-- Memory is fixed regardless of whether you count a thousand or a trillion distinct items.
-- **Mergeable:** the union of two HLLs is the register-wise max. Count daily uniques per shard, then merge for weekly and monthly uniques without re-reading data. (Intersections are not directly supported; inclusion-exclusion is noisy.)
-- Redis: `PFADD visitors:2026-10-09 user42`, `PFCOUNT`, `PFMERGE`. BigQuery `APPROX_COUNT_DISTINCT`, Presto/Trino `approx_distinct`, Druid and ClickHouse all use HLL variants.
-
-Exact alternative for comparison: a set of 100 million 8-byte user IDs is ~800 MB per day per metric; HLL is 12 KB.
-
-### Count-Min Sketch (frequency)
-A 2-D array of counters with `d` rows and `w` columns, one hash per row. Increment: add 1 at `(i, h_i(x))` for each row. Estimate: take the **minimum** across rows (collisions only add, so the min is the least-polluted estimate).
-```
-w = ceil(e / ε)      d = ceil(ln(1/δ))
-estimate ≤ true + ε·N   with probability 1 - δ   (N = total count)
-```
-Example: ε = 0.001 and δ = 0.01 gives w = 2,719 and d = 5, about 13,600 counters (~54 KB with 32-bit counters) to track frequencies over any number of distinct keys. It **overestimates, never underestimates**, and is accurate for heavy hitters but meaningless for rare items (their true count is smaller than the error bound). Conservative update (only increment the rows that are at the current minimum) reduces overestimation.
-
-### Top-K heavy hitters
-- **Count-Min Sketch + min-heap of size K:** for each item, update the sketch, read its estimate, and push it into the heap if it beats the heap minimum. Memory: sketch + K entries.
-- **Space-Saving / Misra-Gries:** keep exactly K counters; when a new item arrives and all counters are taken, replace the smallest and inherit its count + 1. Deterministic error bounds and very simple; used in many stream processors.
-- **Time windows:** keep one sketch per minute and sum the last 60 for "trending in the last hour", or use exponentially decaying counts.
-- **Distributed:** compute local top-K per partition (by key hash, so each key lives on one partition) and merge; or do a two-stage aggregation (approximate fast path, exact batch path later, the classic Lambda architecture for "top songs today").
-- Redis Stack: `TOPK.ADD`, `TOPK.LIST` (HeavyKeeper algorithm), `CMS.INCRBY`.
-
-### Comparison
-| Structure | Question | Memory | Error | Deletes | Mergeable |
-|---|---|---|---|---|---|
-| Bloom filter | Is x in the set? | ~10 bits/item for 1% | False positives only | No | Yes (bitwise OR, same params) |
-| Counting Bloom | Same, with removal | ~4x Bloom | False positives | Yes | Yes |
-| Cuckoo filter | Same, with removal | Less than Bloom below 3% FP | False positives | Yes | No |
-| HyperLogLog | How many distinct? | ~12 KB fixed | ~0.8% std error | No | Yes (register max) |
-| Count-Min Sketch | How often did x occur? | `w × d` counters | Overestimates by ≤ εN | Possible with care | Yes (cell-wise sum) |
-| Space-Saving | Top-K items | K counters | Bounded overcount | No | Approximately |
-
-## Real-world systems
-- **Cassandra, HBase, RocksDB, LevelDB:** a Bloom filter per SSTable so reads skip files that cannot contain the key.
-- **Chrome Safe Browsing (historically):** a local Bloom-style prefix set of malicious URLs, confirming hits with the server.
-- **Medium / feed systems:** Bloom filters of articles a user has already seen to avoid re-recommending them.
-- **CDNs (Akamai):** a Bloom filter to cache an object only on its second request ("one-hit wonders" never pollute the cache).
-- **Redis HyperLogLog** for unique visitors; **Google BigQuery / Druid** HLL++ for approximate distinct counts.
-- **Twitter / X trends and network monitoring:** sketches for heavy hitters and top talkers.
-- **Twitter Snowflake, Instagram, Discord:** 64-bit time-ordered IDs; **PostgreSQL 18, MongoDB ObjectId:** time-prefixed IDs.
-
-## How it shows up in interview problems
-- **URL shortener:** range allocator or counter + base62 (7 chars), or hash + collision retry; Bloom filter to check "custom alias taken?" before hitting the DB; scramble codes to stop enumeration.
-- **Chat / news feed / tweets:** Snowflake IDs give time ordering, so `ORDER BY id DESC` replaces a timestamp index and IDs work as pagination cursors.
-- **Distributed cache:** Bloom filter in front of the DB to stop **cache penetration** (repeated lookups of keys that don't exist).
-- **Web crawler:** Bloom filter of seen URLs (billions) to avoid recrawling.
-- **Metrics, analytics, tracking (ad clicks, YouTube views):** HLL for unique viewers per video per day; Count-Min Sketch for click counts per ad in real time, reconciled by a batch job.
-- **Top-K (trending hashtags, top songs, heavy hitters in logs):** sketch + heap per window, merge across partitions.
-- **Payments / e-commerce orders:** UUIDv7 or Snowflake order IDs created client- or service-side, doubling as idempotency keys.
-- **Rate limiter / security:** Count-Min Sketch to detect abusive IPs among millions without a counter per IP.
-- **Recommendation / notification:** Bloom filter of "already notified" or "already shown" per user.
-
-## Common pitfalls
-- Using UUIDv4 as a clustered primary key in MySQL InnoDB, causing random inserts and bloated indexes.
-- Duplicate Snowflake worker IDs after autoscaling; no lease or registry.
-- Ignoring clock rollback, especially on VMs and containers.
-- Exposing sequential IDs in public URLs (enumeration and business-volume leaks).
-- Sizing a Bloom filter for today's data and silently exceeding `n` next year.
-- Trying to delete from a standard Bloom filter.
-- Using a Count-Min Sketch for rare items, or presenting approximate counts where money is involved (billing must be exact).
-- Forgetting HLL counts are estimates; never use them for "exactly one free trial per user".
-
-## Interview questions
-1. **Why not UUIDv4 as the primary key?** Random values scatter inserts across the B-tree, causing page splits, poor cache locality and larger indexes; UUIDv7 or Snowflake keeps inserts append-only.
-2. **Explain the Snowflake bit layout and its limits.** 1 sign + 41 ms timestamp (~69 years) + 10 worker (1,024 generators) + 12 sequence (4,096/ms/worker); limits are clock skew, worker ID uniqueness and epoch exhaustion.
-3. **How do you handle clocks moving backwards?** Wait out small drifts, refuse and alert on large ones, persist the last timestamp, slew NTP instead of stepping, or use a logical timestamp that never decreases.
-4. **How many characters for a short URL?** Base62: 62^7 ≈ 3.5 trillion, so 7 characters covers 100 billion URLs with room to spare.
-5. **Size a Bloom filter for 100 million items at 1% FP.** About 9.6 bits/item ≈ 960 Mbit ≈ 120 MB, with k = 7 hash functions.
-6. **Count unique daily visitors across 50 servers?** HyperLogLog per server per day (12 KB each), merge with register-wise max; ~0.8% error. Exact would need a distributed set.
-7. **Find the top 10 trending hashtags in the last hour.** Partition by hashtag, Count-Min Sketch + min-heap (or Space-Saving) per minute bucket, sum the last 60 buckets, merge per-partition top-K.
-8. **Why can't a Bloom filter return false negatives?** A queried element's bits were all set when it was inserted and bits are never cleared, so all k bits are always 1 for inserted items.
-
-## Cheat sheet
-- Want sortable, compact, coordination-free: Snowflake (64-bit) or UUIDv7 (128-bit). Never UUIDv4 as a clustered key.
-- Snowflake: 41 time | 10 worker | 12 seq; 4,096 IDs/ms/worker; guard clock rollback and worker ID uniqueness.
-- Dense short codes: range allocator + base62; 7 chars ≈ 3.5T. Hash approach needs collision retry.
-- Bloom: `m ≈ 1.44·n·log2(1/p)`, `k = 0.693·m/n`; ~10 bits/item for 1%; no false negatives, no deletes.
-- Deletes needed: counting Bloom (4x) or cuckoo filter.
-- HLL: count distinct in 12 KB, error 1.04/√m, mergeable.
-- Count-Min: frequencies, `w = e/ε`, `d = ln(1/δ)`, overestimates only. Top-K: CMS + heap or Space-Saving.
-- Always say the exact solution first, then the approximation and its error.
+- **Single DB:** auto-increment is fine
+- **No coordination, 128 bits:** UUIDv7, never v4 as a clustered key
+- **64 bits, sortable:** Snowflake (41 time, 10 worker, 12 sequence)
+- **Short codes:** range blocks + base62, 7 chars ~ 3.5 trillion
+- **Membership:** Bloom filter, ~10 bits per item for 1%
+- **Distinct count:** HyperLogLog, 12 KB, ~0.8%
+- **Frequency / top-K:** Count-Min Sketch + heap

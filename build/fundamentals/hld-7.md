@@ -1,477 +1,635 @@
 === hld-cap | HLD | CAP, PACELC and consistency models ===
-"Is it consistent?" is meaningless until you say *which* consistency. CAP tells you what a replicated system must give up when the network partitions; PACELC adds the trade-off that applies the rest of the time, latency versus consistency; and consistency models (linearizable, sequential, causal, session guarantees, eventual) describe exactly what a reader may observe. This chapter states each precisely, separates consistency from transaction isolation, and shows how to choose per feature rather than per system.
+"Is it consistent?" means nothing until you say which kind of consistency you mean. CAP tells you what a replicated system gives up when the network splits, PACELC adds the latency cost you pay the rest of the time, and consistency models describe exactly what a reader is allowed to see. This chapter explains each one simply and then shows how to pick per feature, not per system.
 
-## CAP, stated precisely
-The CAP theorem (conjectured by Eric Brewer in 2000, proved by Gilbert and Lynch in 2002) concerns a system that replicates a single read/write register across nodes:
+## 1. CAP, stated precisely
 
-- **C, consistency:** specifically **linearizability**. Every read returns the value of the most recent completed write, as if there were a single copy.
-- **A, availability:** every request received by a **non-failing node** must eventually receive a non-error response. Not "99.99% uptime"; it means any live node must answer.
-- **P, partition tolerance:** the system keeps operating even though the network may drop or delay arbitrarily many messages between nodes.
+**Definition:** When the network between replicas breaks, a replicated system must choose between answering every request (availability) and always returning the latest value (consistency).
 
-**The theorem:** when a network partition occurs, a system must choose between C and A. If nodes on both sides keep answering (A), a write on one side cannot be seen on the other, so reads are stale (not C). If the system refuses to answer on at least one side until the partition heals (C), those nodes are unavailable (not A).
+CAP was conjectured by Eric Brewer in 2000 and proved by Gilbert and Lynch in 2002. The three letters have narrow meanings. **C** is linearizability: every read sees the most recent completed write, as if there were one copy. **A** means every request that reaches a non-failing node gets a non-error answer. **P** is a network partition: messages between nodes are lost or delayed. Think of two bank branches whose phone line is cut: either both keep serving customers and may disagree, or one branch stops serving until the line is back.
 
-### What CAP does and does not say
-- Partitions are not optional in a distributed system; networks do fail. So "CA" is not a real choice for a multi-node system. The real choice is **CP or AP during a partition**.
-- When there is no partition, a system can be both consistent and available. CAP says nothing about normal operation.
-- The C in CAP is not the C in ACID (which means application invariants hold).
-- It is a statement about one specific consistency model and one strict definition of availability. Many real systems are neither CAP-consistent nor CAP-available (for example, a single-leader database with async replicas, read from replicas: stale reads and the leader is a single point for writes).
-- Systems are often configurable per operation, so labelling a whole product "CP" or "AP" is a simplification.
+### The problem
 
-### A partition, concretely
-```
-   Region US                    X  network partition  X                 Region EU
- [ replica 1 ] [ replica 2 ]  <------ messages lost ------>  [ replica 3 ]
- Client A: write balance=50 lands on US side.   Client B reads from EU replica 3.
-
- CP choice: replica 3 cannot reach a majority, so it rejects or times out B's read.
- AP choice: replica 3 answers with the old balance=100; the two sides reconcile later.
+```text
+  US side                X  link down  X           EU side
+ [replica 1][replica 2]  <-- no messages -->  [replica 3]
+ Client A writes balance=50 on US side.
+ Client B reads balance from replica 3.
 ```
 
-## PACELC
-Daniel Abadi's extension (2010): **if Partition, choose Availability or Consistency; Else, choose Latency or Consistency.**
+Replica 3 cannot know about the new write. If it answers, B sees the old balance of 100. If it refuses, B gets an error.
 
-The "else" half is the one you live with every day: keeping replicas strongly consistent requires coordination (waiting for a quorum, possibly across regions) on every write, and often on reads, which costs latency even when nothing is broken.
+### Better design
 
-| System (typical configuration) | P: A or C | E: L or C | Notes |
-|---|---|---|---|
-| Cassandra, ScyllaDB, Riak | PA | EL | Tunable; `QUORUM` moves toward C at a latency cost |
-| DynamoDB | PA | EL | Eventually consistent reads by default; strongly consistent reads optional (leader read, single region) |
-| MongoDB (majority writes and reads) | PC-ish | EC | Defaults vary by version; read preference secondary makes it EL |
-| Spanner, CockroachDB, YugabyteDB | PC | EC | Consensus per range; minority side unavailable |
-| ZooKeeper, etcd, Consul | PC | EC | Built for coordination; writes need a majority |
-| HBase / Bigtable | PC | EC | Single owner per region/tablet |
-| Redis primary + async replicas | Neither cleanly | EL | Failover can lose acknowledged writes |
-| Azure Cosmos DB | Tunable | Tunable | Five levels: strong, bounded staleness, session, consistent prefix, eventual |
-
-## Consistency models
-A consistency model is a contract: which values may a read return given the history of writes. From strongest to weakest:
-
-### Linearizability (atomic consistency)
-Every operation appears to take effect instantaneously at some point between its invocation and its response, and all clients agree on that order, which respects real time. Once any read sees a new value, every later read (by anyone) sees it or something newer.
-
-- Needed for: leader election, locks, unique constraints ("username taken"), compare-and-set, inventory or seat allocation, bank balances with overdraft checks.
-- Cost: coordination on every operation (consensus or a single leader), latency proportional to round trips between replicas, and unavailability on the minority side of a partition.
-- Implemented by: Raft/Paxos-replicated stores (etcd, ZooKeeper writes, Spanner, CockroachDB), a single leader with synchronous reads from the leader.
-
-A classic violation: Alice's phone shows the match result "final score 2–1" from an up-to-date replica; Bob, standing next to her, refreshes and gets "match in progress" from a lagging replica, *after* Alice's read completed. Each replica is internally fine, but there is no single-copy illusion.
-
-### Sequential consistency
-All clients see operations in the same total order, and each client's operations appear in its program order, but that order need not match real time across clients. Weaker than linearizable: a read can be "behind" as long as everyone agrees on the sequence. Mostly discussed for CPU memory models; ZooKeeper offers it for reads served by followers (with `sync()` to catch up).
-
-### Causal consistency
-Operations that are causally related (A happened before and could have influenced B: a reply to a post, a write after reading a value) are seen by everyone in that order. Concurrent, unrelated operations may be seen in different orders by different clients.
-
-- It is the strongest model that remains available during partitions (no coordination on the critical path), which makes it attractive for geo-replicated apps.
-- Implemented with dependency tracking: version vectors, Lamport or hybrid logical clocks, or "write after you have seen X" tokens. MongoDB causally consistent sessions, COPS/Eiger research systems, and many CRDT-based systems.
-
-### Session guarantees (client-centric)
-Weaker, per-client guarantees, often all a product needs:
-| Guarantee | Promise | Typical implementation |
-|---|---|---|
-| **Read-your-writes** | You always see your own writes | Read from leader after a write, or from replicas past your write's log position |
-| **Monotonic reads** | You never see older data after newer data | Sticky replica, or "min version" token |
-| **Monotonic writes** | Your writes apply in the order you issued them | Single session order, sequence numbers |
-| **Writes-follow-reads** | A write made after reading X is ordered after X | Carry the read version into the write |
-| **Consistent prefix** | You see writes in an order that is a valid prefix of history | Same partition for related writes |
-
-Cosmos DB's default "session" consistency packages these, using a session token returned on each write.
-
-### Bounded staleness
-Reads may lag, but by no more than K versions or T seconds. Useful for dashboards and leaderboards. Cosmos DB offers it; you can approximate it with replica lag monitoring that removes replicas lagging more than T from rotation.
-
-### Eventual consistency
-If writes stop, all replicas eventually converge to the same value. No promise about what you read in the meantime: stale, out of order, even values going backwards. Cheap, fast, highly available. Usually combined with a conflict-resolution rule (LWW, CRDT merge) so "eventually the same" is well defined.
-
-### Hierarchy
-```
-strict serializability  (serializable transactions + linearizable real-time order; Spanner, CockroachDB*)
-        |                          \
-linearizability                serializability (transactions; no real-time guarantee)
-        |
-sequential consistency
-        |
-causal consistency     <- strongest model available under partition
-        |
-session guarantees (read-your-writes, monotonic reads/writes, writes-follow-reads)
-        |
-eventual consistency
-* CockroachDB provides serializable isolation with real-time guarantees except in rare clock-skew edge cases.
+```text
+ CP choice: replica 3 cannot reach a majority, so it rejects B's read.
+            Correct, but EU users see errors until the link heals.
+ AP choice: replica 3 answers 100 now; both sides reconcile later.
+            Always answers, but B sees stale data for a while.
 ```
 
-## Consistency vs isolation
-Two different questions that interviewers like to see separated:
+Neither choice is wrong. The point is to make it on purpose, per operation, instead of discovering it during an outage.
 
-| | Consistency models (distributed systems) | Isolation levels (databases, the I in ACID) |
-|---|---|---|
-| About | Recency and ordering of operations on replicated objects | How concurrent **transactions** over multiple objects interfere |
-| Strongest | Linearizability | Serializability |
-| Anomalies | Stale reads, reads going backwards, out-of-order causality | Dirty reads, non-repeatable reads, lost updates, write skew, phantoms |
-| Example | "After my write returns, every reader sees it" | "Two transactions behave as if run one after the other" |
+**Trade-offs:**
+- CP: errors or timeouts on the minority side during a partition.
+- AP: stale reads and possible conflicting writes that must be merged later.
 
-They are orthogonal: a single-node Postgres at serializable is serializable but you can still read stale data from its async replica; a linearizable key-value store gives no multi-key transactions. **Strict serializability** combines both, and is what Spanner calls "external consistency". And the C in ACID is a third thing: the application's invariants are preserved, which the database helps with through constraints and the other three letters.
+### What CAP does not say
+- "CA" is not a real option for a multi-node system: partitions happen, so the real choice is CP or AP during a partition.
+- With no partition, a system can be both consistent and available. CAP is silent about normal operation.
+- The C in CAP is not the C in ACID (which means your business rules hold after a transaction).
+- Many real systems are neither strictly CP nor strictly AP, and many let you choose per request.
 
-## Tunable consistency
-Leaderless stores let you pick per request:
+**Key takeaway: CAP is only about the moment of a partition: refuse to answer (CP) or answer with possibly stale data (AP).**
 
-```java
-// DataStax Java driver 4.x: choose consistency per statement
-SimpleStatement write = SimpleStatement.newInstance(
-        "UPDATE inventory SET reserved = reserved + 1 WHERE sku = ?", sku)
-    .setConsistencyLevel(DefaultConsistencyLevel.LOCAL_QUORUM);
+---
 
-SimpleStatement readFeed = SimpleStatement.newInstance(
-        "SELECT * FROM timeline WHERE user_id = ? LIMIT 50", userId)
-    .setConsistencyLevel(DefaultConsistencyLevel.LOCAL_ONE);    // fast, may be stale
+## 2. PACELC
+
+**Definition:** If there is a Partition, choose Availability or Consistency; Else, choose Latency or Consistency.
+
+Daniel Abadi proposed PACELC (2010) because partitions are rare, but the latency cost of consistency is paid on every request. To give a strongly consistent answer, a write must wait for other replicas, often in other zones or regions. To be fast, you answer from the nearest copy and accept that it may be a little behind.
+
+### The problem
+
+```text
+ Leader in Mumbai, replicas in Singapore and Frankfurt.
+ Synchronous write to a majority:  ~60-150 ms (cross-region round trip)
+ Read from the leader only:        every EU user pays ~120 ms
 ```
 
-```java
-// DynamoDB SDK v2: eventually consistent by default, strong on demand
-GetItemRequest req = GetItemRequest.builder()
-    .tableName("accounts").key(Map.of("id", AttributeValue.fromS(id)))
-    .consistentRead(true)       // reads from the partition leader; costs 2x read units
-    .build();
+A team picks "strong consistency everywhere" and the product page becomes slow for every user, even though no partition is happening.
+
+### Better design
+
+```text
+ Write path:  wait for a majority (PC/EC) for orders and payments.
+ Read path:   product descriptions read from the local replica (EL),
+              allowed to be a few seconds behind.
 ```
 
-Rules of thumb with N = 3: `QUORUM` writes and reads (W + R > N) give read-after-write for a single key under normal operation (still not strictly linearizable with LWW and concurrent writers); `ONE`/`ONE` is fastest and eventually consistent; `LOCAL_QUORUM` keeps latency inside one region while remote regions converge asynchronously; `EACH_QUORUM` or `ALL` costs cross-region latency. For true compare-and-set, Cassandra offers lightweight transactions (`IF NOT EXISTS`, Paxos under the hood, about 4 round trips).
+Fast paths and safe paths now live side by side, chosen by what each piece of data needs.
 
-## Choosing per feature
-Decide consistency **per data item and operation**, not per system. Ask: what is the cost of a stale or conflicting read, and what does strong consistency cost in latency and availability?
+Typical labels: Cassandra and DynamoDB (default settings) are PA/EL; Spanner and etcd are PC/EC. Treat these as defaults, not laws, since most systems are tunable.
 
-| Feature | Model | Why |
-|---|---|---|
-| Seat booking, inventory decrement, flash-sale stock | Linearizable / serializable (single leader, conditional write, consensus) | Overselling costs money and trust |
-| Payments, ledger, account balance | Strict serializability or single-leader ACID + idempotency | Correctness and audit |
-| Username / email uniqueness | Linearizable (unique constraint, conditional put) | Two users cannot both win |
-| Distributed lock, leader election | Linearizable (etcd/ZooKeeper) + fencing | Mutual exclusion |
-| Likes, view counts | Eventual (CRDT counter or async aggregation) | Off by a few for a few seconds is fine |
-| News feed, recommendations | Eventual | Freshness of seconds is acceptable |
-| User's own profile edits, posts, cart | Read-your-writes / session | The author must see their change |
-| Chat messages in a conversation | Causal / per-conversation ordering | Replies must follow the messages they answer |
-| Shopping cart (Dynamo-style) | Eventual with merge (union) | Availability to add items beats exactness |
-| Analytics dashboards | Bounded staleness | Minutes of lag acceptable |
-| Configuration / feature flags | Linearizable writes, cached eventual reads | Writes rare; reads must be fast |
+**Key takeaway: Partitions are rare, but the latency cost of consistency is paid on every request; PACELC makes you price it.**
 
-A strong interview answer sounds like: "Inventory reservation goes through a single-leader shard with a conditional update (`UPDATE ... SET stock = stock - 1 WHERE sku = ? AND stock > 0`), which is CP: if the shard's leader is unreachable we show 'try again' rather than oversell. Product reviews and ratings are AP and eventually consistent."
+---
 
-## Examples of CP and AP systems
-- **CP:** ZooKeeper, etcd, Consul (KV), Spanner, CockroachDB, YugabyteDB, TiDB, HBase, MongoDB with majority read/write concerns, Kafka with `acks=all`, `min.insync.replicas=2` and unclean leader election disabled (refuses writes rather than losing data).
-- **AP:** Cassandra and ScyllaDB at `ONE`, Riak, DynamoDB eventually consistent reads and global tables, CouchDB, DNS, CDN caches, Eureka service registry (prefers availability, self-preservation mode).
-- **Neither cleanly:** Redis Sentinel/Cluster with async replication (may lose acknowledged writes, and minority-side masters keep accepting writes briefly until node timeout), typical primary plus async read replicas.
+## 3. Strong consistency (linearizability)
 
-## How it shows up in interview problems
-- **BookMyShow / seat reservation:** CP for seat holds (conditional write or `SELECT ... FOR UPDATE` with a TTL hold), AP for browsing showtimes.
-- **E-commerce:** CP for stock and payment, AP for catalog, reviews, recommendations; read-your-writes for cart and orders.
-- **Payments:** strongly consistent ledger, idempotency keys, outbox to emit events; reconciliation jobs as a safety net.
-- **Chat:** causal ordering within a conversation (server sequence numbers); eventual for presence and typing indicators.
-- **News feed / social:** eventual for feeds and counters; read-your-writes so the author sees their own post.
-- **Distributed cache:** usually AP; explain stale-read tolerance and TTLs.
-- **Rate limiter:** approximate (AP) counters are usually acceptable; a few extra requests during a partition is better than blocking all traffic.
-- **Job scheduler:** linearizable lease or lock (etcd/ZooKeeper) so a job is not run twice, plus idempotent jobs anyway.
-- **Multi-region (Netflix, Uber):** local-region strong consistency, cross-region async; pin a user's writes to a home region.
+**Definition:** The system behaves as if there is a single copy of the data, and every operation takes effect at one instant between its start and its end.
 
-## Common pitfalls
-- Saying "we choose CA". For a distributed system, partitions happen; the choice is what happens during one.
-- Using "consistency" without naming the model; or confusing it with ACID consistency or isolation.
-- Assuming quorum reads and writes give linearizability.
-- Making everything strongly consistent "to be safe", adding cross-region latency to features that do not need it.
-- Making everything eventual, then discovering overselling or duplicate usernames.
-- Forgetting read-your-writes; users perceive lost updates even when nothing is lost.
-- Reading from followers in ZooKeeper/etcd and assuming the result is current (use `sync()` or linearizable reads).
+Once a write completes, every later read, from any client, on any node, sees it (or something newer). This is what people usually mean by "strongly consistent". It needs coordination: a single leader with a consensus protocol, or carefully designed quorum reads and writes.
 
-## Interview questions
-1. **State CAP precisely.** In a system that replicates data, when a network partition happens you must choose between linearizable consistency and availability (every live node answers). Without a partition you can have both; CAP says nothing about latency.
-2. **What does PACELC add?** Even without partitions, there is a trade-off between latency and consistency, because strong consistency requires synchronous coordination between replicas on each operation.
-3. **Linearizability vs serializability?** Linearizability is a recency guarantee on single objects in real time; serializability is an isolation guarantee that concurrent multi-object transactions are equivalent to some serial order, not necessarily real-time order. Strict serializability is both.
-4. **Which consistency model is the strongest that stays available during a partition?** Causal consistency (with session guarantees).
-5. **How would you choose consistency for likes vs inventory?** Likes: eventual, CRDT or aggregated counters, cheap and available. Inventory: linearizable conditional decrement on a single-leader or consensus-backed store, rejecting rather than overselling during partitions.
-6. **Is Cassandra AP or CP?** Configurable per request. At `ONE` it is AP/EL. At `QUORUM` it offers read-after-write for a key in normal operation but is not linearizable; lightweight transactions give linearizable compare-and-set at higher latency.
-7. **A user posts a comment, refreshes, and it is missing. Which guarantee is violated and how do you fix it?** Read-your-writes. Route the author's subsequent reads to the leader or to replicas caught up to their write's version, or overlay the user's recent writes client-side.
-8. **What is the difference between availability in CAP and in an SLA?** CAP availability requires every non-failing node to answer every request; SLA availability is the fraction of successful requests over time. A CP system can still have 99.99% SLA availability.
+### The problem
 
-## Cheat sheet
-- CAP: during a partition choose linearizability or availability; "CA" is not an option for distributed systems.
-- PACELC: else, choose latency or consistency.
-- Models: linearizable > sequential > causal > session (RYW, monotonic reads/writes, writes-follow-reads) > eventual; bounded staleness in between.
-- Causal = strongest available under partition.
-- Isolation (transactions) is separate from consistency (replicas); strict serializability = both; ACID C = invariants.
-- Tunable: W + R > N for read-after-write, not linearizability; LWT/conditional writes for CAS.
-- Choose per feature: money, stock, uniqueness, locks = strong; counters, feeds, recommendations = eventual; user's own data = read-your-writes; chat = causal.
-
-=== hld-consensus | HLD | Consensus, leader election and coordination ===
-Consensus is how a group of machines agrees on a value, such as who the leader is or what the next log entry is, even when some machines crash and messages are delayed. It underpins leader election, distributed locks, configuration stores and every strongly consistent replicated database. This chapter explains why consensus is hard (FLP), walks through Raft in detail, sketches Paxos, shows how ZooKeeper and etcd are used for elections, locks with fencing tokens, discovery and configuration, explains Redlock's caveats and leases, and covers clocks: physical, logical, vector, hybrid logical and TrueTime.
-
-## Why consensus
-Many problems reduce to "all nodes must agree on one thing, once, and never change their minds":
-- **Leader election:** exactly one leader per term, or two leaders corrupt data (split brain).
-- **Atomic commit:** all participants commit or all abort.
-- **Replicated state machines:** every replica applies the same commands in the same order, so they end in the same state. This is how etcd, ZooKeeper, Spanner, CockroachDB, Kafka KRaft and Consul replicate.
-- **Uniqueness and locks:** only one client gets the username, the lock, the seat.
-
-Properties a consensus protocol must provide:
-- **Agreement:** no two nodes decide differently.
-- **Validity:** the decided value was proposed by someone.
-- **Integrity:** a node decides at most once.
-- **Termination:** every non-faulty node eventually decides.
-
-Practical protocols tolerate **crash failures** (nodes stop) with `2f + 1` nodes surviving `f` failures, because any two majorities overlap. A 3-node cluster tolerates 1 failure, 5 tolerates 2. Byzantine (malicious or arbitrary) failures need `3f + 1` nodes and protocols like PBFT or Tendermint; ordinary data-centre systems do not pay that cost.
-
-## FLP: the intuition
-Fischer, Lynch and Paterson (1985) proved that in a fully **asynchronous** system (no bounds on message delay or processing time), no deterministic algorithm can guarantee consensus terminates if even one process may crash. The reason: you cannot distinguish a crashed node from a slow one, so there is always some execution where the protocol waits forever or decides unsafely.
-
-Real systems escape FLP by assuming **partial synchrony**: the network is usually timely, and timeouts are used to suspect failures. Raft and Paxos are designed so that **safety** (never two different decisions) holds always, regardless of timing, while **liveness** (making progress) holds only when the network behaves well enough for a leader to be elected and stay in contact. That is the right trade: a stuck cluster is an outage, but a cluster that decides two things is corruption.
-
-## Raft in detail
-Raft (Ongaro and Ousterhout, 2014) was designed to be understandable. It splits consensus into leader election, log replication and safety.
-
-### Roles and terms
-- Each node is a **follower**, **candidate** or **leader**.
-- Time is divided into **terms**, numbered with increasing integers. Each term begins with an election; at most one leader per term.
-- Every message carries the sender's term. A node that sees a higher term updates its own term and steps down to follower. A message with a stale term is rejected. Terms act as a logical clock and as fencing.
-
-```
-term 1         term 2           term 3             term 4
-[elect|normal ][elect|normal...][elect|(split vote)][elect|normal ...]
-   leader A       leader B          no leader          leader C
+```text
+ t=0  Alice: SET stock=0 on leader        -> OK
+ t=1  Bob:   GET stock from async replica -> 1   (replica still behind)
+ t=2  Bob buys the "last" item that no longer exists.
 ```
 
-### Leader election
-1. Followers expect periodic **heartbeats** (empty AppendEntries) from the leader.
-2. If a follower hears nothing for its **election timeout** (randomised, e.g. 150–300 ms, so nodes rarely time out simultaneously), it becomes a candidate: increments its term, votes for itself and sends `RequestVote(term, candidateId, lastLogIndex, lastLogTerm)` to all.
-3. A node grants its vote if (a) it has not voted for anyone else in this term, and (b) the candidate's log is **at least as up to date** as its own (compare last entry's term, then index). This is the **election restriction**.
-4. A candidate that receives votes from a **majority** becomes leader and immediately sends heartbeats.
-5. If it receives a message from a leader with a term at least as high, it steps down. If the vote splits, the timeout fires again and a new term starts; randomisation makes repeated splits unlikely.
+The replica answered with a value that was already overwritten. Bob's order is accepted for an item that is sold out.
 
-### Log replication
-Clients send commands to the leader. The leader appends the command to its log as an entry `(term, index, command)` and sends `AppendEntries(term, prevLogIndex, prevLogTerm, entries[], leaderCommit)` to followers.
-
-```
-index:      1    2    3    4    5    6
-leader:    [1x] [1y] [2z] [3a] [3b] [3c]      commitIndex = 5 (on a majority)
-follower1: [1x] [1y] [2z] [3a] [3b]           matchIndex = 5
-follower2: [1x] [1y] [2z] [3a] [3b] [3c]      matchIndex = 6
-follower3: [1x] [1y] [2q]                     conflicting entry at 3
-follower4: [1x]                               lagging
-(entry shown as [term + command])
-```
-
-- **Consistency check:** a follower accepts entries only if its log contains an entry at `prevLogIndex` with term `prevLogTerm`. Otherwise it rejects, and the leader decrements `nextIndex` for that follower and retries, walking back until logs match. The follower then deletes any conflicting entries after that point and appends the leader's. (Follower 3 above loses `[2q]`, which was never committed.)
-- This induction gives the **Log Matching property:** if two logs contain an entry with the same index and term, the logs are identical up to that index.
-
-### Commit index
-- An entry is **committed** once the leader has stored it on a majority of nodes **and** it is from the leader's current term (entries from earlier terms are committed indirectly when a current-term entry after them commits; this rule avoids a subtle case where an old-term entry on a majority could still be overwritten).
-- The leader advances `commitIndex`, applies entries up to it to its state machine, replies to clients, and tells followers the new `leaderCommit` in subsequent AppendEntries so they apply too.
-- A write is acknowledged to the client only after commit, so an acknowledged write survives any minority of failures.
-
-### Safety properties
-| Property | Meaning |
-|---|---|
-| Election safety | At most one leader per term (each node votes once per term; majorities overlap) |
-| Leader append-only | A leader never overwrites or deletes its own entries |
-| Log matching | Same index and term implies identical prefixes |
-| Leader completeness | A committed entry is present in the logs of all future leaders (thanks to the election restriction) |
-| State machine safety | No two nodes apply different commands at the same index |
-
-### Operations you also need
-- **Linearizable reads:** a leader may have been deposed without knowing. Either replicate a no-op/read through the log, use **ReadIndex** (leader confirms it is still leader with a heartbeat round to a majority, then serves the read once applied up to that index), or **lease reads** (leader serves reads locally while within a lease shorter than the election timeout, which depends on bounded clock drift).
-- **Log compaction:** periodic snapshots of the state machine; followers far behind receive `InstallSnapshot`.
-- **Membership changes:** add or remove one server at a time, or use joint consensus, so two disjoint majorities can never exist during reconfiguration.
-- **Pre-vote and check-quorum:** extensions (etcd uses them) that stop a partitioned node from disrupting the cluster with ever-higher terms when it rejoins.
-
-### Latency and sizing
-A write costs one round trip from the leader to the fastest majority plus a durable fsync. In one region that is a few milliseconds; across regions it is the RTT to the nearest majority. Use 3 or 5 voters (more voters means slower writes, not more throughput); add non-voting learners/observers for read scaling.
-
-## Paxos, briefly
-Leslie Lamport's Paxos (1989/1998) is the original. Single-decree Paxos decides one value with roles **proposers**, **acceptors** and **learners**:
-
-1. **Prepare / Promise:** a proposer picks a unique ballot number `n` and sends `prepare(n)` to acceptors. Each acceptor promises to ignore ballots lower than `n` and returns the highest-numbered value it has already accepted, if any.
-2. **Accept / Accepted:** with promises from a majority, the proposer sends `accept(n, v)`, where `v` is the value from the highest-ballot accepted response (or its own value if none). Acceptors accept unless they have promised a higher ballot. Once a majority accepts, the value is chosen and learners are told.
-
-**Multi-Paxos** runs this per log slot, with a stable leader that skips phase 1 for successive slots, which is effectively what Raft formalises. Variants: Fast Paxos, EPaxos (leaderless), Flexible Paxos (phase-1 and phase-2 quorums only need to intersect). Used by Google Chubby and Spanner, and DynamoDB and Cassandra LWTs use Paxos too. ZooKeeper uses **ZAB** (ZooKeeper Atomic Broadcast), a closely related primary-backup protocol with epochs.
-
-| | Raft | Multi-Paxos | ZAB |
-|---|---|---|---|
-| Leader | Strong leader, required | Optimisation (stable proposer) | Strong leader |
-| Log holes | Not allowed (contiguous log) | Allowed per slot | Not allowed |
-| Understandability | Designed for it | Notoriously subtle | Moderate |
-| Users | etcd, Consul, CockroachDB, TiKV, Kafka KRaft, MongoDB (Raft-like) | Spanner, Chubby, DynamoDB | ZooKeeper |
-
-## Quorums in one picture
-```
-5 nodes, majority = 3.  Any two majorities share >= 1 node:
-  {A,B,C} and {C,D,E} overlap at C -> a new leader always sees the latest committed entry.
-Partition {A,B} | {C,D,E}: only {C,D,E} can elect a leader and commit; {A,B} stall (CP).
-```
-
-## Coordination services: ZooKeeper and etcd
-You rarely implement Raft yourself. You use a small, strongly consistent coordination store and build primitives on it.
-
-| | ZooKeeper | etcd |
-|---|---|---|
-| Protocol | ZAB | Raft |
-| Data model | Hierarchical znodes (small data, < 1 MB) | Flat key space with prefixes, MVCC revisions |
-| Liveness of clients | Sessions; **ephemeral** znodes deleted when session expires | **Leases** with TTL; keys attached to a lease are deleted when it expires |
-| Ordering primitive | **Sequential** znodes (`lock-0000000042`), zxid | Global revision numbers, `create_revision` |
-| Notifications | One-shot watches (persistent watches in 3.6+) | Streaming watches from a revision |
-| Atomic ops | `multi`, versioned set | Transactions: `If(compare).Then(ops).Else(ops)` |
-| Used by | Kafka (pre-KRaft), HBase, Hadoop, Solr, older Kafka consumers | Kubernetes, CoreDNS, Patroni, Vitess topology, M3 |
-
-### Leader election
-Recipe with ZooKeeper: each candidate creates an **ephemeral sequential** znode under `/election`. The lowest sequence number is leader. Every other node watches only the node immediately before it (not the leader), avoiding a herd effect when the leader dies. If the leader crashes, its session expires, its znode vanishes and the next node becomes leader.
-
-```java
-// Apache Curator LeaderLatch
-CuratorFramework client = CuratorFrameworkFactory.newClient(
-        "zk1:2181,zk2:2181,zk3:2181", new ExponentialBackoffRetry(1000, 3));
-client.start();
-
-LeaderLatch latch = new LeaderLatch(client, "/services/scheduler/leader", nodeId);
-latch.addListener(new LeaderLatchListener() {
-    public void isLeader()  { scheduler.start(); }
-    public void notLeader() { scheduler.stop(); }   // must stop promptly
-});
-latch.start();
-```
-
-With etcd: `campaign` on an election prefix under a lease (the `concurrency` package in Go, `jetcd` Election client in Java); the key with the lowest create revision wins. Kubernetes controllers use `Lease` objects for the same purpose, and Spring Integration offers `LeaderInitiator` for ZooKeeper and a Kubernetes leader-election module.
-
-### Distributed locks with fencing tokens
-A lock in a distributed system is really a **lease**: it expires if the holder disappears. The danger is a holder that *thinks* it still holds the lock after it expired (long GC pause, VM freeze, network delay):
-
-```
-Client 1 acquires lock (token 33) ... GC pause 40 s ... lease expired
-Client 2 acquires lock (token 34), writes to storage
-Client 1 wakes, still believes it holds the lock, writes to storage  -> corruption
-```
-
-**Fix: fencing tokens.** The lock service hands out a monotonically increasing number with each grant (ZooKeeper zxid or znode version, etcd revision of the lock key). Every write to the protected resource carries the token, and **the resource rejects tokens lower than the highest it has seen**.
+### Better design
 
 ```sql
--- Storage-side fencing check: a stale holder's write affects 0 rows
-UPDATE job_state
-SET    status = 'DONE', fencing_token = :token
-WHERE  job_id = :jobId AND fencing_token < :token;
+-- route the decision to the single source of truth, atomically
+UPDATE inventory SET stock = stock - 1
+ WHERE sku = 'X1' AND stock > 0;      -- 0 rows updated = sold out
 ```
+
+The check and the decrement happen in one atomic step on the leader, so two buyers can never both take the last unit.
+
+**Trade-offs:**
+- Higher latency (wait for the leader or a majority).
+- Lower availability during partitions (the minority side must refuse).
+
+**Key takeaway: Use linearizability where a stale read causes a wrong decision, such as stock, money and uniqueness.**
+
+---
+
+## 4. Read-your-writes and monotonic reads
+
+**Definition:** Read-your-writes means a user always sees their own updates. Monotonic reads means a user never sees time go backwards.
+
+These are **session guarantees**: promises to one client, not to everyone. They are much cheaper than linearizability and fix the most visible bugs. Think of editing your profile: you do not care if a stranger sees the new photo two seconds late, but you must see it yourself immediately.
+
+### The problem
+
+```text
+ User updates bio -> write goes to leader.
+ Page reloads     -> read hits replica B (200 ms behind) -> old bio.
+ Reload again     -> replica C (caught up)  -> new bio.
+ Reload again     -> replica B              -> old bio again!
+```
+
+The first read breaks read-your-writes ("my edit vanished"). The flip-flop breaks monotonic reads ("the data went back in time").
+
+### Better design
+
+```text
+ Read-your-writes:
+   - after a write, read that user's data from the leader for ~10 s, or
+   - client sends its last-write position (LSN/version); the replica
+     waits until it has applied that position before answering.
+ Monotonic reads:
+   - pin each user to one replica (hash userId -> replica), or
+   - client remembers the highest version it has seen and rejects
+     answers older than that.
+```
+
+Each user now sees a consistent story, while most reads still go to replicas.
+
+**Key takeaway: Session guarantees fix "my edit disappeared" bugs without paying for global strong consistency.**
+
+---
+
+## 5. Causal consistency
+
+**Definition:** If one event could have caused another, everyone sees them in that order; unrelated events may appear in any order.
+
+"Caused" means the second operation happened after its author saw the first. A reply depends on the question it answers. Causal consistency is about the strongest model that can stay available during a partition, which makes it a sweet spot for social and chat features.
+
+### The problem
+
+```text
+ Alice posts:  "I lost my job"           (write 1)
+ Bob replies:  "So sorry to hear that"   (write 2, after seeing write 1)
+ Carol's replica receives write 2 first:
+     Bob: "So sorry to hear that"   <- reply to nothing
+```
+
+Carol sees an effect before its cause. With a different post, the reply could look rude or meaningless.
+
+### Better design
+
+```text
+ write 2 carries a dependency: {depends_on: write 1}
+ Carol's replica holds write 2 until write 1 has arrived,
+ then shows them in order.
+```
+
+Dependencies travel with the data (often as version vectors), so replicas delay only what truly depends on something missing.
+
+**Key takeaway: Causal consistency keeps cause before effect, which is exactly what comments, replies and chat threads need.**
+
+---
+
+## 6. Eventual consistency
+
+**Definition:** If writes stop, all replicas will eventually converge to the same value.
+
+It promises nothing about when, or what you read in the meantime. It is the cheapest and most available model. It needs a rule for conflicting writes, such as last-write-wins, version vectors with a merge, or CRDTs (data types like counters and sets designed so that concurrent updates always merge cleanly).
+
+### The problem
+
+```text
+ Like counter stored as a plain value, two regions, last-write-wins:
+ US reads 100, adds 1, writes 101
+ EU reads 100, adds 1, writes 101   (concurrently)
+ Final: 101   (one like lost)
+```
+
+Read-modify-write on an eventually consistent value silently loses updates.
+
+### Better design
+
+```text
+ G-Counter CRDT: one slot per region, each region increments only its own.
+ US: {us: 51, eu: 50} ; EU: {us: 50, eu: 51}
+ Merge = max per slot -> {us: 51, eu: 51} -> total 102
+```
+
+Every increment survives the merge, and no coordination is needed on the write path.
+
+**Trade-offs:**
+- Readers may see stale or different values for a while.
+- You must design conflict resolution; last-write-wins quietly drops data.
+
+**Key takeaway: Eventual consistency is great for counts and feeds, as long as you design how conflicts merge.**
+
+### Consistency models side by side
+
+| Model | Promise | Cost |
+|---|---|---|
+| Linearizable | Latest value, for everyone | Highest latency, unavailable in minority |
+| Causal | Cause before effect | Track dependencies |
+| Read-your-writes / monotonic | Sane view for one user | Routing or version tokens |
+| Eventual | Converges someday | Conflict resolution |
+
+---
+
+## 7. Consistency vs. isolation
+
+**Definition:** Consistency models are about replicas of data; isolation levels are about concurrent transactions on the data.
+
+People mix them up because both use the word "consistent". Isolation levels (Read Committed, Repeatable Read, Snapshot, Serializable) answer "what can one transaction see of another running at the same time?" Consistency models answer "can a read see an old copy?"
+
+### The problem
+
+```text
+ Single Postgres node, no replicas -> no stale copies at all.
+ Isolation = Read Committed.
+ Tx A: SELECT count(*) FROM oncall WHERE on_duty  -> 2, so I may leave
+ Tx B: SELECT count(*) FROM oncall WHERE on_duty  -> 2, so I may leave
+ Both UPDATE themselves to off-duty and commit -> 0 doctors on call.
+```
+
+There is no replication bug here. This is **write skew**, an isolation anomaly: two transactions read the same fact and each makes a change that is safe alone but not together.
+
+### Better design
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM oncall WHERE on_duty;
+UPDATE oncall SET on_duty = false WHERE doctor_id = 7;
+COMMIT;  -- one of the two transactions fails and must retry
+```
+
+Serializable (or locking the rows involved with `SELECT ... FOR UPDATE`) stops the second transaction from acting on an outdated count.
+
+### Consistency vs. isolation
+- **Consistency model:** can I read an old copy of one item?
+- **Isolation level:** can concurrent multi-step transactions interleave badly?
+- **Strict serializability** = serializable + linearizable, the strongest combination (Spanner offers it).
+
+**Key takeaway: Replication lag and transaction interleaving are different bugs with different fixes; name which one you are solving.**
+
+---
+
+## 8. Choosing per feature
+
+**Definition:** Pick the weakest model that keeps each feature correct, and pay for strong consistency only where a wrong read causes real harm.
+
+One application usually needs several models. The test question is: "If this read is a few seconds stale, what is the worst thing that happens?"
+
+### The problem
+
+```text
+ E-commerce app, one setting for everything:
+   all strong   -> like buttons wait on cross-region quorum, slow pages
+   all eventual -> two buyers get the last PS5, one refund, angry user
+```
+
+A single global choice is either too slow or too risky.
+
+### Better design
+
+```text
+ Inventory decrement, payment, seat booking -> strong (leader / quorum)
+ Order history for the buyer                -> read-your-writes
+ Chat messages and comments                 -> causal (per-conversation order)
+ Likes, view counts, "trending"             -> eventual (CRDT or batched counters)
+ Product description, listing prices        -> eventual + short cache TTL,
+                                              re-check price at checkout
+```
+
+Each feature gets the cheapest model that keeps it correct, and the critical step (checkout) re-validates against the source of truth.
+
+**Key takeaway: Consistency is a per-feature decision; strong for money and stock, eventual for counters and feeds.**
+
+---
+
+## In an HLD interview
+- **Amazon E-commerce / BookMyShow / Seat Reservation:** inventory and seats need a linearizable decrement or conditional write; browsing can be eventual and cached.
+- **Payment System:** strong consistency plus idempotency keys; a stale balance read can lead to a double spend.
+- **News Feed / YouTube likes and views:** eventual consistency with counters or CRDTs; nobody is hurt if a like count lags by seconds.
+- **Chat/WhatsApp:** causal ordering within a conversation, read-your-writes for the sender's own messages.
+- What to SAY: "I'll pick consistency per feature. Booking a seat is a CP operation with a conditional write; the like counter is AP and eventually consistent, because a stale count harms nobody."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
+|---|---|---|
+| CAP | During a partition, choose errors or stale answers | What should this operation do when replicas cannot talk? |
+| PACELC | Without a partition, choose latency or consistency | Is waiting for a quorum worth the latency here? |
+| Linearizable | Behaves like one copy | Does a stale read cause a wrong decision? |
+| Session guarantees | One user sees a sane, forward-moving view | Could a user see their own edit vanish? |
+| Causal | Cause before effect | Can a reply appear before its message? |
+| Eventual | Converges once writes stop | How do concurrent writes merge? |
+| Isolation | How concurrent transactions interleave | Is this a replication bug or a transaction bug? |
+
+## Final memory aid
+- CAP: a partition happens, so pick CP (refuse) or AP (answer stale).
+- PACELC: else, pick latency or consistency, on every request.
+- Linearizable = one copy, latest value, for everyone.
+- Read-your-writes and monotonic reads = a sane view for one user.
+- Causal = replies never appear before the question.
+- Eventual = converges someday; design the merge.
+- Isolation is about transactions, not replicas.
+- Strong for money and stock, eventual for likes and views.
+
+=== hld-consensus | HLD | Consensus, leader election and coordination ===
+Many distributed systems need a set of machines to agree on one thing: who the leader is, what the next log entry is, or who holds a lock. This chapter explains why that is hard, how quorums and Raft solve it in plain terms, what ZooKeeper and etcd are used for, and how to build locks that stay safe with leases and fencing tokens. It ends with why wall clocks cannot be trusted for ordering and what to use instead.
+
+## 1. Why consensus
+
+**Definition:** Consensus is getting several machines to agree on a single value, even if some of them crash or messages are delayed.
+
+A single database server never has to agree with anyone. As soon as you have replicas, you must agree on who accepts writes and in what order. Think of a committee that must reach one decision even if some members leave the room mid-meeting.
+
+### The problem
+
+```text
+ Two nodes, each thinks the other is dead (network glitch):
+   Node A: "B is silent, I am leader now"  -> accepts writes
+   Node B: "A is silent, I am leader now"  -> accepts writes
+ Result: two leaders, two diverging histories ("split brain")
+```
+
+Both nodes accept conflicting writes, for example selling the same seat twice. Merging the two histories later may be impossible.
+
+### Better design
+
+```text
+ Rule: a leader needs votes from a MAJORITY of a fixed cluster.
+ 5 nodes -> majority = 3.  A partition into {A,B} and {C,D,E}:
+   {A,B}   has 2 votes  -> cannot elect, refuses writes
+   {C,D,E} has 3 votes  -> elects one leader, keeps working
+```
+
+Two majorities of the same group always share at least one member, so two leaders can never both win the same term.
+
+**Trade-offs:**
+- Every decision costs at least one round trip to a majority.
+- The minority side stops accepting writes (a CP choice).
+
+**Key takeaway: Consensus exists to prevent split brain; the majority rule is what makes two leaders impossible.**
+
+---
+
+## 2. Quorums
+
+**Definition:** A quorum is the minimum number of nodes that must take part in an operation for it to count.
+
+With N replicas, if writes wait for W nodes and reads ask R nodes, and **R + W > N**, every read set overlaps every write set in at least one node, so a read can find the latest acknowledged write. Consensus systems use a majority (floor(N/2) + 1) for every decision.
+
+### The problem
+
+```text
+ N=3, W=1, R=1   (R + W = 2, not > 3)
+ Write x=5 lands only on node 1.
+ Read asks node 3 -> old x.  No overlap, stale read.
+```
+
+### Better design
+
+```text
+ N=3, W=2, R=2   (R + W = 4 > 3)
+ Write x=5 on nodes 1,2.  Read asks nodes 2,3 -> node 2 has x=5.
+ Fault tolerance: 3 nodes tolerate 1 failure; 5 tolerate 2.
+```
+
+The overlap guarantees the read touches at least one fresh copy. Leaderless quorums (Dynamo style) still have edge cases, such as concurrent writes and sloppy quorums, so on their own they are not fully linearizable.
+
+**Trade-offs:**
+- Larger quorums mean slower operations and less availability.
+- Clusters use odd sizes (3, 5); a fourth node adds cost but no extra fault tolerance.
+
+**Key takeaway: R + W > N gives overlap; a majority of 2f+1 nodes tolerates f failures.**
+
+---
+
+## 3. Raft leader election
+
+**Definition:** Raft is a consensus algorithm where one elected leader orders all writes, and a new leader is chosen by majority vote when it fails.
+
+Time is split into numbered **terms**. Each node is a follower, a candidate or the leader. The leader sends regular heartbeats. If a follower hears nothing for its **election timeout** (randomized, for example 150-300 ms), it becomes a candidate, increases the term and asks for votes.
+
+### The problem
+
+```text
+ Leader crashes. All 4 followers time out at exactly the same moment,
+ all become candidates, each votes for itself:
+   votes = 1,1,1,1 -> nobody gets 3 -> retry -> same tie again ...
+```
+
+With identical fixed timeouts, elections could split again and again.
+
+### Better design
+
+```text
+ Randomized timeouts: B=170ms, C=240ms, D=210ms, E=290ms
+ t=170ms  B becomes candidate for term 8, asks for votes
+          C, D, E have not timed out yet -> vote for B (one vote per term)
+          B has 4/5 votes -> leader of term 8, starts heartbeats
+ Voting rule: refuse a candidate whose log is less up to date than yours.
+```
+
+Randomness usually lets one node start first and win. The "up-to-date log" rule ensures the new leader already holds every committed entry.
+
+**Key takeaway: Raft elects one leader per term by majority vote; random timeouts break ties and the log check keeps committed data safe.**
+
+---
+
+## 4. Raft log replication
+
+**Definition:** The leader appends each command to its log, copies it to followers, and marks it committed once a majority has stored it.
+
+The log is an ordered list of commands such as "set x=5". Every node applies committed entries in the same order, so every node ends in the same state. This is called a **replicated state machine**.
+
+### The problem
+
+```text
+ Leader L receives "x=5", applies it, replies OK to client,
+ then crashes before sending it to any follower.
+ New leader never saw "x=5" -> the acknowledged write is lost.
+```
+
+Acknowledging before replicating breaks the promise made to the client.
+
+### Better design
+
+```text
+ 1. Client -> L: "x=5"
+ 2. L appends it at index 42 (term 8), sends AppendEntries to F1..F4
+ 3. F1, F2 store it and ack     -> 3 of 5 have it (majority)
+ 4. L marks index 42 committed, applies it, replies OK to client
+ 5. Next heartbeat tells followers "commit index = 42"; they apply it
+```
+
+Any future leader must win votes from a majority, and that majority overlaps the one that stored index 42, so a committed entry is never lost.
+
+**Trade-offs:**
+- Write latency = one round trip to the fastest majority plus a disk flush.
+- All writes go through one leader, so the leader caps write throughput.
+
+**Key takeaway: Commit only after a majority stores the entry; that overlap is why committed data survives any leader change.**
+
+---
+
+## 5. ZooKeeper and etcd
+
+**Definition:** ZooKeeper and etcd are small, strongly consistent key-value stores, built on consensus, that other systems use for coordination.
+
+You do not store business data in them. You store small facts that many machines must agree on: who the leader is, which config is current, which nodes are alive. etcd uses Raft; ZooKeeper uses a similar protocol called ZAB. etcd is the brain of Kubernetes; ZooKeeper was used by Kafka (before KRaft), HBase and Hadoop.
+
+### The problem
+
+```text
+ Each service instance runs its own "am I the leader?" logic
+ using a database flag and wall-clock heartbeats.
+ Edge cases: clock drift, a crashed holder never clears the flag,
+ two instances both read "no leader" and both set it.
+```
+
+Hand-built coordination usually has subtle races that only appear under failure.
+
+### Better design
+
+```text
+ etcd: create key /scheduler/leader attached to a lease (TTL 10s),
+       only if the key does not exist (transaction: create_revision = 0).
+       Winner keeps the lease alive; if it dies, the key expires.
+       Others WATCH the key and retry when it disappears.
+ ZooKeeper: same idea with ephemeral sequential znodes; the lowest
+       sequence number is leader, each node watches the one before it.
+```
+
+Leader election, membership and config watching now come from a battle-tested consensus core.
+
+**Trade-offs:**
+- Writes are relatively slow, and the stored data must stay small.
+- Another critical cluster to run (usually 3 or 5 nodes).
+
+**Key takeaway: Use ZooKeeper or etcd for small coordination facts, never as a general database.**
+
+---
+
+## 6. Distributed locks with leases and fencing tokens
+
+**Definition:** A distributed lock lets only one process act on a resource at a time; a lease is a lock that expires automatically, and a fencing token is an increasing number that proves which holder is current.
+
+Leases solve "the holder crashed and never released". But they create a new danger: a holder that is merely paused (long GC, VM freeze) may still think it holds a lease that has already expired.
+
+### The problem
+
+```text
+ t=0   Worker A gets lease (TTL 10s), starts writing file F
+ t=1   A pauses for 15s (stop-the-world GC)
+ t=11  Lease expires; Worker B gets lease, writes F
+ t=16  A wakes up, still believes it has the lock, writes F
+ Result: A overwrites B's work.
+```
+
+A lease alone cannot stop a paused process, because A cannot notice that time passed while it was frozen.
+
+### Better design
 
 ```java
-// Curator mutex; derive a fencing token from the lock node's sequence/zxid
-InterProcessMutex lock = new InterProcessMutex(client, "/locks/invoice-run");
-if (lock.acquire(5, TimeUnit.SECONDS)) {
-    try {
-        long token = currentLockZxid(client, "/locks/invoice-run");  // monotonically increasing
-        invoiceStore.applyBatch(batch, token);                      // store rejects older tokens
-    } finally {
-        lock.release();
-    }
+// Lock service hands out an increasing token with each grant
+long token = lock.acquire("file-F");   // A gets 33, later B gets 34
+
+// The storage service checks the token on every write
+if (token < highestTokenSeen.get("file-F")) {
+    throw new StaleLockException();    // A's late write with 33 is rejected
 }
+highestTokenSeen.put("file-F", token);
+write(fileF, data);
 ```
 
-If the resource cannot check tokens (a third-party API), make the operation idempotent instead.
+The resource itself rejects old tokens (atomically, in real storage), so a zombie holder cannot do damage. In ZooKeeper the zxid can serve as the token; in etcd, the key's revision.
 
-### Service discovery and configuration
-- **Discovery:** each instance registers an ephemeral node or a lease-backed key (`/services/payments/10.0.0.7:8080`); clients watch the prefix. Health is implied by the session or lease. Consul, etcd and ZooKeeper (Curator Service Discovery, Spring Cloud Zookeeper/Consul) all do this. Eureka deliberately chooses AP instead.
-- **Configuration and feature flags:** store config under a key; services watch and hot-reload. Writes are linearizable; reads are usually served from a local cache.
-- **Membership and partition assignment:** which worker owns which shard (Kafka controller metadata, Helix on ZooKeeper, Vitess topology in etcd).
-- **Keep coordination data small and low-write.** These systems handle thousands of writes per second, not hundreds of thousands; they are not general databases or message queues.
+### Lease vs. fencing token
+- **Lease:** frees the lock if the holder dies. Protects liveness (progress).
+- **Fencing token:** rejects a holder that does not know it lost the lock. Protects safety (correctness).
+- Redis-based Redlock gives leases but no fencing tokens, so it should not guard correctness-critical work.
 
-## Redlock and its caveats
-Redlock (proposed by Redis's author) acquires a lock on a majority of N (typically 5) independent Redis masters with `SET key value NX PX ttl`, treats the lock as held if a majority succeeded within less than the TTL, and releases with a compare-and-delete Lua script.
+**Key takeaway: Leases stop locks being stuck forever; fencing tokens checked by the resource stop stale holders corrupting data.**
 
-Caveats (well argued by Martin Kleppmann):
-- **No fencing token:** the random value identifies the holder for release but is not monotonic, so storage cannot reject a stale holder after a pause.
-- **Timing assumptions:** safety depends on bounded clock drift, bounded network delay and bounded process pauses. A clock jump on a Redis node (NTP step) can expire a key early and let a second client acquire a majority.
-- **Persistence and restarts:** a Redis node that restarts without fsynced data forgets locks, unless it delays rejoining for at least the TTL.
+---
 
-Guidance: a single Redis `SET NX PX` lock (or Redlock) is fine for **efficiency** locks, where a rare double execution only wastes work (avoid two workers sending the same digest email if the operation is idempotent anyway). For **correctness** locks (money, inventory, exclusive file writes), use a consensus-backed store (etcd, ZooKeeper, a database row lock or conditional write) plus fencing tokens.
+## 7. Clocks: why wall clocks lie
 
-## Leases
-A lease is a lock with a time limit: the holder has rights until time T unless it renews.
-- Leases let systems make progress when holders die, without manual cleanup.
-- They depend on time, so the holder must stop acting **before** the lease expires, using a monotonic clock and a safety margin for clock drift (e.g. renew at one third of the TTL, stop work at TTL minus drift).
-- Examples: Raft leader leases for local reads, Chubby/ZooKeeper sessions, etcd leases, Kubernetes `Lease` objects, Kafka consumer-group session timeouts, GFS chunk leases for the primary replica.
+**Definition:** A wall clock is a machine's time-of-day clock; across machines it drifts and jumps, so it cannot reliably order events.
 
-## Clocks and ordering
-### Physical clocks
-- **Time-of-day (wall) clocks** (`System.currentTimeMillis()`, `Instant.now()`): synchronised by NTP, typically within milliseconds in a data centre, tens to hundreds of milliseconds over the internet, and can **jump backwards** on correction or leap seconds. Never use them to measure durations or to order events across machines.
-- **Monotonic clocks** (`System.nanoTime()`): only go forward; meaningful only on one machine; use for timeouts and durations.
-- Consequence: last-write-wins by wall-clock timestamp can drop a later write if the writer's clock is behind.
+Each server's quartz clock drifts, and NTP corrects it, sometimes by stepping it backwards. Leap seconds and VM pauses add more noise. Skew of a few milliseconds between machines is normal, and much more is possible after a bad sync.
 
-### Lamport clocks
-Each process keeps a counter. Increment on each local event; send the counter with every message; on receipt set `counter = max(local, received) + 1`. Ordering by `(counter, nodeId)` gives a total order consistent with causality: if A happened before B, then `L(A) < L(B)`. The converse does not hold, so Lamport clocks cannot tell you whether two events were concurrent.
+### The problem
 
-```java
-public final class LamportClock {
-    private final AtomicLong time = new AtomicLong();
-    public long tick()                 { return time.incrementAndGet(); }          // local event / send
-    public long onReceive(long remote) { return time.accumulateAndGet(remote, (l, r) -> Math.max(l, r) + 1); }
-}
+```text
+ Node A's clock is 50 ms ahead of node B's.
+ t_real=0   Client writes x=1 via A  -> stamped 10:00:00.050
+ t_real=10  Client writes x=2 via B  -> stamped 10:00:00.010
+ Last-write-wins keeps x=1 (bigger timestamp); x=2 is silently lost.
 ```
 
-### Vector clocks
-Each node keeps a vector of counters, one per node. Compare element-wise: if every entry of A is less than or equal to B's (and one is strictly less), A happened before B; if neither dominates, they are **concurrent** and a conflict exists. Used for conflict detection in Dynamo and Riak (as version vectors per key). Cost: size grows with the number of writers; systems prune or use dotted version vectors.
+The later write lost only because its machine's clock was behind.
 
+### Better design
+
+```text
+ Use wall time for humans (display) and TTLs with a safety margin.
+ Use versions, sequence numbers or logical clocks for ordering.
+ Within one machine, measure durations with a monotonic clock
+ (Java: System.nanoTime(), not System.currentTimeMillis()).
 ```
-A = [2,1,0]  B = [2,2,0]  -> A < B (B saw A)
-A = [2,1,0]  C = [1,1,1]  -> concurrent: keep both siblings or merge
+
+Ordering now comes from counters that cannot run backwards.
+
+**Key takeaway: Never order events across machines by wall-clock timestamps alone.**
+
+---
+
+## 8. Logical clocks
+
+**Definition:** A logical clock is a counter that orders events by cause and effect instead of by physical time.
+
+A **Lamport clock** is one counter per node: increment it on every event, attach it to messages, and on receiving set `counter = max(local, received) + 1`. If A happened before B, A's number is smaller. But a smaller number does not prove that A happened before B. A **vector clock** keeps one counter per node, so it can also tell when two events are concurrent (neither saw the other).
+
+### The problem
+
+```text
+ Lamport: event P has 4, event Q has 6.
+ Did P cause Q, or were they independent?  Cannot tell.
 ```
 
-### Hybrid logical clocks (HLC)
-HLC (Kulkarni et al., 2014) combines a physical timestamp with a logical counter: `(max physical time seen, logical counter)`. It stays close to wall-clock time (so timestamps are meaningful to humans and for snapshot reads "as of 10:00"), never goes backwards, and captures causality like a Lamport clock. Used by CockroachDB, YugabyteDB and MongoDB (cluster time). CockroachDB also enforces a maximum clock offset (500 ms by default) and uses **uncertainty intervals**: a read that sees a value with a timestamp slightly in its future, within the offset, restarts at a higher timestamp to preserve consistency. Nodes whose clocks drift too far shut themselves down.
+### Better design
 
-### TrueTime (Google Spanner)
-TrueTime exposes time as an interval `[earliest, latest]` with bounded uncertainty epsilon, maintained using GPS receivers and atomic clocks in every data centre (epsilon is typically a few milliseconds). Spanner assigns each transaction a commit timestamp `s` and then performs **commit wait**: it does not make the commit visible until `TT.now().earliest > s`, guaranteeing that any transaction starting afterwards gets a larger timestamp. This yields **external consistency** (strict serializability) globally, and lock-free consistent snapshot reads at any timestamp. The price is that each write waits about epsilon, which is why small, well-bounded uncertainty matters. Cloud providers now expose similar precise clock services (for example AWS Time Sync with published error bounds, which Aurora DSQL relies on).
+```text
+ Vector clocks [A, B]:
+   P = [2, 1]   Q = [1, 3]
+   P <= Q?  no (2 > 1).  Q <= P?  no (3 > 1).  -> concurrent
+   -> real conflict: keep both versions, merge or ask the user.
+ R = [2, 3] >= both -> R saw both and can safely replace them.
+```
 
-| Clock | Captures causality | Detects concurrency | Close to real time | Typical use |
-|---|---|---|---|---|
-| Wall clock | No | No | Yes (with skew) | Logs, TTLs, human display |
-| Monotonic | Single node only | No | No | Timeouts, durations |
-| Lamport | Yes (one direction) | No | No | Total ordering, Raft terms are similar |
-| Vector / version vector | Yes | Yes | No | Conflict detection (Dynamo, Riak) |
-| HLC | Yes | No | Yes | CockroachDB, YugabyteDB, MongoDB |
-| TrueTime | Via commit wait | No | Yes, bounded | Spanner external consistency |
+Vector clocks detect true conflicts (Dynamo-style stores use them). Hybrid logical clocks (HLC), used by CockroachDB, combine physical time with a logical counter to stay close to real time while preserving causality. Google Spanner instead uses TrueTime, which reports time as an uncertainty interval and waits it out before committing.
 
-## Real-world systems
-- **etcd:** Raft; Kubernetes stores all cluster state here; leases for leader election; linearizable reads by default (ReadIndex), serializable (possibly stale) reads optional.
-- **ZooKeeper:** ZAB; writes linearizable, reads from followers sequentially consistent (use `sync()` first if you need the latest). Kafka used it for controller election and metadata until **KRaft** replaced it with an internal Raft quorum.
-- **Consul:** Raft for the catalog and KV; gossip (Serf) for membership and failure detection; sessions for locks.
-- **Spanner / CockroachDB / YugabyteDB / TiKV:** a Paxos or Raft group per range or tablet, thousands of groups per cluster, with leaseholders serving reads.
-- **MongoDB replica sets:** Raft-inspired election protocol (protocol version 1) with terms.
-- **Chubby:** Google's Paxos-based lock service, the inspiration for ZooKeeper, which introduced sequencers (fencing tokens).
+**Trade-offs:**
+- Vector clocks grow with the number of writers.
+- Lamport clocks are tiny but cannot detect concurrency.
 
-## How it shows up in interview problems
-- **Job scheduler (cron at scale):** leader election for the scheduler or lease-based ownership of job partitions; fencing tokens or idempotent job runs to survive a stale leader.
-- **Distributed lock service / seat reservation:** etcd/ZooKeeper locks with fencing, or (often better) a conditional write in the database itself.
-- **Distributed key-value store / database design:** Raft per partition, leader leases for reads, majority quorums.
-- **Kafka-like log or message queue:** controller election and per-partition leader with an in-sync replica set; KRaft for metadata.
-- **Service discovery / API gateway:** registry in Consul/etcd/ZooKeeper, or AP Eureka; config pushed via watches.
-- **Payments:** a single writer per account shard (via leader election) plus idempotency keys.
-- **Chat / collaborative editing:** Lamport or vector clocks and CRDTs to order and merge concurrent edits.
-- **Unique ID generator:** worker IDs assigned via ZooKeeper sequential nodes; guard against clock rollback.
+**Key takeaway: Lamport clocks give an order consistent with causality; vector clocks also tell you when two writes conflict.**
 
-## Common pitfalls
-- Even-sized clusters (4 nodes tolerate 1 failure, same as 3, with slower writes). Use 3 or 5.
-- Putting high-volume data or queues into ZooKeeper/etcd.
-- Distributed locks without fencing tokens on correctness-critical paths; trusting Redis TTL locks for money.
-- A leader that keeps working after losing leadership; it must stop on `notLeader` or lease loss, before the lease runs out.
-- Ordering events by wall-clock timestamps across machines; measuring timeouts with wall clocks.
-- Spreading 3 voters across 2 data centres (losing the one with 2 voters stops everything); use 3 sites or 5 voters over 3 sites.
-- Election timeouts shorter than typical GC pauses or cross-zone latency spikes, causing election storms.
-- Reading from followers and assuming linearizability.
+---
 
-## Interview questions
-1. **Why do consensus systems use an odd number of nodes?** Fault tolerance depends on the majority size: 2f + 1 nodes tolerate f failures. A fourth node adds latency and cost without tolerating an extra failure compared with three.
-2. **Walk through a Raft leader election.** A follower times out (randomised), increments its term, votes for itself and requests votes; nodes grant at most one vote per term and only to candidates whose log is at least as up to date; a majority makes it leader, and it sends heartbeats. Split votes retry in a new term.
-3. **When is a Raft entry committed?** When the leader has replicated an entry from its current term to a majority; it and all preceding entries are then committed, applied to the state machine and acknowledged to the client.
-4. **What does FLP say and how do real systems live with it?** In a purely asynchronous system with even one crash, deterministic consensus cannot guarantee termination. Real systems assume partial synchrony: always safe, live when timeouts are reasonable.
-5. **Why do distributed locks need fencing tokens?** A holder can pause past its lease and resume believing it holds the lock. A monotonically increasing token checked by the resource rejects the stale holder's writes.
-6. **Is Redlock safe?** Not for correctness-critical mutual exclusion: it provides no fencing token and depends on timing assumptions about clocks and pauses. It is acceptable for efficiency locks; use etcd/ZooKeeper plus fencing for correctness.
-7. **Lamport clocks vs vector clocks vs HLC?** Lamport gives a causality-consistent total order but cannot detect concurrency; vector clocks detect concurrency at the cost of size per writer; HLC adds a logical counter to physical time so timestamps are causal and near real time.
-8. **How does Spanner achieve external consistency?** TrueTime gives bounded clock uncertainty; Spanner waits out that uncertainty (commit wait) before exposing a commit, so timestamp order matches real-time order across the globe.
+## In an HLD interview
+- **Job Scheduler:** one active scheduler elected through etcd or ZooKeeper with a lease; job writes carry fencing tokens so a paused old leader cannot double-run a job.
+- **Distributed Cache / Rate Limiter:** cluster membership and config come from a coordination service, not from each node guessing.
+- **Payment System / Seat Reservation:** a lock alone is not enough; pair it with fencing tokens or a conditional write in the database.
+- **Chat/WhatsApp, Logging/Monitoring:** order messages with per-conversation sequence numbers, not server timestamps.
+- What to SAY: "I'll use etcd for leader election with a lease, and every write carries a fencing token that storage checks, so a GC-paused old leader cannot corrupt data."
 
-## Cheat sheet
-- Consensus = agreement on a value or log order despite crashes; 2f + 1 nodes tolerate f; Byzantine needs 3f + 1.
-- FLP: no guaranteed termination in pure async; real systems are always safe, live under partial synchrony.
-- Raft: terms; randomised election timeouts; vote once per term; election restriction (up-to-date log); AppendEntries consistency check; commit on majority for current-term entries; ReadIndex/lease reads; snapshots; single-server membership changes.
-- Paxos: prepare/promise, accept/accepted; Multi-Paxos with a stable leader; ZooKeeper uses ZAB.
-- ZooKeeper (ephemeral sequential znodes, watches) and etcd (leases, revisions, txns) for election, locks, discovery, config. Keep them small.
-- Locks are leases; always use fencing tokens for correctness; Redlock only for efficiency.
-- Clocks: wall (skews, jumps), monotonic (durations), Lamport (order), vector (concurrency), HLC (causal + near real time), TrueTime (bounded uncertainty + commit wait).
+## At a glance
+
+| Concept | Core idea | Ask yourself |
+|---|---|---|
+| Consensus | Agree on one value despite failures | Could two nodes both think they are leader? |
+| Quorum | Overlapping majorities | Does R + W > N? How many failures can I survive? |
+| Raft election | One leader per term by majority vote | What happens when the leader dies? |
+| Raft replication | Commit after a majority stores it | Was this write acknowledged before it was safe? |
+| ZooKeeper/etcd | Coordination store built on consensus | Am I hand-rolling leader election? |
+| Lease + fencing | Expiring lock + token checked by the resource | What if the lock holder pauses for 20 s? |
+| Wall clocks | Drift and jump across machines | Am I ordering events by timestamps? |
+| Logical clocks | Counters that follow causality | Do I need to detect concurrent writes? |
+
+## Final memory aid
+- Consensus prevents split brain.
+- A majority of 2f+1 nodes survives f failures.
+- Raft: random timeouts, one vote per term, commit on majority.
+- etcd and ZooKeeper hold small coordination facts, not business data.
+- Lease = liveness; fencing token = safety.
+- Wall clocks lie; use versions or logical clocks for order.
+- Vector clocks spot conflicts; Lamport clocks only order.

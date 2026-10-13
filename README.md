@@ -41,7 +41,8 @@ KB makes you **commit to your own design before you see any answer**, then gives
 | ✅ **A real verdict** | One click grades your answer: **Strong / Solid / Partial / Needs work**, what you got right, the gaps, and what to study next. It reads your diagrams too. |
 | 💬 **A tutor that pushes back** | Chat about your answer with an AI that knows the topic, your attempt and its verdict. *"Quiz me like an interviewer"* is one click away, and it won't spoil the design before you've tried. |
 | 🎙️ **Talk instead of type** | Ask the tutor out loud and hear its answers. *Talk mode* is a hands-free spoken conversation, and you can dictate your answer too. Works with Ollama, Claude and OpenAI, and can run fully offline. |
-| 📚 **Fundamentals, done properly** | 37 in-depth chapters (caching, sharding, consensus, SOLID, design patterns, concurrency…), each linked from the problems that need it. |
+| 📚 **Fundamentals, done properly** | 37 chapters (caching, sharding, consensus, SOLID, design patterns, concurrency…) written simply: definition, the problem, a better way, key takeaway. Each is linked from the problems that need it. |
+| 📖 **Learn anything** | `kb add "core java"`, `kb add "operating systems"`, even `kb add "calculus"`: your AI plans a short course and writes every chapter in the same clear style, into your private library. |
 | 🧩 **DSA by pattern** | 304 problems in 32 patterns, each with a guide and a Java template. The grader checks whether you used the pattern, not just whether the code works. |
 | 🔒 **Private and yours** | Plain JSON files on your machine. No account, no tracking. Bring your own Claude or OpenAI key, or run **free and offline** with Ollama. |
 | ⌨️ **Site or terminal** | Everything also works from the `kb` command: `kb evaluate lld 2`, `kb clarify hld 7 "why Kafka here?"`, `kb pending --run`. |
@@ -367,6 +368,8 @@ Topics are addressed by track and number: `lld 1`–`lld 20`, `hld 1`–`hld 20`
 | `kb setup` | Chooses the provider, model and key, then tests the connection |
 | `kb status` | Shows the AI settings, progress and pending items |
 | `kb serve` | Starts the site |
+| `kb add "<subject>"` | Plans a course on any subject and writes its chapters into your library (see [Your own library](#your-own-library)) |
+| `kb library` | Lists your libraries; `kb library remove "<subject>" --yes` deletes one |
 | `kb data` | Shows your data folder and how to back it up as a private repo |
 | `kb reset --yes` | Wipes all answers, verdicts, notes and chats (write-ups stay) |
 
@@ -414,6 +417,7 @@ KB keeps **shared material** and **your own work** apart, so you can publish or 
 └── kb-data/             ← your data folder (private): created automatically on first save
     ├── progress/        ← one small JSON file per item you've worked on, e.g. lld-02.json, dsa-two-sum.json, read-hld-caching.json
     ├── images/          ← diagrams and photos pasted into your answers
+    ├── library/         ← courses you generate with kb add "<subject>"
     └── README.md
 ```
 
@@ -510,6 +514,7 @@ lib/store.js             read/write content JSON; addresses like "lld 1"
 lib/ai.js                provider layer (Claude, OpenAI-compatible, Ollama), streaming, kb.config.json
 lib/tutor.js             evaluate / clarify / doubts, with the prompts, shared by the CLI and the server
 lib/voice.js             optional OpenAI speech-to-text / text-to-speech for the voice features
+lib/library.js, libgen.js  your own libraries: reading them, and planning/writing them with the AI (kb add)
 lib/userdata.js          your data folder (../kb-data): answers, verdicts, notes, chats, read status kept outside the repo
 lib/images.js            answer images: save to the data folder, attach to prompts as real image inputs
 public/                  index.html, app.js, voice.js (mic, read-aloud, talk mode), diagram.js (rough.js renderer), styles.css, vendor/
@@ -550,6 +555,30 @@ Every topic page starts with a **Read first** card listing its prerequisites, wi
 has a *Mark as read* button, and has its own tutor chat. From the terminal, `kb read` lists the articles, `kb read sharding` prints one, `kb read 21 --done` marks one read,
 and `kb clarify read 21 "…"` asks about it. Sources live in `build/fundamentals/*.md`, and the topic → prerequisite map lives in `build/make-fundamentals.js`.
 `node build/make-fundamentals.js` rebuilds `content/fundamentals.json` and keeps your read status and chats.
+
+## Your own library
+
+Add a reading track on **any** subject. Your configured AI (Claude, OpenAI or Ollama) plans a short course, then writes each chapter in the
+same simple style as the built-in fundamentals: a definition, a plain explanation, the problem, a better way and a key takeaway, ending with
+*In practice*, *At a glance* and a *Final memory aid*. Examples adapt to the subject: code for programming, scenarios and diagrams for
+technical topics, worked examples for maths and science.
+
+```bash
+kb add "core java"                                   # plans ~10 chapters, shows the outline, asks before writing
+kb add "operating systems" --chapters 12 --level advanced
+kb add "calculus" --level beginner
+kb add "core java"                                   # run again any time: finishes chapters that are missing
+kb add "core java" --more 3                          # add 3 more chapters that continue the course
+kb add "core java" --redo 4                          # rewrite chapter 4
+kb library                                           # your libraries and reading progress
+kb library remove "core java" --yes                  # delete one (its chapters, read status and chats)
+```
+
+- Each chapter is one AI call (usually 1-3 minutes). Chapters are saved as they finish, so stopping with Ctrl+C loses nothing.
+- Libraries live in your data folder (`kb-data/library/<subject>/`, one Markdown file per chapter), never in the public repo.
+- On the site they appear under **My library** in the sidebar, with the same reader, *On this page* contents, read status and tutor chat.
+  In the terminal, `kb read` lists them after the built-in chapters.
+- Quality follows the model: Claude or GPT-5 write the best chapters; small local models are fine for a first pass.
 
 ## About the DSA track
 

@@ -1,490 +1,698 @@
 === hld-geo | HLD | Geospatial indexing and location services ===
-"Drivers within 2 km", "restaurants near me", "which delivery zone is this address in" are two-dimensional proximity queries, and an ordinary B-tree index on latitude and longitude cannot answer them efficiently. The trick is to map 2-D space onto 1-D keys (geohash, S2, H3) or to use spatial trees (quadtrees, R-trees) so a proximity query becomes a handful of key or range lookups followed by an exact distance filter. This chapter covers the geometry, each index family and its trade-offs, and how ride-hailing and delivery platforms ingest millions of moving locations and match them in milliseconds.
+"Drivers within 2 km" and "restaurants near me" are two-dimensional proximity questions, and a normal database index on latitude and longitude answers them badly. The trick is to turn 2-D space into 1-D keys (geohash, S2, H3) or a spatial tree (quadtree, R-tree), so a nearby search becomes a few key lookups plus an exact distance filter. This chapter explains each index, then shows how a ride-hailing app ingests millions of moving locations and matches riders to drivers.
 
-## Coordinates and distance
-- **Latitude** runs from -90 (south pole) to +90; **longitude** from -180 to +180. GPS reports WGS84 coordinates.
-- One degree of latitude is about **111 km** everywhere. One degree of longitude is `111 km × cos(latitude)`: 111 km at the equator, ~79 km in Delhi (28.6°N), ~71 km in London (51.5°N), 0 at the poles. So a "box of ±0.01°" is not square.
-- Precision: 5 decimal places ≈ 1.1 m, 6 ≈ 11 cm. Phone GPS is typically accurate to 5–20 m in cities, worse among tall buildings.
+## 1. Why lat/long range queries are hard
 
-### Haversine (great-circle distance)
-```java
-static double haversineKm(double lat1, double lon1, double lat2, double lon2) {
-    final double R = 6371.0; // mean Earth radius in km
-    double dLat = Math.toRadians(lat2 - lat1);
-    double dLon = Math.toRadians(lon2 - lon1);
-    double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
-             + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
-             * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    return 2 * R * Math.asin(Math.sqrt(a));
-}
-```
-For short distances (under a few km) the **equirectangular approximation** `x = Δlon·cos(meanLat), y = Δlat, d = R·√(x²+y²)` is accurate to well under 1% and far cheaper, which matters when filtering thousands of candidates per request. Remember that straight-line distance is not travel distance: a river or a one-way system can turn 500 m into 4 km, so ranking uses ETA, not haversine.
+**Definition:** A proximity query asks for all points within some distance of a location; it needs locality in *both* dimensions at once.
 
-### Why a normal index fails
-`WHERE lat BETWEEN a AND b AND lon BETWEEN c AND d` with separate B-tree indexes can use only one index range efficiently; the other dimension is filtered row by row. In a city with a million points, the latitude band alone may contain 100,000 rows. Spatial indexes solve this by preserving **locality in both dimensions**.
+A B-tree index sorts by one key. It is like a phone book sorted by surname: great for "all Sharmas", useless for "everyone living on my street". One degree of latitude is about 111 km everywhere, but one degree of longitude is `111 km x cos(latitude)`, about 108 km in Bengaluru and 71 km in London, so a "plus or minus 0.01 degree" box is not even square.
 
-## Geohash
-Geohash recursively bisects the world: one bit for longitude (left or right half), one for latitude (bottom or top), alternating, then encodes every 5 bits as one base-32 character. Each extra character divides the cell by 32.
-
-| Length | Cell size (approx, at equator) | Typical use |
-|---|---|---|
-| 4 | 39 km × 19.5 km | Region, city-level sharding |
-| 5 | 4.9 km × 4.9 km | "Nearby" search for sparse areas |
-| 6 | 1.2 km × 0.61 km | Driver/restaurant search radius ~1 km |
-| 7 | 153 m × 153 m | Neighbourhood, precise matching |
-| 8 | 38 m × 19 m | Building level |
-| 9 | 4.8 m × 4.8 m | Very fine; near GPS noise |
-
-**Properties:** points sharing a longer prefix are close, so a geohash can be stored in a plain string column and queried with `LIKE 'tdr1w%'` or a range scan, and you can index it with any B-tree or key-value store.
-
-**The edge (neighbour) problem:** two points 10 m apart on either side of a cell boundary can have completely different geohashes (especially at the prime meridian and equator, where even the first character differs). Therefore a proximity search must:
-1. Pick a precision whose cell is at least as large as the search radius.
-2. Compute the user's cell **plus its 8 neighbours** (a 3×3 block).
-3. Fetch all points in those 9 cells.
-4. Filter by exact distance and sort.
-
-If too few results come back, drop one character (32x larger cells) and repeat. Geohash cells are also distorted near the poles and are rectangles rather than squares at odd lengths.
-
-## Quadtree
-A tree where each node covers a rectangle and splits into four children when it holds more than a threshold (say 100) points. Dense Manhattan gets tiny leaves, rural Montana gets huge ones, so every leaf holds a similar number of points, which makes "find the nearest 20 restaurants" efficient regardless of density.
-
-```
-                [World]
-       ┌──────┬──────┬──────┐
-      NW     NE     SW     SE        each node: bounds + children or point list
-             │
-      ┌───┬───┬───┐                  split when points > 100
-     NW  NE  SW  SE
-```
-- **Static quadtree:** built offline (e.g. nightly from the business table) and loaded into memory on each search server. Yelp-style: 200 million places × ~100 bytes fits in ~20 GB across a few machines; rebuilds are cheap. Great for places that rarely move.
-- **Dynamic quadtree:** supports inserts, deletes and merges of under-full nodes. Moving objects that update every few seconds cause constant split/merge churn and need locking, so for drivers a fixed grid or cell-based index is usually simpler.
-- **Search:** descend to the leaf containing the user, then expand to neighbouring leaves until you have K candidates within the radius.
-
-## S2 and H3: hierarchical cell systems
-### Google S2
-S2 projects the sphere onto the six faces of a cube and orders each face's cells along a **Hilbert curve**, giving 31 levels of cells identified by a 64-bit integer. Key properties:
-- Cells nearby in space have nearby IDs (Hilbert locality is better than geohash's Z-order), so a region maps to a small set of **ID ranges** that can be scanned in any sorted store.
-- `RegionCoverer` turns any circle or polygon into a covering of a few cells at mixed levels.
-- Cells are roughly equal-area across the globe, with no pole or meridian discontinuities.
-- Used by Google Maps, Foursquare, MongoDB `2dsphere`, Pokémon Go and Uber (historically for its dispatch index).
-
-### Uber H3
-H3 tiles the world with **hexagons** across 16 resolutions (resolution 7 ≈ 5 km², resolution 9 ≈ 0.1 km², each ~174 m across).
-- Every hexagon has **six neighbours at equal distance**; squares have 4 edge and 4 corner neighbours at different distances. That makes "k-ring" searches (`gridDisk(cell, k)`) and smoothing or diffusion calculations clean.
-- Ideal for **aggregation**: supply/demand per cell, surge pricing, heat maps, delivery-time models.
-- Hierarchy is approximate (a hexagon cannot be exactly divided into seven hexagons), so parent/child containment is not perfect; S2 is better for exact region coverings.
-
-### R-trees and PostGIS
-An R-tree groups nearby objects into nested **minimum bounding rectangles**; it indexes points and also shapes (polygons, lines), which cell systems handle less naturally. PostgreSQL's PostGIS uses GiST-based R-trees:
+### The problem
 
 ```sql
-CREATE TABLE restaurants (
-  id     BIGINT PRIMARY KEY,
-  name   TEXT,
-  geom   GEOGRAPHY(Point, 4326)
-);
-CREATE INDEX idx_restaurants_geom ON restaurants USING GIST (geom);
+-- index on (lat, lon)
+SELECT * FROM drivers
+WHERE lat BETWEEN 12.95 AND 12.99
+  AND lon BETWEEN 77.58 AND 77.62;
+```
 
--- within 2 km, nearest first (KNN operator <-> uses the index)
-SELECT id, name, ST_Distance(geom, ST_MakePoint(77.209, 28.613)::geography) AS m
-FROM restaurants
-WHERE ST_DWithin(geom, ST_MakePoint(77.209, 28.613)::geography, 2000)
-ORDER BY geom <-> ST_MakePoint(77.209, 28.613)::geography
-LIMIT 20;
+The index narrows latitude well, but every row in that latitude band, across the whole city width, must then be checked for longitude. In a city with a million points, that band can be 100,000 rows to return 50.
 
--- which delivery zone contains this address? (point-in-polygon)
+### Better design
+
+```text
+2-D point -> cell ID (one key that keeps nearby points close together)
+query: "which cells cover my 2 km circle?" -> fetch those few cells
+       -> exact distance filter on a small candidate list
+```
+
+Spatial indexes preserve locality in both dimensions, so the database reads only nearby candidates.
+
+**Key takeaway:** Say "a B-tree only narrows one dimension, so I'll map 2-D space to cells" before naming any specific index.
+
+---
+
+## 2. Geohash
+
+**Definition:** Geohash splits the world in half again and again (alternating longitude and latitude) and writes the result as a base-32 string; a longer string means a smaller cell.
+
+Each extra character divides the cell into 32 smaller ones. Points that share a longer prefix are usually close, so a plain string column with a normal index can answer "everything in this cell" as a prefix or range scan.
+
+### The problem
+
+You want a "restaurants within about 1 km" search in a key-value store that has no spatial index at all.
+
+### Better design
+
+```text
+Length | Cell size (approx, at equator) | Use
+  5    | 4.9 km x 4.9 km                | sparse areas, coarse search
+  6    | 1.2 km x 0.6 km                | ~1 km nearby search
+  7    | 153 m x 153 m                  | neighbourhood, precise matching
+```
+
+```sql
+-- geohash6 column with an ordinary B-tree index
+SELECT id, lat, lon FROM restaurants WHERE geohash6 = 'tdr1w2';
+```
+
+Store the geohash next to each point and query by prefix. Any database or key-value store can do this.
+
+**Trade-offs:**
+- Fixed precision: pick the length that matches your search radius.
+- Cells are rectangles, and they distort near the poles.
+
+**Key takeaway:** Geohash turns location into a string prefix that any ordinary index can search.
+
+---
+
+## 3. The geohash neighbour problem
+
+**Definition:** Two points a few metres apart can sit on opposite sides of a cell boundary and have completely different geohashes.
+
+At some boundaries even the first character differs (for example across the equator or the prime meridian). Prefix similarity implies closeness, but closeness does not imply prefix similarity.
+
+### The problem
+
+```text
++-------------+-------------+
+|   cell W    |   cell X    |    R  = rider, near the left edge of cell X
+|             |             |    D1 = driver inside cell X, 900 m away
+|        D2 . | . R      D1 |    D2 = driver in cell W, only 30 m away
++-------------+-------------+
+```
+
+Searching only the rider's own cell returns D1 and misses D2, who is far closer but sits just across the border.
+
+### Better design
+
+```text
++------+------+------+
+|  NW  |  N   |  NE  |
++------+------+------+     1. choose a cell size >= search radius
+|  W   |  me  |  E   |     2. fetch me + 8 neighbours (9 cells)
++------+------+------+     3. compute exact distance, filter, sort
+|  SW  |  S   |  SE  |     4. too few results? use one character less
++------+------+------+
+```
+
+Neighbour cells are cheap to compute from the geohash itself, so this is nine lookups, not a scan.
+
+**Key takeaway:** Always search the cell plus its 8 neighbours, then filter by real distance.
+
+---
+
+## 4. Quadtree
+
+**Definition:** A quadtree is a tree where each node covers a rectangle and splits into four children when it holds too many points (say more than 100).
+
+Dense areas get many small cells, empty areas get a few big ones, so every leaf holds a similar number of points. A busy city centre and a quiet village both return a sensible number of candidates.
+
+### The problem
+
+A fixed geohash grid at 1 km gives 5,000 restaurants per cell in central Mumbai and zero in rural areas. "Find the nearest 20" is slow in one place and needs many widening steps in the other.
+
+### Better design
+
+```text
+              [ India ]
+        /      |      |      \
+      NW      NE     SW      SE
+              /  |  |  \             split only where points > 100
+            ...  [Mumbai centre: tiny leaves]  ...
+```
+
+Build the tree in memory on each search server from the places table (for example nightly), descend to the user's leaf, and expand to neighbouring leaves until you have K results. Hundreds of millions of places fit in tens of gigabytes across a few machines.
+
+**Trade-offs:**
+- Moving objects that update every few seconds cause constant splits and merges, so quadtrees suit places that rarely move (restaurants, hotels), not drivers.
+- Custom in-memory code rather than a database feature.
+
+**Key takeaway:** Quadtree adapts to density; ideal for a mostly static "nearby places" index.
+
+---
+
+## 5. S2 and H3
+
+**Definition:** S2 (Google) and H3 (Uber) are hierarchical cell systems that cover the whole globe and give every cell a 64-bit integer ID.
+
+**S2** projects the Earth onto the six faces of a cube and numbers cells along a Hilbert curve (a space-filling curve that keeps nearby cells close in ID order), with levels 0 to 30. It can cover any circle or polygon with a handful of cells, which makes it good for delivery zones and geofences. **H3** tiles the world with hexagons at 16 resolutions; a resolution-9 hexagon is roughly 0.1 square km.
+
+### The problem
+
+Surge pricing needs "demand vs supply per area". With square cells, a cell has 4 edge neighbours and 4 corner neighbours at different distances, so smoothing demand into neighbouring areas is uneven.
+
+### Better design
+
+```text
+     __    __
+  __/  \__/  \     every hexagon has 6 neighbours, all at the same distance
+ /  \__/  \__/     gridDisk(cell, 1) = me + 6 neighbours
+ \__/  \__/  \     gridDisk(cell, 2) = next ring (19 cells in total)
+    \__/  \__/
+```
+
+Count riders and drivers per H3 cell, smooth over rings, and price per cell.
+
+**Trade-offs:**
+- H3's parent-child hierarchy is approximate (a hexagon cannot be split exactly into smaller hexagons); S2 is better for exact region coverings.
+- Both need a library rather than a plain string prefix.
+
+**Key takeaway:** S2 for exact coverings of shapes; H3 hexagons for uniform neighbours and aggregation such as surge and heat maps.
+
+---
+
+## 6. Redis GEO and PostGIS
+
+**Definition:** Redis GEO stores points in a sorted set scored by a 52-bit geohash; PostGIS adds spatial types and R-tree-style (GiST) indexes to PostgreSQL.
+
+They are the two off-the-shelf answers. Redis is fast and in memory for live, moving points; PostGIS is rich and durable for shapes, zones and static places.
+
+### The problem
+
+A team writes every driver ping into PostGIS. At a million updates per second the database falls over, while the data being written is overwritten four seconds later anyway.
+
+### Better design
+
+```text
+# Live driver positions in Redis (Redis 6.2+)
+GEOADD drivers:blr 77.5946 12.9716 driver:881
+GEOSEARCH drivers:blr FROMLONLAT 77.60 12.97 BYRADIUS 2 km ASC COUNT 20 WITHDIST
+```
+
+```sql
+-- Static zones in PostGIS: which delivery zone contains this address?
 SELECT zone_id FROM delivery_zones
 WHERE ST_Contains(boundary, ST_SetSRID(ST_MakePoint(77.209, 28.613), 4326));
 ```
-PostGIS is the right answer for relatively static data with rich queries (polygons, zones, geofences, routes). It is not the right place for millions of location updates per second.
 
-### Redis GEO
-Redis stores members in a sorted set whose score is a 52-bit interleaved geohash:
+Use the right store for each job: Redis for "where is everyone right now", PostGIS for polygons, geofences and places that change slowly.
+
+**Trade-offs:**
+- Redis GEO has no per-member expiry, so stale drivers need a separate heartbeat key or sweeper; one key per city can become huge, so shard by city or cell.
+- PostGIS does not scale to millions of writes per second.
+
+**Key takeaway:** Redis GEO for moving points, PostGIS for shapes and static data.
+
+---
+
+## 7. Driver location updates at scale
+
+**Definition:** Location ingestion is the pipeline that takes a ping from every active driver every few seconds and keeps a fresh, searchable index of current positions.
+
+The key insight is that a driver's *current* position is short-lived data: it is replaced every few seconds. It belongs in memory, not in a transactional database.
+
+### The problem
+
+```text
+5,000,000 active drivers / one ping every 4 s = 1,250,000 writes/s
+each ping ~100 bytes                          = ~125 MB/s
+INSERT each one into a relational DB          -> overloaded, and 99% is overwritten
 ```
-GEOADD drivers:blr 77.5946 12.9716 driver:881
-GEOSEARCH drivers:blr FROMLONLAT 77.60 12.97 BYRADIUS 2 km ASC COUNT 20 WITHDIST
-ZREM drivers:blr driver:881
+
+### Better design
+
+```text
+Driver app --(WebSocket / gRPC stream)--> Location gateway (stateless, per region)
+                                               |
+                                               v
+                              Kafka "driver-locations" (partitioned by city/cell)
+                               /                                   \
+              Location index service                         Cold path: trails to
+              (in-memory cell -> drivers, per city shard)     data lake for ETA training,
+                                                              disputes and analytics
 ```
-Updates are O(log N) and searches touch only the relevant score ranges. Weaknesses: no per-member TTL (stale drivers must be removed explicitly or tracked in a separate heartbeat key), and one key per city can become a hot, very large key, so shard by city and cell.
 
-### Comparison
-| Index | Shape | Strengths | Weaknesses | Typical use |
-|---|---|---|---|---|
-| Geohash | Rectangles, Z-order string | Works in any KV/B-tree store, simple prefix queries | Edge/neighbour problem, distortion, fixed precision | Simple nearby search, sharding keys |
-| Quadtree | Adaptive rectangles | Adapts to density, K-nearest efficiently | Churn with moving objects, custom in-memory code | Yelp-style static POIs |
-| S2 | Quad cells on cube, Hilbert | 64-bit IDs, great locality, exact coverings | More complex library | Region covering, geofences, Google-scale |
-| H3 | Hexagons | Uniform neighbours, aggregation, k-rings | Imperfect hierarchy | Surge pricing, supply/demand, analytics |
-| R-tree (PostGIS) | Bounding rectangles | Shapes, polygons, rich SQL | Write throughput, single DB scaling | Zones, geofencing, static places |
-| Redis GEO | Geohash in sorted set | Fast in-memory updates and radius search | No member TTL, big keys | Live driver positions |
+Only move a driver between cell buckets when they cross a cell boundary (most pings stay in the same cell). Store `lastSeen` with each entry and drop drivers silent for 15-30 seconds, so ghost drivers vanish. If an index node dies, it rebuilds from the live stream within seconds, because everyone pings again shortly.
 
-## Location services at scale: the ride-hailing pattern
-### Requirements and numbers
-Say 5 million active drivers worldwide, each sending a location every 4 seconds: **1.25 million writes/second**. Each payload (driver ID, lat, lon, heading, speed, accuracy, timestamp, status) is ~100 bytes, so ~125 MB/s of ingress. Riders request ~50,000 matches/second at peak, each needing "available drivers near me" in under 100 ms.
+**Trade-offs:**
+- In-memory state is lost on crash; acceptable because it refills from the next pings.
+- Hot spots (airports, stadiums) need finer cells or extra replicas.
 
-### Ingestion path
+**Key takeaway:** Current location lives in memory, sharded by city then cell; history flows to cheap storage asynchronously.
+
+---
+
+## 8. Nearby search and matching
+
+**Definition:** Matching finds candidate drivers near a rider, ranks them, and assigns exactly one driver with an atomic lock.
+
+Straight-line distance only shortlists. A river or a one-way street can turn 500 m into 4 km, so ranking uses ETA (estimated time of arrival over the road network).
+
+### The problem
+
+Two riders request at the same moment. Both searches return driver 881 as nearest, both send an offer, and the driver gets two trips.
+
+### Better design
+
+```text
+1. rider cell -> gridDisk(cell, 1 or 2) -> candidate drivers
+2. filter: available, right vehicle type, lastSeen < 15 s
+3. rank top N by ETA (routing engine), rating, acceptance chance
+4. lock:  SET driver:881:offer trip:9 NX PX 15000   (only one wins)
+5. offer for ~15 s; decline/timeout -> release, try next driver
+6. accept -> create trip in the DB, stream driver location to rider
 ```
-Driver app ──(WebSocket/gRPC stream or batched HTTP)──> Location gateway (stateless, regional)
-     │                                                     │
-     │                                                     ├──> Kafka topic "driver-locations"
-     │                                                     │       partitioned by city / cell
-     │                                                     │
-     │                                       ┌─────────────┴──────────────┐
-     │                              Location index service          Trip tracking service
-     │                              (in-memory grid per city shard) (pushes to rider app)
-     │                                                     │
-     │                                       Cold path: S3/data lake (trails for analytics,
-     │                                       ETA training, fraud, disputes)
-```
-Key decisions:
-- **Do not write every ping to a database.** Current position is ephemeral, overwritten every 4 seconds. Keep it in memory (in-process grid or Redis); persist trails asynchronously in bulk via Kafka to a data lake or Cassandra (`(driver_id, day)` partition) for history.
-- **Client-side smoothing:** send more often when moving fast or on a trip, less often when idle; snap to the road network (map matching) to remove GPS jitter.
-- **Only re-index on cell change:** most pings stay in the same cell; update the position in place and move the driver between cell buckets only when crossing a boundary.
-- **Expiry:** a driver that stops pinging (tunnel, app killed) must disappear from search after ~15–30 seconds. Store `lastSeen` with each entry and filter or sweep stale ones.
 
-### The in-memory grid
-Each location index server owns a set of cells (for example H3 resolution 8 or S2 level 13) for one city. Structure:
-```java
-// cellId -> drivers currently in that cell
-ConcurrentHashMap<Long, Set<Long>> driversByCell;
-// driverId -> latest state (position, status, vehicle type, lastSeen)
-ConcurrentHashMap<Long, DriverState> stateByDriver;
+`NX` means "set only if the key does not exist", so only one trip can claim the driver; `PX 15000` makes the lock expire if nobody answers.
 
-void onPing(Ping p) {
-    long newCell = H3.latLngToCell(p.lat(), p.lon(), 8);
-    DriverState old = stateByDriver.put(p.driverId(), DriverState.from(p, newCell));
-    if (old == null || old.cell() != newCell) {
-        if (old != null) driversByCell.getOrDefault(old.cell(), Set.of()).remove(p.driverId());
-        driversByCell.computeIfAbsent(newCell, c -> ConcurrentHashMap.newKeySet()).add(p.driverId());
-    }
-}
-```
-Search: compute the rider's cell, take `gridDisk(cell, k)` (k = 1 or 2), collect drivers, filter by status (available, vehicle type) and freshness, compute approximate distance, then rank the top N by ETA. A single server comfortably holds a large city (a million drivers × ~200 bytes = 200 MB).
+**Trade-offs:**
+- Greedy nearest-driver is simple; batching requests over a 1-2 second window can match the whole area better but adds a little delay.
 
-### Sharding by region
-- **Shard by city / region first:** almost all queries are local, and the business is organised that way (pricing, regulation). A city maps to one or more index servers.
-- **Large cities split by cell:** consistent hashing of cell IDs across servers; a query fans out to the servers owning the k-ring cells (usually one or two).
-- **Hot spots:** airports, stadiums and concert exits concentrate drivers and requests; use finer cells there or replicate read-heavy shards.
-- **Replication:** run each shard with a replica; because state rebuilds from the live stream within seconds (everyone pings every 4 s), losing a node means a brief degradation, not data loss. Uber's Ringpop used gossip-based consistent hashing for exactly this.
+**Key takeaway:** Shortlist by cells, rank by ETA, and claim the driver with an atomic, expiring lock.
 
-### Matching and dispatch
-1. Rider requests a trip; the dispatch service queries the index for available drivers within the k-ring.
-2. Rank candidates by **ETA** (road-network routing, not straight-line), driver rating, acceptance probability, and global efficiency (batch matching over a 1–2 second window can beat greedy nearest-driver for the whole city).
-3. **Offer and lock:** mark the driver as `OFFERED` atomically (`SET driver:881:lock trip:9 NX PX 15000` or a compare-and-set on driver state) so two riders never get the same driver; offer with a 10–15 second timeout; on decline or timeout, release and try the next.
-4. On accept, create the trip (durable DB transaction), switch the driver to `ON_TRIP`, and start streaming the driver's location to the rider via WebSocket or push.
+---
 
-### ETA
-- Model the road network as a weighted graph (edges = road segments, weights = current travel time from live speed data).
-- Plain Dijkstra on a continent-sized graph is too slow; production routers use **Contraction Hierarchies** or similar precomputation to answer point-to-point queries in milliseconds (OSRM, GraphHopper, Valhalla).
-- Adjust with ML using historical trips, time of day, weather and events. Cache ETAs between cell pairs for coarse estimates (pricing) and compute precise ones only for the final candidates.
+## In an HLD interview
 
-### Other location products
-- **Yelp / "nearby places":** read-heavy, write-light. Static quadtree or geohash index in memory, rebuilt periodically; business details in a DB and cache; results ranked by distance, rating and relevance; CDN for photos.
-- **Food delivery:** three moving parties (customer, restaurant, courier); delivery zones as polygons (PostGIS or S2 coverings); courier assignment includes food prep time; order batching for couriers.
-- **Geofencing:** "notify when the user enters the store area": precompute S2/H3 coverings of each fence, index fences by cell, and on each location update check only fences in the user's cell.
-- **Friends nearby / location sharing:** pub/sub per user or per cell; only send updates to friends within some radius; throttle.
+- **Uber / Ride Tracking:** WebSocket pings, Kafka by city, in-memory cell index, re-index on cell change, TTL for stale drivers, ETA ranking, atomic offer lock.
+- **Yelp / nearby places:** geohash or quadtree built offline, 9-cell search, results cached, ranked by distance and rating.
+- **Food delivery:** delivery zones as polygons (PostGIS or S2 coverings), couriers tracked like drivers, ETA includes food prep time.
+- **Notification System / Metrics:** geo-targeted pushes and heat maps by H3 cell.
+- **What to say:** "Current positions live in memory sharded by city and cell; I search the rider's cell plus neighbours, filter by freshness, rank by ETA, and lock the chosen driver with SET NX and a timeout."
 
-## How it shows up in interview problems
-- **Uber / Lyft / Ola:** the whole ingestion + in-memory grid + matching + lock + ETA story; mention WebSockets for live tracking and Kafka for trails.
-- **Yelp / Google Places / proximity service:** geohash or quadtree, 9-cell search, read replicas and caching, rebuild index offline.
-- **Food delivery (Swiggy, DoorDash):** zones as polygons, courier location like drivers, ETA including prep.
-- **Tracking / logistics / fleet:** ingestion at scale, time-series storage of trails, geofence alerts.
-- **Notification system:** geo-targeted pushes ("users in this H3 cell") using cell-tagged segments.
-- **Metrics / analytics:** aggregate events by H3 cell for heat maps and surge.
+## At a glance
 
-## Common pitfalls
-- Searching only the user's own geohash cell and missing everything just across the boundary.
-- Treating degrees as equal distances in both directions.
-- Writing every location ping to a relational DB.
-- Ranking by straight-line distance instead of ETA.
-- No staleness handling, so ghost drivers who went offline still appear.
-- A single global Redis key for all drivers (hot, huge key).
-- Matching without an atomic lock, double-assigning a driver.
-- Choosing precision too fine for the radius, turning one query into hundreds of cell lookups.
+| Concept | Core idea | Ask yourself |
+|---|---|---|
+| Why it is hard | B-tree narrows one dimension | Am I scanning a whole latitude band? |
+| Geohash | Location as a string prefix | Which length matches my radius? |
+| Neighbour problem | Close points, different prefixes | Did I search all 9 cells? |
+| Quadtree | Split where dense | Do my points move often? |
+| S2 / H3 | Global cells, 64-bit IDs | Do I need shape coverings or uniform hexagons? |
+| Redis GEO / PostGIS | Moving points vs shapes | Is this live data or static data? |
+| Location ingestion | Memory, not a DB per ping | What happens to a driver who stops pinging? |
+| Matching | Cells -> ETA -> atomic lock | Can two riders get the same driver? |
 
-## Interview questions
-1. **Why can't a B-tree on (lat, lon) answer "nearby" efficiently?** A composite index narrows only the first dimension's range; the second is filtered row by row. Spatial encodings preserve 2-D locality in one key.
-2. **What is the geohash edge problem and how do you fix it?** Nearby points across a cell boundary have different prefixes; always query the cell plus its 8 neighbours and then filter by exact distance.
-3. **Quadtree vs geohash?** Quadtrees adapt to density (similar counts per leaf) and suit static POIs in memory; geohash is a fixed grid that works in any key-value store and handles updates simply.
-4. **Why does Uber use hexagons?** H3 hexagons have six equidistant neighbours, making radius rings, smoothing and supply/demand aggregation uniform; squares have uneven neighbour distances.
-5. **How do you handle 1M+ location updates per second?** Persistent connections into stateless regional gateways, Kafka partitioned by city/cell, in-memory cell index per shard, update membership only on cell change, persist trails asynchronously in batches.
-6. **How do you prevent two riders getting the same driver?** An atomic state transition (`SET NX PX` lock or CAS on driver status) with an offer timeout, released on decline.
-7. **How do you shard a location index?** By city/region first, then by cell with consistent hashing; split hot cells; rebuild from the live stream on failure.
+## Final memory aid
 
-## Cheat sheet
-- 1° lat ≈ 111 km; 1° lon ≈ 111 km × cos(lat). Haversine for accuracy, equirectangular for speed.
-- Geohash: base32 Z-order; 6 chars ≈ 1.2 km, 7 ≈ 150 m; query 9 cells then filter.
-- Quadtree: adaptive, in-memory, great for static places. R-tree/PostGIS: shapes, polygons, zones.
-- S2: Hilbert curve, 64-bit cell IDs, region coverings. H3: hexagons, k-rings, aggregation/surge.
-- Moving objects: memory, not DB; Kafka for trails; re-index on cell change; TTL stale entries.
-- Shard by city, then cell; hot cells split; rebuild from stream.
-- Match: k-ring candidates → filter → rank by ETA → atomic lock with timeout.
+- **1 degree latitude ~ 111 km;** longitude shrinks with cos(latitude)
+- **Geohash:** 6 chars ~ 1.2 km, 7 chars ~ 150 m
+- **Always** search the cell plus 8 neighbours
+- **Quadtree** for static places, **H3** for aggregation, **S2** for shapes
+- **Redis GEO** for live drivers, **PostGIS** for zones
+- **Pings:** memory + Kafka, never one DB insert each
+- **Match:** shortlist by cell, rank by ETA, lock with NX + expiry
 
 === hld-observability | HLD | Observability and resilience patterns ===
-In a distributed system something is always partially broken, so the questions are how quickly you notice, how precisely you can locate the cause, and how small you can keep the blast radius. Observability (logs, metrics, traces, SLOs and alerting) answers the first two; resilience patterns (timeouts, retries, circuit breakers, bulkheads, fallbacks, health checks) and safe deployment practices answer the third. This chapter gives you the vocabulary and the concrete Spring and Resilience4j configuration to discuss both convincingly.
+In a distributed system something is always partly broken, so the real questions are how fast you notice, how quickly you find the cause, and how small you keep the damage. Observability (logs, metrics, traces and SLOs) answers the first two; resilience patterns (timeouts, retries, circuit breakers, bulkheads, fallbacks, health checks and canary releases) answer the third. Each idea below comes with a failure scenario and the fix.
 
-## Monitoring vs observability
-Monitoring checks known failure modes ("is CPU above 90%?"). Observability is the ability to ask **new** questions about a system from its outputs without shipping new code ("why are checkout requests from Android users in Mumbai slow since 14:05?"). That requires high-quality, correlated telemetry: logs, metrics and traces linked by shared identifiers.
+## 1. Logs, metrics and traces
 
-## The three signals
-| Signal | What it is | Strength | Cost / weakness | Tools |
-|---|---|---|---|---|
-| Metrics | Numeric time series (counters, gauges, histograms) with labels | Cheap, aggregatable, ideal for dashboards and alerts | Lose per-request detail; label cardinality limits | Prometheus, Micrometer, Datadog, CloudWatch |
-| Logs | Timestamped event records | Rich detail, arbitrary context | Expensive at volume; hard to aggregate | ELK/OpenSearch, Loki, Splunk |
-| Traces | Tree of spans for one request across services | Shows where latency and errors originate | Needs instrumentation and sampling | OpenTelemetry, Jaeger, Tempo, Zipkin |
+**Definition:** Metrics are cheap numeric time series, logs are detailed event records, and traces show one request's path across services.
 
-Increasingly, **profiles** (continuous CPU/memory profiling) and **events** (deploys, config changes) are treated as further signals; overlaying deploy markers on dashboards resolves a large share of incidents ("latency rose at 14:05, which is when v2.31 shipped").
+Think of a hospital: metrics are the vital-signs monitor (heart rate, at a glance), traces are the patient's journey through departments, and logs are the doctor's detailed notes. Metrics tell you *that* something is wrong, traces tell you *where*, logs tell you *why*.
 
-### Structured logging and correlation IDs
-Log JSON, not prose, so fields can be indexed and queried:
+### The problem
+
+Checkout is slow. The team has only unstructured text logs on 40 pods. Engineers SSH into machines and `grep` for an hour before realising the slowness is in a downstream inventory call.
+
+### Better design
+
+```text
+Metrics (Prometheus/Micrometer): checkout p99 jumped from 300 ms to 2 s at 14:05  -> alert
+Trace (OpenTelemetry):           checkout 2.1 s = inventory call 1.9 s            -> where
+Logs (JSON, searchable):         inventory: "connection pool exhausted"           -> why
+```
+
+Log JSON, not prose, so fields can be searched. OpenTelemetry is the vendor-neutral standard for producing all three, with a Java agent that instruments Spring, JDBC and Kafka without code changes.
+
+**Trade-offs:**
+- Logs are expensive at volume; sample successful requests and keep all errors.
+- Traces are usually sampled, so a rare slow request might not be kept.
+
+**Key takeaway:** Metrics detect, traces locate, logs explain.
+
+---
+
+## 2. Correlation IDs
+
+**Definition:** A correlation ID (trace ID) is a unique ID created at the edge for each request and passed along to every service and log line it touches.
+
+It is like a courier tracking number: every depot scans the same number, so you can follow one parcel end to end.
+
+### The problem
+
+```text
+gateway   ERROR timeout calling order-service
+order-svc ERROR payment failed
+payment   ERROR card declined
+(which of these 10,000 errors per minute belong to the same customer request?)
+```
+
+Without a shared ID, the logs from different services cannot be joined.
+
+### Better design
+
 ```json
-{"ts":"2026-10-09T14:05:12.481Z","level":"ERROR","service":"payment-service",
- "traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7",
- "userId":"u_8812","orderId":"o_99172","event":"charge_failed",
- "provider":"stripe","errorCode":"card_declined","latencyMs":842}
+{"ts":"2026-10-13T14:05:12Z","level":"ERROR","service":"payment-service",
+ "traceId":"4bf92f3577b34da6a3ce929d0e0e4736","orderId":"o_99172",
+ "event":"charge_failed","errorCode":"card_declined","latencyMs":842}
 ```
-- Every request gets a **trace ID** at the edge (W3C `traceparent` header); every service propagates it and puts it in every log line through the MDC. Clicking from a trace to its logs, or from an error log to its trace, is the core debugging loop.
-- Log **events and decisions**, not every line of control flow. Use levels consistently; avoid logging in tight loops.
-- Never log secrets, tokens, full card numbers or unnecessary PII; mask at the logging layer.
-- At high volume, **sample** successful requests (keep 1–10%) but keep all errors; set retention by tier (hot 7 days searchable, cold in object storage for 90+ days).
 
-### Distributed tracing and OpenTelemetry
-A **trace** is a tree of **spans**; each span records a unit of work (an HTTP handler, a DB query, a Kafka publish) with start time, duration, attributes and status, and a parent span ID. Context propagates in headers (HTTP `traceparent`, Kafka record headers, gRPC metadata).
+The gateway creates the ID and sends it in the W3C `traceparent` header (and in Kafka record headers for async hops). Each service puts it into the logging MDC so every log line carries it. Search one `traceId` and you see the whole story.
 
-**OpenTelemetry (OTel)** is the vendor-neutral standard: APIs and SDKs for traces, metrics and logs, auto-instrumentation agents (the Java agent instruments Spring MVC, JDBC, Kafka, gRPC and HTTP clients with no code), and the **Collector**, which receives, batches, samples and exports to any backend.
+**Key takeaway:** Every request gets one trace ID at the edge, and every log line carries it.
 
-Sampling:
-- **Head sampling:** decide at the start (keep 5% of traces). Cheap, but may drop the interesting slow or failed ones.
-- **Tail sampling:** the collector buffers complete traces and keeps all errors and slow ones plus a percentage of the rest. Better signal, more infrastructure.
+---
 
-In Spring Boot 3, Micrometer Tracing bridges to OTel:
+## 3. Golden signals
+
+**Definition:** The four golden signals are latency, traffic, errors and saturation: the minimum set to watch for any service.
+
+**Saturation** means how "full" a resource is: queue depth, thread-pool usage, consumer lag. Two related checklists: **RED** (Rate, Errors, Duration) per service and **USE** (Utilisation, Saturation, Errors) per resource such as a connection pool.
+
+### The problem
+
+A team watches only CPU and memory. A bug makes the cart service return `200 OK` with an empty cart. CPU looks perfect, and nobody notices until sales drop.
+
+### Better design
+
+```text
+Per service:   requests/s, error ratio, p50/p95/p99 latency
+Per resource:  DB pool in use / max, Kafka consumer lag, queue depth
+Business:      orders per minute, payment success rate
+```
+
+Business metrics catch "successful" failures that technical metrics miss.
+
+**Key takeaway:** Watch latency, traffic, errors and saturation per service, plus one or two business metrics.
+
+---
+
+## 4. Percentiles
+
+**Definition:** The p99 latency is the value that 99% of requests are faster than; it describes the slow tail that averages hide.
+
+If 99 requests take 50 ms and one takes 5 s, the average is about 100 ms and looks fine, while 1 user in 100 waits 5 seconds.
+
+### The problem
+
+```text
+Page calls 100 backends in parallel. Each backend: p99 = 1 s, usually 20 ms.
+Chance at least one backend is slow = 1 - 0.99^100 = ~63%
+-> most page loads are slow, while every backend's average looks healthy
+```
+
+Also wrong: averaging the p99 of 20 pods. Percentiles cannot be averaged.
+
+### Better design
+
+Export **histograms** (counts per latency bucket), add the buckets up across pods, then compute the percentile:
+
+```text
+histogram_quantile(0.99,
+  sum by (le) (rate(http_server_requests_seconds_bucket[5m])))
+```
+
+In Spring Boot, enable `percentiles-histogram` for `http.server.requests`. Use route templates such as `/orders/{id}` as labels, never raw IDs, because every unique label value creates a new time series.
+
+**Key takeaway:** Alert on p95/p99 from merged histograms, never on averages or averaged percentiles.
+
+---
+
+## 5. SLI, SLO and error budget
+
+**Definition:** An SLI is a measured ratio of good events, an SLO is the target for it, and the error budget is the failure the SLO allows.
+
+Example: SLI = "share of checkout requests that succeed in under 300 ms"; SLO = 99.9% over 30 days. The error budget is 0.1%: about 43 minutes of total outage, or 1 bad request in 1,000. An **SLA** is the external contract with penalties, set looser than the SLO.
+
+### The problem
+
+Product wants to ship daily; operations wants to freeze releases because "stability matters". The argument repeats every week with no data.
+
+### Better design
+
+```text
+SLO 99.9% over 30 days -> budget ~43 min
+Budget left   -> ship features normally
+Budget burning 14x faster than allowed for 1 hour -> page someone
+Budget spent  -> freeze risky releases, fix reliability first
+```
+
+The budget turns an opinion fight into a shared rule. Page on symptoms (users failing), not causes (CPU at 85%).
+
+**Trade-offs:**
+- Picking the wrong SLI (measured at the server, not near the user) hides real pain.
+
+**Key takeaway:** SLO = target, error budget = 1 - SLO; spend it on shipping, stop when it runs out.
+
+---
+
+## 6. Timeouts
+
+**Definition:** A timeout is the maximum time a caller waits for a response before giving up.
+
+Many HTTP clients wait forever by default. A call with no timeout holds a thread until the other side answers, which may be never.
+
+### The problem
+
+```text
+Tomcat threads: 200
+Inventory service hangs; calls have no timeout
+-> after a few seconds all 200 threads are stuck waiting
+-> checkout, login, health checks: all stop responding
+```
+
+One hung dependency takes down a healthy service.
+
+### Better design
+
+```java
+HttpClient client = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofMillis(500))
+        .build();
+HttpRequest req = HttpRequest.newBuilder(URI.create("http://inventory/stock/42"))
+        .timeout(Duration.ofSeconds(1))      // based on the dependency's p99.9 + margin
+        .build();
+```
+
+Better still, pass a **deadline**: if the user request has 2 s in total and 1.5 s is used, the next call gets at most 0.5 s.
+
+**Key takeaway:** Every network call gets a timeout shorter than the caller's own.
+
+---
+
+## 7. Retries with backoff and jitter
+
+**Definition:** A retry repeats a failed call; backoff waits longer after each attempt, and jitter adds randomness to the wait.
+
+Retries fix brief glitches, but done badly they multiply load exactly when a service is struggling.
+
+### The problem
+
+```text
+Gateway retries 3x -> Service A retries 3x -> Service B retries 3x -> DB
+One DB failure = 3 x 3 x 3 = 27 calls to the DB
+All clients retry at exactly 100 ms -> synchronised waves of traffic
+```
+
+### Better design
+
+```text
+retry only: timeouts, connection resets, 503   (never 400s)
+retry only: idempotent calls, or calls with an idempotency key
+retry at ONE layer, max 2-3 attempts
+sleep = random(0, min(cap, base * 2^attempt))   <- exponential backoff + full jitter
+```
+
+Retrying a non-idempotent payment without an idempotency key can charge a customer twice.
+
+**Trade-offs:**
+- Retries add latency; keep them inside the overall deadline.
+
+**Key takeaway:** Retry transient failures on idempotent calls, at one layer, with backoff and jitter.
+
+---
+
+## 8. Circuit breaker
+
+**Definition:** A circuit breaker watches calls to a dependency and, when too many fail, stops calling it for a while and fails fast instead.
+
+Like a household fuse: when something is wrong, it trips, protecting the rest of the house, and you try again later.
+
+### The problem
+
+The payment provider is down. Every checkout waits the full 2-second timeout and then fails. Threads pile up, and the provider gets hammered while trying to recover.
+
+### Better design
+
+```text
+            failure rate >= 50% (over last 50 calls)
+ CLOSED  ------------------------------------------> OPEN  (fail fast, use fallback)
+   ^                                                  |
+   | trial calls succeed                              | after 10 s
+   |                                                  v
+   +------------------------------------------- HALF_OPEN (let 5 trial calls through)
+                         trial calls fail -> back to OPEN
+```
+
 ```yaml
-management:
-  tracing:
-    sampling:
-      probability: 0.1
-  otlp:
-    tracing:
-      endpoint: http://otel-collector:4318/v1/traces
-  endpoints:
-    web:
-      exposure:
-        include: health,prometheus,info
-  metrics:
-    distribution:
-      percentiles-histogram:
-        http.server.requests: true
-      slo:
-        http.server.requests: 100ms,300ms,1s
-logging:
-  pattern:
-    level: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]"
+resilience4j.circuitbreaker.instances.payment:
+  slidingWindowSize: 50
+  failureRateThreshold: 50
+  slowCallDurationThreshold: 800ms
+  waitDurationInOpenState: 10s
+  permittedNumberOfCallsInHalfOpenState: 5
 ```
 
-## What to measure
-### RED, USE and the four golden signals
-- **RED** (per request-driven service): **R**ate (requests/sec), **E**rrors (failed requests/sec or ratio), **D**uration (latency distribution).
-- **USE** (per resource such as CPU, disk, connection pool, thread pool, queue): **U**tilisation (% busy), **S**aturation (queued work: run queue, pool wait time, consumer lag), **E**rrors.
-- **Google's four golden signals:** latency, traffic, errors, saturation. RED plus saturation.
+Callers fail in microseconds instead of seconds, and the dependency gets room to recover. Counting slow calls catches degradation before outright failure.
 
-Add **business metrics**: orders per minute, payment success rate, matches per second, messages delivered. They catch failures that technical metrics miss (a bug that returns 200 with an empty cart).
+**Key takeaway:** Closed -> open -> half-open: fail fast while a dependency is sick, probe gently to recover.
 
-### Percentiles and histograms
-Averages hide pain. If 99 requests take 50 ms and one takes 5 s, the mean is ~100 ms and looks fine while 1% of users wait 5 seconds. Report **p50, p95, p99, p99.9**.
-- **Tail amplification:** a page that fans out to 100 backends sees each backend's p99 on 63% of page loads (`1 - 0.99^100`). Tail latency of dependencies becomes typical latency of aggregators.
-- **You cannot average percentiles** across instances. Averaging the p99 of 20 pods is mathematically meaningless. Instead, export **histograms** (bucket counts), sum buckets across instances, then compute the percentile: `histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket[5m])))`.
-- Choose bucket boundaries around your SLO thresholds, or use native/exponential histograms.
+### Circuit breaker vs. retry
 
-### Cardinality
-Each unique label combination is a separate time series. Labels like `endpoint`, `status`, `region` are fine; `userId`, `orderId` or raw URLs with IDs (`/orders/91827`) explode storage and crash Prometheus. Use the route template (`/orders/{id}`); put high-cardinality detail in logs and traces.
+- **Retry** bets the failure is brief and tries again.
+- **Circuit breaker** decides the failure is not brief and stops trying for a while.
+- Use both: retries inside, and the breaker stops retries once it opens.
 
-## SLI, SLO, SLA and error budgets
-| Term | Meaning | Example |
+---
+
+## 9. Bulkhead
+
+**Definition:** A bulkhead gives each dependency its own limited pool of threads or connections, so one slow dependency cannot use up everything.
+
+Ships have watertight compartments: one flooded section does not sink the ship.
+
+### The problem
+
+A slow recommendation service holds all 200 shared Tomcat threads. Checkout, which never calls recommendations directly but shares the threads, stops working too.
+
+### Better design
+
+```java
+@Bulkhead(name = "recommendations")              // maxConcurrentCalls: 20
+public List<Product> recommend(String userId) { ... }
+```
+
+```text
+Thread budget: recommendations max 20 | inventory max 40 | payment max 40 | rest free
+```
+
+Recommendations can use at most 20 concurrent calls; the 21st is rejected immediately and the page shows a fallback.
+
+**Key takeaway:** Isolate resources per dependency so one failure stays in its own compartment.
+
+---
+
+## 10. Fallbacks and graceful degradation
+
+**Definition:** A fallback is the planned alternative response when a dependency fails: cached data, a default, or a feature switched off.
+
+Decide per feature what "degraded but working" looks like, before the incident.
+
+### The problem
+
+The personalised recommendations service fails, and the whole home page returns an error, even though the catalogue and cart work fine.
+
+### Better design
+
+```text
+Recommendations down -> show "popular items" from cache
+Reviews down         -> hide the reviews section
+Price service slow   -> show last cached price; checkout re-validates
+Payment provider down -> accept order as PENDING, charge async, email later
+```
+
+Never fall back to a lie on correctness-critical paths: a payment must never be "assumed successful".
+
+**Key takeaway:** Degrade features, not the whole product, and never fake correctness.
+
+---
+
+## 11. Health checks
+
+**Definition:** Health checks are endpoints the platform polls: **liveness** asks "is this process stuck and in need of a restart?", **readiness** asks "can it take traffic right now?".
+
+Kubernetes restarts a container that fails liveness and removes a pod from the load balancer while it fails readiness.
+
+### The problem
+
+```text
+liveness probe = "can I reach the database?"
+DB has a 30-second blip -> every pod fails liveness
+-> Kubernetes restarts the whole fleet at once -> full outage, cold caches
+```
+
+A dependency hiccup becomes a self-inflicted outage.
+
+### Better design
+
+```text
+/actuator/health/liveness   -> only internal state (app not deadlocked)
+/actuator/health/readiness  -> warm-up done, can serve; may include critical local deps
+```
+
+Spring Boot exposes both groups. Liveness never checks downstream services.
+
+**Key takeaway:** Liveness restarts, readiness removes from traffic; keep dependencies out of liveness.
+
+---
+
+## 12. Canary releases
+
+**Definition:** A canary release sends a small share of traffic to the new version first and widens it only if its metrics stay healthy.
+
+Most outages come from changes, so the release process itself is a resilience mechanism. Like miners' canaries, the small group warns you before everyone is affected.
+
+### The problem
+
+Version 2.31 is rolled out to all pods at once. It has a bug that fails 5% of checkouts. Every customer is affected within minutes, and rollback takes 20 minutes.
+
+### Better design
+
+```text
+1% traffic -> compare error rate and p99 with the old version for 10 min
+  healthy  -> 5% -> 25% -> 100%
+  worse    -> automatic rollback (Argo Rollouts, Flagger)
+```
+
+Only 1% of users see the bug, for minutes. Pair with feature flags (deploy code dark, switch on separately) and treat config changes the same way.
+
+**Trade-offs:**
+- Needs good metrics and traffic splitting; database changes must work with old and new code (expand, migrate, then contract).
+
+**Key takeaway:** Release to a few, measure, then widen; automate the rollback.
+
+### Canary vs. blue-green
+
+- **Blue-green:** two full environments, switch all traffic at once, instant rollback, double capacity.
+- **Canary:** shift traffic gradually while comparing metrics, limiting the blast radius.
+
+---
+
+## In an HLD interview
+
+- **Every design:** close with "what I'd monitor" (golden signals, p99, consumer lag, cache hit ratio) and "how it fails" (timeouts, breakers, fallbacks).
+- **Payment System:** idempotent retries, a circuit breaker per provider with failover to a second provider, never fall back to "success".
+- **Netflix / YouTube / News Feed:** bulkhead the recommendation call and degrade to popular content from cache.
+- **Logging/Monitoring and Metrics systems:** agents -> Kafka -> processors -> hot and cold storage, histograms, label cardinality limits, tail sampling of traces.
+- **What to say:** "Every call has a timeout and a circuit breaker; retries happen at one layer with jitter; I'd define an SLO of 99.9% for checkout and alert on error-budget burn rate."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
 |---|---|---|
-| SLI (indicator) | A measured ratio of good events to total | % of checkout requests that succeed in < 300 ms |
-| SLO (objective) | Internal target for an SLI over a window | 99.9% over a rolling 28 days |
-| SLA (agreement) | External contract with penalties | 99.5% monthly or service credits |
-| Error budget | `1 - SLO` of allowed failure | 0.1% of 28 days ≈ 40 minutes; or 1 in 1,000 requests |
+| Logs, metrics, traces | Detect, locate, explain | Can I find a slow call in minutes? |
+| Correlation ID | One ID through every hop | Can I join logs from all services? |
+| Golden signals | Latency, traffic, errors, saturation | Would I notice a 200 with wrong data? |
+| Percentiles | Tail, not average | Am I averaging percentiles? |
+| SLO / error budget | Target and allowed failure | Do we ship or stabilise this week? |
+| Timeouts | Never wait forever | Is my timeout shorter than my caller's? |
+| Retries | Backoff + jitter, one layer | Is this call idempotent? |
+| Circuit breaker | Fail fast when sick | What happens while it is open? |
+| Bulkhead | Separate pools | Can one dependency drain all threads? |
+| Fallback | Degrade, never lie | What does "degraded" look like here? |
+| Health checks | Liveness vs readiness | Does liveness depend on the DB? |
+| Canary | Small slice first | Who notices a bad release, users or metrics? |
 
-- SLAs are looser than SLOs so you breach internally before you pay externally.
-- **Error budget policy:** while budget remains, ship features fast; when it is exhausted, freeze risky releases and prioritise reliability work. It turns "reliability vs velocity" into a data-driven agreement.
-- Nines and downtime per year: 99% ≈ 3.65 days, 99.9% ≈ 8.8 hours, 99.95% ≈ 4.4 hours, 99.99% ≈ 53 minutes, 99.999% ≈ 5.3 minutes. Serial dependencies multiply: three services at 99.9% in series give ~99.7%.
-- Measure SLIs as close to the user as possible (load balancer logs, client RUM), not just at the service.
+## Final memory aid
 
-## Alerting
-- **Alert on symptoms, not causes.** Page on "checkout error rate above SLO burn" (users are affected); put "CPU at 85%" on a dashboard or ticket, not a pager.
-- **Burn-rate alerts:** page when the error budget is being consumed fast. A common multi-window rule: page if the 1-hour burn rate exceeds 14.4x (2% of a 30-day budget in an hour) **and** the 5-minute burn rate confirms it is still happening; ticket for slow burns (e.g. 6-hour window at 6x).
-- Every page must be **actionable** and link to a runbook and dashboard. Noisy alerts train people to ignore them.
-- Alert on **absence** too: "no orders processed for 10 minutes" or "consumer lag growing for 15 minutes" catches silent failures.
-
-## Resilience patterns
-### Timeouts
-Every network call needs a timeout; the default in many clients is infinite. Set connect timeouts short (~100 ms–1 s) and read timeouts based on the dependency's p99.9 plus margin. Propagate a **deadline**: if the user request has 2 s total and 1.5 s has elapsed, the next call gets at most 0.5 s, and work whose deadline passed is dropped.
-
-### Retries
-- Retry only **transient** failures (connection reset, 503, timeout) and only **idempotent** operations, or operations made idempotent with an idempotency key.
-- Use **exponential backoff with jitter** (`sleep = random(0, base × 2^attempt)`, capped) so clients don't synchronise.
-- Retry at **one layer**. If the gateway, service and client each retry 3 times, one failure becomes 27 calls (retry amplification). Use a **retry budget** (retries limited to e.g. 10% of requests) so retries can't multiply load during an outage.
-
-### Circuit breaker
-Wraps calls to a dependency and tracks failures over a sliding window.
-```
-          failure rate >= threshold
- CLOSED ───────────────────────────> OPEN  (fail fast, return fallback, no calls)
-   ^                                   │
-   │ trial calls succeed               │ wait duration elapsed
-   │                                   v
-   └──────────────────────────── HALF_OPEN (allow N trial calls)
-                trial calls fail ──> back to OPEN
-```
-Benefits: callers fail in microseconds instead of waiting for timeouts, freeing threads; the struggling dependency gets breathing room to recover. Breakers also count **slow calls** (Resilience4j `slowCallRateThreshold`), which catches degradation before outright failure.
-
-### Bulkheads
-Isolate resources per dependency so one slow dependency can't drain everything: separate thread pools or semaphores per downstream, separate connection pools, separate consumer groups, even separate clusters per tenant tier ("cell-based architecture"). Without bulkheads, a slow recommendation service can exhaust Tomcat's 200 threads and take down checkout.
-
-### Fallbacks and graceful degradation
-Decide per feature what "degraded" looks like:
-- Serve **cached or stale** data (last known product price display, with checkout re-validating).
-- Return a **default** (generic popular items instead of personalised recommendations).
-- **Disable non-critical features** (hide reviews, turn off live typing indicators) via feature flags or kill switches.
-- **Queue for later** (accept the order, process payment asynchronously, email confirmation).
-Never fall back silently on correctness-critical paths: a payment must not be "assumed successful".
-
-### Health checks
-| Probe | Question | On failure | Should check |
-|---|---|---|---|
-| Liveness | Is the process stuck beyond recovery? | Restart container | Only internal state (event loop alive, no deadlock); not dependencies |
-| Readiness | Can it serve traffic right now? | Remove from load balancer | Warm-up done, critical local resources ready |
-| Startup | Has slow startup finished? | Delay other probes | Initialisation complete |
-Classic mistake: a liveness probe that checks the database. When the DB blips, every pod fails liveness and Kubernetes restarts the whole fleet, turning a dependency hiccup into a full outage. Spring Boot exposes `/actuator/health/liveness` and `/actuator/health/readiness` groups for exactly this split.
-
-### Resilience4j in Spring Boot
-```yaml
-resilience4j:
-  circuitbreaker:
-    instances:
-      inventory:
-        slidingWindowType: COUNT_BASED
-        slidingWindowSize: 50
-        minimumNumberOfCalls: 20
-        failureRateThreshold: 50
-        slowCallDurationThreshold: 800ms
-        slowCallRateThreshold: 60
-        waitDurationInOpenState: 10s
-        permittedNumberOfCallsInHalfOpenState: 5
-  retry:
-    instances:
-      inventory:
-        maxAttempts: 3
-        waitDuration: 100ms
-        enableExponentialBackoff: true
-        exponentialBackoffMultiplier: 2
-        enableRandomizedWait: true
-        retryExceptions: [java.io.IOException, java.util.concurrent.TimeoutException]
-  bulkhead:
-    instances:
-      inventory:
-        maxConcurrentCalls: 30
-        maxWaitDuration: 0
-  timelimiter:
-    instances:
-      inventory:
-        timeoutDuration: 1s
-```
-```java
-@Service
-public class InventoryClient {
-    private final RestClient restClient;
-    private final MeterRegistry meters;
-
-    public InventoryClient(RestClient.Builder builder, MeterRegistry meters) {
-        this.restClient = builder.baseUrl("http://inventory-service").build();
-        this.meters = meters;
-    }
-
-    // Order of decoration: Retry( CircuitBreaker( RateLimiter( TimeLimiter( Bulkhead( call )))))
-    @Retry(name = "inventory")
-    @CircuitBreaker(name = "inventory", fallbackMethod = "cachedAvailability")
-    @Bulkhead(name = "inventory")
-    public Availability check(String sku) {
-        return restClient.get().uri("/stock/{sku}", sku).retrieve().body(Availability.class);
-    }
-
-    private Availability cachedAvailability(String sku, Throwable t) {
-        meters.counter("inventory.fallback", "reason", t.getClass().getSimpleName()).increment();
-        return Availability.unknown(sku); // UI shows "check availability at checkout"
-    }
-}
-```
-Resilience4j publishes breaker state, failure rates and bulkhead usage to Micrometer automatically, so breaker transitions show up on dashboards. Custom business metrics are a line each:
-```java
-Timer.builder("checkout.latency").publishPercentileHistogram().register(meters)
-     .record(() -> checkoutService.placeOrder(cmd));
-meters.counter("orders.placed", "channel", channel).increment();
-```
-
-### Chaos engineering
-Verify all of this deliberately: inject latency and failures (Chaos Monkey for Spring Boot, Gremlin, AWS FIS, Toxiproxy, Chaos Mesh), kill instances and zones, and run **game days**. Start with a hypothesis ("if the recommendation service adds 2 s latency, checkout p99 stays under 500 ms"), limit the blast radius, start in staging, and graduate to production with abort conditions. Netflix's Simian Army popularised this; the point is to find missing timeouts and bad fallbacks before your customers do.
-
-## Safe deployments
-Most outages are caused by changes, so the release process is a resilience mechanism.
-| Strategy | How | Pros | Cons |
-|---|---|---|---|
-| Rolling | Replace instances in batches | No extra capacity, default in Kubernetes | Mixed versions during rollout; slower rollback |
-| Blue-green | Two full environments; switch traffic at the LB | Instant switch and rollback | Double capacity; DB schema must suit both |
-| Canary | Send 1% → 5% → 25% → 100% to the new version, comparing SLIs | Limits blast radius, data-driven promotion | Needs good metrics and traffic splitting |
-| Feature flags | Deploy code dark, enable per user/tenant/percentage at runtime | Decouples deploy from release; kill switch | Flag debt; combinatorial testing |
-| Shadow / dark launch | Mirror production traffic to the new version, discard responses | Real load without user impact | Side effects must be suppressed |
-
-- **Automated canary analysis** (Argo Rollouts, Flagger, Spinnaker Kayenta) compares canary vs baseline error rate and latency and rolls back automatically.
-- **Database changes** use expand → migrate → contract so old and new code both work during a rollout: add the nullable column, deploy code writing both, backfill, switch reads, then drop the old column later.
-- **Config changes** deserve the same canarying as code; many famous outages were a bad config pushed globally in seconds.
-
-## Real-world systems
-- **Google SRE:** SLOs, error budgets, burn-rate alerting, golden signals.
-- **Netflix:** Hystrix (now Resilience4j in the ecosystem), Chaos Monkey, adaptive concurrency limits, Atlas metrics.
-- **Amazon:** cell-based architecture and shuffle sharding to limit blast radius; Builders' Library guidance on timeouts, retries, jitter and backoff.
-- **Uber:** Jaeger (open-sourced tracing), M3 metrics platform.
-- **Stack:** OpenTelemetry → Collector → Prometheus/Mimir (metrics), Loki/OpenSearch (logs), Tempo/Jaeger (traces), Grafana dashboards and alerting.
-
-## How it shows up in interview problems
-- **Every design:** close with "what I'd monitor" (RED per service, consumer lag, cache hit ratio, p99) and "how it fails" (timeouts, breakers, DLQ, degraded mode).
-- **Logging / metrics system design:** agents → Kafka → stream processors → tiered storage (hot index, cold object store), downsampling, cardinality control, tail sampling.
-- **Payments:** idempotent retries, circuit breaker per provider with failover to a second PSP, never fallback to "success", reconciliation jobs, alerts on success-rate drop.
-- **News feed / Netflix / YouTube:** degrade personalisation to popular content; serve stale cache; bulkhead the recommendation call.
-- **Notification system:** per-provider breakers and retry queues with backoff; DLQ and replay.
-- **E-commerce / BookMyShow:** canary releases before a sale, load shedding of browse traffic to protect checkout, feature-flag kill switches.
-- **API gateway:** central place for timeouts, retries (careful), breakers, request IDs and access logs.
-- **Job scheduler:** heartbeats and liveness of workers, alert on missed schedules ("absence" alerts).
-
-## Common pitfalls
-- No timeout, or a timeout longer than the caller's own.
-- Retrying non-idempotent operations, or retrying at every layer.
-- Averaging percentiles or alerting on averages.
-- High-cardinality labels (user IDs) in metrics.
-- Liveness probes that depend on downstream services.
-- Fallbacks that hide correctness failures.
-- Alerts on causes that page at 3 a.m. with no user impact; or no alert at all for silent failures.
-- Logs without trace IDs, making cross-service debugging guesswork.
-- Big-bang global deploys and config pushes.
-
-## Interview questions
-1. **Logs, metrics or traces: which for what?** Metrics to detect and alert cheaply, traces to locate which service or call is slow, logs for the detailed context of a specific failure; link them with trace IDs.
-2. **Why p99 instead of average, and how do you compute it across pods?** Averages hide tail pain that fan-out amplifies; export histograms, sum buckets across instances, then compute the quantile; never average per-pod percentiles.
-3. **Explain SLO and error budget with numbers.** 99.9% success over 28 days allows ~40 minutes or 0.1% failures; while budget remains, ship; when spent, freeze risky changes.
-4. **Describe circuit breaker states.** Closed (normal, counting failures), open (fail fast for a wait period), half-open (allow a few trial calls; success closes, failure re-opens).
-5. **How do you avoid retry storms?** Retry only idempotent, transient failures, at one layer, with exponential backoff and jitter, within a retry budget, and honour circuit breakers and `Retry-After`.
-6. **Liveness vs readiness?** Liveness restarts a stuck process and must not check dependencies; readiness removes an instance from the load balancer while it can't serve.
-7. **Canary vs blue-green?** Blue-green switches all traffic at once with instant rollback but needs double capacity; canary shifts traffic gradually, comparing SLIs, to limit blast radius.
-8. **What would you alert on for a Kafka-based pipeline?** Consumer lag growth, DLQ rate, end-to-end latency SLO burn, and absence of output events; not broker CPU alone.
-
-## Cheat sheet
-- Signals: metrics (detect), traces (locate), logs (explain); correlate with trace ID via W3C `traceparent` and MDC.
-- OpenTelemetry: vendor-neutral SDK + Java agent + Collector; head vs tail sampling.
-- RED per service, USE per resource, golden signals = latency, traffic, errors, saturation.
-- Percentiles from histograms; never average percentiles; watch label cardinality.
-- SLI → SLO → SLA; error budget = 1 - SLO; page on burn rate and symptoms.
-- Timeouts + deadline propagation; retries with jitter, idempotent only, one layer, budgeted.
-- Circuit breaker closed/open/half-open; bulkheads per dependency; fallbacks that degrade, never lie.
-- Liveness (process) vs readiness (traffic) vs startup; never check deps in liveness.
-- Deploy safely: canary with automated analysis, blue-green, feature flags, expand-migrate-contract.
-- Chaos engineering with hypotheses and limited blast radius.
+- **Metrics** detect, **traces** locate, **logs** explain
+- **One trace ID** per request, in every log line
+- **p99 from histograms,** never averages
+- **Error budget = 1 - SLO;** page on burn rate
+- **Timeout everything;** retry once, with jitter
+- **Breaker:** closed, open, half-open
+- **Bulkheads + fallbacks** keep failures small
+- **Liveness ignores dependencies;** canary every release

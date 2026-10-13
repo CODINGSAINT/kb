@@ -1,522 +1,577 @@
 === hld-indexes | HLD | Database indexes and storage engines ===
-Every database is a storage engine (how bytes are laid out on disk) with a query layer on top. The two dominant engine designs, **B-trees** (update in place) and **LSM trees** (append, then merge), make opposite trade-offs between read speed, write speed and space, and that choice explains most of the behaviour you see in Postgres, MySQL, RocksDB and Cassandra. This chapter covers how both engines work, the index types you build on top of them, how to read a query plan, and when an index makes things worse.
+An index is a second, sorted copy of some of your data that lets the database jump straight to the rows a query needs instead of reading the whole table. This chapter covers how B-tree indexes work, how to order the columns of a composite index, when an index makes things slower, and why write-heavy systems use LSM trees instead. It ends with the inverted index, which powers search boxes.
 
-## Core concepts
-- **Index:** an extra data structure, derived from the table, that lets you find rows without scanning everything. It speeds up reads and slows down writes, because every insert, update and delete must also update every index.
-- **Heap vs clustered storage:** in a *heap* (Postgres), rows live in insertion order and every index points at a physical row location (a TID). In a *clustered* layout (MySQL InnoDB, SQL Server clustered index), the table itself *is* a B-tree ordered by primary key, and secondary indexes store the primary key as their pointer.
-- **Selectivity:** the fraction of rows a predicate matches. Indexes pay off when selectivity is low (few rows). Matching 30% of a table through an index is usually slower than a sequential scan.
-- **Write-ahead log (WAL):** an append-only log of changes, flushed to disk before the change is acknowledged. After a crash, the engine replays the WAL to recover. The WAL is also the raw material for replication and change data capture.
+## 1. What an index is
 
-## B-tree engines
-A B-tree (in practice a B+tree) is a balanced tree of fixed-size **pages** (8 KB in Postgres, 16 KB in InnoDB). Interior pages hold keys and child pointers; leaf pages hold keys plus either the row (clustered) or a pointer to it. Leaves are linked, so range scans walk sideways.
+**Definition:** An index is a separate data structure, kept sorted by one or more columns, that points to the matching rows.
 
-```
-                 [ 100 | 500 ]                  root (1 page)
-               /       |       \
-      [20|60]      [200|350]     [700|900]      interior
-      /  |  \       /  |  \       /  |  \
-   leaf leaf leaf leaf leaf leaf leaf leaf leaf  -> linked list for range scans
+Think of the index at the back of a textbook. To find "quorum" you do not read all 600 pages; you look it up in an alphabetical list and go to page 412. A database index does the same for rows, at the price of keeping that list up to date on every write.
+
+### The problem
+
+```sql
+-- orders has 100 million rows, no index on customer_id
+SELECT * FROM orders WHERE customer_id = 42;
 ```
 
-With a branching factor of a few hundred, a tree of depth 3–4 covers billions of rows: 500^4 is about 6 x 10^10. A point lookup is therefore 3–4 page reads, and the upper levels are almost always cached in memory, so a lookup typically costs one disk read.
+The database must do a **full table scan**: read every row and test it. That is tens of gigabytes of I/O to return perhaps 30 rows, and it gets slower every day as the table grows.
 
-### How a write works
-1. Append the change record to the WAL and fsync (this is the durability point).
-2. Find the leaf page and modify it in the buffer pool (memory). The page is now *dirty*.
-3. If the page is full, **split** it into two and insert a separator key into the parent (which can cascade upwards).
-4. A background checkpointer later writes dirty pages to their place in the data file.
+### Better design
 
-Because pages are modified in place, a crash during a half-written page could corrupt the tree. Engines protect against this with full-page images in the WAL (Postgres) or a doublewrite buffer (InnoDB).
-
-### Strengths and costs
-- Predictable read latency: one key lives in exactly one place.
-- Excellent for range scans and ordered reads.
-- Natural home for transactions and row locks.
-- Writes are random I/O (a page anywhere in the file), and a one-row change rewrites a whole page: write amplification of roughly page size / row size, plus the WAL copy.
-- Fragmentation: page splits leave half-empty pages; random keys (UUID v4) make this much worse than sequential keys.
-
-## LSM-tree engines
-A **log-structured merge tree** never updates data in place. It buffers writes in memory, flushes them as immutable sorted files, then merges those files in the background. RocksDB, LevelDB, Cassandra, ScyllaDB, HBase, Bigtable and the storage layers of CockroachDB, TiKV and YugabyteDB are all LSM-based.
-
-```
-write -> WAL (append) -> memtable (sorted, in memory: skiplist / red-black tree)
-                              | full (e.g. 64 MB)
-                              v
-                         flush to SSTable (immutable, sorted, on disk)  L0
-                              | background compaction
-                              v
-                     L1 (10x bigger) -> L2 (10x bigger) -> ...
+```sql
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+-- the query now walks a sorted structure to the 30 matching entries
 ```
 
-### The pieces
-- **Memtable:** sorted in-memory structure. Writes go to the WAL (for crash recovery) and the memtable, then return. That is why LSM writes are so fast: sequential I/O only.
-- **SSTable (sorted string table):** an immutable file of sorted key-value pairs, with a sparse **block index** (first key of every 4–64 KB block) and a **Bloom filter**. Once written, never modified.
-- **Deletes:** written as a **tombstone** marker, because older SSTables still contain the value. The data only disappears once compaction merges the tombstone with every older version.
-- **Compaction:** background merge-sort of SSTables. Duplicate keys keep only the newest version, tombstones remove dead data, and the number of files a read must check stays bounded.
+The query cost now depends on how many rows match, not on how big the table is. It stays fast at 100 million rows or 1 billion.
 
-### How a read works
-1. Check the memtable (and any immutable memtable being flushed).
-2. For each SSTable from newest to oldest, check its Bloom filter. If the filter says "definitely not here", skip the file without touching disk.
-3. If the filter says "maybe", use the block index to read one block and binary search it.
-4. Return the first (newest) version found, or not-found if the newest entry is a tombstone.
+**Trade-offs:**
+- Extra disk and memory for every index.
+- Every insert, update and delete must also update the index.
 
-Without Bloom filters, a lookup for a missing key would read a block from every SSTable. With about 10 bits per key (roughly 1% false positives), almost all of those reads are skipped. Range scans cannot use Bloom filters, so they must merge iterators across all overlapping files, which is why range scans are relatively more expensive on LSM engines.
+**Key takeaway:** An index turns "read everything" into "look it up", and you pay for it on every write.
 
-### Compaction strategies
-| Strategy | How | Good for | Cost |
-|---|---|---|---|
-| **Size-tiered** (Cassandra STCS default) | Merge several SSTables of similar size into one bigger one | Write-heavy workloads | Higher read amplification, up to 2x temporary disk space |
-| **Leveled** (RocksDB default, Cassandra LCS) | Each level is 10x the previous; files in a level have non-overlapping key ranges | Read-heavy, space-sensitive | More write amplification (a key is rewritten ~10x per level) |
-| **Time-window** (Cassandra TWCS) | Group SSTables by time window, never merge across windows | Time-series with TTL | Bad if old data is updated or deleted out of order |
+---
 
-## The three amplifications
-Every engine trades these off; you cannot minimise all three at once (the RUM conjecture: Read, Update, Memory).
+## 2. The B-tree index
+
+**Definition:** A B-tree is a balanced tree of fixed-size pages, sorted by key, where each page holds hundreds of keys and child pointers.
+
+This is the default index in PostgreSQL, MySQL (InnoDB), Oracle and SQL Server. Because each page (8 KB in Postgres, 16 KB in InnoDB) holds hundreds of entries, the tree is very wide and very shallow. Three or four levels are enough for billions of rows, and the top levels usually sit in memory.
+
+### The problem
+
+Without a sorted structure, a range query like "orders from last week" has no place to start. A hash index can find one exact key quickly, but it cannot answer `BETWEEN`, `>`, `ORDER BY` or "starts with", because hashing destroys the order.
+
+### Better design
+
+```text
+                 [ 100 | 500 | 900 ]                 root (in memory)
+               /        |        \
+      [ 10 | 40 | 70 ] [ ... ]  [ 910 | 950 ]        internal pages
+        /    |    \
+ [41 42 43 ... 69] -> [70 71 ... 99] -> ...          leaf pages, linked
+```
+
+A lookup reads one page per level: about 4 page reads for a billion rows. A range query finds the first key, then walks the linked leaf pages in order, so `WHERE created_at BETWEEN ...` and `ORDER BY` come almost free.
+
+**Trade-offs:**
+- Writes update pages in place at random locations, and a full page must split in two.
+- Random keys (such as UUID v4) scatter inserts across the whole tree, hurting cache hit rates. Time-ordered keys (UUID v7, Snowflake IDs) keep inserts at the right-hand edge.
+
+**Key takeaway:** B-trees give fast exact lookups and fast ranges with steady, predictable read performance.
+
+---
+
+## 3. Composite indexes and the leftmost prefix rule
+
+**Definition:** A composite index is one index on several columns, sorted by the first column, then by the second within each first value, and so on.
+
+A phone book is a composite index on (last name, first name). It is great for "Sharma, Pallav" and for "everyone named Sharma", but useless for "everyone named Pallav", because first names are scattered across the whole book. This is the **leftmost prefix rule**: an index can only seek using a prefix of its columns, starting from the left.
+
+### The problem
+
+```sql
+CREATE INDEX idx_bad ON orders (created_at, customer_id);
+
+SELECT * FROM orders
+WHERE customer_id = 42
+ORDER BY created_at DESC LIMIT 20;
+```
+
+The index is sorted by `created_at` first, so customer 42's orders are spread across the entire index. The database either scans the whole index or ignores it.
+
+### Better design
+
+```sql
+CREATE INDEX idx_good ON orders (customer_id, created_at DESC);
+-- seek to customer_id = 42, read the first 20 entries, stop
+```
+
+**Rule of thumb:** columns tested with equality go first, then the one range or sort column. This one index also serves `WHERE customer_id = 42` on its own, so you rarely need a separate index on `(customer_id)`.
+
+**Trade-offs:**
+- Column order is a real decision; one index cannot serve every query shape.
+- Some engines can "skip scan" an index whose first column has few distinct values, but do not design around it.
+
+**Key takeaway:** Order composite index columns as equality first, range or sort last, and check every important query against the leftmost prefix.
+
+---
+
+## 4. Covering indexes
+
+**Definition:** A covering index contains every column a query reads, so the database answers the query from the index alone without visiting the table.
+
+Normally an index lookup finds a pointer, then makes a second, often random, read to fetch the full row. If the index already holds everything needed, that second read disappears. Postgres calls this an "Index Only Scan"; MySQL's `EXPLAIN` shows "Using index".
+
+### The problem
+
+```sql
+-- index on (customer_id, created_at) only
+SELECT created_at, total, status
+FROM orders WHERE customer_id = 42
+ORDER BY created_at DESC LIMIT 20;
+```
+
+The index finds 20 entries quickly, but `total` and `status` are not in it, so the engine performs 20 extra random reads into the table. On a hot endpoint called thousands of times a second, those lookups dominate the cost.
+
+### Better design
+
+```sql
+-- PostgreSQL 11+ / SQL Server: INCLUDE stores extra columns in leaf pages only
+CREATE INDEX idx_orders_cover
+  ON orders (customer_id, created_at DESC) INCLUDE (total, status);
+```
+
+The query is now answered from one small, contiguous slice of the index. In MySQL, which has no `INCLUDE`, you get the same effect by adding the columns to the end of the index key.
+
+**Trade-offs:**
+- A wider index uses more memory and makes writes to those columns slightly costlier.
+- Use it for a few hot queries, not for every query.
+
+**Key takeaway:** For a very hot read, put the selected columns into the index so the table is never touched.
+
+---
+
+## 5. When indexes hurt
+
+**Definition:** An index hurts when the cost it adds to writes, memory and storage is larger than the time it saves on reads.
+
+Every index is a promise the database must keep on every write. An index nobody queries is pure cost. An index on a column with few distinct values is often ignored by the query planner (the part of the database that picks how to run a query), because reading most of the table directly is cheaper.
+
+### The problem
+
+```text
+events table: 50,000 inserts/sec, 9 indexes
+one insert = 1 table write + 9 index writes = 10 writes
+index on status ('NEW','DONE','FAILED') -> ~33% of rows per value, planner ignores it
+```
+
+Write throughput drops, the indexes no longer fit in memory, and the cache starts evicting the pages that real queries need.
+
+### Better design
+
+```text
+events table: 2 indexes that match actual query patterns
+  (device_id, created_at)                          -- the main read path
+  partial index ON (created_at) WHERE status = 'FAILED'   -- only the rare value
+analytics queries -> separate warehouse fed by change data capture
+```
+
+Keep the indexes that real queries use, index only the rare value with a partial index, and move ad-hoc analytics to a system built for scans.
+
+**Trade-offs:**
+- Fewer indexes means some unusual queries become slow; that is a deliberate choice.
+
+**Key takeaway:** Index for the queries you actually run; on write-heavy tables, every extra index is a tax on every write.
+
+---
+
+## 6. LSM trees for write-heavy workloads
+
+**Definition:** A log-structured merge tree (LSM tree) buffers writes in memory and writes them to disk as sorted, immutable files, which are merged in the background.
+
+Instead of finding and editing the right page on disk, an LSM engine just appends. Writes go to a **write-ahead log** (WAL, an append-only file for crash recovery) and an in-memory sorted table called the **memtable**. When the memtable fills, it is flushed as a sorted file called an **SSTable**. A background process called **compaction** merges SSTables and throws away overwritten and deleted values. Cassandra, ScyllaDB, RocksDB, LevelDB and HBase all work this way.
+
+### The problem
+
+```text
+chat app: 200,000 message writes/sec, B-tree storage
+each write -> find leaf page (random read) -> modify 16 KB page -> write it back
+a 200-byte message causes a full page write; random I/O everywhere
+```
+
+The disk spends its time seeking and rewriting whole pages for tiny changes. Throughput hits a ceiling long before the hardware's sequential write speed.
+
+### Better design
+
+```text
+write:  WAL (append)  +  memtable (in memory, sorted)
+        memtable full -> flush as SSTable-5 (one sequential write)
+read:   memtable -> SSTable-5 -> SSTable-4 -> ...   (newest first)
+        each SSTable has a Bloom filter: "key is definitely not here" -> skip it
+background: compaction merges SSTables, drops old versions and tombstones
+```
+
+All disk writes are sequential and batched, so write throughput is very high. A **Bloom filter** is a small in-memory structure that can say "definitely not here" for a key, so reads skip most files.
+
+**Trade-offs:**
+- Reads may check several files; a missing key or a range scan costs more than in a B-tree.
+- Compaction uses disk I/O and CPU in the background and can cause latency spikes.
+- Deletes write a marker called a **tombstone**; many tombstones slow reads until compaction removes them.
+
+**Key takeaway:** LSM trees trade some read cost and background work for very fast, sequential writes.
+
+### B-tree vs. LSM
 
 | | B-tree | LSM tree |
 |---|---|---|
-| Write amplification | Page rewrite per change + WAL (often 10–100x for small rows) | Rewritten once per compaction level (10–30x leveled; lower for tiered) |
-| Read amplification | Low: one path, 3–4 pages, mostly cached | Higher: memtable + several SSTables, mitigated by Bloom filters and caches |
-| Space amplification | Fragmentation, half-full pages (often 1.3–1.5x) | Stale versions and tombstones until compacted (~1.1x leveled, up to 2x tiered) |
-| Write pattern | Random I/O | Sequential I/O, SSD friendly |
-| Latency profile | Stable | Usually fast, with spikes when compaction falls behind |
-| Typical systems | Postgres, MySQL InnoDB, Oracle, SQL Server, MongoDB WiredTiger | RocksDB, Cassandra, ScyllaDB, HBase, Bigtable, LevelDB |
+| Writes | In place, random I/O | Append, sequential I/O |
+| Reads | Predictable, one path | May check several files |
+| Best for | Read-heavy, transactional (orders, payments) | Write-heavy (chat, metrics, logs, IoT) |
+| Examples | PostgreSQL, MySQL InnoDB | Cassandra, RocksDB, HBase |
 
-Rule of thumb for interviews: **write-heavy, append-mostly, key-value or time-series access leans LSM; read-heavy, transactional, rich secondary indexes leans B-tree.**
+The underlying idea is a three-way trade between read cost, write cost and space. No engine wins all three; you choose by workload.
 
-## Index types you build on top
-### Primary and clustered indexes
-In InnoDB the primary key *is* the table order. Consequences: a sequential PK (auto-increment, Snowflake, UUID v7) appends to the right edge of the tree; a random PK (UUID v4) inserts all over the tree, causing page splits, cache misses and much higher disk usage. Secondary indexes store the PK, so a wide PK bloats every index. In Postgres the heap is unordered; `CLUSTER` reorders it once but does not maintain the order.
+---
 
-### Secondary indexes
-Any extra index on non-PK columns. In InnoDB a secondary lookup is two tree traversals (secondary index to find the PK, then the clustered index to find the row). In Postgres it is an index probe plus a heap fetch.
+## 7. The inverted index for search
 
-### Composite indexes and the leftmost-prefix rule
-An index on `(a, b, c)` is sorted by `a`, then `b` within `a`, then `c` within `b`, like a phone book sorted by last name then first name.
+**Definition:** An inverted index maps each word (term) to the list of documents that contain it, called a posting list.
+
+A B-tree is sorted by the whole value, so it can find "starts with wireless" but not "contains headphones". An inverted index is like a cookbook's index by ingredient: look up "garlic" and get every recipe that uses it. Lucene, Elasticsearch, OpenSearch and Solr are built on it.
+
+### The problem
 
 ```sql
-CREATE INDEX idx_orders_user_status_created
-  ON orders (user_id, status, created_at);
-
--- Uses the index fully: equality on a prefix, range on the last used column
-SELECT * FROM orders WHERE user_id = 42 AND status = 'PAID' AND created_at > now() - interval '7 days';
-
--- Seeks on user_id only (status skipped, so created_at cannot be used for seeking)
-SELECT * FROM orders WHERE user_id = 42 AND created_at > now() - interval '7 days';
-
--- Cannot seek with this index (no leading user_id)
-SELECT * FROM orders WHERE status = 'PAID';
+SELECT * FROM products
+WHERE description LIKE '%wireless headphones%';
+-- leading % -> no B-tree can help -> scan all 50 million rows
 ```
 
-Design rules:
-- Put **equality** columns first, then the **range or sort** column. A range on a column stops the index from being used for seeking on the columns after it.
-- Match the `ORDER BY` so the database can stream results in index order and stop at `LIMIT` without sorting.
-- One well-designed composite index often replaces several single-column ones.
+Every search reads the whole table. It also misses "headphone" (singular), cannot rank results by relevance and cannot handle typos.
 
-### Covering indexes
-If the index contains every column the query needs, the engine answers from the index alone ("Index Only Scan" in Postgres, "Using index" in MySQL EXPLAIN) and skips the row fetch.
+### Better design
 
-```sql
--- Postgres: key columns plus payload columns not used for ordering
-CREATE INDEX idx_feed_cover ON posts (author_id, created_at DESC) INCLUDE (title, like_count);
+```text
+text is tokenised and normalised: "Wireless Headphones" -> [wireless, headphon]
+  wireless  -> [3, 17, 42, 108, ...]
+  headphon  -> [17, 42, 99, ...]
+query "wireless headphones" -> intersect lists -> [17, 42] -> rank with BM25
 ```
 
-In Postgres, index-only scans also depend on the visibility map, so a table that is not vacuumed regularly falls back to heap fetches.
+The query reads two short posting lists instead of 50 million rows. A ranking formula such as BM25 scores rarer words higher, so the best match comes first.
 
-### Partial (filtered) indexes
-Index only the rows you query. Smaller, faster, cheaper to maintain.
+**Trade-offs:**
+- It is a second system to run, kept in sync with the main database, usually through change data capture (CDC: streaming every committed change), so search results lag slightly.
+- At small scale, PostgreSQL full-text search with a GIN index may be enough.
 
-```sql
-CREATE INDEX idx_jobs_pending ON jobs (run_at) WHERE status = 'PENDING';
-CREATE UNIQUE INDEX uniq_active_email ON users (email) WHERE deleted_at IS NULL;
-```
+**Key takeaway:** Use a B-tree for "find by value" and an inverted index for "find by words inside text".
 
-The second is a classic: enforce uniqueness only among non-deleted users (soft deletes).
+---
 
-### Other index types
-| Type | What it does | Example |
+## In an HLD interview
+
+- **URL Shortener:** the lookup by short code is a point query on the primary key; a B-tree or a key-value store is fine. Use time-ordered IDs if the key is the clustered index.
+- **Chat/WhatsApp, Logging, Metrics:** write-heavy and time-ordered, so pick an LSM store such as Cassandra, partitioned by conversation or source and sorted by time.
+- **News Feed:** a composite index `(author_id, created_at DESC)`, possibly covering, serves "latest posts by this author" in one seek.
+- **Seat Reservation / BookMyShow:** a unique index on `(show_id, seat_id)` is the last line of defence against double booking.
+- **Amazon E-commerce / Google Search:** keep the catalogue in a relational database and serve search from an inverted index (Elasticsearch) fed by CDC.
+- **What to SAY:** "My main read is X, so I index the equality columns, then the sort column. The table is write-heavy, so I keep only that index, and if writes keep growing I move to an LSM-based store."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
 |---|---|---|
-| Hash index | Equality only, O(1); no ranges | Postgres `USING hash`, in-memory KV stores |
-| Expression / functional | Index on a computed value | `CREATE INDEX ON users (lower(email))` |
-| GIN (generalized inverted) | Many keys per row: arrays, JSONB, full text | `CREATE INDEX ON docs USING gin (tags)` |
-| GiST / R-tree | Geometric and range overlap | PostGIS `ST_DWithin`, exclusion constraints for bookings |
-| BRIN | Tiny min/max summary per block range | Huge append-only time-series tables |
-| Bitmap | Bit per distinct value; combine with AND/OR | Low-cardinality columns in warehouses (Oracle, Druid) |
+| Index | Sorted copy that points to rows | Which query is doing a full scan? |
+| B-tree | Wide, shallow, sorted pages | Do I need ranges and ordering? |
+| Composite index | Sorted by column 1, then column 2 | Equality first, range or sort last? |
+| Covering index | Index holds every column read | Is this query hot enough to cover? |
+| Indexes that hurt | Cost on every write | Does a real query use this index? |
+| LSM tree | Append, flush, compact | Is the workload write-heavy? |
+| Inverted index | Word -> list of documents | Am I searching inside text? |
 
-## Inverted indexes and full-text search
-A B-tree on a `description` column cannot answer "which documents contain the word *kafka*". An **inverted index** maps each term to a **posting list** of document IDs (plus positions and frequencies).
+## Final memory aid
 
-```
-Analysis: "Kafka Streams scales!" -> tokenise -> lowercase -> stem -> [kafka, stream, scale]
-
-term     -> posting list (docId:positions)
-kafka    -> 3:[0], 17:[4,9], 42:[1]
-stream   -> 3:[1], 8:[2]
-scale    -> 3:[2], 42:[7]
-```
-
-- Query `kafka AND scale`: intersect sorted posting lists (fast, especially with skip pointers).
-- Phrase queries use positions; ranking uses BM25 (term frequency, inverse document frequency, document length).
-- Lucene (inside Elasticsearch, OpenSearch and Solr) stores the index as immutable **segments** that are periodically merged: the same idea as an LSM tree. New documents become searchable after a *refresh* (about 1 s by default), which is why search is "near real time".
-- Postgres has built-in full text (`tsvector` plus a GIN index), which is good enough for many products before you need a search cluster.
-
-## Reading a query plan
-Always confirm with `EXPLAIN` rather than guessing.
-
-```sql
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT id, total FROM orders
-WHERE user_id = 42 AND status = 'PAID'
-ORDER BY created_at DESC LIMIT 20;
-
--- Good:
--- Limit (actual time=0.05..0.09 rows=20)
---   -> Index Scan Backward using idx_orders_user_status_created on orders
---        Index Cond: ((user_id = 42) AND (status = 'PAID'))
---        Buffers: shared hit=6
--- Bad signs:
---   Seq Scan on orders (rows=50000000)         -> missing or unusable index
---   Sort Method: external merge Disk           -> ORDER BY not served by an index
---   rows estimated=10 vs actual=900000         -> stale statistics, run ANALYZE
-```
-
-What to look for: Seq Scan vs Index Scan vs Index Only Scan vs Bitmap Heap Scan; the gap between estimated and actual rows; sorts and hashes spilling to disk; nested loops over large row counts. In MySQL, check `type` (`ALL` means full scan; `ref`, `range`, `const` are good), `key`, `rows` and `Extra` (`Using filesort`, `Using temporary`).
-
-### Why an index is ignored
-- A function or cast on the column: `WHERE date(created_at) = ...`, or comparing a varchar column to a number. Use an expression index or rewrite as a range.
-- Leading wildcard: `LIKE '%abc'` (use a trigram GIN index or a search engine).
-- Leftmost prefix not satisfied.
-- Low selectivity: the planner correctly prefers a sequential scan.
-- `OR` across different columns (sometimes solved by bitmap OR or a `UNION`).
-- Stale statistics.
-
-## Java/Spring example
-```java
-@Entity
-@Table(name = "orders", indexes = {
-    @Index(name = "idx_orders_user_status_created", columnList = "user_id, status, created_at")
-})
-public class Order {
-    @Id
-    private UUID id;            // generate UUID v7 (time-ordered) to avoid random B-tree inserts
-    @Column(name = "user_id", nullable = false) private long userId;
-    @Enumerated(EnumType.STRING) private OrderStatus status;
-    @Column(name = "created_at") private Instant createdAt;
-}
-
-public interface OrderRepository extends JpaRepository<Order, UUID> {
-    // Served by the composite index: equality, equality, then ordered by the third column
-    List<Order> findTop20ByUserIdAndStatusOrderByCreatedAtDesc(long userId, OrderStatus status);
-}
-```
-
-In production, create indexes through migrations (Flyway/Liquibase), not Hibernate `ddl-auto`, and in Postgres use `CREATE INDEX CONCURRENTLY` so the table is not locked against writes during the build (MySQL: online DDL or gh-ost / pt-online-schema-change).
-
-## Real-world systems
-- **PostgreSQL:** heap plus B-tree by default. MVCC keeps old row versions in the heap, so an update creates a new tuple and may add new entries to every index (HOT updates avoid this when no indexed column changes and the page has free space). VACUUM reclaims dead tuples. Rich index types: GIN, GiST, BRIN, partial, expression, covering.
-- **MySQL InnoDB:** clustered PK B-tree; secondary indexes hold the PK; the change buffer defers secondary index updates; the doublewrite buffer protects against torn pages.
-- **RocksDB:** embeddable LSM used inside Kafka Streams state stores, Flink, TiKV, MyRocks (MySQL on RocksDB, adopted by Meta for space efficiency); CockroachDB uses Pebble, a Go LSM inspired by it.
-- **Cassandra / ScyllaDB:** LSM per node; the partition key picks the node, clustering columns set the sort order inside the partition, and tables are designed per query. Secondary indexes are local per node and should be used sparingly.
-- **Elasticsearch:** Lucene inverted-index segments, merged in the background like LSM compaction.
-
-## How it shows up in interview problems
-- **URL shortener:** lookup by short code is a point query; a B-tree PK or a KV store works. Prefer time-ordered IDs if the code is the clustered key.
-- **Chat / messaging:** write-heavy and time-ordered per conversation, so an LSM store (Cassandra) with a `(conversation_id, bucket)` partition and `message_id DESC` clustering.
-- **Metrics, logging, tracking:** append-only, huge volume, TTL: LSM with time-window compaction or columnar stores; BRIN in Postgres at modest scale.
-- **E-commerce / search:** catalog in a relational DB, search through an inverted index (Elasticsearch) fed by CDC.
-- **Job scheduler:** partial index on `(run_at) WHERE status = 'PENDING'` plus `SELECT ... FOR UPDATE SKIP LOCKED`.
-- **News feed:** covering index `(author_id, created_at DESC)` for fan-out-on-read queries.
-- **Seat reservation (BookMyShow):** a unique index on `(show_id, seat_id)` is the last line of defence against double booking.
-
-## Common pitfalls
-- Indexing every column. Each index costs write throughput, memory and disk; write-heavy tables should carry only what queries need.
-- Random UUID v4 as a clustered PK in MySQL.
-- Composite index in the wrong column order.
-- Forgetting that the ORM generates queries the index does not support (log and inspect the SQL).
-- Building an index on a busy table without `CONCURRENTLY` / online DDL.
-- Expecting an LSM store to do cheap cross-partition range scans or cheap deletes (tombstones pile up and slow reads; Cassandra warns after thousands per query).
-- Unused indexes left behind; check `pg_stat_user_indexes.idx_scan` and drop them.
-
-## Interview questions
-1. **Why are LSM trees faster for writes than B-trees?** They turn random writes into sequential ones: append to the WAL, insert into the in-memory memtable, and flush sorted immutable files later. B-trees must locate and rewrite a page in place, which is random I/O and amplifies small writes to full pages.
-2. **How does an LSM tree avoid reading every SSTable on a lookup?** Each SSTable has a Bloom filter that rules out files that cannot contain the key, plus a sparse block index so only one block is read from files that might. Compaction keeps the file count bounded.
-3. **You have an index on (a, b). Does `WHERE b = ?` use it?** Not for seeking, because of the leftmost-prefix rule: the index is sorted by `a` first. Some engines can do a skip scan or full index scan, but generally you need an index starting with `b`.
-4. **What is a covering index and why does it help?** An index containing every column the query reads, so the engine never touches the table rows: fewer random I/Os and often a large speed-up for hot queries.
-5. **When does adding an index hurt?** On write-heavy tables (every write updates every index), for low-selectivity columns the planner will not use, when the index set exceeds memory and causes cache churn, and during creation on a live table if built with locking DDL.
-6. **What is write amplification and why does it matter on SSDs?** Bytes physically written divided by bytes logically written. High amplification consumes disk bandwidth and SSD endurance; leveled compaction and B-tree page rewrites both cause it.
-7. **How does full-text search differ from a B-tree index?** It tokenises text into terms and maps each term to posting lists of documents, supporting boolean, phrase and relevance-ranked queries that a sorted B-tree cannot answer.
-8. **Why does a tombstone-heavy Cassandra table get slow?** Reads must skip every tombstone in the scanned range until compaction (after `gc_grace_seconds`) purges them; model with TTLs and time-window compaction instead of frequent deletes.
-
-## Cheat sheet
-- B-tree: pages, update in place, 3–4 levels, stable reads, random writes. LSM: WAL + memtable + SSTables + compaction, sequential writes, Bloom filters for reads.
-- Amplification triangle: read vs write vs space; pick per workload.
-- Compaction: size-tiered (writes), leveled (reads/space), time-window (TTL time-series).
-- Composite index: equality columns first, then the range/sort column; leftmost prefix.
-- Covering (`INCLUDE`), partial (`WHERE`), expression, GIN (JSON/arrays/text), GiST (geo, ranges), BRIN (huge append tables).
-- Clustered PK: short and sequential (UUID v7, Snowflake).
-- Verify with `EXPLAIN ANALYZE`; compare estimated vs actual rows.
-- Inverted index = term to posting list; Lucene segments merge like LSM.
+- **Index:** look it up, do not scan
+- **B-tree:** shallow, sorted, ranges are cheap
+- **Composite:** leftmost prefix; equality first, range last
+- **Covering:** never touch the table
+- **Cost:** every index taxes every write
+- **LSM:** append now, merge later
+- **Search:** words to documents, not values to rows
 
 === hld-replication | HLD | Replication: leader-follower, multi-leader and leaderless ===
-Replication keeps copies of the same data on several machines to survive failures, serve more reads and put data closer to users. The hard part is not copying bytes but handling change: deciding who accepts writes, how fast followers catch up, what readers see in between, and what happens when the leader dies. This chapter covers the three architectures (single-leader, multi-leader, leaderless), synchronous versus asynchronous trade-offs, replication-lag anomalies, failover and split brain, conflict resolution, quorums and CDC.
+Replication keeps copies of the same data on several machines so the system survives failures, serves more reads and sits closer to users. Copying bytes is easy; the hard part is deciding who accepts writes, what readers see while copies catch up, and what happens when a machine dies. This chapter walks through leader-follower, multi-leader and leaderless replication, with the problems each one creates and how to handle them.
 
-## Why replicate
-- **Availability and durability:** survive the loss of a disk, node, zone or region.
-- **Read scaling:** spread reads across replicas.
-- **Latency:** serve users from a nearby replica.
-- **Workload isolation:** run analytics or backups on a replica, not the primary.
+## 1. Why replicate
 
-Replication is not a backup: a bad `DELETE` replicates to every copy within milliseconds. You still need snapshots and point-in-time recovery.
+**Definition:** Replication means keeping the same data on more than one machine, called replicas.
 
-## What gets shipped
-| Method | What travels | Notes |
-|---|---|---|
-| Statement-based | The SQL statement | Breaks on non-determinism (`now()`, `rand()`, auto-increment races); mostly historical |
-| Physical / WAL shipping | Low-level page or byte changes | Exact copy; replicas must run the same engine version; whole-cluster only (Postgres streaming replication) |
-| Logical / row-based | "Row with PK 42 in table orders changed to ..." | Version independent, filterable by table, readable by other systems: the basis of CDC (MySQL binlog ROW format, Postgres logical decoding) |
-| Trigger / application-level | Custom code | Flexible but slow and error prone |
+There are four reasons: survive the loss of a disk, machine or data centre (availability and durability); spread reads across machines (read scaling); serve users from a nearby copy (latency); and run backups or reports on a copy instead of the main database (isolation).
 
-## Single-leader (leader-follower, primary-replica)
-One node, the leader, accepts all writes. It appends to its log and streams the log to followers, which apply changes in the same order. Reads can go to the leader or to followers.
+### The problem
 
+```text
+one database server, 99.9% of its disks never fail... until one does
+  -> every write since the last nightly backup is gone (up to 24 hours)
+  -> the app is down until a new server is restored (hours)
+  -> meanwhile 20,000 reads/sec were already saturating its CPU
 ```
+
+A single copy is a single point of failure for both data and uptime, and it caps read throughput at one machine.
+
+### Better design
+
+```text
              writes
- clients ---------------> [ Leader ] --- replication log ---> [ Follower 1 ]
-    |                                \--------------------> [ Follower 2 ]
-    +--- reads (may be stale) --------------------------------^
+ app ---------------------> [ Leader ] --log--> [ Follower A, zone 2 ]
+  |                                    \--log--> [ Follower B, zone 3 ]
+  +--- reads spread over A and B ------------------^
 ```
 
-### Synchronous, asynchronous, semi-synchronous
-| Mode | Leader acknowledges the client when | On leader loss | Write latency | Availability |
-|---|---|---|---|---|
-| **Asynchronous** | Its own log is durable | Recent writes can be lost | Lowest | Writes continue even if all followers are down |
-| **Synchronous** (all followers) | Every follower has the write | No loss | Slowest follower dictates latency | Any follower failure blocks writes |
-| **Semi-synchronous** (one or a quorum) | At least one / a quorum of followers have it | No loss if that follower survives | One round trip to the fastest follower(s) | Tolerates some follower failures |
+If the leader dies, a follower holding the same data takes over in seconds, and reads scale by adding followers.
 
-In practice: MySQL semi-sync (`rpl_semi_sync_master_wait_for_slave_count`), Postgres `synchronous_standby_names = 'ANY 1 (s1, s2)'`, and consensus-replicated systems (Spanner, CockroachDB, etcd, Kafka with `acks=all` and `min.insync.replicas=2`), which wait for a majority or an in-sync set. A common production setup is one synchronous standby in another zone of the same region plus asynchronous replicas elsewhere.
+**Trade-offs:**
+- More machines to pay for and operate.
+- Copies can disagree for a while; the rest of this chapter is about that.
 
-### Adding a new follower
-1. Take a consistent snapshot of the leader tied to a log position (Postgres LSN, MySQL GTID set).
-2. Copy the snapshot to the new node.
-3. Stream the log from that position until caught up.
+**Key takeaway:** Replication buys availability, read scale and locality. It is not a backup: a bad `DELETE` is copied to every replica within milliseconds, so you still need snapshots.
 
-## Replication lag and its anomalies
-With asynchronous followers, a follower may be milliseconds or minutes behind. The system is eventually consistent, and three user-visible anomalies appear.
+---
 
-### 1. Read-your-writes (read-after-write)
-A user updates their profile, the page reloads from a lagging follower, and the old value appears. The user thinks the save failed.
+## 2. Leader-follower replication
 
-Fixes:
-- Read the user's own data (or anything they edited in the last N seconds) from the leader.
-- Track the write's log position and route the read to a replica that has applied at least that position (or wait until it has).
-- Sticky routing to the leader for a session after a write.
+**Definition:** In leader-follower (also called primary-replica) replication, one node, the leader, accepts all writes and streams its change log to followers, which apply the changes in the same order.
 
-### 2. Monotonic reads
-A user refreshes twice; the first read hits an up-to-date replica, the second a lagging one. A comment appears, then disappears, and time seems to run backwards.
+This is how PostgreSQL streaming replication, MySQL replication, MongoDB replica sets and Kafka partitions work. Because every write goes through one node, there is one clear order of events and no write conflicts. Reads can go to the leader or to any follower.
 
-Fix: pin each user to one replica (hash the user ID), or carry a "last seen position" token and never read from a replica behind it.
+### The problem
 
-### 3. Consistent prefix reads
-Causally related writes are seen out of order: an observer sees the answer to a question before the question, because the two writes landed on different partitions with different lag.
+If any node could accept writes without coordination, two updates to the same row could land on different nodes in a different order:
 
-Fix: write causally related data to the same partition (one conversation, one partition), or track causal dependencies (version vectors, hybrid logical clocks).
+```text
+node 1: balance = 100 -> set 150 -> set 80
+node 2: balance = 100 -> set 80  -> set 150
+the two copies now disagree forever
+```
+
+### Better design
+
+```text
+client -> Leader: log #101 "set 150", #102 "set 80"
+Leader -> Follower A: apply #101, #102 in order
+Leader -> Follower B: apply #101, #102 in order
+every copy ends at 80
+```
+
+One writer means one order, and followers that replay the same log in the same order end up identical.
+
+**Trade-offs:**
+- Write throughput is limited to what one leader can handle (sharding fixes that; see the next chapter).
+- Followers can be behind the leader (replication lag, section 4).
+
+**Key takeaway:** Leader-follower is the default because one writer gives one order and no conflicts.
+
+---
+
+## 3. Synchronous vs. asynchronous replication
+
+**Definition:** With synchronous replication the leader waits for a follower to confirm a write before telling the client "done"; with asynchronous replication it confirms immediately and ships the change afterwards.
+
+It is like sending a parcel. Synchronous is "wait at the counter until the other branch confirms it has a copy". Asynchronous is "drop it off and leave"; usually fine, but if the shop burns down before shipping, the parcel is lost.
+
+### The problem
+
+```text
+asynchronous only:
+  10:00:00.000  client writes payment #9001 -> leader says OK
+  10:00:00.050  leader crashes before shipping #9001
+  10:00:30      follower promoted to leader -> payment #9001 does not exist
+```
+
+The client was told the payment succeeded, but it is gone. With fully synchronous replication to every follower the opposite happens: one slow or dead follower blocks all writes.
+
+### Better design
+
+```text
+semi-synchronous: wait for ANY 1 follower, the rest are asynchronous
+  leader --sync--> Follower A (zone 2)   must ack before client gets OK
+  leader --async-> Follower B (zone 3)   catches up in the background
+PostgreSQL:  synchronous_standby_names = 'ANY 1 (a, b)'
+```
+
+At least two machines hold every confirmed write, and if one follower is slow the leader can wait for the other.
+
+**Trade-offs:**
+- Every write pays one extra network round trip (about 1-2 ms across zones; far more across regions).
+- Async keeps writes fast and available but can lose the last few writes on failover.
+
+**Key takeaway:** For data you must not lose (payments), wait for at least one other copy; for data you can afford to lose a second of (likes, metrics), async is fine.
+
+---
+
+## 4. Replication lag and read-your-writes
+
+**Definition:** Replication lag is the delay between a write landing on the leader and that write appearing on a follower.
+
+Lag is usually milliseconds, but under heavy load or a long-running write it can grow to seconds or minutes. During that window, followers serve old data. The system is **eventually consistent**: copies agree if writes stop for long enough. The most visible symptom is breaking **read-your-writes**, the promise that a user always sees their own changes.
+
+### The problem
+
+```text
+t=0     user saves new display name "Pallav S" -> leader
+t=5ms   page reloads, read goes to Follower B (lag 2 s)
+        -> shows the OLD name; user thinks the save failed and tries again
+```
+
+A second symptom is **monotonic reads** breaking: two refreshes hit two followers with different lag, so a new comment appears and then disappears.
+
+### Better design
 
 ```java
-// Read-your-writes using a log-position token (illustrative)
-public Profile updateProfile(long userId, ProfileUpdate u) {
-    long lsn = primaryDao.updateAndReturnLsn(userId, u);   // e.g. pg_current_wal_lsn()
-    session.setAttribute("minLsn", lsn);
-    return primaryDao.find(userId);
-}
-
+// After a write, route that user's reads to the leader for a short window
 public Profile getProfile(long userId) {
-    Long minLsn = (Long) session.getAttribute("minLsn");
-    DataSource ds = (minLsn == null) ? replicaRouter.any()
-                                     : replicaRouter.anyCaughtUpTo(minLsn).orElse(primary);
-    return dao(ds).find(userId);
+    Instant lastWrite = recentWrites.get(userId);          // set on every update
+    boolean fresh = lastWrite != null
+            && lastWrite.isAfter(Instant.now().minusSeconds(10));
+    DataSource ds = fresh ? leader : replicaFor(userId);   // replicaFor pins a user to one follower
+    return profileDao.find(ds, userId);
 }
 ```
 
-In Spring, the common simpler pattern is an `AbstractRoutingDataSource` that routes `@Transactional(readOnly = true)` to replicas and everything else to the primary, plus a rule that reads immediately after a write go to the primary.
+The user reads their own recent changes from the leader, and pinning each user to one follower (for example by hashing the user ID) gives monotonic reads. A stricter option is to remember the log position of the user's last write and read only from a follower that has reached it.
 
-## Failover
-When the leader dies, a follower must be promoted.
+**Trade-offs:**
+- More reads hit the leader right after writes.
+- Other users may still briefly see the old value; that is usually acceptable.
 
-1. **Detect** failure, usually by missed heartbeats over a timeout (too short causes needless failovers under load; too long extends downtime).
-2. **Choose** a new leader: the follower with the most up-to-date log, ideally decided via a consensus system (Patroni with etcd, Orchestrator for MySQL, RDS/Aurora managed failover).
-3. **Reconfigure:** clients and other followers point to the new leader (DNS, virtual IP, a proxy such as PgBouncer/ProxySQL/HAProxy, or service discovery).
-4. **Demote** the old leader when it returns so it rejoins as a follower, discarding any writes it never replicated.
+**Key takeaway:** Lag is normal; design so a user never sees their own write disappear.
 
-### What goes wrong
-- **Lost writes:** with async replication, writes the old leader acknowledged but did not ship are gone. If those writes had side effects elsewhere (IDs cached in Redis, emails sent), the system becomes inconsistent: a promoted replica can reuse auto-increment IDs that other systems already associate with different rows.
-- **Split brain:** a network partition makes the old leader *think* it is still leader while a new one is elected. Both accept writes and data diverges.
-- **Wrong timeout:** a GC pause or overloaded network triggers failover of a healthy leader, and the cluster flaps.
+---
 
-### Fencing
-You cannot rely on the old leader to know it has been deposed (it may be paused mid-write). Protect the system instead:
-- **Fencing tokens / epochs:** every new leader gets a monotonically increasing term number. Storage and downstream services reject requests carrying an older term.
-- **STONITH** ("shoot the other node in the head"): power off or network-isolate the old node via the hypervisor or a fencing device.
-- **Leases:** the leader holds a time-limited lease from a coordinator and stops accepting writes when it cannot renew it. This relies on bounded clock drift and pauses, so combine it with tokens.
-- **Quorum requirement:** a leader can only commit with acknowledgements from a majority, so an old leader on the minority side of a partition cannot make progress (this is how Raft avoids split brain).
+## 5. Failover and split brain
 
-## Multi-leader replication
-Several nodes accept writes, typically one leader per data centre, replicating to each other asynchronously.
+**Definition:** Failover is promoting a follower to leader when the leader dies; split brain is when two nodes both believe they are the leader and both accept writes.
 
-```
-   DC us-east                       DC eu-west
- [ Leader A ] <--- async, both ---> [ Leader B ]
-   |   |                               |   |
-followers                            followers
+Failover has three steps: detect the leader is dead (usually missed heartbeats for some timeout), choose the most up-to-date follower, and point clients and other followers at it. Each step can go wrong. The hardest case is a leader that is not dead, only slow or cut off by the network.
+
+### The problem
+
+```text
+network partition:
+  [ Old leader ]  X  [ Follower A, Follower B ]
+  A is promoted -> new leader, accepts writes for seat 12 -> user 1
+  old leader still serving its own clients -> writes seat 12 -> user 2
+partition heals: two histories, two owners of seat 12
 ```
 
-Uses: multi-region active-active with local write latency; offline-capable clients (each phone is effectively a leader: calendar and notes apps); collaborative editing (each user's document copy is a leader).
+Split brain silently corrupts data. Another real failure: if an async follower is promoted, writes it never received are lost, and IDs the old leader already handed out can be reused. GitHub had a well-known incident where a stale MySQL follower was promoted, primary keys were reused, and some private data was shown to the wrong users.
 
-The cost is **write conflicts**: two leaders accept different changes to the same record concurrently, and you only find out later.
+### Better design
 
-### Conflict handling
-| Approach | How | Trade-off |
+```text
+leader election through consensus (Raft, ZooKeeper, etcd): needs a majority (2 of 3)
+each new leader gets a higher epoch (term) number: old = 7, new = 8
+every write carries the epoch; storage and followers reject epoch 7
+  -> the old leader's writes are refused (fencing)
+old leader cannot reach a majority -> steps down on its own
+```
+
+A majority vote means only one side of a partition can elect a leader, and the epoch number (a **fencing token**) makes any stale leader's writes harmless.
+
+**Trade-offs:**
+- A short timeout fails over on a mere slow spell; a long one means longer downtime. Typical values are seconds to tens of seconds.
+- You need an odd number of voters (3 or 5), possibly across three zones.
+
+**Key takeaway:** Automatic failover is only safe with a majority-based election and fencing so an old leader cannot keep writing.
+
+---
+
+## 6. Multi-leader replication and conflicts
+
+**Definition:** In multi-leader replication, several nodes (typically one per region) each accept writes and replicate them to each other asynchronously.
+
+This helps when users in Mumbai and New York both need fast local writes, or when a device must work offline (a calendar app on your phone is effectively a leader that syncs later). The price is **write conflicts**: the same record changed in two places at once.
+
+### The problem
+
+```text
+Mumbai leader:    doc 77 title = "Q3 plan"     at 10:00:00.100
+New York leader:  doc 77 title = "Q3 roadmap"  at 10:00:00.120
+both succeed locally, then replicate to each other -> which one wins?
+```
+
+With **last-writer-wins** (LWW: keep the higher timestamp), "Q3 roadmap" wins and the Mumbai edit is silently thrown away. If the clocks are skewed, the "later" write may not even be the real later one.
+
+### Better design
+
+```text
+Option 1, avoid conflicts: each record has a home region; all writes for doc 77 go to Mumbai
+Option 2, merge: use data types that combine safely (CRDTs)
+  like counter:  Mumbai +3, New York +2  -> merged = +5, nothing lost
+  tag set:       add "urgent" in one region, add "q3" in the other -> both kept
+Option 3, keep both versions and let the app or user pick
+```
+
+Routing each record to a home region removes most conflicts. For data that truly is edited everywhere, **CRDTs** (conflict-free replicated data types: counters, sets and similar structures designed so merges always agree) avoid losing updates.
+
+**Trade-offs:**
+- Conflict handling is complex and often surprising for users.
+- LWW is simple but loses data; for example, DynamoDB global tables resolve concurrent writes with last-writer-wins.
+
+**Key takeaway:** Use multi-leader only when you need local writes in several regions or offline, and decide up front how each conflict is resolved.
+
+---
+
+## 7. Leaderless replication and quorums (N, R, W)
+
+**Definition:** In leaderless replication, the client (or a coordinator node) sends each write to several replicas and reads from several replicas, with no single leader; quorums decide when an operation counts as successful.
+
+This is the Amazon Dynamo design, used by Cassandra, ScyllaDB and Riak. Three numbers matter: **N** is how many replicas hold each key, **W** is how many must confirm a write, and **R** is how many are asked on a read. If **W + R > N**, the set of nodes you read from must overlap the set that took the latest write, so at least one answer is fresh.
+
+### The problem
+
+```text
+N = 3, W = 1, R = 1   (fast, but no overlap)
+write x = 5 -> only replica 1 confirms; replicas 2 and 3 still have x = 4
+read  x     -> asks replica 3 only -> returns 4 (stale)
+```
+
+Because 1 + 1 is not greater than 3, the read and the write can miss each other entirely.
+
+### Better design
+
+```text
+N = 3, W = 2, R = 2   (2 + 2 > 3)
+write x = 5 -> replicas 1 and 2 confirm (replica 3 is down)
+read  x     -> asks replicas 2 and 3 -> gets {5 (newer version), 4}
+            -> returns 5, then writes 5 back to replica 3 (read repair)
+Cassandra: replication_factor = 3, consistency level QUORUM (= 2) for reads and writes
+```
+
+The overlap guarantees the newest version is seen, and version numbers tell the coordinator which answer is newer. Replicas that missed writes catch up through **read repair** (fix on read) and **anti-entropy** (a background job that compares replicas, often with Merkle trees, which are hash trees that find differences cheaply).
+
+**Trade-offs:**
+- Higher W or R means higher latency and less tolerance of down nodes; W = N blocks writes if any replica is down.
+- The guarantee weakens with a **sloppy quorum** (writes stored on substitute nodes during failures, then handed back later by **hinted handoff**) and with concurrent writes resolved by timestamps. Quorums are not the same as transactions.
+
+**Key takeaway:** Pick N, R and W per use case: W + R > N for fresher reads, small R or W for speed and availability.
+
+### Leader-follower vs. multi-leader vs. leaderless
+
+- **Leader-follower:** one writer, no conflicts, simple; failover is the hard part. The default for most systems.
+- **Multi-leader:** local writes in many regions or offline; you must resolve conflicts.
+- **Leaderless:** no failover at all and high write availability; you tune consistency with N, R and W and accept repair work.
+
+---
+
+## In an HLD interview
+
+- **Payment System / Amazon E-commerce orders:** leader-follower with at least one synchronous follower in another zone, consensus-based failover with fencing, and reads of a user's own orders from the leader.
+- **News Feed / Notification System:** async followers serve the heavy read traffic; a few seconds of lag is fine, but read-your-writes for the author's own post.
+- **Chat/WhatsApp, Metrics, Ride Tracking:** leaderless (Cassandra) with RF = 3 and QUORUM for messages, ONE for high-volume location pings you can afford to lose.
+- **Google Docs-style editing or offline apps:** multi-leader with CRDTs or operational transforms; say how conflicts merge.
+- **What to SAY:** "Writes go to a single leader; I replicate synchronously to one follower in another zone so a confirmed write survives a crash, and asynchronously to read replicas. After a user writes, I route their reads to the leader for a few seconds."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
 |---|---|---|
-| **Avoid conflicts** | Route all writes for a record to one "home" leader (each user homed in a region) | Simplest and most common; breaks down when the home DC fails over |
-| **Last-write-wins (LWW)** | Attach a timestamp; highest wins | Simple, but silently drops concurrent writes, and clock skew can let an older write win |
-| **Version vectors + siblings** | Detect concurrency; keep both values and let the app or user merge (Riak, the Dynamo shopping cart) | Correct, but pushes complexity into the application |
-| **CRDTs** | Data types whose merge is commutative, associative and idempotent, so replicas converge automatically | Limited to types that have a CRDT; metadata overhead |
-| **Operational transform** | Transform concurrent edits against each other (Google Docs) | Complex; usually needs a central server |
-| **Custom merge logic** | On-write or on-read handlers | Domain specific and hard to test |
+| Replication | Same data on several machines | What happens if this machine dies? |
+| Leader-follower | One writer, followers replay its log | Can one leader take all the writes? |
+| Sync vs. async | Wait for a copy, or ship later | Can I afford to lose the last second of writes? |
+| Replication lag | Followers are behind | Will a user see their own write vanish? |
+| Failover and split brain | Promote a follower safely | What stops the old leader from writing? |
+| Multi-leader | Many writers, conflicts | How exactly do conflicts merge? |
+| Leaderless quorum | W + R > N gives overlap | Which N, R, W fit this data? |
 
-### CRDT examples
-- **G-Counter:** each replica keeps its own count; value = sum; merge = element-wise max. Good for likes and views.
-- **PN-Counter:** two G-Counters (increments and decrements).
-- **OR-Set (observed-remove set):** adds carry unique tags; a remove deletes only the tags it has seen, so a concurrent add wins. Good for shopping carts and group membership.
-- **LWW-Register / LWW-Map:** per-field last-writer-wins.
-- **Sequence CRDTs** (RGA, Yjs, Automerge): collaborative text editing.
+## Final memory aid
 
-```java
-// G-Counter CRDT: merge is element-wise max, so replicas converge regardless of order
-public final class GCounter {
-    private final Map<String, Long> counts = new HashMap<>();
-    private final String replicaId;
-    public GCounter(String replicaId) { this.replicaId = replicaId; }
-
-    public void increment() { counts.merge(replicaId, 1L, Long::sum); }
-    public long value() { return counts.values().stream().mapToLong(Long::longValue).sum(); }
-    public void merge(GCounter other) {
-        other.counts.forEach((k, v) -> counts.merge(k, v, Math::max));
-    }
-}
-```
-
-Real systems: Redis Enterprise active-active (CRDT-based), Riak data types, DynamoDB global tables (LWW per item), Cassandra multi-DC (LWW per cell), CouchDB/PouchDB (revision trees with exposed conflicts), MySQL Group Replication multi-primary (certification-based conflict detection).
-
-## Leaderless replication (Dynamo style)
-Any replica accepts reads and writes. The client, or a coordinator node acting for it, sends each request to several replicas in parallel. Used by the original Amazon Dynamo design (2007 paper), Cassandra, ScyllaDB, Riak and Voldemort. (DynamoDB, despite the name, uses leader-based Multi-Paxos replication per partition.)
-
-### Quorums: N, W, R
-- **N:** number of replicas for each key (replication factor), typically 3.
-- **W:** replicas that must acknowledge a write.
-- **R:** replicas that must answer a read.
-- If **W + R > N**, the read set and the write set overlap in at least one replica, so a read sees the latest acknowledged write under normal conditions.
-
-| N, W, R | Property |
-|---|---|
-| 3, 2, 2 | Classic quorum; tolerates one node down for both reads and writes |
-| 3, 3, 1 | Fast reads; writes fail if any replica is down |
-| 3, 1, 3 | Fast writes; reads need all replicas |
-| 3, 1, 1 | Fastest and most available; no overlap, eventual consistency only |
-
-Each value carries a version (a timestamp in Cassandra, a version vector in Riak), so the reader picks the newest response.
-
-Quorums are not linearizable on their own. Edge cases: a write that succeeded on fewer than W nodes is reported as failed but not rolled back, so later reads may or may not see it; concurrent writes under LWW lose data; a replica restored from an old copy shrinks the effective overlap; and sloppy quorums break the overlap entirely.
-
-### Sloppy quorum and hinted handoff
-If some of the N home replicas are unreachable, a **sloppy quorum** lets the write land on other healthy nodes so it still collects W acknowledgements. Those stand-in nodes store a **hint** ("this belongs to node C") and forward the data when C returns: **hinted handoff**. Write availability goes up, but W + R > N no longer guarantees reading the latest value until hints are delivered.
-
-### Repairing divergence
-- **Read repair:** a read collects R responses; if some are stale, the coordinator writes the newest value back to them. This fixes frequently read keys.
-- **Anti-entropy:** a background process compares replicas and copies missing data. Comparing every key would be too expensive, so replicas build **Merkle trees** (hash trees) over key ranges.
-
-```
-             root = H(H12 + H34)
-            /                  \
-     H12 = H(H1+H2)      H34 = H(H3+H4)
-       /     \             /      \
-     H1      H2          H3       H4      <- hash of each key range's data
-```
-
-Two replicas compare root hashes; if equal, they are in sync. If not, they descend only into subtrees that differ, so finding a few changed keys among billions takes O(log n) hash comparisons plus transfer of the differing ranges. Cassandra runs this as `nodetool repair`, which must complete within `gc_grace_seconds` (default 10 days), otherwise a replica that missed a tombstone can resurrect deleted data.
-
-### Cassandra example
-```sql
-CREATE KEYSPACE chat WITH replication =
-  {'class': 'NetworkTopologyStrategy', 'us_east': 3, 'eu_west': 3};
-
--- Per-request consistency level (cqlsh syntax; drivers set it per statement)
-CONSISTENCY LOCAL_QUORUM;   -- 2 of 3 in the local DC: strong within the DC, low latency
-INSERT INTO messages (conversation_id, message_id, body) VALUES (?, ?, ?);
-SELECT * FROM messages WHERE conversation_id = ? LIMIT 50;
-```
-
-With `LOCAL_QUORUM` for both reads and writes, W + R = 4 > 3 within a data centre, while the remote DC is updated asynchronously.
-
-## Change data capture (CDC) and logical replication
-CDC turns the database's replication log into an event stream other systems can consume. Instead of dual writes (write to the DB, then publish to Kafka, which can fail halfway), you write only to the database and a connector tails the log.
-
-```
-Postgres (wal_level=logical) --logical decoding--> Debezium --> Kafka topic orders.cdc
-                                                                   |-> Elasticsearch (search)
-                                                                   |-> Redis (cache invalidation)
-                                                                   |-> Data warehouse
-```
-
-- **Postgres:** logical replication slots plus publications/subscriptions (native table-level replication between clusters), or the `pgoutput` plugin for Debezium. Beware: an abandoned slot makes the primary retain WAL forever and can fill its disk.
-- **MySQL:** row-based binlog with GTIDs; Debezium, Maxwell, Canal.
-- **MongoDB:** change streams over the oplog. **DynamoDB:** Streams. **Cassandra:** a CDC commit-log directory.
-- **Outbox pattern:** write the business row and an `outbox` event row in one local transaction; CDC publishes the outbox row. This gives atomic "update state and emit event" without distributed transactions.
-
-## Comparing the three architectures
-| | Single-leader | Multi-leader | Leaderless |
-|---|---|---|---|
-| Write path | One node | One per region/device | Any W of N replicas |
-| Conflicts | None (serialised at the leader) | Yes, must be resolved | Yes (concurrent writes), resolved by versions/LWW |
-| Write availability | Lost during failover | High (regions independent) | High (sloppy quorum) |
-| Consistency achievable | Strong on the leader; lag on followers | Eventual | Tunable via R/W; not linearizable by default |
-| Multi-region write latency | Remote writes cross regions | Local | Local with LOCAL_QUORUM |
-| Examples | Postgres, MySQL, MongoDB replica sets, Redis, Kafka partitions | DynamoDB global tables, CouchDB, Redis active-active | Cassandra, ScyllaDB, Riak, Dynamo |
-
-## How it shows up in interview problems
-- **E-commerce / payments:** single leader per shard with semi-sync or consensus replication so an acknowledged payment is never lost; read replicas for catalog browsing; read-your-writes for order status right after checkout.
-- **Chat / messaging:** Cassandra with RF 3 and `LOCAL_QUORUM`; per-conversation ordering via server-assigned sequence numbers rather than wall clocks.
-- **News feed / likes:** replica reads are fine; like counts can be CRDT counters or asynchronously aggregated.
-- **Distributed cache:** Redis primary-replica with Sentinel or Cluster failover; accept a small window of lost writes.
-- **Multi-region user profiles:** home each user in a region (conflict avoidance) with async replication for reads elsewhere.
-- **Collaborative editing:** CRDTs or OT.
-- **Search and analytics:** CDC from the source of truth into Elasticsearch and the warehouse.
-- **Seat reservation / inventory:** never multi-leader LWW for the authoritative count; use a single leader or a consensus store.
-
-## Common pitfalls
-- Reading from replicas without thinking about read-your-writes, so users see their own changes vanish.
-- Treating async replicas as a durable copy during failover.
-- Automatic failover with aggressive timeouts (flapping), or without fencing (split brain).
-- LWW in multi-leader setups for data that cannot tolerate silently lost updates (balances, inventory).
-- Believing W + R > N gives linearizability.
-- Not running repair in Cassandra, so deleted data resurrects.
-- Dual writes to the DB and a message broker instead of outbox plus CDC.
-- An unused Postgres replication slot filling the primary's disk.
-
-## Interview questions
-1. **Synchronous or asynchronous replication for a payments database?** Semi-synchronous (or quorum/consensus) so an acknowledged write exists on at least two nodes. Fully synchronous to every replica turns any replica failure into a write outage; fully async can lose acknowledged payments on failover.
-2. **A user updates their profile and immediately sees the old value. Why, and how do you fix it?** The read hit a lagging replica. Route the user's own reads to the leader for a short window after a write, or track the write's log position and read only from replicas that have caught up to it.
-3. **What is split brain and how do you prevent it?** Two nodes both believe they are leader and accept conflicting writes, usually after a partition. Prevent it with majority-based election, fencing tokens checked by storage, leases and STONITH.
-4. **How does Cassandra stay consistent without a leader?** Quorum reads and writes (W + R > N) with timestamps, plus hinted handoff for temporary failures, read repair for hot keys and Merkle-tree anti-entropy repair for everything else.
-5. **What is a sloppy quorum?** Writes are accepted by any reachable nodes, not only the key's home replicas, to stay available; the stand-ins forward data later via hinted handoff. Reads may miss the write until then.
-6. **How do you resolve conflicts in active-active multi-region?** Prefer avoiding them by homing each record in one region; otherwise LWW where loss is acceptable, CRDTs for counters and sets, or keep siblings and merge in the application.
-7. **Why CDC instead of publishing events from application code?** Dual writes can partially fail and leave the DB and the stream inconsistent; CDC derives events from the committed log (often via an outbox table), so every committed change is published, in commit order.
-8. **Is replication a backup?** No. Mistakes and corruption replicate instantly; you still need snapshots and point-in-time recovery.
-
-## Cheat sheet
-- Single-leader: simple, no conflicts, follower lag, failover risk. Multi-leader: local writes, conflicts. Leaderless: quorums, high availability, versioning.
-- Sync = no loss, slow and fragile; async = fast, can lose writes; semi-sync = practical default for critical data.
-- Lag anomalies: read-your-writes (leader or LSN-aware reads), monotonic reads (sticky replica), consistent prefix (same partition / causal tracking).
-- Failover: detect, elect most up-to-date, redirect, demote; fence with epochs/tokens and STONITH.
-- Conflicts: avoid (home region) > CRDT > siblings > LWW (lossy).
-- Quorum: W + R > N overlap; N=3, W=2, R=2 classic; not linearizable alone.
-- Repair: hinted handoff, read repair, Merkle-tree anti-entropy (within gc_grace).
-- CDC: logical decoding/binlog to Debezium to Kafka; outbox pattern; watch replication slots.
+- **Why:** survive, scale reads, stay close; not a backup
+- **Leader-follower:** one writer, one order
+- **Sync:** safe but slow; **async:** fast but lossy
+- **Lag:** read your own writes from the leader
+- **Failover:** majority vote plus fencing token
+- **Multi-leader:** home region or CRDT, never silent LWW for money
+- **Leaderless:** W + R > N

@@ -1,415 +1,588 @@
 === hld-messaging | HLD | Message queues, pub/sub and event-driven architecture ===
-Messaging decouples the service that produces work or facts from the services that react to them, in time, in availability and in scale. This chapter separates the two big families (queues and logs), opens up Kafka's internals, compares RabbitMQ and SQS semantics, and then covers the hard parts interviewers probe: delivery guarantees, retries and DLQs, backpressure, the outbox pattern, event sourcing, CQRS and choreography versus orchestration.
+Messaging lets one service hand off work or announce a fact without waiting for the services that react to it. This chapter compares queues, pub/sub and logs, explains how Kafka partitions, offsets and consumer groups work, and then covers the parts interviewers probe: delivery guarantees, retries and dead-letter queues, backpressure, the outbox pattern, and choreography versus orchestration.
 
-## Why asynchronous messaging
-A synchronous call chain `A → B → C` has availability `A × B × C` and latency `A + B + C`. If C is slow, A's threads pile up. Putting a broker between them changes the contract from "do this now" to "this needs doing" or "this happened":
-- **Temporal decoupling:** the consumer can be down for an hour; messages wait.
-- **Load levelling:** a 10x spike becomes a growing backlog instead of a cascading failure. Consumers drain it at their own pace.
-- **Fan-out:** one `OrderPlaced` event feeds billing, inventory, email, analytics and search indexing without the order service knowing any of them.
-- **Independent scaling:** add consumers for the slow stage only.
+## 1. Sync vs. async communication
 
-The price is eventual consistency, harder debugging (correlation IDs and tracing become mandatory), duplicate and out-of-order delivery, and one more piece of infrastructure to run.
+**Definition:** In synchronous calls the caller waits for the answer; in asynchronous messaging the caller drops a message on a broker and moves on.
 
-## Two families: queues and logs
-| | Message queue (RabbitMQ, SQS, ActiveMQ) | Distributed log (Kafka, Pulsar, Kinesis) |
-|---|---|---|
-| Storage model | Messages deleted once acknowledged | Append-only log retained by time/size; reading does not delete |
-| Consumption | Competing consumers; each message to one worker | Consumers track an offset; many independent groups re-read the same data |
-| Ordering | Best effort (FIFO queues are a special mode) | Strict within a partition |
-| Replay | No (once acked, gone) | Yes, rewind the offset |
-| Per-message routing | Rich (exchanges, topics, headers, priorities, delays) | Minimal: topic + partition by key |
-| Per-message ack/redelivery | Yes, individual | Offset commit (everything before offset N is done) |
-| Throughput | Tens of thousands/s per node | Millions/s per cluster (sequential disk I/O, batching, zero-copy) |
-| Best for | Task/job queues, RPC-style work distribution, per-message retry/delay | Event streams, CDC, analytics pipelines, event sourcing, many readers |
+A phone call is synchronous: both people must be available at the same time. A text message is asynchronous: the sender continues, and the receiver reads it when ready. A **broker** is the middleman (Kafka, RabbitMQ, SQS) that stores messages until consumers take them.
 
-Rule of thumb: **"do this job" → queue; "this happened" → log.** Many companies run both.
+### The problem
 
-**Point-to-point vs pub/sub.** A queue with several workers is point-to-point: each message processed once by one of them. Pub/sub delivers each message to every subscriber. Kafka gives both at once: within a consumer group it is point-to-point (partitions are split among members); across groups it is pub/sub.
-
-## Kafka internals
-```
-Topic "orders" (3 partitions, replication factor 3)
-
-P0: [0][1][2][3][4][5][6] ...   leader broker-1, followers broker-2, broker-3
-P1: [0][1][2][3][4] ...         leader broker-2, followers broker-3, broker-1
-P2: [0][1][2][3][4][5] ...      leader broker-3, followers broker-1, broker-2
-
-Consumer group "billing":   c1 ← P0, P1     c2 ← P2
-Consumer group "analytics": a1 ← P0, P1, P2  (independent offsets)
+```text
+ POST /orders
+   OrderService -> PaymentService   (80 ms)
+                -> InventoryService (60 ms)
+                -> EmailService     (900 ms, sometimes down)
+                -> AnalyticsService (120 ms)
+ Total ~1.2 s, and the order FAILS when EmailService is down.
 ```
 
-### Topics, partitions and offsets
-- A **topic** is a named stream split into **partitions**. Each partition is an ordered, immutable sequence of records stored as segment files on disk; each record gets a monotonically increasing **offset**.
-- Partitions are the unit of **parallelism** (one consumer per partition per group at a time) and of **ordering**.
-- The producer chooses the partition: `hash(key) % numPartitions` when a key is set, otherwise sticky/round-robin batching. **Same key → same partition → ordered.** Key by `orderId`, `accountId` or `userId`, whichever entity's events must stay in order.
-- Changing the partition count remaps keys, which breaks per-key ordering across the change. Over-provision partitions up front (for example 2–3x expected consumer count).
+The user waits for work they do not care about, and one non-critical service can break checkout.
 
-### Consumer groups and rebalancing
-- Consumers in a group share partitions. With 6 partitions and 3 consumers each gets 2; a 7th consumer would sit idle. **Max parallelism = partition count.**
-- When a member joins, leaves or misses heartbeats (`session.timeout.ms`) or takes too long between polls (`max.poll.interval.ms`), the group **rebalances**. Cooperative sticky assignment avoids the old "stop the world" rebalance.
-- Each group commits its offset per partition to the internal `__consumer_offsets` topic. **Lag** = log end offset minus committed offset; it is the most important consumer metric.
+### Better design
 
-### Replication, ISR and acks
-- Each partition has one **leader** (handles reads and writes) and followers that replicate it. Followers that are caught up form the **in-sync replica set (ISR)**.
-- The **high watermark** is the offset replicated to all ISR members; consumers only see records below it.
-- Producer `acks`:
+```text
+ POST /orders
+   OrderService -> PaymentService, InventoryService  (sync, must succeed)
+                -> publish "OrderPlaced" to broker    (~5 ms)
+   reply 201 to user  (~150 ms)
 
-| Setting | Meaning | Risk |
+ broker -> EmailService      (sends when it can, retries if down)
+        -> AnalyticsService  (consumes at its own pace)
+```
+
+Only steps that decide the response stay synchronous. Everything else reacts to an event, so a slow or failed consumer no longer hurts the user.
+
+**Trade-offs:**
+- Harder to debug: the flow is spread across services and time (use trace IDs).
+- Results are eventually consistent; the email arrives a little later.
+
+**Key takeaway: Keep the response path synchronous and minimal; push side effects to async messages.**
+
+---
+
+## 2. Queue vs. pub/sub vs. log
+
+**Definition:** A queue gives each message to one consumer; pub/sub gives each message to every subscriber; a log stores messages durably in order so any reader can read from any position.
+
+A queue is like a to-do pile shared by workers: each task is done once, then removed. Pub/sub is like a newsletter: every subscriber gets a copy. A log is like a ledger: entries are kept, and each reader keeps its own bookmark.
+
+### The problem
+
+```text
+ Using a plain work queue for "OrderPlaced":
+   EmailService and AnalyticsService both consume from one queue
+   -> each message goes to ONE of them
+   -> half the orders get no email, half are missing from analytics
+ Later: "replay last week's orders into the new fraud model" -> data gone
+```
+
+A queue splits work; it does not broadcast. And once acknowledged, messages are deleted, so they cannot be replayed.
+
+### Better design
+
+| Need | Use | Examples |
 |---|---|---|
-| `acks=0` | Fire and forget | Loses data on any failure |
-| `acks=1` | Leader wrote it | Lost if the leader dies before followers copy |
-| `acks=all` | All ISR members have it | Durable, slightly higher latency |
+| Spread tasks across workers, each done once | Queue | SQS, RabbitMQ queue |
+| Every interested service gets every event | Pub/sub | SNS, RabbitMQ fanout exchange |
+| Fan-out plus ordering, replay, high volume | Log | Kafka, Kinesis, Pulsar |
 
-- Pair `acks=all` with `min.insync.replicas=2` and replication factor 3: a write succeeds only if at least two copies exist, and the topic tolerates one broker down. Set `unclean.leader.election.enable=false` so an out-of-date replica never becomes leader.
-- `enable.idempotence=true` gives each producer an ID and per-partition sequence numbers, so broker-side retries do not create duplicates or reorder records.
+A log does both jobs: each consumer group gets every event, and within a group the work is split. Events stay for the retention period, so a new service can replay history.
 
-### Retention and compaction
-- **Delete policy:** keep data for `retention.ms` (e.g. 7 days) or `retention.bytes`, then drop whole segments. Consumers can replay anything inside the window.
-- **Compact policy:** keep at least the **latest value per key**; older values for the same key are garbage-collected, and a record with a null value (a **tombstone**) deletes the key. A compacted topic is a durable changelog of current state: user profiles, account settings, Kafka Streams state stores, CDC tables.
-- Tiered storage moves old segments to object storage, making long retention cheap.
+**Key takeaway: Queue = work split, pub/sub = broadcast, log = broadcast + order + replay.**
 
-### Why Kafka is fast
-Sequential appends to the OS page cache, batching and compression per partition, zero-copy `sendfile` from page cache to socket, and consumers that pull at their own pace.
+---
 
-## RabbitMQ and SQS semantics
-**RabbitMQ (AMQP):** producers publish to an **exchange**; bindings route to **queues**. Exchange types: *direct* (exact routing key), *topic* (wildcards like `order.*.eu`), *fanout* (broadcast), *headers*. Consumers ack each message; `prefetch` (QoS) caps unacked messages per consumer, which is your backpressure knob. Nack with requeue, dead-letter exchanges, TTL, priorities and delayed delivery are built in. Quorum queues replicate via Raft. Streams add a Kafka-like log mode.
+## 3. Kafka partitions, offsets and consumer groups
 
-**Amazon SQS:**
-- **Standard queues:** nearly unlimited throughput, at-least-once, best-effort ordering.
-- **FIFO queues:** strict ordering per `MessageGroupId`, deduplication by `MessageDeduplicationId` within a 5-minute window, lower throughput.
-- **Visibility timeout:** a received message is hidden, not deleted. If the consumer does not delete it before the timeout, it reappears for another consumer. That is how SQS gives at-least-once, and why long processing must extend the timeout.
-- `maxReceiveCount` on a redrive policy moves repeat failures to a DLQ. Long polling (`WaitTimeSeconds=20`) cuts empty receives.
-- SNS + SQS gives fan-out: one SNS topic, one SQS queue per subscriber service.
+**Definition:** A Kafka topic is split into partitions; each partition is an append-only log where every message has a sequential offset, and a consumer group shares the partitions among its members.
 
-## Delivery guarantees
-| Guarantee | How it arises | Consequence |
-|---|---|---|
-| **At-most-once** | Commit/ack *before* processing | Crash mid-processing loses the message |
-| **At-least-once** | Process, *then* commit/ack | Crash after processing but before commit redelivers; duplicates |
-| **Exactly-once** | Atomic "process + record progress" | Possible only inside a closed system, or as exactly-once *effects* via idempotency |
+A **partition** is the unit of parallelism and ordering. An **offset** is a message's position in its partition (0, 1, 2...). A **consumer group** is a set of instances of one service; Kafka assigns each partition to exactly one consumer in the group. Each group commits its own offsets, so groups do not affect each other.
 
-Exactly-once delivery over a network is impossible in general; what you build is **at-least-once delivery plus idempotent processing = exactly-once effect**. Kafka offers true exactly-once *within Kafka* (read-process-write between topics) with idempotent producers plus **transactions**: the output records and the consumer offset commit are written atomically, and downstream consumers use `isolation.level=read_committed`. The moment you call an external API or write to another database, you are back to idempotency (see the idempotency chapter).
+### The problem
 
-## Failure handling: retries, DLQs and poison messages
-A **poison message** is one that will never succeed (malformed payload, a bug for that shape of data). With naive retry it blocks a Kafka partition forever or loops endlessly in a queue.
+```text
+ Topic "payments" with 1 partition, 6 consumer instances in a group.
+   partition 0 -> consumer 1;  consumers 2..6 sit idle.
+ Or: 12 partitions, producer sends with NO key
+   PaymentCreated(order 42) -> partition 3
+   PaymentRefunded(order 42) -> partition 9  (processed first!)
+```
 
-A robust pipeline:
-1. **Classify** errors. Transient (timeout, 503, lock conflict) → retry. Permanent (validation, deserialization, 4xx) → straight to DLQ.
-2. **Bounded in-place retry** with exponential backoff for a few attempts (milliseconds to seconds).
-3. **Retry topics/queues** with increasing delay (`orders-retry-1m`, `orders-retry-10m`) so a slow retry does not block the main partition.
-4. **Dead-letter queue** after N attempts, with the original payload, error, stack trace, attempt count and source offset in headers.
-5. **Operate the DLQ:** alert on its depth, build tooling to inspect, fix and **redrive** messages.
+One partition caps throughput at one consumer. Without a key, related events land in different partitions and can be processed out of order.
 
-Trade-off: moving a message to a retry topic lets later messages for the same key overtake it. If strict per-key ordering matters (account ledger), either block the partition (and alert) or park all subsequent messages for that key too.
+### Better design
 
-## Backpressure
-When producers outpace consumers something must give: buffer, drop, or slow the producer.
-- Kafka is pull-based, so consumers are naturally protected; the backlog becomes lag on disk. Watch lag and autoscale consumers (up to the partition count), e.g. KEDA on lag.
-- RabbitMQ: `prefetch` limits in-flight work per consumer; memory/disk alarms throttle publishers.
-- Bounded in-process queues and thread pools; reject (`429/503`) at the edge rather than accepting work you cannot finish.
-- Reactive streams (Project Reactor) propagate demand (`request(n)`) end to end.
-- Size it: if each message takes 20 ms and you must process 5,000 msg/s, you need at least 100 concurrent workers, so at least 100 partitions (or batch processing).
+```java
+// Same key -> same partition -> ordered for that key
+producer.send(new ProducerRecord<>("payments", orderId, event));
+```
 
-## The transactional outbox
-The **dual-write problem**: a service updates its DB and publishes an event. If it commits the DB and crashes before publishing, the event is lost; if it publishes first and the DB commit fails, the world hears about something that never happened.
+```text
+ 12 partitions, key = orderId, group of 6 consumers -> 2 partitions each
+ All events of order 42 go to one partition, so they stay in order.
+ Max useful consumers in a group = number of partitions.
+```
 
-The fix: write the event into an `outbox` table **in the same local transaction** as the business change, and relay it afterwards.
+Ordering is guaranteed only within a partition, so pick the key that defines "must stay in order" (order ID, user ID, chat ID).
+
+**Trade-offs:**
+- A hot key (one celebrity user) overloads one partition.
+- Adding partitions later changes the key-to-partition mapping for new messages.
+- Rebalancing (when consumers join or leave) briefly pauses consumption.
+
+**Key takeaway: Partition count sets parallelism; the message key sets ordering.**
+
+---
+
+## 4. Delivery guarantees
+
+**Definition:** At-most-once may lose messages, at-least-once may duplicate them, and exactly-once means the effect happens once.
+
+The difference is when the consumer records its progress (commits the offset or acks). Over a real network, "exactly-once delivery" end to end is not possible; what you can build is **exactly-once effect** with at-least-once delivery plus an idempotent consumer (one where processing the same message twice has the same result as once).
+
+### The problem
+
+```text
+ at-most-once:  commit offset -> process -> crash  => message lost
+ at-least-once: process (charge card) -> crash before commit
+                restart -> same message again -> card charged TWICE
+```
+
+### Better design
+
+```sql
+-- at-least-once delivery + idempotent consumer
+INSERT INTO processed_messages (message_id) VALUES ('evt-981');
+-- unique key violation => already done, skip
+UPDATE accounts SET balance = balance - 500 WHERE id = 7;
+-- both statements in ONE database transaction, then commit the offset
+```
+
+Duplicates are now harmless. On the producer side, Kafka's idempotent producer (`enable.idempotence=true`) stops retries creating duplicates, and `acks=all` with `min.insync.replicas=2` stops acknowledged messages being lost. Kafka transactions give exactly-once for read-from-Kafka, write-to-Kafka pipelines, but not for external side effects like sending an email.
+
+**Key takeaway: Default to at-least-once delivery with idempotent consumers; that is how real systems get exactly-once effects.**
+
+---
+
+## 5. Retries and dead-letter queues
+
+**Definition:** Retries re-attempt a failed message; a dead-letter queue (DLQ) is where messages go after too many failures so they stop blocking others.
+
+Some failures are temporary (a timeout), and a retry fixes them. Others are permanent (malformed JSON, a deleted account). A message that fails every time is called a **poison message**.
+
+### The problem
+
+```text
+ partition 4:  [m100][m101 bad JSON][m102][m103]...
+ consumer retries m101 forever -> m102 onward never processed
+ lag grows to 2 million, alerts fire, orders stuck
+```
+
+In an ordered log, one poison message blocks everything behind it in that partition.
+
+### Better design
+
+```text
+ attempt 1 fails -> retry after 1 s
+ attempt 2 fails -> retry after 5 s   (exponential backoff + jitter)
+ attempt 3 fails -> publish to "orders.DLQ" with error + headers,
+                    commit offset, continue with m102
+ DLQ: alert, inspect, fix the bug, replay the message to the main topic
+```
+
+Healthy messages keep flowing, and failures are kept for a human or automated replay instead of being dropped. For longer delays, use separate retry topics so the main consumer is not stuck sleeping.
+
+**Trade-offs:**
+- Moving a message aside breaks strict ordering for that key.
+- A DLQ nobody watches is just a slower way to lose data.
+
+**Key takeaway: Bounded retries with backoff, then park the message in a DLQ and keep going.**
+
+---
+
+## 6. Backpressure
+
+**Definition:** Backpressure is a way for a slow consumer to slow down producers, or for the system to absorb or shed load, instead of falling over.
+
+A broker is a buffer, like a reservoir behind a dam. It smooths spikes, but if inflow stays above outflow for long enough, it fills up.
+
+### The problem
+
+```text
+ Flash sale: producers 50,000 msg/s, consumers handle 10,000 msg/s
+ Backlog grows by 40,000/s -> 144 million in an hour
+ In-memory queue -> OutOfMemoryError; consumers retry harder -> DB melts
+```
+
+### Better design
+
+```text
+ 1. Durable buffer (Kafka) absorbs the spike instead of memory.
+ 2. Consumers pull at their own pace (max.poll.records) -> no overload.
+ 3. Monitor consumer lag; autoscale consumers up to the partition count.
+ 4. At the edge: rate-limit or return 429 / "try later" for non-critical work.
+ 5. Bounded in-memory queues: when full, block or reject, never grow forever.
+```
+
+Pull-based consumption plus lag-based scaling lets the system catch up, and limits at the edge stop unbounded growth.
+
+**Key takeaway: Every queue must be bounded or monitored; decide in advance whether you buffer, scale, slow down or shed.**
+
+---
+
+## 7. The outbox pattern
+
+**Definition:** Write the business change and the event to the same database in one transaction, then publish the event from that table.
+
+The core problem is the **dual write**: updating a database and a broker are two separate systems, and you cannot commit both atomically.
+
+### The problem
+
+```java
+@Transactional
+public void placeOrder(Order o) {
+    orderRepo.save(o);                          // DB commit happens at method end
+    kafka.send("orders", o.id(), placed(o));    // sent before the commit
+}
+// Kafka send succeeds, then DB commit fails -> event for an order that does not exist
+// Or reorder them: DB commits, then the app crashes -> order with no event
+```
+
+Either way, the database and the event stream disagree.
+
+### Better design
+
 ```sql
 BEGIN;
-INSERT INTO orders (id, user_id, total, status) VALUES (:id, :uid, 4999, 'PLACED');
-INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, created_at)
-VALUES (gen_random_uuid(), 'Order', :id, 'OrderPlaced', :json, now());
+INSERT INTO orders (id, status, ...) VALUES (42, 'PLACED', ...);
+INSERT INTO outbox (id, topic, key, payload) VALUES (gen_random_uuid(), 'orders', '42', '{...}');
 COMMIT;
+-- A relay publishes outbox rows to Kafka, then marks them sent.
+-- Relay = polling job, or CDC (Debezium reading the DB's change log).
 ```
-A relay publishes outbox rows to the broker, either a poller (`SELECT ... FOR UPDATE SKIP LOCKED`, publish, mark sent) or, better, **CDC** with Debezium reading the database's write-ahead log. The relay is at-least-once, so consumers must dedupe by event ID. The mirror image on the consumer side is the **inbox** table: record processed message IDs in the same transaction as the side effect.
 
-## Event sourcing and CQRS
-**Event sourcing** stores the sequence of state-changing events as the source of truth (`AccountOpened`, `MoneyDeposited`, `MoneyWithdrawn`); current state is a fold over the events. Benefits: full audit trail, time travel, rebuilding new read models by replay, natural fit for domains that are already ledgers. Costs: event schema evolution (events are forever; use upcasters), snapshots needed for long streams, harder ad-hoc queries, and a steep learning curve. Use it for ledgers, booking histories and compliance-heavy domains; not for a CRUD settings page.
+Both rows commit or neither does. The relay may publish an event twice after a crash, so consumers must be idempotent.
 
-**CQRS** (Command Query Responsibility Segregation) splits the write model (validates commands, enforces invariants, normalised) from one or more read models (denormalised, query-optimised, possibly in different stores) kept up to date by events. It pairs naturally with event sourcing but does not require it. Expect read-your-writes lag: return the new version on the command response, or have the UI wait for the projection to reach it.
+**Key takeaway: Never dual-write; commit the event with the data and let a relay publish it.**
 
-## Choreography vs orchestration
-| | Choreography | Orchestration |
+---
+
+## 8. Choreography vs. orchestration
+
+**Definition:** In choreography, services react to each other's events with no central controller; in orchestration, one coordinator tells each service what to do next.
+
+Both are ways to run a **saga**: a multi-step business process across services, where each step has a compensating action (an undo, such as a refund) instead of one big distributed transaction.
+
+### The problem
+
+```text
+ Choreography with 7 services:
+ OrderPlaced -> Payment -> PaymentDone -> Inventory -> Reserved
+   -> Shipping -> ... -> Loyalty -> ...
+ Question: "Where is order 42 stuck, and who triggers the refund?"
+ Answer: read logs from 7 services.
+```
+
+Pure choreography spreads the business flow across many services, so nobody owns it.
+
+### Better design
+
+```text
+ OrderSaga (orchestrator, state stored in DB):
+   1. command Payment.charge      -> ok
+   2. command Inventory.reserve   -> FAILED
+   3. compensate: Payment.refund  -> ok
+   4. mark order CANCELLED
+ Small flows (2-3 steps, e.g. "send email on signup") -> choreography is fine.
+```
+
+The orchestrator holds the state of each order, so failures, timeouts and compensation have one owner. Tools like Temporal or Camunda provide this.
+
+### Choreography vs. orchestration
+- **Choreography:** loose coupling, no single point of control; hard to see and change long flows.
+- **Orchestration:** clear flow and status in one place; the orchestrator is extra code and must be highly available.
+
+**Key takeaway: Choreography for simple reactions, orchestration for long business flows that need compensation.**
+
+---
+
+## In an HLD interview
+- **Notification System:** order events go to a topic; email, SMS and push services each have a consumer group, with retries, DLQs and idempotency keys to avoid double notifications.
+- **Chat/WhatsApp:** partition by conversation ID so messages in one chat stay in order.
+- **Payment System / Amazon E-commerce:** outbox for "PaymentCompleted", idempotent consumers, and an orchestrated saga for order, payment and inventory.
+- **YouTube / Logging/Monitoring:** async pipelines (upload -> transcode -> thumbnail) and logs buffered in Kafka to absorb spikes.
+- What to SAY: "Kafka gives at-least-once delivery, so every consumer is idempotent with a processed-message table, and I key by orderId to keep each order's events in order."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
 |---|---|---|
-| Control | Each service reacts to events and emits its own | A central orchestrator sends commands and tracks state |
-| Coupling | Loose; producers do not know consumers | Orchestrator knows every step |
-| Visibility | Flow is implicit, spread over services | Flow is explicit in one place |
-| Change | Easy to add a listener; hard to change a sequence | Easy to change the sequence |
-| Failure handling | Each service handles compensation | Orchestrator drives retries and compensations |
-| Tools | Kafka/SNS events | Temporal, Camunda/Zeebe, AWS Step Functions, a saga state machine |
+| Async messaging | Don't wait for side effects | Does the user need this step's result now? |
+| Queue / pub-sub / log | Split work / broadcast / ordered replayable history | One consumer, all consumers, or replay? |
+| Partitions and keys | Parallelism and per-key ordering | What must stay in order? |
+| Delivery guarantees | At-least-once + idempotency | What happens if this message arrives twice? |
+| Retries and DLQ | Bounded retries, then park it | Can one bad message block a partition? |
+| Backpressure | Buffer, scale, slow or shed | What if producers outpace consumers for an hour? |
+| Outbox | Commit event with data | Am I writing to DB and broker separately? |
+| Choreography vs. orchestration | Reactions vs. a coordinator | Who owns this flow and its compensation? |
 
-Use choreography for simple fan-out reactions (send email when order placed). Use orchestration once a business process has more than 3–4 steps, timeouts, human steps or compensations.
-
-## Spring Kafka example
-```java
-@Configuration
-class KafkaConfig {
-    @Bean
-    DefaultErrorHandler errorHandler(KafkaTemplate<String, Object> template) {
-        var recoverer = new DeadLetterPublishingRecoverer(template,
-            (rec, ex) -> new TopicPartition(rec.topic() + ".DLT", rec.partition()));
-        var backoff = new ExponentialBackOffWithMaxRetries(4);
-        backoff.setInitialInterval(500);
-        backoff.setMultiplier(2.0);
-        var handler = new DefaultErrorHandler(recoverer, backoff);
-        handler.addNotRetryableExceptions(ValidationException.class,
-                                          DeserializationException.class);
-        return handler;
-    }
-}
-
-@Component
-class PaymentListener {
-    private final ProcessedEventRepository processed;
-    private final LedgerService ledger;
-
-    @KafkaListener(topics = "orders", groupId = "billing", concurrency = "6")
-    @Transactional
-    public void onOrderPlaced(@Payload OrderPlaced evt,
-                              @Header(KafkaHeaders.RECEIVED_KEY) String orderId) {
-        if (!processed.markIfNew(evt.eventId())) {   // INSERT ... ON CONFLICT DO NOTHING
-            return;                                  // duplicate delivery, ignore
-        }
-        ledger.charge(evt.orderId(), evt.amount());  // same DB transaction as the marker
-    }
-}
-```
-```yaml
-spring:
-  kafka:
-    producer:
-      acks: all
-      properties:
-        enable.idempotence: true
-        max.in.flight.requests.per.connection: 5
-    consumer:
-      enable-auto-commit: false
-      auto-offset-reset: earliest
-      properties:
-        isolation.level: read_committed
-        max.poll.records: 200
-    listener:
-      ack-mode: record
-```
-Spring Kafka also has `@RetryableTopic` for non-blocking retry topics with configurable delays.
-
-## Real-world systems
-- **LinkedIn** built Kafka for activity tracking and metrics; it now carries trillions of messages per day.
-- **Uber** uses Kafka for trip events and a retry-topic/DLQ pattern documented in its engineering blog.
-- **Netflix** pipes playback and device events through Kafka into Flink and its data lake.
-- **Shopify, Debezium users** use CDC from MySQL/Postgres into Kafka as the outbox transport.
-
-## How it shows up in interview problems
-- **Notification system:** a queue per channel (email, SMS, push), priority queues, retry with backoff, DLQ, idempotency by notification ID, rate limits per provider.
-- **News feed:** `PostCreated` event → fan-out workers write into followers' feed caches.
-- **Chat:** Kafka between chat service and gateway servers, partitioned by conversation ID for ordering.
-- **YouTube/Dropbox:** upload complete event → transcoding or indexing job queue.
-- **E-commerce/payments:** outbox from the order service, saga across inventory, payment and shipping.
-- **Logging/metrics/ads clicks:** Kafka as the durable buffer before stream processing.
-- **Job scheduler:** due jobs pushed to a work queue; workers ack on completion; visibility timeouts for crashes.
-
-## Common pitfalls
-- Assuming exactly-once delivery and writing non-idempotent consumers.
-- Auto-committing offsets before processing (silent message loss).
-- Too few partitions, capping consumer parallelism; or keyless publishing that destroys ordering.
-- Hot partitions from a skewed key (one celebrity user); salt the key if per-key order is not needed.
-- Unbounded retries that block a partition on a poison message.
-- Huge messages (multi-MB); store the blob in S3 and send a reference (claim-check pattern).
-- No schema discipline; use Avro/Protobuf with a schema registry and backward-compatible evolution.
-- Using a broker as a database for ad-hoc queries.
-
-## Interview questions
-1. **Queue or Kafka for sending emails?** Either works; a queue (SQS/RabbitMQ) fits naturally because each email is an independent job with per-message retry and delay. Choose Kafka if the same events also feed analytics or several consumers.
-2. **How does Kafka guarantee ordering?** Only within a partition. Use the entity ID as the key, keep producer idempotence on, and have one consumer thread per partition (or per key).
-3. **What happens when a consumer crashes mid-batch?** Its partitions are reassigned after the session timeout; the new owner resumes from the last committed offset, so uncommitted records are redelivered. Processing must be idempotent.
-4. **How do you avoid losing data in Kafka?** RF=3, `acks=all`, `min.insync.replicas=2`, idempotent producer, unclean leader election off, commit offsets only after processing.
-5. **Explain the outbox pattern.** Write the business row and an event row in one local transaction; a relay (poller or Debezium CDC) publishes events; consumers dedupe by event ID. It removes the dual-write inconsistency.
-6. **How do you handle a poison message?** Classify the error; send non-retryable ones immediately to a DLQ; retry transient ones with backoff via retry topics; alert on DLQ depth and support redrive.
-7. **Choreography or orchestration for order checkout?** Orchestration (Temporal or a saga orchestrator) once it involves payment, inventory, shipping and compensations; choreography for side reactions like emails and analytics.
-8. **What is log compaction for?** Keeping the latest value per key indefinitely so a topic can rebuild current state (changelogs, KTables, CDC snapshots).
-
-## Cheat sheet
-- Queue = jobs, deleted on ack, per-message retry. Log = facts, retained, replayable, many groups.
-- Kafka: partition = order + parallelism unit; key picks the partition; parallelism capped by partitions.
-- Durability: RF 3, acks=all, min.insync=2, idempotent producer.
-- At-least-once + idempotent consumer = exactly-once effect. Kafka EOS only inside Kafka.
-- Retries with backoff → retry topics → DLQ; never block forever.
-- Outbox (+ CDC) for DB + event atomicity; inbox for consumer dedupe.
-- Event sourcing = events are the truth; CQRS = separate read models.
-- Simple reactions: choreography. Multi-step with compensation: orchestration.
-- Monitor consumer lag, DLQ depth, rebalance rate.
+## Final memory aid
+- Sync for the answer, async for side effects.
+- Queue splits, pub/sub copies, log keeps and replays.
+- Partitions give parallelism; keys give order.
+- At-least-once + idempotent consumer = exactly-once effect.
+- Retry with backoff, then DLQ.
+- Every buffer needs a limit and a lag alarm.
+- Outbox kills the dual write.
+- Long flows with refunds need an orchestrator.
 
 === hld-stream-processing | HLD | Batch and stream processing ===
-Once events are flowing through a log, you need to turn them into answers: counts, aggregates, joins, alerts and derived datasets. Batch processing computes over bounded data with high throughput and simple correctness; stream processing computes continuously over unbounded data with low latency but must deal with time, disorder, state and failure. This chapter covers both, the architectures that combine them, windowing and watermarks, exactly-once state, and the pre-aggregation tricks that power metrics, trending and ads systems.
+Batch processing works on a fixed pile of data after the fact; stream processing works on events continuously as they arrive. This chapter explains how streams handle time correctly with event time, windows and watermarks, how they keep state safe with checkpoints, and when to use Lambda or Kappa architecture. It ends with worked examples: metrics, trending topics and click counting.
 
-## Bounded vs unbounded data
-- **Batch:** input is finite and known (yesterday's logs in S3). Jobs run to completion, can be re-run from scratch, and see all data before producing output. Latency: minutes to hours.
-- **Stream:** input never ends (clicks arriving now). The job runs forever, emits results incrementally, and must decide when it has "enough" data to emit. Latency: milliseconds to seconds.
+## 1. Batch vs. stream processing
 
-A useful mental model: **a batch is just a stream that ends**, and modern engines (Flink, Spark Structured Streaming, Beam) use the same APIs for both.
+**Definition:** Batch processing runs a job over a bounded dataset (for example, all of yesterday's logs); stream processing runs continuously over an unbounded flow of events.
 
-## Batch processing
-### MapReduce
+Batch is like counting the day's cash after the shop closes: simple, complete, but late. Streaming is like a running total updated at the till with every sale: fresh, but you must handle sales recorded out of order. Batch tools include Spark and Hadoop MapReduce; stream tools include Flink, Kafka Streams and Spark Structured Streaming.
+
+### The problem
+
+```text
+ Fraud detection as a nightly batch job:
+   02:00  job scans yesterday's 40M transactions
+   02:40  flags a stolen card used 300 times since 14:00 yesterday
+ Fraud found 12 hours too late.
 ```
-input splits → map(k1,v1) → list(k2,v2) → shuffle & sort by k2 → reduce(k2, list(v2)) → output
-word count: map emits (word, 1); shuffle groups by word; reduce sums
+
+### Better design
+
+```text
+ Stream: transactions -> Kafka -> Flink job
+   per card: count in last 5 minutes > 10?  -> block card (seconds)
+ Batch (still useful): nightly job retrains the fraud model on all data
+   and recomputes exact daily reports.
 ```
-Key ideas that still matter: move computation to the data, partition by key so all values for a key meet in one reducer, materialise intermediate results to disk for fault tolerance (a failed task is simply re-run), and keep tasks deterministic so re-execution is safe. Combiners pre-aggregate on the map side to shrink the shuffle.
 
-### Spark
-Spark keeps intermediate data in memory and builds a DAG of transformations, so iterative and multi-stage jobs are 10–100x faster than chained MapReduce. Narrow transformations (`map`, `filter`) stay within a partition; **wide** ones (`groupByKey`, `join`) trigger a **shuffle** across the network, which is the expensive part. Lineage lets lost partitions be recomputed. DataFrames/SQL with the Catalyst optimiser are the normal interface.
+Use streaming when the value of the answer decays in minutes; use batch for heavy, complete, recomputable work.
 
-Batch patterns to know:
-- **ETL/ELT** into a warehouse or lakehouse (Parquet/Iceberg/Delta on S3).
-- **Broadcast join** when one side is small; **sort-merge join** when both are large.
-- **Skew handling:** salt hot keys, then aggregate twice.
-- **Idempotent outputs:** write to a partition path (`dt=2026-10-09/`) and overwrite atomically, so re-runs replace instead of duplicating.
+**Trade-offs:**
+- Streaming adds complexity: time, state, late data, and 24x7 operation.
+- Batch is simpler and easier to rerun, but results are hours old.
 
-## Stream processing engines
-| Engine | Model | Strengths | Notes |
-|---|---|---|---|
-| **Apache Flink** | True record-at-a-time, distributed dataflow | Event-time semantics, large keyed state (RocksDB), exactly-once checkpoints, low latency | The default answer for serious stateful streaming |
-| **Kafka Streams** | Library inside your Java app | No separate cluster; state in local RocksDB backed by compacted changelog topics; EOS within Kafka | Input and output must be Kafka; scale = partitions |
-| **Spark Structured Streaming** | Micro-batches (or continuous mode) | Unified with batch Spark, SQL | Latency typically hundreds of ms to seconds |
-| **Apache Beam / Dataflow** | Unified model, runner-agnostic | Rigorous windowing/triggers model | Runs on Flink, Spark or Google Dataflow |
-| **ksqlDB, Flink SQL** | Streaming SQL | Fast to build simple pipelines | Less control for complex logic |
+**Key takeaway: Choose by freshness: seconds need streams, hours can be batch.**
 
-## Lambda vs Kappa architecture
+---
+
+## 2. Event time vs. processing time
+
+**Definition:** Event time is when something actually happened (stamped on the device); processing time is when your system handles it.
+
+They differ because of network delays, offline phones and backlogs. A phone in airplane mode may upload yesterday's clicks this morning.
+
+### The problem
+
+```text
+ Count clicks per minute using processing time:
+ Ad clicked at 10:00:30 on a phone on a slow train.
+ Event arrives at 10:04:10.
+ Report: 10:00 minute undercounted, 10:04 minute overcounted.
+ After a consumer outage, a 30-minute backlog lands in one minute -> fake spike.
 ```
-Lambda:  events ─┬─> batch layer (Spark over all history) ──> batch views ─┐
-                 └─> speed layer (stream, recent only)  ──> realtime view ─┴─> serving: merge
 
-Kappa:   events ──> log (long retention) ──> stream processor ──> serving views
-         reprocess = start a new job version from offset 0, swap when caught up
+Results depend on when your pipeline was healthy, not on what users did.
+
+### Better design
+
+```text
+ Each event carries eventTime = 10:00:30 (set by the client or edge).
+ Group by eventTime -> the click goes into the 10:00 bucket,
+ whenever it arrives.  Replaying old data gives the same answer.
 ```
-| | Lambda | Kappa |
+
+Correct, reproducible results come from grouping by event time.
+
+**Key takeaway: Aggregate by event time when correctness matters; processing time is only fine for rough operational dashboards.**
+
+---
+
+## 3. Windows: tumbling, sliding, session
+
+**Definition:** A window groups an endless stream into finite chunks so you can compute an aggregate over each chunk.
+
+You cannot "count all clicks" on an infinite stream, but you can count clicks per minute. The window type decides how the chunks are cut.
+
+### The problem
+
+```text
+ "Requests in the last 5 minutes, updated every minute"
+ implemented with fixed 5-minute buckets:
+   10:00-10:05, 10:05-10:10 ...
+ At 10:07 the dashboard shows 10:00-10:05 (stale) or a half-full bucket.
+```
+
+The wrong window shape gives answers that jump or lag.
+
+### Better design
+
+```text
+ Tumbling (fixed, no overlap): 10:00-10:01, 10:01-10:02 ...
+     -> clicks per minute, billing per hour
+ Sliding / hopping (size 5 min, every 1 min): 10:00-10:05, 10:01-10:06 ...
+     -> "last 5 minutes" metrics; each event lands in 5 windows
+ Session (gap-based): a window per user that closes after 30 min idle
+     -> visits per user session, watch-time per sitting
+```
+
+Each shape matches a question: per period, rolling recent, or per burst of activity.
+
+**Key takeaway: Tumbling for per-period totals, sliding for rolling metrics, session for user activity bursts.**
+
+---
+
+## 4. Watermarks and late data
+
+**Definition:** A watermark is the stream's estimate that "no more events older than time T will arrive", which tells a window when it may close.
+
+Using event time raises a question: when is the 10:00-10:01 window finished? Events can always be late. A watermark is usually set as "largest event time seen, minus an allowed delay" (for example, 30 seconds).
+
+### The problem
+
+```text
+ Close each window the moment the clock passes its end:
+   10:01:00 -> emit count for 10:00-10:01 = 980
+   10:01:20 -> 40 more events for 10:00 arrive -> dropped
+ Or wait 1 hour before closing every window -> dashboard 1 hour late
+```
+
+Closing too early loses data; waiting too long kills freshness.
+
+### Better design
+
+```text
+ watermark = max eventTime seen - 30 s
+ Window 10:00-10:01 emits when watermark passes 10:01  (~10:01:30)
+ Allowed lateness 10 min: late events update the result (emit a correction)
+ Later than that -> side output to a "late events" store for batch repair
+```
+
+Most data is counted promptly, stragglers still fix the result, and very late data is kept rather than lost.
+
+**Trade-offs:**
+- Bigger watermark delay = more complete but slower results.
+- Allowing late updates means downstream systems must accept corrections (upserts, not appends).
+
+**Key takeaway: Watermarks trade latency for completeness; decide what happens to late events, never ignore them.**
+
+---
+
+## 5. Stateful processing and checkpoints
+
+**Definition:** Stateful processing keeps data between events (counts, open windows, last seen values); checkpoints periodically save that state so the job can recover after a crash.
+
+Counting clicks per ad requires remembering the running count. That state lives inside the stream processor (in Flink, often in RocksDB on local disk), partitioned by key like the data.
+
+### The problem
+
+```text
+ Job keeps counts in a HashMap in memory.
+ Machine dies at 10:42.
+ Restart -> counts start from 0, or re-read Kafka from the beginning
+ -> numbers wrong, or hours to recover.
+```
+
+### Better design
+
+```text
+ Every 1 minute, Flink takes a consistent checkpoint:
+   - all operator state (counts, open windows) -> S3 / HDFS
+   - the Kafka offsets that state corresponds to
+ Crash at 10:42 -> restore checkpoint from 10:41
+   -> rewind Kafka to the saved offsets -> reprocess 1 minute
+```
+
+State and input position are saved together, so after recovery each event affects the state exactly once. Output to external systems still needs idempotent writes or transactional sinks to avoid duplicates.
+
+**Trade-offs:**
+- Large state makes checkpoints slower and recovery longer.
+- Shorter checkpoint intervals mean less replay but more overhead.
+
+**Key takeaway: Save state and input offsets together; that is what makes streaming results exactly-once inside the job.**
+
+---
+
+## 6. Lambda vs. Kappa architecture
+
+**Definition:** Lambda runs a batch layer and a streaming layer side by side; Kappa uses a single streaming pipeline and reprocesses history by replaying the log.
+
+Lambda arose when streaming engines were not trusted to be accurate: the stream gave fast approximate numbers, and the nightly batch overwrote them with exact ones. Modern engines with event time, watermarks and checkpoints made Kappa practical.
+
+### The problem
+
+```text
+ Lambda: the same "revenue per hour" logic written twice
+   - Spark batch job (SQL) and a Flink streaming job (Java)
+ A bug fix lands in one but not the other -> two numbers that never match
+```
+
+### Better design
+
+```text
+ Kappa: Kafka (long retention or tiered storage) -> one Flink job -> store
+ Need to fix logic? Deploy job v2, replay from offset 0 into a new table,
+ switch readers when it catches up, delete v1.
+```
+
+One codebase, one set of numbers. Lambda still fits when history is too large to replay or when the batch side needs tools the stream lacks, such as model training over years of data.
+
+### Lambda vs. Kappa
+- **Lambda:** two pipelines; accurate batch plus fast stream; double the code.
+- **Kappa:** one pipeline; reprocess by replay; needs long log retention.
+
+**Key takeaway: Prefer Kappa today; keep a batch layer only when replaying history through the stream is impractical.**
+
+---
+
+## 7. Worked examples: metrics, trending, click counting
+
+**Definition:** Most streaming interview questions are a key, a window and an aggregate, plus a sink to serve the results.
+
+### The problem
+
+```text
+ Ad click counting: every click does
+   UPDATE ads SET clicks = clicks + 1 WHERE id = ?
+ At 200,000 clicks/s, hot ads become lock hotspots; the DB falls over.
+ Retries double-count; no protection against bots.
+```
+
+### Better design
+
+```text
+ Click counting:
+   clicks -> Kafka (key = adId) -> Flink: dedupe by clickId,
+   tumbling 1-min window, count per adId -> upsert into OLAP store
+   (one row per ad per minute), hourly rollups for billing.
+ Metrics / Monitoring:
+   agents pre-aggregate per 10 s -> stream computes p50/p99 per service
+   per minute -> time-series DB; alerts on sliding 5-min windows.
+ Trending hashtags:
+   sliding 1-hour window, hop 1 min, count per tag (sharded by tag),
+   then a top-K per window merged across shards; approximate counts
+   (Count-Min Sketch) when tags are too many to count exactly.
+```
+
+Writes become one row per key per window instead of one per event, and dedupe by event ID makes retries safe.
+
+**Key takeaway: Key, window, aggregate, then write small pre-aggregated results; never update a database row per event.**
+
+---
+
+## In an HLD interview
+- **Metrics / Logging/Monitoring:** agents to Kafka to a stream job; tumbling windows per minute into a time-series store; alerts on sliding windows.
+- **News Feed / Google Search trending:** sliding windows plus top-K; mention approximate counting for huge key spaces.
+- **Uber / Ride Tracking:** location events keyed by driver ID; event time matters because phones lose signal; session windows for trips.
+- **Payment System fraud, Rate Limiter analytics:** stateful per-card or per-user counts over short windows.
+- What to SAY: "I'll aggregate on event time with one-minute tumbling windows, a 30-second watermark and late events sent to a correction path, and Flink checkpoints with Kafka offsets give exactly-once counts."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
 |---|---|---|
-| Code paths | Two (batch + stream), must agree | One |
-| Correctness | Batch layer periodically fixes stream approximations | Stream engine must be correct (event time, exactly-once) |
-| Reprocessing | Re-run batch | Replay the log into a new job |
-| Ops cost | High (two systems, reconciliation) | Lower, but needs long log retention or tiered storage |
+| Batch vs. stream | Bounded later vs. unbounded now | How fast does the answer lose value? |
+| Event vs. processing time | When it happened vs. when we saw it | Would a backlog distort my numbers? |
+| Windows | Tumbling, sliding, session | Per period, rolling, or per activity burst? |
+| Watermarks | "Nothing older than T is coming" | How late can data be, and what do I do then? |
+| State + checkpoints | Save state with input offsets | What happens to my counts after a crash? |
+| Lambda vs. Kappa | Two pipelines vs. one with replay | Can I reprocess history through the stream? |
+| Pre-aggregation | One write per key per window | Am I updating a DB row per event? |
 
-Lambda was a response to early stream engines being inaccurate. With Flink-class engines, Kappa is the usual modern answer, often with the lake as the long-term replay source. Many ad and billing systems still keep a daily batch **reconciliation** job as a correctness backstop, which is effectively Lambda-lite.
-
-## Time: event time vs processing time
-- **Event time:** when the event happened on the device (timestamp in the payload).
-- **Ingestion time:** when it reached the broker.
-- **Processing time:** when the operator sees it.
-
-Mobile clients go offline, networks delay, partitions lag. A click at 10:59:58 may arrive at 11:03. Aggregating by processing time is simple but gives wrong and non-reproducible answers (replaying yesterday puts everything into "now"). Aggregate by **event time** for anything business-relevant (billing, ads, metrics per minute).
-
-## Watermarks and late data
-A **watermark** is the engine's assertion: "I believe no more events with timestamp less than T will arrive." When the watermark passes the end of a window, the window fires.
-```
-Watermark = max event time seen − allowed out-of-orderness (e.g. 10 s)
-
-events:  10:00:03  10:00:07  10:00:01  10:00:12  10:00:15 ...
-max seen:   :03       :07       :07       :12       :15
-watermark:  9:59:53   9:59:57   9:59:57   10:00:02  10:00:05
-```
-Trade-off: a larger bound means more complete results but higher latency; a smaller bound means faster results but more late events.
-
-Handling events that arrive after the watermark:
-- **Allowed lateness:** keep window state for an extra period and emit **updated** results (downstream must accept upserts).
-- **Side output:** route very late events to a separate stream for correction or batch reconciliation.
-- **Drop** them, with a metric, if accuracy at the margin does not matter.
-
-Idle partitions can stall watermarks (the minimum across inputs stops moving); engines provide idleness timeouts.
-
-## Windows
-| Window | Definition | Example |
-|---|---|---|
-| **Tumbling** | Fixed size, non-overlapping | Clicks per ad per minute |
-| **Sliding / hopping** | Fixed size, advancing by a smaller slide (an event is in several windows) | Requests in the last 5 min, updated every 10 s (rate limiting, alerting) |
-| **Session** | Per key, closes after a gap of inactivity | User sessions with a 30-min gap; watch time per viewing session |
-| **Global + trigger** | One window per key, emits on custom triggers | Emit every 1,000 events or every 5 s |
-
-```
-Tumbling 1m: |----W1----|----W2----|----W3----|
-Sliding 5m/1m: |-----W1-----|
-                 |-----W2-----|
-                   |-----W3-----|
-Session (gap 30m):  e e e     e       ......(31m idle)......   e e
-                    |-------S1-------|                         |-S2-|
-```
-
-## Stateful processing and checkpoints
-Aggregations, joins, dedup and pattern detection need **state**: counts per key, the last seen event, a buffer of a window. In Flink, state is **keyed** (partitioned by the same key as the stream, so it scales out) and held in memory or RocksDB on local disk.
-
-Fault tolerance via **distributed snapshots** (Chandy-Lamport style):
-1. The job manager injects a **checkpoint barrier** into each source.
-2. Each operator, on receiving barriers from all inputs, snapshots its state to durable storage (S3/HDFS) and forwards the barrier.
-3. The checkpoint completes when every operator has acknowledged. Source offsets are part of it.
-4. On failure, every operator restores the last completed checkpoint and sources rewind to the recorded offsets. State and input position are consistent, so internal results are **exactly-once**.
-
-**End-to-end exactly-once** also needs the sink to cooperate:
-- **Transactional sink:** two-phase commit tied to checkpoints (Flink's Kafka sink pre-commits a Kafka transaction and commits it when the checkpoint completes). Readers use `read_committed`.
-- **Idempotent sink:** upsert by a deterministic key (`(ad_id, window_start)`), so replays overwrite instead of double-counting. This is the simplest and most common choice for databases.
-
-Kafka Streams does the same with Kafka transactions: input offsets, state changelog writes and output records are committed atomically (`processing.guarantee=exactly_once_v2`).
-
-**Savepoints** are manually triggered checkpoints used to upgrade or rescale a job without losing state.
-
-## Stream joins
-| Join | What | State needed |
-|---|---|---|
-| **Stream-stream (windowed)** | Match impressions with clicks within 30 min by `impression_id` | Buffer both sides for the window |
-| **Stream-table** | Enrich each order event with the current customer record | Table materialised locally from a compacted topic/CDC (KTable, broadcast state) |
-| **Table-table** | Maintain a joined materialised view of two changelogs | Both tables |
-| **Temporal join** | Join with the table *as of the event's time* (FX rate at trade time) | Versioned table |
-
-Prefer a local, co-partitioned table over calling a database per event: a remote lookup per record caps throughput at the DB's QPS and adds latency. If you must call out, use async I/O with a cache.
-
-## Pre-aggregation for metrics, top-K and counting
-Raw events are too many to query at read time; push aggregation into the stream.
-- **Rollups:** per-second counters → per-minute → per-hour, stored in a time-series DB or OLAP store (Druid, Pinot, ClickHouse). Downsample old data.
-- **Local pre-aggregation:** aggregate on the producer or in a first operator (combiner) before the network shuffle; this also fixes hot keys.
-- **Two-stage aggregation for skew:** key by `(videoId, random 0..N)`, aggregate, then re-key by `videoId` and merge.
-- **Top-K / trending:** per partition keep counts in a **count-min sketch** plus a min-heap of size K; merge heaps across partitions every window. Exact counting with a hash map per window works if the key space fits in memory.
-- **Distinct counts:** HyperLogLog per window, mergeable across windows and shards (unique viewers per hour).
-- **Percentiles:** t-digest or HDR histograms, mergeable; never average p99s.
-
-## Real-world systems
-- **Netflix:** Kafka plus Flink (Keystone) for real-time personalisation and operational insight.
-- **Uber:** Flink-based platform for surge pricing and marketplace metrics, Pinot for real-time OLAP.
-- **LinkedIn:** Samza (and Kafka Streams-style processing) for feeds and metrics; Pinot for "who viewed your profile".
-- **Twitter/X:** trending topics with windowed counting and heavy-hitter algorithms.
-- **Google:** MillWheel and Dataflow, where the watermark model came from.
-
-## How it shows up in interview problems
-- **Ad click aggregation:** Kafka (key `ad_id`) → Flink with 1-minute tumbling event-time windows, watermark 10–30 s, dedupe by `click_id` (state with TTL), allowed lateness with upserts, idempotent sink to an OLAP store keyed by `(ad_id, minute)`, and a daily batch reconciliation from raw logs in S3 for billing.
-- **Metrics/monitoring:** agents → Kafka → stream rollups (10 s, 1 min) → time-series DB; alerting rules as sliding windows.
-- **Logging:** Kafka → stream parsing/enrichment → Elasticsearch hot tier + S3 cold tier; batch jobs for long-range analytics.
-- **Trending hashtags / top-K songs / YouTube views:** windowed counts with count-min sketch and heaps; approximate is fine and stated as such.
-- **Uber:** location stream → geo-cell aggregation of supply and demand per H3 cell per minute → surge pricing.
-- **Fraud/payments:** stateful pattern detection (5 failed attempts in 2 minutes across cards per device) with session or sliding windows.
-- **Web crawler / search indexing:** batch for full re-index, stream for incremental updates.
-
-## Common pitfalls
-- Using processing time for billing or metrics, so replays and lag produce wrong numbers.
-- Ignoring late data, or not telling downstream that results may be updated.
-- Unbounded state (dedup sets without TTL, session windows on bot traffic that never goes idle).
-- Hot keys overwhelming one task; fix with local pre-aggregation or salting.
-- Per-event synchronous DB lookups for enrichment.
-- Non-idempotent sinks, which turn checkpoint replays into double counts.
-- Claiming "exactly-once" without explaining sources, state and sink.
-- Under-sizing Kafka retention so you cannot reprocess after a bug.
-
-## Interview questions
-1. **Event time vs processing time, and why it matters?** Event time is when it happened; processing time is when the system sees it. Business aggregates must use event time so delayed, out-of-order or replayed events land in the right window.
-2. **What is a watermark?** A monotonically advancing timestamp asserting no older events are expected; windows fire when it passes their end. Its delay trades completeness against latency.
-3. **How do you handle late events in ad click counting?** Allowed lateness with updated (upserted) window results; very late events to a side output; a daily batch reconciliation from raw logs for billing.
-4. **How does Flink achieve exactly-once?** Checkpoint barriers create consistent snapshots of operator state plus source offsets; on failure it restores and replays. End to end requires a transactional (2PC) or idempotent sink.
-5. **Lambda or Kappa?** Kappa (one streaming code path, replay from the log) unless you need a batch layer for heavy historical recomputation or financial reconciliation; mention the duplicate-logic cost of Lambda.
-6. **How do you compute top-K trending items over the last hour?** Sliding window counts per key with local pre-aggregation; per-partition heap of size K (or count-min sketch plus heap for large key spaces); merge partial top-Ks centrally; serve from cache.
-7. **How do you enrich a click stream with ad metadata?** Stream-table join: materialise the ad table from a CDC/compacted topic into local state (or broadcast state) instead of querying the DB per event.
-8. **How do you deal with a hot key?** Two-phase aggregation with a salted key, or local combiners before the shuffle.
-
-## Cheat sheet
-- Batch: bounded, re-runnable, high throughput (Spark, MapReduce). Stream: unbounded, incremental, low latency (Flink, Kafka Streams).
-- Kappa = one stream path + replay; Lambda = batch + speed layers; keep a batch reconciliation for money.
-- Use event time; watermark = max seen minus bound; late data → allowed lateness, side output or drop.
-- Windows: tumbling (fixed), sliding (overlapping), session (gap-based).
-- State is keyed and checkpointed; barriers give consistent snapshots; sinks must be transactional or idempotent.
-- Joins: stream-stream windowed, stream-table via local materialised table, temporal for as-of.
-- Pre-aggregate: combiners, rollups, salting, count-min + heap for top-K, HLL for distinct, t-digest for percentiles.
+## Final memory aid
+- Batch = complete but late; stream = fresh but must handle time.
+- Group by event time, not arrival time.
+- Tumbling per period, sliding for "last N minutes", session for activity.
+- Watermarks decide when a window closes; plan for late data.
+- Checkpoint state and offsets together.
+- Kappa by default; Lambda only when replay is impractical.
+- Key, window, aggregate, then write small results.

@@ -176,7 +176,9 @@
     const q = $("#filter").value.trim().toLowerCase();
     const match = (s) => !q || String(s).toLowerCase().includes(q);
     let html = "";
-    const fgroups = state.fund?.groups || [];
+    const allGroups = state.fund?.groups || [];
+    const fgroups = allGroups.filter((g) => !g.library);
+    const lgroups = allGroups.filter((g) => g.library);
     if (fgroups.length) {
       const fall = fgroups.flatMap((g) => g.items);
       html += `<details class="track" data-key="FUND" ${open.FUND !== false || q ? "open" : ""}>
@@ -188,6 +190,22 @@
         html += `<details class="subtrack" data-key="${esc(k)}" ${open[k] || q ? "open" : ""}>
           <summary>${CHEV}${esc(g.name)}<span class="count">${g.items.filter((x) => x.readAt).length}/${g.items.length}</span></summary>
           <ul class="items">${items.map((x) => `<li><a href="#/read/${esc(x.id)}" data-href="#/read/${esc(x.id)}"><span class="num">${x.number}</span><span class="t">${esc(x.title)}</span>${statusDot({ evaluated: !!x.readAt })}</a></li>`).join("")}</ul>
+        </details>`;
+      }
+      html += `</details>`;
+    }
+    // Your own libraries (kb add "<subject>"), kept in your data folder.
+    if (lgroups.length) {
+      const lall = lgroups.flatMap((g) => g.items);
+      html += `<details class="track" data-key="LIB" ${open.LIB !== false || q ? "open" : ""}>
+        <summary>${CHEV}<span class="track-dot" style="background:var(--sub)"></span>My library<span class="count">${lall.filter((x) => x.readAt).length}/${lall.length}</span></summary>`;
+      for (const g of lgroups) {
+        const items = g.items.filter((x) => match(x.title) || match(g.name));
+        if (!items.length) continue;
+        const k = "LIB:" + g.key;
+        html += `<details class="subtrack" data-key="${esc(k)}" ${open[k] || q ? "open" : ""}>
+          <summary>${CHEV}${esc(g.name)}<span class="count">${g.items.filter((x) => x.readAt).length}/${g.items.length}</span></summary>
+          <ul class="items">${items.map((x, i) => `<li><a href="#/read/${esc(x.id)}" data-href="#/read/${esc(x.id)}"><span class="num">${i + 1}</span><span class="t">${esc(x.title)}</span>${statusDot({ evaluated: !!x.readAt })}</a></li>`).join("")}</ul>
         </details>`;
       }
       html += `</details>`;
@@ -307,7 +325,7 @@
     const scrollChat = () => { chatLog.scrollTop = chatLog.scrollHeight; };
     function renderChat() {
       const msgs = item.chat || [];
-      chatLog.innerHTML = msgs.length ? "" : `<div class="chat-empty">Ask about trade-offs, edge cases, or why the write-up does something a certain way. Ask for a quiz to practise interview questions. The tutor already has this topic's write-up, your saved answer and its verdict.</div>`;
+      chatLog.innerHTML = msgs.length ? "" : `<div class="chat-empty">${esc(ctx.emptyHint || "Ask about trade-offs, edge cases, or why the write-up does something a certain way. Ask for a quiz to practise interview questions. The tutor already has this topic's write-up, your saved answer and its verdict.")}</div>`;
       msgs.forEach((m) => appendMsg(m.role, m.content));
       $("#chatClear").hidden = !msgs.length;
       scrollChat();
@@ -777,7 +795,9 @@
     const used = (it.usedBy || []).map((u) => { const h = topicHref(u.key); return h ? `<a class="pill link" href="${h}">${esc(u.key.replace("-", " "))} · ${esc(u.title)}</a>` : ""; }).join("");
     root.innerHTML = `
       <div class="topic-head">
-        <div class="crumbs"><span class="badge ${esc(g.track)}">${esc(g.track)}</span><span>Fundamentals</span><span>·</span><span>#${it.number}</span></div>
+        <div class="crumbs">${g.library
+          ? `<span class="badge LIB">Library</span><span>${esc(g.name)}</span><span>·</span><span>Chapter ${g.items.indexOf(it) + 1} of ${g.items.length}</span>`
+          : `<span class="badge ${esc(g.track)}">${esc(g.track)}</span><span>Fundamentals</span><span>·</span><span>#${it.number}</span>`}</div>
         <h1 class="title">${esc(it.title)}</h1>
         <p class="lede">${esc(it.summary)}</p>
         ${used ? `<div class="pill-row"><span class="muted small" style="align-self:center">Read before:</span>${used}</div>` : ""}
@@ -792,6 +812,9 @@
     // Contents list: one entry per "##" heading; clicks scroll (hash routing owns the URL).
     const heads = [...$("#article").querySelectorAll("h2")];
     if (heads.length > 2) {
+      // Headings that already carry a number ("1. Encapsulation") get a plain list, so numbers don't double up.
+      const numbered = heads.filter((h) => /^\s*\d+[.)]\s/.test(h.textContent)).length >= heads.length / 2;
+      $("#tocList").classList.toggle("plain", numbered);
       $("#tocList").innerHTML = heads.map((h, k) => `<li><button type="button" data-k="${k}">${esc(h.textContent)}</button></li>`).join("");
       $("#tocList").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) heads[+b.dataset.k].scrollIntoView({ behavior: "smooth", block: "start" }); });
       $("#toc").hidden = false;
@@ -803,7 +826,10 @@
       addr: { track: "READ", number: it.number }, cli: `read ${it.number}`,
       tutorTitle: "Ask the tutor about this",
       chatPlaceholder: "Ask anything about this concept…  (Enter sends · Shift+Enter for a new line)",
-      chips: ["Explain it with a real-world example", "Quiz me on this", "What do interviewers ask about this?", "Common misconceptions?"],
+      emptyHint: "Ask anything about this chapter: a simpler explanation, another example, how it's used in practice, or a quick quiz. The tutor has the whole chapter.",
+      chips: g.library
+        ? ["Explain it with a simple example", "Quiz me on this", "Give me a practice problem", "Common misconceptions?"]
+        : ["Explain it with a real-world example", "Quiz me on this", "What do interviewers ask about this?", "Common misconceptions?"],
     });
     document.title = `${it.title} — KB`;
   }

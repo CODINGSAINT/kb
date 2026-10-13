@@ -1,196 +1,742 @@
 === hld-cdn-storage | HLD | CDNs, object storage and media delivery ===
-Large binary content (images, video, downloads, backups, logs) should never stream through your application servers or live in your database. It belongs in **object storage** and is delivered through a **CDN**. This chapter explains storage types, how object stores and CDNs work, upload and download patterns, media pipelines and file-sync chunking.
+Big files such as photos, videos, downloads and backups should not pass through your application servers or sit inside your database. They belong in object storage, with their metadata in a database, and they reach users through a CDN, a network of servers close to users that caches content. This chapter covers the storage types, upload patterns, CDN caching rules, private content, video streaming and file-sync chunking.
 
-## Storage types
-| Type | Abstraction | Examples | Use for |
-|---|---|---|---|
-| Block storage | Raw disk volumes attached to one machine | EBS, persistent disks | Databases, OS disks: low latency, random I/O |
-| File storage | Shared hierarchical file system (NFS/SMB) | EFS, Filestore | Shared files between servers, legacy apps |
-| Object storage | Flat namespace of immutable objects over HTTP | S3, GCS, Azure Blob, MinIO | Media, backups, data lakes, static sites, logs |
+## 1. Block, file and object storage
 
-## Object storage in depth
-- **Model:** buckets contain objects addressed by key (`users/42/avatar.jpg`). "Folders" are just key prefixes.
-- **Durability:** data is replicated or erasure-coded across devices and availability zones, typically quoted at 99.999999999% (11 nines) annual durability.
-- **Consistency:** major providers now offer strong read-after-write consistency for new and overwritten objects.
-- **Immutability:** objects are written whole and replaced, not edited in place. Appending means writing a new object (or a new version).
-- **Scale:** effectively unlimited objects and bytes, with throughput scaling by key prefix and parallelism.
-- **Cost model:** per GB stored (cheaper in colder tiers), per request, and especially **per GB of egress**.
-- **Features:** versioning, lifecycle rules (move to infrequent access after 30 days, archive after 180, delete after 2 years), server-side encryption, object lock (WORM, for compliance), event notifications on upload.
+**Definition:** Block storage is a raw disk attached to one machine; file storage is a shared folder tree many machines mount; object storage is a flat bucket of whole files (objects) read and written over HTTP by key.
 
-### Metadata belongs in a database
-Store bytes in object storage, and store **metadata** (owner, filename, size, MIME type, checksum, ACL, processing status) in your database. Queries ("list Alice's photos from 2025") hit the DB; downloads fetch the object by key.
+A useful picture: block storage is your laptop's hard drive, file storage is the office shared drive, and object storage is a huge warehouse where every parcel has a label (the key) and you can only swap whole parcels, not edit inside one.
 
-## Upload patterns
-### Pre-signed URLs (direct-to-storage)
+### The problem
+
+```text
+Photo app keeps uploads on the local disk of app-1:
+/var/app/uploads/42/avatar.jpg
+User's next request goes to app-2 -> image not found
+app-1 disk fills up or dies -> photos gone
 ```
-1. Client → API: "I want to upload photo.jpg (4 MB)"
-2. API checks auth/quota, creates metadata row (status=PENDING), returns a pre-signed PUT URL (valid 10 min)
-3. Client → S3: PUT bytes directly using the signed URL
-4. S3 → event (S3 notification / Kafka) → processing worker (virus scan, thumbnails, transcoding)
-5. Worker updates metadata status=READY
+
+Local disk ties files to one server, does not scale, and has no built-in redundancy.
+
+### Better design
+
+```text
+Block  (EBS, persistent disk) -> the database's own data files
+File   (EFS, NFS)             -> legacy apps needing a shared folder
+Object (S3, GCS, Azure Blob)  -> photos, videos, backups, logs
+  key: users/42/avatar.jpg, any server reads it over HTTPS
+  data copied across zones; S3 is designed for 11 nines durability
 ```
-App servers never touch the bytes, so they stay small and stateless and bandwidth costs drop. The same pattern works for downloads with **pre-signed GET URLs** for private content.
-### Multipart and resumable uploads
-Large files are split into parts (e.g. 8–100 MB), uploaded in parallel and retried individually, then completed with a final call. That gives faster uploads, resumability on flaky mobile networks, and no single huge request.
-### Validation
-Verify size limits and content type server-side after upload; check checksums (Content-MD5/CRC); scan for malware before making content public.
 
-## CDN (content delivery network)
-A CDN is a globally distributed set of edge servers (points of presence) that cache content near users.
-### How it works
-1. DNS or anycast routes the user to a nearby edge.
-2. The edge checks its cache by **cache key** (URL plus selected headers, cookies and query parameters).
-3. On a hit, it serves immediately (milliseconds). On a miss, it fetches from the **origin** (or a mid-tier "shield" cache), stores the response per its TTL, and serves it.
-### Pull vs push
-- **Pull CDN:** the edge fetches lazily on the first request. Easy and the default for websites and APIs.
-- **Push CDN:** you upload content ahead of time. Useful for large, predictable releases (game patches, popular videos).
-### Cache control
-- `Cache-Control: public, max-age=31536000, immutable` for **fingerprinted assets** (`app.3f9a2c.js`). Change the file name to "invalidate" instantly.
-- Short TTLs plus `stale-while-revalidate` for semi-dynamic content.
-- Purges/invalidations exist but are slow and limited, so prefer versioned URLs.
-- Normalise cache keys (strip tracking query params) to raise hit ratios.
-### Private content
-Signed URLs or signed cookies with expiry (CloudFront signed URLs, token auth) let the CDN serve paid or private media without exposing it publicly.
-### Beyond caching
-TLS termination near users, HTTP/2 and HTTP/3, DDoS absorption, WAF, image optimisation (resize, WebP/AVIF), edge compute (Workers, Lambda@Edge) for redirects, A/B routing and auth checks.
-### Origin protection
-An **origin shield** (an extra cache tier) collapses misses from hundreds of edges into one origin request, which is critical for viral content. Use request collapsing at the edge too.
+Each kind of data goes to the storage that fits it. Object storage scales to practically unlimited size, is cheap per GB, and is shared by every server.
 
-## Video delivery
-1. **Upload** the source to object storage (multipart, resumable).
-2. **Transcode** into multiple renditions (240p…4K) and codecs (H.264, H.265, AV1) using a pipeline of workers fed by a queue. Split the video into chunks for parallel transcoding.
-3. **Package** into short segments (2–6 s) with manifests: HLS (`.m3u8`) or MPEG-DASH (`.mpd`).
-4. **Adaptive bitrate (ABR) streaming:** the player measures bandwidth and buffer level and switches renditions segment by segment, so playback continues when the network drops.
-5. **Distribute** via CDN; extremely popular content is pre-positioned at edges or inside ISP networks (Netflix Open Connect).
-6. **Live streaming** adds an ingest protocol (RTMP/SRT/WebRTC), real-time transcoding and low-latency HLS/DASH with smaller segments.
-Thumbnails, previews and captions are additional outputs of the same pipeline.
+**Trade-offs:**
+- Objects are replaced whole; you cannot edit a byte in the middle.
+- Data transfer out (egress) is often the biggest part of the bill.
 
-## File sync (Dropbox / Google Drive)
-- **Chunking:** split files into blocks (fixed ~4 MB, or **content-defined chunking** with rolling hashes so an insertion doesn't shift every later block).
-- **Content addressing:** identify chunks by hash (SHA-256). Upload only chunks the server doesn't already have, which deduplicates across versions and users.
-- **Metadata service:** maps file → version → ordered list of chunk hashes, plus a per-user change journal (cursor) so clients fetch "what changed since cursor X".
-- **Sync protocol:** clients watch local changes, upload new chunks, commit the new file version (with conflict detection via the base version), and receive notifications (long poll or WebSocket) of remote changes.
-- **Conflicts:** if two devices edit the same base version, keep both ("conflicted copy") or merge for specific formats.
+**Key takeaway:** Databases on block storage, user files in object storage; avoid local disk for anything users upload.
 
-## Image pipelines
-Generate standard sizes on upload, or resize on the fly at the edge with caching. Strip EXIF metadata (privacy), convert to modern formats, and serve via CDN with long TTLs and versioned URLs.
+---
 
-## Interview questions
-1. **How should users upload large videos?** Pre-signed multipart upload direct to object storage, an event-triggered transcoding pipeline, a metadata status in the DB, and CDN delivery with ABR.
-2. **How do you serve private photos through a CDN?** Short-lived signed URLs or cookies issued by your API after authorisation; the CDN validates the signature.
-3. **How do you invalidate a CSS file cached at the edge for a year?** Don't. Version the filename and update the HTML reference.
-4. **Why not store images in the database?** DB storage is expensive, inflates backups and replication, and isn't built for streaming large blobs; object storage plus a CDN is cheaper and faster.
+## 2. Object storage plus metadata in a database
 
-## Cheat sheet
+**Definition:** Store the file bytes in object storage and store facts about the file (owner, name, size, type, status, object key) as a row in your database.
+
+Object storage is great at "give me the bytes for this key" and poor at queries such as "Alice's photos from 2025, newest first". A database is the opposite. Use each for what it does well.
+
+### The problem
+
+```sql
+CREATE TABLE photos (
+  id BIGINT PRIMARY KEY,
+  owner_id BIGINT,
+  data BYTEA          -- 4 MB image inside the row
+);
+-- 100M photos = ~400 TB in the database
 ```
-Bytes → object storage (S3); metadata → DB; delivery → CDN
-Uploads: pre-signed URLs, multipart/resumable, event → workers, status in DB
-CDN: edge cache by key; pull vs push; long TTL + versioned filenames; signed URLs for private
-Shield/collapsing to protect origin; egress is the big cost
-Video: transcode → segments (HLS/DASH) → ABR → CDN/ISP caches
-Sync: content-defined chunks, hash-addressed, dedup, metadata journal + cursor, conflict copies
+
+Blobs inside the database make it huge and expensive, slow backups and replication, and tie up DB connections streaming bytes.
+
+### Better design
+
+```sql
+CREATE TABLE photos (
+  id BIGINT PRIMARY KEY,
+  owner_id BIGINT NOT NULL,
+  object_key TEXT NOT NULL,    -- 'photos/42/9f3c.jpg' in S3
+  size_bytes BIGINT,
+  content_type TEXT,
+  status TEXT,                 -- PENDING, READY, BLOCKED
+  created_at TIMESTAMPTZ
+);
+CREATE INDEX ON photos (owner_id, created_at DESC);
 ```
+
+Queries stay fast and small in the database, and the bytes live cheaply in S3.
+
+**Key takeaway:** Bytes in object storage, metadata in a database, joined by the object key.
+
+---
+
+## 3. Pre-signed uploads
+
+**Definition:** A pre-signed URL is a time-limited link, signed by your backend, that lets a client upload or download one specific object directly from object storage without holding storage credentials.
+
+It is like a valet ticket: the backend checks who you are, hands you a ticket for one parking spot for 10 minutes, and you park the car yourself.
+
+### The problem
+
+```text
+Client --(500 MB video)--> API server --(500 MB)--> S3
+1,000 uploads at once = 500 GB flowing through API servers
+API threads blocked for minutes, memory and bandwidth exhausted
+```
+
+App servers become expensive, slow pipes for bytes they never need to look at.
+
+### Better design
+
+```text
+1. Client -> API: "upload cat.mp4, 500 MB"
+2. API checks login and quota, inserts row status=PENDING,
+   returns pre-signed PUT URL valid for 10 minutes
+3. Client -> S3: PUT bytes directly
+4. S3 event -> queue -> worker: virus scan, thumbnails
+5. Worker sets status=READY
+```
+
+The API only handles small JSON calls. Bytes go straight to storage, and processing is triggered by the upload event.
+
+**Trade-offs:**
+- You must check size and content type after upload too; the client could send something else.
+
+**Key takeaway:** The API authorises, storage carries the bytes.
+
+---
+
+## 4. Multipart uploads
+
+**Definition:** A multipart upload splits a large file into parts that are uploaded separately (often in parallel) and then joined into one object by a final "complete" call.
+
+On a phone in a train, a 2 GB single upload that fails at 95% must start again. With parts, only the failed part is retried.
+
+### The problem
+
+```text
+Single PUT of 2 GB over a mobile network
+Network drops at 1.9 GB -> whole upload lost, start from zero
+One TCP stream -> slow, cannot use full bandwidth
+```
+
+Large single requests are slow and fragile.
+
+### Better design
+
+```text
+initiate  -> uploadId
+part 1..N -> 2 GB / 64 MB = 32 parts, 4 in parallel,
+             each with its own pre-signed URL and checksum
+part 17 fails -> retry part 17 only
+complete(uploadId, [part ETags]) -> one object
+(S3: parts are 5 MB to 5 GB, last part may be smaller,
+ up to 10,000 parts)
+```
+
+Uploads are faster and resumable. A lifecycle rule should clean up uploads that were started and never completed.
+
+**Key takeaway:** Large uploads should be multipart and resumable, with pre-signed URLs per part.
+
+---
+
+## 5. CDN: pull vs. push
+
+**Definition:** A CDN is a set of edge servers in many cities that cache your content near users; a pull CDN fetches content from your origin on the first request, a push CDN is loaded by you ahead of time.
+
+The origin is your own server or bucket that holds the master copy. The CDN is like local corner shops stocking popular items so customers do not drive to the central warehouse.
+
+### The problem
+
+```text
+All images served from one bucket in us-east
+User in Sydney: ~200 ms round trip, image page takes 3 s
+Viral post: 1M requests in 10 minutes -> all hit the origin
+```
+
+Far-away users wait, and the origin pays for every byte and every request.
+
+### Better design
+
+```text
+Pull CDN (default):
+  user -> nearest edge -> hit? serve in ~10-30 ms
+                       -> miss? fetch from origin once, cache, serve
+  origin shield (one extra cache tier) collapses misses from
+  hundreds of edges into a single origin fetch
+Push CDN: upload a game patch to edges before launch day
+```
+
+Most requests are served near the user, and the origin sees a tiny fraction of traffic.
+
+### Pull vs. push
+
+- **Pull:** zero setup per file, first request per edge is slow; the right default.
+- **Push:** you control what is where and when; good for big, predictable releases.
+
+**Key takeaway:** Put a pull CDN in front of every static asset and media file; push only for planned big releases.
+
+---
+
+## 6. Cache-Control and versioned URLs
+
+**Definition:** `Cache-Control` is the HTTP header that tells browsers and CDNs how long they may cache a response; a versioned URL puts a content hash or version in the file name so a new version gets a new URL.
+
+CDN purges exist but are slower and limited. If the URL changes whenever the content changes, you never need to purge.
+
+### The problem
+
+```http
+GET /static/app.js
+Cache-Control: public, max-age=86400
+
+-- You deploy a bug fix to app.js --
+Browsers and edges keep the old app.js for up to 24 hours.
+New HTML + old JS = broken page.
+```
+
+A fixed URL with a long TTL means users keep the old file; a short TTL means poor caching.
+
+### Better design
+
+```http
+GET /static/app.3f9a2c.js
+Cache-Control: public, max-age=31536000, immutable
+
+GET /index.html
+Cache-Control: no-cache          (always revalidate, cheap 304s)
+
+Deploy: build emits app.81b7e0.js, index.html now points to it.
+```
+
+Assets cache for a year because their content never changes under that name. The small HTML page always revalidates and picks up new names immediately.
+
+**Key takeaway:** Long TTL plus content-hashed names for assets, short or no-cache for the HTML that references them.
+
+---
+
+## 7. Signed URLs for private content
+
+**Definition:** A signed URL (or signed cookie) is a CDN or storage link that includes an expiry time and a cryptographic signature, so only holders of a valid, unexpired link can fetch the content.
+
+Paid videos or private photos still benefit from CDN caching, but must not be readable by anyone who guesses the URL.
+
+### The problem
+
+```text
+https://cdn.example.com/courses/java-101/lesson1.mp4
+Public URL -> shared on a forum -> anyone can stream it forever
+```
+
+Public URLs leak, and there is no way to take access back.
+
+### Better design
+
+```text
+1. User asks API for lesson 1; API checks the purchase
+2. API returns a link signed with a key the CDN trusts:
+   .../lesson1.m3u8?Expires=1760000000&Signature=...&Key-Pair-Id=...
+3. CDN validates signature and expiry, then serves from cache
+4. Link stops working after, say, 1 hour
+```
+
+The CDN keeps caching, but only authorised users with fresh links get through. Signed cookies suit video, where one playback fetches hundreds of segment files.
+
+**Key takeaway:** Authorise in your API, then hand out short-lived signed URLs or cookies the CDN can check.
+
+---
+
+## 8. Video transcoding and adaptive bitrate
+
+**Definition:** Transcoding converts an uploaded video into several resolutions and formats; adaptive bitrate (ABR) streaming lets the player switch between them every few seconds based on current network speed.
+
+The video is cut into short segments (commonly 2-6 seconds) listed in a manifest file: HLS uses `.m3u8`, MPEG-DASH uses `.mpd`. The player reads the manifest and picks, segment by segment, the best quality it can download in time.
+
+### The problem
+
+```text
+Upload: one 4K file, 20 Mbps
+Viewer on 3 Mbps mobile -> constant buffering
+Viewer's network drops mid-video -> playback stops
+One big file -> cannot start until enough is downloaded
+```
+
+One fixed quality is too heavy for weak networks and wastes quality on strong ones.
+
+### Better design
+
+```text
+upload -> S3 -> event -> queue -> transcode workers (in parallel,
+          split by chunk) -> renditions:
+          240p 0.4 Mbps | 480p 1.5 Mbps | 720p 3 Mbps | 1080p 6 Mbps
+       -> segments of ~4 s + master.m3u8 -> S3 -> CDN
+player: bandwidth drops -> next segment at 480p, rises -> 1080p
+```
+
+Playback starts quickly and keeps going when the network changes. Very popular titles are pre-placed at edges or inside ISP networks (Netflix Open Connect).
+
+**Trade-offs:**
+- Storage multiplies with each rendition; transcoding is CPU-heavy, so it runs as an async pipeline.
+
+**Key takeaway:** Transcode once into a ladder of qualities, segment it, and let the player adapt.
+
+---
+
+## 9. File sync chunking
+
+**Definition:** Chunking splits files into blocks identified by their content hash, so a sync client uploads only the blocks that changed or that the server does not already have.
+
+This is how Dropbox-style sync stays fast. A file becomes a list of block hashes; a new version is just a new list that mostly reuses old blocks.
+
+### The problem
+
+```text
+User edits one paragraph in a 200 MB file
+Naive sync re-uploads all 200 MB
+10 users store the same 1 GB installer -> 10 GB stored
+```
+
+Whole-file sync wastes bandwidth and storage on data that did not change.
+
+### Better design
+
+```text
+file v1 -> blocks (~4 MB): [h1, h2, h3, ..., h50]  (SHA-256 each)
+edit    -> blocks:          [h1, h2, h3', ..., h50]
+client: "server, which of these hashes are new?" -> only h3'
+upload h3' (4 MB), then commit version v2 = new hash list
+metadata DB: file -> version -> ordered block hashes
+other devices: long-poll / WebSocket "changes since cursor X"
+```
+
+Only changed blocks travel, and identical blocks are stored once. Content-defined chunking (block boundaries chosen by a rolling hash) keeps an insertion from shifting every later block. If two devices edit the same base version, the loser's file is saved as a "conflicted copy".
+
+**Key takeaway:** Hash-addressed blocks give you delta sync and deduplication; metadata tracks versions and changes.
+
+---
+
+## In an HLD interview
+
+- **YouTube, Netflix:** pre-signed multipart upload to object storage, an async transcoding pipeline, HLS/DASH segments, ABR players, CDN delivery with signed URLs for paid content.
+- **Dropbox / Google Drive:** content-hashed chunks in object storage, a metadata DB of file versions and block lists, a change cursor for sync, conflicted copies.
+- **News Feed, Chat/WhatsApp, Amazon E-commerce:** images and attachments uploaded via pre-signed URLs, served through a CDN with versioned URLs and thumbnails made by workers.
+- **URL Shortener, Google Search:** CDN and long-TTL caching for static assets; the redirect API itself stays behind the LB.
+- **What to say:** "Clients upload directly to S3 with pre-signed URLs; a metadata row tracks status; an S3 event starts processing; everything is served from a CDN with versioned URLs, and private media uses short-lived signed URLs."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
+|---|---|---|
+| Block / file / object | Disk vs. shared folder vs. HTTP bucket | Is this a DB disk or user content? |
+| Metadata in DB | Bytes in S3, facts in a table | Can I query files without touching bytes? |
+| Pre-signed uploads | Client sends bytes straight to storage | Do my API servers carry file bytes? |
+| Multipart | Parallel, retryable parts | What if the upload fails at 95%? |
+| CDN pull vs. push | Cache near users, origin as source | Where are users, how popular is the file? |
+| Cache-Control + versioned URLs | New content, new URL | How do users get the new version? |
+| Signed URLs | Expiring, signed access | Can someone share this link forever? |
+| Transcoding + ABR | Quality ladder, player adapts | What happens on a slow network? |
+| Sync chunking | Upload only new blocks | Am I re-sending unchanged data? |
+
+## Final memory aid
+
+- **Bytes to object storage, metadata to the database**
+- **Upload direct with pre-signed URLs; big files multipart**
+- **Pull CDN in front of every static and media file**
+- **Hashed file names + one-year TTL; never purge**
+- **Private content: short-lived signed URLs or cookies**
+- **Video: transcode, segment, adapt, CDN**
+- **Sync: hash-addressed blocks, send only what changed**
 
 === hld-databases | HLD | Choosing a database: SQL vs NoSQL and beyond ===
-"Which database?" comes up in every design. The right answer comes from **access patterns, consistency needs, scale and operational constraints**, not brand names. This chapter covers the main database families, how they store and query data, their trade-offs, and a decision process you can say out loud.
+"Which database?" comes up in every design, and the right answer comes from how the data is read and written, not from brand names. This chapter walks through relational databases and the main NoSQL families (key-value, document, wide-column, graph), plus search engines and time-series stores, each with the problem it solves. It ends with polyglot persistence and worked choices you can say out loud in an interview.
 
-## Start from access patterns
-Before naming a database, write down:
-1. The main **queries** (lookups by key? range scans by time? joins? full-text? graph traversal?).
-2. **Read/write ratio** and QPS.
-3. **Consistency needs** (must every read see the latest write? multi-row transactions?).
-4. **Data size and growth.**
-5. **Latency targets.**
-6. **Operational context** (managed service available? team expertise?).
+## 1. Choose by access pattern
 
-## Relational databases (PostgreSQL, MySQL, Oracle, SQL Server)
-- **Model:** tables with typed columns, primary and foreign keys, constraints, joins.
-- **Transactions:** ACID with configurable isolation levels.
-- **Query flexibility:** ad-hoc SQL, secondary indexes, aggregations.
-- **Scaling:** vertical first; read replicas for read scaling; partitioning (declarative partitioning by range or hash) for large tables; sharding (Vitess, Citus) or distributed SQL for write scaling.
-- **Best for:** core business data with relationships and invariants: users, orders, payments, inventory, bookings.
-- **Watch:** cross-shard joins and transactions once you shard; schema migrations on huge tables.
+**Definition:** An access pattern is a concrete description of how data is queried and written: by what key, how often, in what order, and with what consistency need.
 
-### Isolation levels and their anomalies
-| Level | Prevents | Still allows |
+Choosing a database without listing access patterns is like buying a vehicle without knowing whether you will carry passengers, cargo or race. Write them down first, then match a store.
+
+### The problem
+
+```text
+"We'll use MongoDB because it scales."
+Later requirements:
+  - transfer money between two accounts atomically
+  - report: revenue by region by month with joins
+Team now fights the database every sprint.
+```
+
+Picking by reputation leads to a store that does not fit the real queries.
+
+### Better design
+
+```text
+Access patterns for a chat app:
+  1. send message          -> 50,000 writes/s, append-only
+  2. last 50 messages in a conversation, newest first
+  3. user profile by id    -> read-heavy, small
+  4. search old messages by text
+Choices: (1,2) wide-column by conversation_id; (3) relational
+         or key-value + cache; (4) search engine fed by events
+```
+
+Each pattern points at a store. Also note read/write ratio, data size, latency targets and what your team can operate.
+
+**Key takeaway:** List the top queries, the write rate and the consistency need before naming any database.
+
+---
+
+## 2. Relational databases
+
+**Definition:** A relational database (PostgreSQL, MySQL) stores data in tables with a fixed schema, links them with keys and joins, and offers ACID transactions.
+
+ACID means a transaction is all-or-nothing (atomic), keeps rules valid (consistent), is not disturbed by other transactions running at the same time (isolated), and survives crashes once committed (durable). Relational databases are the safe default for business data with relationships and rules.
+
+### The problem
+
+```text
+Key-value store, no transactions:
+put(account:A, balance - 500)    -- succeeds
+put(account:B, balance + 500)    -- server crashes before this
+500 disappears from the system.
+```
+
+Without multi-row transactions, a crash halfway through leaves money in neither account.
+
+### Better design
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 500
+ WHERE id = 'A' AND balance >= 500;
+UPDATE accounts SET balance = balance + 500 WHERE id = 'B';
+INSERT INTO transfers(from_id, to_id, amount) VALUES ('A','B',500);
+COMMIT;
+```
+
+Either all three changes happen or none does, and constraints and foreign keys guard the data.
+
+**Trade-offs:**
+- Scaling writes beyond one primary needs sharding or a distributed SQL database (Spanner, CockroachDB), which adds complexity or write latency.
+- Schema changes on very large tables need care.
+
+**Key takeaway:** Use relational for orders, payments, bookings and anything with invariants; scale with replicas, then partitioning, then sharding.
+
+---
+
+## 3. Key-value stores
+
+**Definition:** A key-value store saves a value under a key and retrieves it by that key, with little else in the way of querying.
+
+It is a giant, distributed hash map. Because every request is "get by key", it can partition data across many machines and keep latency low at huge scale. Examples: Redis (in memory), DynamoDB (managed, durable).
+
+### The problem
+
+```text
+Session lookups: 200,000 reads/s, always by session_id
+Stored in Postgres with joins to users and roles
+Primary at 90% CPU just answering one-row lookups
+```
+
+A general-purpose database spends effort on features this pattern never uses.
+
+### Better design
+
+```text
+Redis:    GET session:7f3a...   -> {userId, roles, expiresAt}
+          SET with TTL 30 min
+DynamoDB: partition key = sessionId
+          single-digit ms reads at any scale, auto partitioning
+```
+
+Each lookup is one key, so the store can spread keys over many nodes and keep latency flat.
+
+**Trade-offs:**
+- No joins or ad-hoc queries; any query not by key needs a secondary index or another store.
+
+**Key takeaway:** Use key-value for lookups by ID at large scale: sessions, carts, short URLs, idempotency keys.
+
+---
+
+## 4. Document stores
+
+**Definition:** A document store (MongoDB, Couchbase, Firestore) stores JSON-like documents, each with its own flexible shape, and lets you query and index fields inside them.
+
+It fits data that is read and written as one unit (an aggregate) and whose shape varies, like a product whose attributes differ by category.
+
+### The problem
+
+```text
+Relational catalog: products + attributes(product_id, name, value)
+Phone has 40 attributes, T-shirt has 6, book has 10
+Showing one product page = joins over 5 tables,
+and every new category means a schema change.
+```
+
+Variable shapes fight a fixed schema, and the page needs many joins to rebuild one object.
+
+### Better design
+
+```json
+{
+  "_id": "sku-123",
+  "title": "Pixel phone",
+  "category": "phones",
+  "price": { "amount": 49900, "currency": "INR" },
+  "attrs": { "ram": "8GB", "storage": "128GB", "colour": "black" },
+  "variants": [ { "sku": "sku-123-b", "colour": "blue" } ]
+}
+```
+
+One read returns the whole product, and new attributes need no migration. Index fields such as `category` for queries.
+
+**Trade-offs:**
+- Joins across documents are limited and costly, so you duplicate data; multi-document transactions exist but are best kept rare at scale.
+
+**Key takeaway:** Use a document store for self-contained aggregates with varying shape, such as catalogs, profiles and content.
+
+---
+
+## 5. Wide-column stores
+
+**Definition:** A wide-column store (Cassandra, ScyllaDB, HBase, Bigtable) groups rows by a partition key and keeps rows inside each partition sorted by clustering columns, built for very high write rates across many nodes.
+
+Writes go to an append-only log and memory first (an LSM tree), so they are very fast. You design one table per query: the partition key decides which node holds the data, and the sort order inside it serves "latest N" reads.
+
+### The problem
+
+```text
+Chat messages in one Postgres table:
+  50,000 inserts/s, 5 billion rows, growing daily
+  SELECT ... WHERE conversation_id = ? ORDER BY sent_at DESC LIMIT 50
+Single primary cannot absorb the writes; index keeps growing.
+```
+
+One relational primary hits its write ceiling, and the table outgrows a single machine.
+
+### Better design
+
+```sql
+-- Cassandra CQL
+CREATE TABLE messages_by_conversation (
+  conversation_id uuid,
+  bucket text,             -- e.g. '2026-10', bounds partition size
+  message_id timeuuid,
+  sender_id uuid,
+  body text,
+  PRIMARY KEY ((conversation_id, bucket), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+```
+
+"Latest 50 messages" is one partition read, writes spread across nodes by conversation, and adding nodes adds capacity roughly linearly.
+
+**Trade-offs:**
+- No joins and weak ad-hoc querying; a new query often means a new table.
+- Consistency is tunable (ONE, QUORUM, ALL) rather than full ACID.
+
+**Key takeaway:** Use wide-column for huge, write-heavy, time-ordered data read by a known key.
+
+---
+
+## 6. Graph databases
+
+**Definition:** A graph database (Neo4j, Amazon Neptune) stores nodes and the edges between them, and is built to follow relationships quickly.
+
+When the question is about connections ("friends of friends", "accounts sharing a device with a known fraudster"), following links directly is much cheaper than repeated self-joins.
+
+### The problem
+
+```sql
+-- friends of friends of friends in SQL
+SELECT DISTINCT f3.friend_id
+FROM friends f1
+JOIN friends f2 ON f2.user_id = f1.friend_id
+JOIN friends f3 ON f3.user_id = f2.friend_id
+WHERE f1.user_id = 42;
+-- each extra hop = another join, cost explodes
+```
+
+Multi-hop relationship queries become slow and awkward as depth grows.
+
+### Better design
+
+```text
+// Cypher (Neo4j)
+MATCH (me:User {id: 42})-[:FRIEND*1..3]->(other:User)
+RETURN DISTINCT other.id
+```
+
+The query follows edges from one starting node, so its cost depends on the neighbourhood it touches, not the size of the whole graph.
+
+**Trade-offs:**
+- Harder to shard; many large social networks still keep the graph in sharded key-value or relational stores with app-level traversal.
+
+**Key takeaway:** Reach for a graph database when deep relationship traversal is the core query, such as fraud rings or recommendations.
+
+---
+
+## 7. Search engines
+
+**Definition:** A search engine (Elasticsearch, OpenSearch, Solr) builds an inverted index, a map from each word to the documents containing it, for fast full-text search, relevance ranking and filters.
+
+It is the index at the back of a book: look up the word, get the pages. It is usually a secondary store, fed from the source of truth.
+
+### The problem
+
+```sql
+SELECT * FROM products
+WHERE title LIKE '%wireless headphone%';
+-- full scan of 50M rows, no typo tolerance,
+-- no ranking by relevance, no facets
+```
+
+`LIKE '%...%'` cannot use a normal index and has no idea which result is most relevant.
+
+### Better design
+
+```text
+Postgres (source of truth) -> CDC (Debezium) -> Kafka
+  -> indexer -> Elasticsearch index "products"
+Query: match "wireles headphone" (fuzzy), filter brand, price,
+       facets by brand, sorted by relevance (BM25)
+Index lags the DB by about a second.
+```
+
+Search is fast, typo-tolerant and ranked, while orders and stock stay in the database.
+
+**Key takeaway:** Use a search engine for text search and facets, as an eventually consistent copy of the real data.
+
+---
+
+## 8. Time-series databases
+
+**Definition:** A time-series database (Prometheus, InfluxDB, TimescaleDB) stores timestamped measurements and is built for appending them and aggregating over time ranges.
+
+Metrics arrive in order, are rarely updated, and are queried as "average over the last hour per host". Time-series stores compress such data heavily and drop or shrink old data automatically.
+
+### The problem
+
+```text
+10,000 servers x 200 metrics x every 10 s = 200,000 points/s
+Stored as rows in a general-purpose table:
+  storage grows by TBs, "p99 latency per service last 24 h"
+  takes minutes, deleting old rows causes heavy churn
+```
+
+A general table is not built for constant appends, range aggregation and retention.
+
+### Better design
+
+```text
+metric: http_latency_ms{service="orders", host="h17"}
+- data split by time chunks, compressed (delta encoding)
+- retention: raw 15 days, 1-minute rollups 1 year
+- query: p99 over 5-minute windows, last 24 h -> milliseconds
+```
+
+Writes are cheap appends, queries scan only the needed time range, and old data expires by dropping whole chunks.
+
+**Key takeaway:** Use a time-series store for metrics, monitoring and IoT data with time-range queries and retention.
+
+---
+
+## 9. Polyglot persistence
+
+**Definition:** Polyglot persistence means using several databases in one system, each for the access pattern it handles best, with one clear source of truth per piece of data.
+
+The risk is copies that disagree. The fix is to name the owner of each piece of data and derive the other copies from its changes.
+
+### The problem
+
+```text
+Order service writes to Postgres AND Elasticsearch AND Redis
+in the same request (dual writes)
+Elasticsearch write fails -> order exists but is not searchable
+Redis write succeeds, Postgres rolls back -> ghost order in cache
+```
+
+Writing to several stores from the app with no ordering or retry leaves them inconsistent.
+
+### Better design
+
+```text
+Postgres (source of truth for orders)
+   |  CDC / outbox events
+   v
+ Kafka --> Elasticsearch (search, ~1 s behind)
+       --> Redis (cache invalidation)
+       --> ClickHouse (analytics, minutes behind)
+```
+
+One write path; every other store is a derived copy that can be rebuilt by replaying events, with known lag.
+
+**Key takeaway:** Many stores are fine, as long as each piece of data has one owner and the copies are derived from it.
+
+---
+
+## 10. Worked choices for common problems
+
+**Definition:** A worked choice pairs a known interview problem with the store that fits its main access pattern, plus a one-line reason.
+
+Having these ready lets you answer "which database?" in one sentence and move on.
+
+| Problem | Main store | Why |
 |---|---|---|
-| Read uncommitted | (almost nothing) | Dirty reads |
-| Read committed (Postgres default) | Dirty reads | Non-repeatable reads, lost updates, write skew |
-| Repeatable read / snapshot isolation | Non-repeatable reads, (in Postgres) lost updates | Write skew |
-| Serializable | All of the above | Nothing (at a throughput cost, retries on conflict) |
-**Write skew example:** two doctors each check "at least one other doctor is on call" and both go off call. Prevent it with `SELECT … FOR UPDATE`, serializable isolation, or a constraint.
+| URL Shortener | Key-value (DynamoDB) + Redis cache | Lookup by short code at huge read scale |
+| Payment System, BookMyShow | Relational (Postgres) | ACID, constraints, no double booking |
+| Chat/WhatsApp | Wide-column (Cassandra) | Write-heavy, latest messages per conversation |
+| Amazon catalog | Document store + search engine | Varying product shapes, text search and facets |
+| Metrics, Logging/Monitoring | Time-series DB / log search engine | Appends, time-range queries, retention |
+| Social graph, fraud | Graph DB (or sharded KV + app traversal) | Multi-hop relationships |
+| Uber driver locations | Redis geo index + Cassandra history | Fast nearby queries, high write rate |
 
-## Distributed SQL / NewSQL (Spanner, CockroachDB, YugabyteDB, TiDB)
-SQL and ACID transactions with automatic sharding and replication via consensus (Raft/Paxos). Horizontal scaling without hand-made sharding, and multi-region with strong consistency, at the cost of higher write latency (consensus round trips) and operational and cost considerations. Good for global systems needing strong consistency (financial ledgers, inventory across regions).
+### SQL vs. NoSQL
 
-## Key-value stores (Redis, DynamoDB, Riak, RocksDB embedded)
-- **Model:** `get(key)`, `put(key, value)`, sometimes range by sort key.
-- **Strengths:** extreme throughput, predictable low latency, simple horizontal partitioning.
-- **DynamoDB specifics:** partition key plus optional sort key; queries within one partition by sort-key range; global and local secondary indexes; on-demand or provisioned capacity; single-digit millisecond latency at any scale. Design tables around access patterns, often **single-table design**.
-- **Best for:** sessions, carts, user preferences, feature flags, counters, idempotency keys, metadata lookups by ID.
+- **SQL:** flexible queries, joins and transactions; the default until a specific scale or shape forces a change.
+- **NoSQL:** designed around known access patterns at large scale; fewer query options, more modelling up front.
+- "NoSQL scales, SQL does not" is too simple: relational databases scale far with replicas and sharding, and NoSQL needs careful key design to avoid hot partitions.
 
-## Document stores (MongoDB, Couchbase, Firestore)
-- **Model:** JSON-like documents with flexible schemas; query by fields inside documents; secondary indexes.
-- **Strengths:** natural fit for aggregates read and written together (a product with its variants and attributes); fast iteration on schema.
-- **Trade-offs:** joins are limited (`$lookup` exists but is costly), so denormalise; multi-document transactions exist but are best avoided at high scale.
-- **Best for:** catalogs, content management, user profiles with varying attributes, event payloads.
+**Key takeaway:** Start relational for core business data and add specialised stores where a pattern clearly needs one.
 
-## Wide-column stores (Cassandra, ScyllaDB, HBase, Bigtable)
-- **Model:** rows identified by a **partition key**; within a partition, rows are sorted by **clustering columns**. Sparse columns.
-- **Storage:** LSM trees, so writes are sequential and very fast; reads use Bloom filters and compaction.
-- **Strengths:** massive write throughput, linear horizontal scaling, multi-datacenter replication, tunable consistency (`ONE`, `QUORUM`, `ALL`).
-- **Modelling rule:** one table **per query**, denormalised. `messages_by_conversation (conversation_id, message_id DESC)` serves "latest 50 messages in a conversation" in one partition read.
-- **Watch:** no joins, limited secondary indexes, unbounded partitions (bucket by time, e.g. `(conversation_id, month)`), tombstones from deletes.
-- **Best for:** messaging, time-ordered events, IoT telemetry, activity feeds, write-heavy logs.
+---
 
-## Search engines (Elasticsearch, OpenSearch, Solr)
-Inverted indexes for full-text search, relevance scoring (BM25), fuzzy matching, faceting and aggregations. Usually a **secondary store** fed asynchronously from the source of truth (via CDC or events), so they're eventually consistent. Use for product search, log search and autocomplete.
+## In an HLD interview
 
-## Time-series databases (InfluxDB, TimescaleDB, Prometheus, Druid, ClickHouse)
-Optimised for append-mostly timestamped data: compression (delta encoding, Gorilla), time-based partitioning, downsampling and retention policies, fast time-range aggregations. Use for metrics, monitoring, IoT and financial ticks.
+- **Payment System, Seat Reservation, BookMyShow:** relational for bookings and money, with transactions and unique constraints to prevent double booking.
+- **Chat/WhatsApp, News Feed, Notification System:** wide-column for message and feed timelines partitioned by conversation or user, Redis for hot data.
+- **Amazon E-commerce, Google Search:** document store or relational for the catalog, a search engine fed by CDC for text search and facets.
+- **Metrics, Logging/Monitoring, Ride Tracking:** time-series storage with retention and rollups; a search engine for log text.
+- **What to say:** "Orders live in Postgres as the source of truth; changes flow through CDC into Kafka, which feeds Elasticsearch for search and Redis for caching, each a few seconds behind at most."
 
-## Graph databases (Neo4j, Amazon Neptune, JanusGraph)
-Nodes and edges with properties; traversal queries ("friends of friends who like X", shortest paths) are efficient regardless of graph size. Use for social graphs, fraud rings, recommendations and knowledge graphs. Many social networks still store graphs in sharded relational or KV stores with application-level traversal.
+## At a glance
 
-## Columnar / OLAP warehouses (BigQuery, Snowflake, Redshift, ClickHouse)
-Column-oriented storage compresses well and scans only the needed columns, so aggregations over billions of rows are fast. Built for analytics, not transactional updates. Feed them via ETL/ELT or CDC from OLTP systems.
+| Concept | Core idea | Ask yourself |
+|---|---|---|
+| Access patterns | Queries decide the store | What are my top 3 queries and write rate? |
+| Relational | Tables, joins, ACID | Do I need multi-row transactions or rules? |
+| Key-value | Get/put by key at scale | Is every read by a known ID? |
+| Document | Flexible aggregates | Is the object read and written as one unit? |
+| Wide-column | Partition key + sorted rows | Is it write-heavy and read by key and time? |
+| Graph | Follow edges fast | Is the question about multi-hop links? |
+| Search engine | Inverted index, relevance | Do users type free text? |
+| Time-series | Timestamped appends, retention | Is it metrics over time ranges? |
+| Polyglot | One owner, derived copies | Which store is the source of truth? |
 
-## Vector databases (pgvector, Pinecone, Weaviate, Milvus, OpenSearch k-NN)
-Store embeddings and answer approximate nearest-neighbour queries (HNSW, IVF), for semantic search and RAG. Often an extension of an existing store (Postgres + pgvector) rather than a new system.
+## Final memory aid
 
-## Decision guide
-| Requirement | Lean towards |
-|---|---|
-| Multi-row ACID transactions, relationships, flexible queries | Relational (PostgreSQL/MySQL) |
-| Global strong consistency + horizontal writes | Distributed SQL (Spanner, CockroachDB) |
-| Simple key lookups at huge scale, predictable latency | Key-value (DynamoDB, Redis for in-memory) |
-| Aggregates with varying shape, read as a whole | Document (MongoDB) |
-| Massive write throughput, time-ordered partitions | Wide-column (Cassandra/Scylla) |
-| Full-text search, relevance, facets | Search engine (Elasticsearch/OpenSearch) |
-| Metrics and time-range aggregations | Time-series DB |
-| Deep relationship traversal | Graph DB |
-| Analytics over large history | Columnar warehouse |
-| Semantic similarity | Vector index/DB |
-
-## Polyglot persistence and data flow
-Real systems combine stores: Postgres for orders (source of truth) → CDC (Debezium) → Kafka → Elasticsearch (search), Redis (cache), ClickHouse (analytics). State clearly **which store is the source of truth** for each piece of data and how others are derived (and how stale they may be).
-
-## Normalisation vs denormalisation
-- **Normalised:** no duplication, so updates happen in one place and integrity is easy, but reads need joins.
-- **Denormalised:** duplicate data for fast reads (author name stored on each post), but updates fan out and can be temporarily inconsistent.
-Read-heavy systems at scale usually denormalise read models while keeping a normalised source of truth.
-
-## Interview questions
-1. **SQL or NoSQL for an e-commerce order system?** Relational for orders, payments and inventory (transactions, constraints); NoSQL or a search engine for the catalog and browsing; a cache for hot product pages.
-2. **Why Cassandra for chat messages?** Write-heavy, partitioned by conversation, time-ordered reads within a partition, linear scaling and multi-DC replication.
-3. **How do you avoid hot partitions in DynamoDB/Cassandra?** High-cardinality partition keys, write sharding (`key#suffix`), and time bucketing.
-4. **When would you pick a distributed SQL database?** When you need horizontal write scaling **and** strong consistency/transactions, possibly across regions, and can accept higher write latency.
-
-## Cheat sheet
-```
-Access patterns → store. Name the source of truth; derive the rest (CDC/events).
-Relational: ACID, joins, flexible queries; replicas → partitioning → sharding/distributed SQL
-KV: get/put at scale (DynamoDB pk+sk) · Document: flexible aggregates · Wide-column: write-heavy, query-per-table
-Search: inverted index (secondary) · Time-series: metrics · Graph: traversals · OLAP: columnar analytics · Vector: ANN
-Isolation: RC (lost update/write skew possible) → snapshot → serializable
-```
+- **Access patterns first, database second**
+- **Relational for money, bookings and invariants**
+- **Key-value for lookups by ID at scale**
+- **Document for flexible, self-contained objects**
+- **Wide-column for huge write-heavy timelines**
+- **Graph for deep relationships, search engine for text**
+- **Time-series for metrics with retention**
+- **One source of truth; derive the rest through CDC**

@@ -1,461 +1,593 @@
 === hld-sharding | HLD | Partitioning (sharding) ===
-When one machine can no longer hold the data or absorb the write rate, you split the dataset into **partitions** (shards) and spread them across nodes. Replication copies the same data; partitioning divides different data. The quality of a sharded design depends almost entirely on the partition key: it decides whether load spreads evenly, which queries stay on one shard, and how painful growth will be. This chapter covers partitioning schemes, choosing keys, hot spots, secondary indexes, cross-shard queries, rebalancing and a practical resharding playbook.
+Sharding splits one big dataset into smaller pieces, called shards or partitions, and puts them on different machines so no single machine has to hold all the data or take all the writes. Replication copies the same data; sharding divides different data. Almost everything about a sharded design depends on one choice, the shard key, so this chapter spends most of its time on choosing it well and on what to do when it goes wrong.
 
-## Core concepts
-- **Partition / shard:** a subset of the data owned by one node (or one replica group). Each record belongs to exactly one partition.
-- **Partition key (shard key):** the attribute used to decide the partition, e.g. `user_id`, `tenant_id`, `conversation_id`.
-- **Router:** the component that maps key to partition to node. It can live in the client library (Cassandra drivers, Redis Cluster clients), in a proxy (Vitess VTGate, MongoDB mongos, Citus coordinator), or in a metadata service the clients consult.
-- **Skew:** some partitions receive more data or traffic than others. A partition that is much busier than the rest is a **hot spot**.
-- **Sharding is combined with replication:** each partition usually has a leader and followers (or N leaderless replicas), and one physical node hosts many partitions.
+## 1. Why shard
 
-```
-               router (key -> partition -> node)
-              /             |              \
-   Node A                Node B               Node C
-   P1 (leader)           P2 (leader)          P3 (leader)
-   P3 (follower)         P1 (follower)        P2 (follower)
-```
+**Definition:** Sharding (also called partitioning) means splitting a dataset by some key so each machine stores and serves only part of it.
 
-### When to shard
-Sharding adds permanent complexity, so exhaust simpler options first: vertical scaling (a large modern server handles tens of thousands of transactions per second and tens of TB), read replicas, caching, archiving cold data, and table partitioning inside one database. Shard when the **write throughput**, **data size** or **working set** clearly exceeds one node, or when you need data residency per region. In interviews, do the back-of-envelope maths and say so: "6 TB per year and 40 K writes per second at peak, so we shard by user_id."
+Replication helps reads, but every replica still holds the full dataset and every write still goes through one leader. When the data no longer fits on one machine, or the write rate is more than one machine can absorb, you must split the data itself. Think of a library that outgrew its building: you do not build ten identical copies, you put A-F in one building and G-M in another.
 
-## Partitioning schemes
-### Range partitioning
-Each partition owns a contiguous key range: A–F, G–M, and so on, or timestamps by month. Used by HBase, Bigtable, Spanner, CockroachDB (ranges of ~512 MB), TiKV, MongoDB ranged sharding.
+### The problem
 
-- Efficient range scans: "orders for user 42 between March and May" hits one or two partitions.
-- Partitions can split dynamically when they grow.
-- **Risk:** sequential keys (timestamps, auto-increment IDs) send every new write to the last partition, a hot tail. Mitigate by prefixing with a high-cardinality component (`sensor_id, timestamp`) rather than leading with time.
-
-### Hash partitioning
-Apply a hash to the key and assign hash ranges (or hash mod a fixed number of slots) to partitions. Used by Cassandra, DynamoDB, Redis Cluster, MongoDB hashed sharding, Citus, Vitess (default vindex).
-
-- Spreads keys uniformly, even sequential ones.
-- **Loses range queries** across keys: adjacent keys land on different partitions.
-- Compound keys recover locality: Cassandra hashes only the partition key and keeps rows sorted by clustering columns within it, so `PRIMARY KEY ((user_id), created_at)` gives even distribution across users and ordered range scans within one user.
-
-### Directory (lookup) partitioning
-A mapping service stores `key -> shard` explicitly (or `tenant -> shard`).
-
-- Maximum flexibility: move a single tenant, place a big customer on dedicated hardware, rebalance anything.
-- Costs: an extra lookup (cache it aggressively), and the directory must be highly available and consistent; it becomes a critical dependency.
-- Common for multi-tenant SaaS (Slack, Shopify-style "pods" or "cells"), and in Vitess as a lookup vindex.
-
-### Geographic partitioning
-Partition by region or country: EU users' data stays in EU shards. Driven by latency and data-residency law (GDPR, India's DPDP). Often combined with another scheme inside each region. Cross-region users (travelling, moving) need a migration path.
-
-### Comparison
-| Scheme | Distribution | Range queries | Rebalancing | Typical use |
-|---|---|---|---|---|
-| Range | Can be skewed (hot tail) | Excellent | Split/merge ranges | Time-ordered data, ordered scans, NewSQL |
-| Hash | Even | Only within a partition (compound key) | Move hash slots/vnodes | KV workloads, user data, sessions |
-| Directory | As good as your placement | Depends | Move individual keys/tenants | Multi-tenant SaaS, uneven tenants |
-| Geo | By population | Within region | Move users between regions | Residency, latency |
-
-## Choosing a shard key
-A good key has:
-1. **High cardinality:** many distinct values (user_id, not country).
-2. **Even access frequency:** no single value dominates traffic.
-3. **Query alignment:** the most frequent and latency-critical queries include the key, so they hit one shard.
-4. **Transaction alignment:** data changed together lives together (an order and its line items share `customer_id` or `order_id`).
-5. **Stability:** it does not change. Changing a shard key value means moving the row.
-
-Worked examples:
-| System | Good key | Why | Bad key |
-|---|---|---|---|
-| Chat | `conversation_id` (plus time bucket) | All messages of a conversation in one partition, ordered | `message_id` (history scattered) |
-| E-commerce orders | `customer_id` | "My orders" is single-shard; checkout touches one customer | `order_date` (hot tail) |
-| Multi-tenant SaaS | `tenant_id` | Tenant isolation, joins stay local | `user_id` if most queries are tenant-wide |
-| URL shortener | `short_code` (hash) | Point lookups only, even spread | creation time |
-| Metrics | `(metric_id, time_bucket)` | Spread across metrics and time, range within bucket | `timestamp` alone |
-| Ride hailing | `city_id` / geo cell | Matching queries are local | `driver_id` for proximity search |
-
-## Hot keys and the celebrity problem
-Even with a perfect hash, one key can be hot: a celebrity with 100 million followers, a viral tweet's like counter, a flash-sale product, a single huge tenant. Hashing cannot split a single key, so you need application-level techniques.
-
-- **Key salting / write sharding:** append a suffix `0..N-1` to spread writes for one logical key across N partitions; reads fan out to all N and combine.
-
-```java
-// Spread writes for a hot counter across 16 sub-keys; read sums them
-private static final int SALT = 16;
-
-public void incrementLikes(String postId) {
-    int bucket = ThreadLocalRandom.current().nextInt(SALT);
-    redis.opsForValue().increment("likes:" + postId + ":" + bucket);
-}
-
-public long getLikes(String postId) {
-    List<String> keys = IntStream.range(0, SALT)
-        .mapToObj(i -> "likes:" + postId + ":" + i).toList();
-    return redis.opsForValue().multiGet(keys).stream()
-        .filter(Objects::nonNull).mapToLong(Long::parseLong).sum();
-}
+```text
+orders database: 8 TB, growing 1 TB/month, 40,000 writes/sec at peak
+largest practical single machine: ~10 TB fast disk, ~15,000 writes/sec
+read replicas do not help: each one also needs 8 TB and replays all 40,000 writes/sec
 ```
 
-- **Salt only the hot keys:** detect heavy hitters (count-min sketch, per-key metrics) and salt them dynamically, keeping normal keys cheap to read.
-- **Caching and request coalescing** for read-hot keys: replicate the hot value to many cache nodes or to an in-process near cache.
-- **Aggregate before writing:** buffer increments in memory or a stream processor and flush every second.
-- **Special handling for celebrities in feeds:** fan-out-on-write for normal users, fan-out-on-read for celebrity posts (merged at read time).
-- **Dedicated shards** for whale tenants via directory partitioning.
-- **Time bucketing** to stop one partition growing forever (`(device_id, day)`).
+Within two months the data no longer fits, and the write rate is already more than one leader can handle.
 
-DynamoDB has "adaptive capacity" and split-for-heat that isolates hot items onto their own partitions, but a single item is still limited (about 1,000 write units per second per partition), so salting remains necessary for truly hot items.
+### Better design
 
-## Secondary indexes in a sharded database
-Data is partitioned by the primary key, but you also query by other attributes ("cars with colour = red", "orders by status"). Two designs:
+```text
+shard by customer_id across 8 shards (each one a small leader-follower group)
+  shard 0: ~1 TB, ~5,000 writes/sec
+  shard 1: ~1 TB, ~5,000 writes/sec
+  ...
+  shard 7: ~1 TB, ~5,000 writes/sec
+router: shard = f(customer_id)
+```
 
-### Local (document-partitioned) index
-Each partition indexes only its own data.
-- Writes are cheap: update the index on the same shard, in the same transaction.
-- Reads by the secondary attribute must **scatter-gather** across all partitions and merge.
-- Used by: MongoDB, Elasticsearch, Cassandra secondary indexes, DynamoDB **local** secondary indexes (same partition key, different sort key).
+Each shard is small enough for one machine, and adding shards adds both storage and write capacity.
 
-### Global (term-partitioned) index
-The index itself is partitioned by the indexed value: all `colour=red` entries live on one index partition.
-- Reads by the attribute hit one index partition.
-- Writes touch the data shard plus one or more index shards: a distributed write, usually updated **asynchronously**, so the index is eventually consistent.
-- Used by: DynamoDB **global** secondary indexes (async), Vitess lookup vindexes, Citus/Spanner/CockroachDB global indexes (kept consistent with distributed transactions, at a write-latency cost).
+**Trade-offs:**
+- Queries that span shards, joins and transactions across shards become hard (section 5).
+- More moving parts: routing, rebalancing, per-shard monitoring.
 
-| | Local index | Global index |
+**Key takeaway:** Shard when one machine cannot hold the data or take the writes. Before that, try a bigger machine, read replicas, caching and archiving old data.
+
+---
+
+## 2. Range vs. hash partitioning
+
+**Definition:** Range partitioning gives each shard a continuous range of keys (A-F, G-M); hash partitioning gives each shard a range of hash values of the key, which scatters neighbouring keys.
+
+Range partitioning is like a dictionary split into volumes: great for "all words from 'cat' to 'cow'", but if every new word started with "z", one volume would get all the work. Hashing turns the key into a random-looking number first, so load spreads evenly, but neighbouring keys end up on different shards.
+
+### The problem
+
+```text
+range partitioning on created_at (one shard per month)
+  shard Jan: idle
+  shard Feb: idle
+  shard Mar: idle
+  shard Apr (current month): 100% of all writes  <- hot shard
+```
+
+Any key that grows over time (timestamps, auto-increment IDs) sends every new write to the last shard. The other shards sit idle while one melts down.
+
+### Better design
+
+```text
+hash partitioning on order_id
+  hash(order_id) in [0, 2^32) split into 8 equal ranges
+  new orders land on random-looking shards -> ~12.5% of writes each
+range partitioning still used where ranges matter:
+  key = (sensor_id, timestamp) -> spreads by sensor, keeps time order within a sensor
+```
+
+Hashing removes the hot-shard problem for random lookups. When you also need range scans, put a well-spread value first and the time inside it.
+
+**Trade-offs:**
+- Hash partitioning makes range queries ("all orders last week") hit every shard.
+- Range partitioning needs careful split points and watching for hot ranges.
+
+**Key takeaway:** Hash for even load and point lookups; range when you truly need ordered scans, and never range on a key that only grows.
+
+### Range vs. hash
+
+- **Range:** keeps order, supports scans, risks hot spots. Used by HBase, Bigtable and MongoDB ranged sharding.
+- **Hash:** spreads load evenly, loses order. Used by Cassandra (partition key), DynamoDB and Redis Cluster.
+- Many systems combine them: hash on the first part of the key, sort by the second part within the shard (Cassandra partition key plus clustering columns).
+
+---
+
+## 3. Directory partitioning
+
+**Definition:** Directory partitioning uses a lookup table that records, for each key or group of keys, which shard holds it.
+
+Instead of computing the shard from the key with a fixed formula, you ask a directory, like a hotel front desk that knows which room each guest is in. That gives full control: you can move one customer without changing any formula.
+
+### The problem
+
+```text
+SaaS app, hash(tenant_id) % 16 decides the shard
+tenant "BigBank" grows to 40% of all traffic, stuck on shard 5 with 30 small tenants
+moving BigBank means changing the formula -> which moves everyone else too
+```
+
+A pure formula cannot make an exception for one huge tenant.
+
+### Better design
+
+```text
+directory (cached in every app server, stored in etcd / a small DB):
+  tenant_id     -> shard
+  "acme"        -> shard-3
+  "bigbank"     -> shard-17  (dedicated)
+  "tinyco"      -> shard-3
+move a tenant: copy data, update one directory row, done
+```
+
+Each tenant can be placed, moved or isolated individually.
+
+**Trade-offs:**
+- An extra lookup on every request, so the directory must be cached and highly available.
+- The directory itself becomes critical infrastructure.
+
+**Key takeaway:** Use a directory when a few keys are very different in size, typically tenants in a multi-tenant system.
+
+---
+
+## 4. Choosing a shard key
+
+**Definition:** The shard key is the field used to decide which shard a record lives on.
+
+A good shard key has four properties: **high cardinality** (many distinct values), **even spread** of data and traffic, it **matches the main query** so most requests touch one shard, and it is **stable** (it never changes, because changing it means moving the record).
+
+### The problem
+
+```text
+chat messages, shard key = message_id (hashed)
+query: "last 50 messages in conversation 881"
+  -> those 50 messages are spread across all 16 shards
+  -> every page load asks 16 shards and merges results
+alternative bad key: country -> India shard holds 40% of users
+```
+
+The first key spreads load but breaks the main query; the second matches some queries but has few, uneven values.
+
+### Better design
+
+```text
+shard key = conversation_id (hashed), sort by message_id inside the shard
+  "last 50 messages in conversation 881" -> one shard, one sorted read
+orders: shard key = customer_id
+  "my orders" -> one shard; "order by id" -> include the shard in the order ID
+```
+
+Every common request now goes to exactly one shard, and load spreads because there are millions of conversations.
+
+**Trade-offs:**
+- Queries by any other field (for example "all messages by user X") need a secondary index or a second copy of the data.
+
+**Key takeaway:** Pick the key your most important query filters on, as long as it has many values and spreads evenly.
+
+---
+
+## 5. Hot keys and salting
+
+**Definition:** A hot key is a single key that gets far more traffic than others, overloading the one shard that holds it; salting splits that key into several sub-keys spread across shards.
+
+Even with a perfect hash, all traffic for one key goes to one shard. A celebrity's post, a flash-sale product or a viral video can receive a large fraction of all requests. Hashing cannot help, because the same key always hashes to the same place.
+
+### The problem
+
+```text
+like counter for a celebrity post, key = post:777
+shard 4 holds post:777 -> 200,000 likes/sec
+every other shard: ~3,000 ops/sec
+shard 4 CPU 100%, timeouts for every other key that lives on shard 4
+```
+
+### Better design
+
+```text
+write: key = post:777#<random 0-9>      -> 10 sub-keys on ~10 shards, ~20,000/sec each
+read:  sum(post:777#0 ... post:777#9)   -> 10 small reads, cached for 1-2 seconds
+apply salting only to keys detected as hot (a small "hot keys" list)
+```
+
+Writes spread over ten shards, and reads pay a small fan-out that a cache absorbs.
+
+**Trade-offs:**
+- Reads become a fan-out and merge; salting every key would make all reads 10x more expensive.
+- You need detection (per-key counters) to know which keys are hot.
+
+**Key takeaway:** Hashing fixes uneven keys, not one hot key. For that, split the key (salting), cache its reads, or batch its writes.
+
+---
+
+## 6. Cross-shard queries
+
+**Definition:** A cross-shard query needs data from more than one shard, so a router sends it to many shards and merges the results (scatter-gather).
+
+Scatter-gather works, but the query is only as fast as the slowest shard, and the load is multiplied by the number of shards. Joins across shards and transactions across shards are even harder.
+
+### The problem
+
+```text
+"top 10 products by sales today" with orders sharded by customer_id across 32 shards
+  -> 32 queries in parallel, each returns its local top 10, router merges
+  -> p99 latency = slowest of 32 shards; 32x the load of a single-shard query
+"transfer money between customer A (shard 3) and customer B (shard 19)"
+  -> one database transaction cannot span two shards
+```
+
+### Better design
+
+```text
+reporting: stream orders (CDC) into an analytics store; precompute top-10 every minute
+transfers: saga -> debit A on shard 3, then credit B on shard 19,
+           with a compensating "refund A" if the credit fails
+           (or two-phase commit when strict atomicity is required)
+co-locate data queried together: customer, their orders and their addresses share customer_id
+```
+
+Keep the hot path single-shard, move analytics elsewhere, and handle the rare cross-shard write explicitly.
+
+**Trade-offs:**
+- Sagas are eventually consistent and need compensation logic; two-phase commit is atomic but slower and blocks if the coordinator fails.
+
+**Key takeaway:** Design the shard key so frequent queries stay on one shard; treat scatter-gather as the exception.
+
+---
+
+## 7. Secondary indexes: local vs. global
+
+**Definition:** A local secondary index lives inside each shard and covers only that shard's data; a global secondary index is partitioned by the indexed value itself and covers all shards.
+
+If orders are sharded by `customer_id` and you need "all orders with status = SHIPPED" or "find user by email", the shard key does not help. A secondary index does, but you must decide where it lives.
+
+### The problem
+
+```text
+users sharded by user_id across 16 shards, login by email
+local index on email in each shard:
+  "find email = a@b.com" -> ask all 16 shards, 15 answer "not here"
+  at 10,000 logins/sec that is 160,000 index lookups/sec
+```
+
+### Better design
+
+```text
+global index, partitioned by email:
+  hash(email) -> index shard 6 -> { email: a@b.com, user_id: 9912 }
+  then hash(9912) -> user shard 11 -> the user row
+  = 2 targeted reads instead of 16
+```
+
+Reads are targeted, but a write to a user can now touch two shards (the data and the index), so global indexes are usually updated asynchronously. DynamoDB global secondary indexes, for example, are eventually consistent.
+
+**Trade-offs:**
+- **Local:** writes are cheap and consistent, reads by that field scatter to every shard (Cassandra, MongoDB and Elasticsearch work this way).
+- **Global:** reads are targeted, writes are costlier and the index can lag behind the data.
+
+**Key takeaway:** Local index for rare or analytical lookups; global index (or a separate lookup table) for frequent lookups by a non-shard field such as email.
+
+---
+
+## 8. Rebalancing
+
+**Definition:** Rebalancing is moving data between machines when you add or remove nodes, or when some shards grow larger or hotter than others.
+
+The naive formula `shard = hash(key) % N` is fine until N changes. Going from 4 to 5 nodes changes the result for about 80% of keys, so most of the data has to move at once. Good schemes move only the minimum.
+
+### The problem
+
+```text
+hash(key) % 4  ->  hash(key) % 5
+key hash 6:  6 % 4 = 2,  6 % 5 = 1   -> moves
+key hash 13: 13 % 4 = 1, 13 % 5 = 3  -> moves
+~80% of 8 TB = ~6.4 TB copied over the network while serving live traffic
+```
+
+### Better design
+
+```text
+fixed number of logical partitions, many more than nodes:
+  1024 partitions, 4 nodes -> 256 partitions each
+  add node 5 -> it takes ~205 partitions from the others; nothing else moves
+  partition -> node map kept in a coordinator (ZooKeeper / etcd)
+moving one partition: copy snapshot -> stream new changes -> switch routing -> delete old copy
+```
+
+Only the partitions that change owner are copied, about 20% of the data, and the key-to-partition formula never changes. Redis Cluster (16,384 hash slots), Couchbase (1,024 vBuckets) and Elasticsearch (shard count fixed when the index is created) use this idea. Systems such as HBase and MongoDB instead split a range when it grows too big and move the pieces. Consistent hashing, the next chapter, is another answer.
+
+**Trade-offs:**
+- Moving data uses network and disk I/O, so throttle it and avoid it during incidents.
+- Fully automatic rebalancing can make a bad situation worse; many teams keep a human approval step.
+
+**Key takeaway:** Never use `% N` on physical nodes; map keys to many fixed partitions and move whole partitions.
+
+---
+
+## In an HLD interview
+
+- **Chat/WhatsApp:** shard messages by `conversation_id`, sorted by message time inside the shard, so loading a chat is one shard read.
+- **URL Shortener / Distributed Cache:** hash on the short code or cache key; mention consistent hashing or fixed hash slots for adding nodes.
+- **News Feed / Twitter-like systems:** shard by `user_id`; call out celebrity hot keys and handle them with salting, caching or fan-out-on-read for very large accounts.
+- **Amazon E-commerce / Payment System:** shard orders by `customer_id`, keep cross-shard transfers as sagas, and push reporting to an analytics store via CDC.
+- **What to SAY:** "My shard key is X because the main query filters on it, it has millions of values and it never changes. Queries by Y use a global index. I will start with 1024 logical partitions so adding machines moves only whole partitions."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
 |---|---|---|
-| Write cost | Single shard | Multi-shard (async or distributed txn) |
-| Read by indexed attribute | All shards (scatter-gather) | One index shard (+ fetch) |
-| Consistency | Same as data | Often eventual |
-| Good when | Queries also filter on the shard key, or rare | Frequent lookups by that attribute |
+| Sharding | Split data across machines | Does it still fit on one machine? |
+| Range vs. hash | Keep order, or spread evenly | Do I need range scans on this key? |
+| Directory | Lookup table decides the shard | Are a few keys much bigger than others? |
+| Shard key | Field that decides placement | Does my main query hit one shard? |
+| Hot keys | One key overloads one shard | Is there a celebrity or flash-sale key? |
+| Cross-shard queries | Scatter-gather, sagas | Which queries touch every shard? |
+| Secondary indexes | Local (per shard) or global | Do I look up often by a non-shard field? |
+| Rebalancing | Move the minimum data | What moves when I add a node? |
 
-A common alternative in practice: maintain a separate lookup table or search index (Elasticsearch fed by CDC) for secondary access patterns.
+## Final memory aid
 
-## Cross-shard queries and transactions
-### Scatter-gather
-The router sends the query to every shard, waits for all, and merges (sort, top-K, aggregate).
-- Latency is governed by the **slowest shard** (tail latency amplification: with 100 shards, a 1-in-100 slow response hits most queries).
-- Throughput does not scale: every query costs every shard.
-- Pagination and `ORDER BY ... LIMIT` need per-shard top-K then a global merge.
-- Mitigate with hedged requests, timeouts with partial results, pre-aggregated views, or a search/OLAP store for broad queries.
-
-### Joins
-- **Co-location:** shard related tables on the same key (`orders` and `order_items` by `customer_id`) so joins stay local. Citus calls these co-located distributed tables.
-- **Reference (broadcast) tables:** small, rarely changing tables (countries, currencies, product categories) replicated to every shard.
-- **Denormalise** into the shard's aggregate, or join in the application.
-
-### Transactions
-Single-shard transactions are cheap; multi-shard ones need two-phase commit (Vitess and Citus support it with caveats), a distributed SQL engine (Spanner, CockroachDB), or a saga with compensations. Design the key so that the critical transactions are single-shard: for payments between two accounts on different shards, the usual answer is a ledger with a saga or an idempotent two-step transfer rather than a cross-shard lock.
-
-## Rebalancing
-Over time nodes are added, removed or overloaded, and partitions must move. Goals: keep load even, move as little data as possible, keep serving during the move.
-
-### Why not hash mod N
-`partition = hash(key) % N` moves almost every key when N changes: going from 4 to 5 nodes relocates about 80% of the data (see the consistent hashing chapter). Never tie the key mapping directly to the node count.
-
-### Strategy 1: fixed number of partitions
-Create many more partitions than nodes up front (e.g. 1,024 for 10 nodes). Keys map to partitions with a fixed function; partitions map to nodes through a small table. Adding a node steals whole partitions from others; only the partition-to-node table changes.
-- Examples: Redis Cluster (16,384 hash slots), Couchbase (1,024 vBuckets), Riak (ring of fixed partitions), Elasticsearch (fixed primary shard count per index), Kafka (fixed partitions per topic; increasing them changes key-to-partition mapping).
-- Choose the count carefully: too few limits future scale-out and makes partitions huge; too many adds overhead. Elasticsearch fixes it at index creation, so you reindex or use the split API.
-
-### Strategy 2: dynamic splitting
-Start with few partitions; when one exceeds a size or load threshold, split it in two; merge small neighbours.
-- Examples: HBase regions, Bigtable tablets, MongoDB chunks (split and moved by the balancer), CockroachDB/TiKV ranges, DynamoDB partitions (split on size over 10 GB or on throughput).
-- Adapts to data volume and to skew; with an empty database, pre-split to avoid all writes hitting one partition initially.
-
-### Strategy 3: partitions proportional to nodes
-Each node owns a fixed number of partitions (Cassandra vnodes / tokens); a new node splits random existing ranges and takes half. This is consistent hashing with virtual nodes.
-
-### Automatic vs manual
-Fully automatic rebalancing can turn a slow node into a cascade (it looks dead, data is moved, the move overloads others). Many operators prefer the system to propose moves and a human or a rate-limited controller to apply them. Always throttle data movement.
-
-## Real-world systems
-- **Vitess (MySQL, used by YouTube, Slack, GitHub):** keyspaces split into shards by keyspace ID ranges; **vindexes** map column values to keyspace IDs (hash, lookup, custom). VTGate routes queries, scatters when needed. Resharding uses VReplication: copy, stream changes, verify (VDiff), then switch reads and writes with a brief write pause.
-- **Citus (Postgres extension):** distributed tables hashed on a distribution column, reference tables on every node, co-location groups for local joins, a coordinator planning distributed queries; shard rebalancer moves shards online using logical replication.
-- **DynamoDB:** partition key hashed to partitions; each partition about 10 GB and roughly 3,000 read / 1,000 write units per second; automatic splitting by size and heat; LSIs (local, strongly consistent, 10 GB per partition key limit) and GSIs (global, eventually consistent).
-- **MongoDB:** `sh.shardCollection("db.orders", { customerId: "hashed" })` or ranged keys; data in chunks moved by the balancer; `mongos` routers and config servers holding metadata; targeted vs broadcast queries; reshardCollection (5.0+) for changing the key online.
-- **Cassandra:** Murmur3 hash of the partition key on a token ring with vnodes; replication along the ring.
-- **Spanner / CockroachDB:** range partitioning with automatic split, merge and load-based rebalancing; each range replicated with Paxos/Raft.
-
-## Resharding playbook
-Changing shard count or key on a live system, without downtime:
-
-1. **Plan:** choose the new key/layout; estimate data per shard and growth for 2–3 years; prefer a layout with many logical shards (so the next expansion is a move, not a re-hash).
-2. **Provision** target shards and make the router aware of both old and new mappings.
-3. **Backfill:** copy existing data to the new layout in throttled batches (snapshot at a known log position).
-4. **Catch up:** stream ongoing changes from the source via CDC (binlog, logical replication, VReplication) until lag is near zero. Alternatively, dual-write from the application, but CDC avoids partial-failure inconsistencies.
-5. **Verify:** row counts, checksums per key range, shadow reads comparing old and new results.
-6. **Cut over reads** gradually (by percentage or tenant), watching error rates and latency.
-7. **Cut over writes:** a brief write freeze or a fenced switch so no write lands on the old shard after the switch; keep reverse replication running to allow rollback.
-8. **Clean up:** stop reverse replication after a bake period, delete the old copies, update runbooks.
-
-## How it shows up in interview problems
-- **URL shortener:** hash-shard by short code; 7-character codes and billions of rows fit in a handful of shards; directory not needed.
-- **Chat (WhatsApp/Messenger):** shard messages by `conversation_id` with time buckets; user inboxes by `user_id`.
-- **News feed / Twitter:** timelines sharded by `user_id`; celebrity problem solved by hybrid fan-out.
-- **Distributed cache:** key hashed onto nodes via consistent hashing or hash slots.
-- **Rate limiter:** counters sharded by API key; hot tenants get local pre-aggregation.
-- **Uber / maps:** geo partitioning by city then cell; split hot cells (airports).
-- **E-commerce:** orders by `customer_id`, catalog by `product_id`, inventory per `sku` with flash-sale hot keys handled by token buckets or pre-allocated stock shards.
-- **Metrics / logging:** `(metric, time_bucket)` or time-partitioned indices (one index per day) that are dropped wholesale for retention.
-- **Payments:** shard ledgers by account; cross-account transfers via saga or a distributed SQL store.
-
-## Common pitfalls
-- Sharding too early, or sharding before measuring.
-- A low-cardinality or monotonically increasing shard key.
-- Choosing a key that matches storage but not the critical queries, so everything becomes scatter-gather.
-- Ignoring the hot-key problem until a celebrity or flash sale happens.
-- `hash % N` mapping that forces a full reshuffle on growth.
-- Global secondary indexes assumed to be strongly consistent.
-- Cross-shard transactions on the hot path.
-- Unbounded partitions (a Cassandra partition growing to GBs) because the key lacked a time bucket.
-- Auto-increment IDs per shard colliding: use globally unique IDs (Snowflake, UUID v7).
-
-## Interview questions
-1. **Range or hash partitioning for time-series sensor data?** Hash (or compound) on `sensor_id` with a time bucket, then range within the partition. Pure time-range partitioning puts all current writes on one hot partition.
-2. **How do you handle a celebrity account whose posts get millions of likes per minute?** Salt the counter key across N sub-keys and sum on read, aggregate increments in memory or a stream before writing, cache reads, and use fan-out-on-read for that author's posts in feeds.
-3. **Local vs global secondary indexes?** Local indexes are updated with the data on the same shard but queries must scatter-gather; global indexes are partitioned by the indexed term so reads are targeted, but writes span shards and are usually eventually consistent.
-4. **Why is hash mod N a bad idea?** Changing N remaps most keys (about 80% when going from 4 to 5 nodes), causing massive data movement and cache misses. Use a fixed number of logical partitions or consistent hashing.
-5. **How would you reshard a live MySQL database?** Create target shards, backfill a snapshot, stream changes via binlog/CDC, verify with checksums and shadow reads, shift reads, then switch writes with a brief fenced cut-over, keeping reverse replication for rollback (Vitess automates this).
-6. **What makes a good shard key for a multi-tenant SaaS?** Usually `tenant_id`: high cardinality, aligns with nearly every query and transaction, isolates tenants; use a directory to place very large tenants on dedicated shards.
-7. **How do you run "top 10 products by sales" across 64 shards?** Each shard computes its local top-K (or partial aggregates) and the router merges; better, maintain a pre-aggregated view in a stream processor or OLAP store rather than querying OLTP shards.
-8. **How many logical partitions should you create up front?** Enough to cover several years of growth with partitions of manageable size (often 10–100x the initial node count), so scaling out is moving partitions rather than re-hashing keys.
-
-## Cheat sheet
-- Shard when write throughput, size or working set exceeds one node; try replicas, caching and archiving first.
-- Range: scans, hot tail risk. Hash: even, no cross-key ranges. Directory: flexible, extra lookup. Geo: residency and latency.
-- Shard key: high cardinality, even access, matches main queries and transactions, immutable.
-- Hot keys: salting, heavy-hitter detection, caching, pre-aggregation, dedicated shards, hybrid fan-out.
-- Secondary indexes: local (cheap writes, scatter reads) vs global (targeted reads, async/distributed writes).
-- Cross-shard: co-locate, reference tables, denormalise, saga instead of 2PC.
-- Rebalancing: fixed many partitions (Redis 16,384 slots) or dynamic split (HBase, Mongo, DynamoDB); never hash % N.
-- Resharding: backfill, CDC catch-up, verify, shift reads, fenced write cut-over, rollback path.
+- **Shard:** divide the data; replication copies it
+- **Hash:** even load; **range:** ordered scans
+- **Key:** many values, even spread, main query, never changes
+- **Hot key:** salt it, cache it
+- **Cross-shard:** rare by design; sagas for writes
+- **Index:** local writes cheap, global reads cheap
+- **Rebalance:** many fixed partitions, never `% N` on nodes
 
 === hld-consistent-hashing | HLD | Consistent hashing ===
-Consistent hashing maps keys to nodes so that when a node joins or leaves, only a small fraction of keys, roughly 1/N, has to move, instead of nearly all of them. It is the placement algorithm behind Dynamo-style databases, distributed caches and sticky load balancing. This chapter explains why naive modulo hashing fails, how the hash ring and virtual nodes work, replication along the ring, the alternatives (rendezvous hashing, jump consistent hash, bounded loads), and gives a Java implementation you can write in an interview.
+Consistent hashing is a way to spread keys across servers so that adding or removing a server moves only a small share of the keys, instead of nearly all of them. It places both servers and keys on a circle of hash values, and each key belongs to the next server clockwise. This chapter shows why the simple `hash % N` approach fails, how the ring and virtual nodes fix it, and how to build one in Java with a `TreeMap`.
 
-## The problem with hash mod N
-The obvious placement is `node = hash(key) % N`. It distributes evenly, but adding or removing one node changes N for every key.
+## 1. The mod-N problem
 
-Worked numbers: with 4 nodes, keys map as `h % 4`; after adding a fifth node they map as `h % 5`. A key stays put only if `h % 4 == h % 5`. The pattern repeats every lcm(4, 5) = 20 hash values, and within hashes 0..19 only 0, 1, 2 and 3 satisfy it: 4 out of 20. So **80% of keys move**. In general, going from N to N+1 nodes moves about N/(N+1) of keys.
+**Definition:** Mod-N placement picks a server with `hash(key) % N`, where N is the number of servers.
 
-Consequences:
-- **Cache:** a cache cluster of 10 nodes becomes 11, and about 91% of lookups miss at once. The database behind it sees a sudden thundering herd and may fall over.
-- **Storage:** almost the entire dataset must be copied across the network during a simple expansion.
+It is simple and spreads keys evenly, and it works perfectly as long as N never changes. The trouble is that N does change: servers fail, and you add servers to grow. When N changes, the answer changes for almost every key.
 
-The ideal is that adding the (N+1)th node moves only about 1/(N+1) of keys, all of them *to the new node*, and none between existing nodes. Consistent hashing achieves that.
+### The problem
 
-## The hash ring
-1. Choose a hash function with a large output space, e.g. 0 to 2^32 − 1 or 2^64 − 1, and imagine it bent into a circle.
-2. Hash each **node** (by its ID, e.g. `"10.0.0.7:6379"`) to a position on the ring.
-3. Hash each **key** to a position on the ring.
-4. A key belongs to the **first node clockwise** from its position (its successor), wrapping around at the end.
-
-```
-                  0 / 2^32
-                     |
-          Node A (10) *
-                   /      \
-   key k3 (95) .              . key k1 (18)
-              |                |
-  Node D (80) *                * Node B (35)
-              |                |
-    key k4 (70) .              . key k2 (50)
-                   \       /
-                    * Node C (60)
-
-  k1 (18) -> B (35)   k2 (50) -> C (60)   k4 (70) -> D (80)   k3 (95) -> wraps -> A (10)
+```text
+4 cache servers -> 5 cache servers, 1,000,000 cached keys
+a key stays put only if hash % 4 == hash % 5
+  that is true only when (hash % 20) is 0, 1, 2 or 3  -> 4 out of 20 = 20%
+  -> 80% of keys (800,000) now map to a different server
+10 -> 11 servers: only 10 of 110 residues match -> ~91% of keys move
 ```
 
-### Adding and removing nodes
-- **Add node E at position 45:** only keys between B (35) and E (45) move, from C to E. Every other key keeps its node.
-- **Remove node C:** only C's keys (35, 60] move, to its successor D.
+For a cache, 800,000 keys suddenly miss at once, and all of those requests hit the database together: a self-inflicted outage. For a database, 80% of the data must be copied over the network.
 
-So each membership change moves about K/N keys, and only between the neighbours involved.
+### Better design
 
-### The uneven-load problem
-With only a few nodes at random positions, the arcs between them are very uneven. With N nodes placed randomly, the largest arc is on the order of (ln N)/N of the ring, so one node can own several times the average share. Also, when a node fails, its entire load lands on a single successor, which may then overload: a cascading failure.
+```text
+consistent hashing, 4 -> 5 servers:
+  only the keys the new server takes over move: about 1/5 = 20% (200,000 keys)
+  the other 800,000 keys stay exactly where they were
+```
 
-## Virtual nodes (vnodes)
-Give each physical node many positions on the ring, e.g. 100–256 tokens, by hashing `"nodeA#0"`, `"nodeA#1"`, and so on.
+In general, adding one server to N moves about 1/(N+1) of the keys, the theoretical minimum needed to give the new server a fair share.
 
-- **Smoother distribution:** each node owns many small arcs, so its total share converges to 1/N. With V vnodes per node, the relative standard deviation of load is roughly 1/sqrt(V): about 10% at 100 vnodes, about 3% at 1,000.
-- **Failure spreads out:** a dead node's many small arcs are taken over by many different successors, so the load is shared across the cluster.
-- **Heterogeneous hardware:** give a bigger machine proportionally more vnodes (weighting).
-- **Cost:** a larger ring table (still tiny: 100 nodes x 256 vnodes = 25,600 entries) and more, smaller ranges to stream and repair.
+**Key takeaway:** `hash % N` moves almost everything when N changes; consistent hashing moves only what it must.
 
-Cassandra historically used `num_tokens: 256`; Cassandra 4.0 changed the default to 16 with a token allocation algorithm that places tokens deliberately rather than randomly, achieving good balance with fewer ranges (fewer ranges makes repair and streaming cheaper).
+---
 
-## Replication along the ring
-To store N replicas, walk clockwise from the key's position and pick the next N **distinct physical nodes** (skipping vnodes of a node already chosen). This list is the key's **preference list**.
+## 2. The hash ring
 
-- **Rack/zone awareness:** also skip nodes in an already-used rack or availability zone so replicas survive a zone outage (Cassandra `NetworkTopologyStrategy`).
-- The first node in the list often acts as the coordinator for that key.
-- Sloppy quorum and hinted handoff extend the list past unavailable nodes (see the replication chapter).
+**Definition:** A hash ring treats the range of hash values (for example 0 to 2^32 - 1) as a circle; each server is placed at the hash of its name, and each key is owned by the first server found by walking clockwise from the key's hash.
 
-## Java implementation (TreeMap ring)
-A sorted map gives O(log V) lookup: `ceilingEntry(hash)` finds the successor, and wrapping to `firstEntry()` closes the circle.
+Picture a round clock face. Servers sit at a few positions around it. To find a key's home, put the key on the clock face and walk clockwise until you hit a server. When a server is added, it only takes over the keys between itself and the server before it; nobody else is affected.
+
+### The problem
+
+With mod-N, every server's share is defined by N itself, so changing N redraws every boundary at once. There is no way to add capacity without moving keys between servers that did not change.
+
+### Better design
+
+```text
+             0
+         S1 (at 10)
+   S4 (at 85)      key k1 (at 20) -> walks clockwise -> S2
+                   S2 (at 30)
+         S3 (at 60)
+      key k2 (at 70) -> walks clockwise -> S4
+
+add S5 at 45: only keys in (30, 45] move, from S3 to S5
+remove S2:    only keys in (10, 30] move, to S3 (the next server clockwise)
+```
+
+Each server owns the arc between its predecessor and itself. Adding or removing a server changes exactly one arc.
+
+**Trade-offs:**
+- With only a few servers, the random positions create very uneven arcs: one server might own 50% of the circle and another 10%.
+- When a server dies, its whole arc lands on one neighbour, which may then be overloaded.
+
+**Key takeaway:** On a ring, a membership change affects only the neighbouring arc, not the whole key space.
+
+---
+
+## 3. Virtual nodes
+
+**Definition:** Virtual nodes (vnodes) place each physical server at many points on the ring, for example 100 to 256, instead of just one.
+
+Instead of one big arc per server, each server owns many small arcs scattered around the circle. By the law of large numbers, the total share per server evens out. It is like dealing a deck of cards: one card each is very unequal, but 50 cards each comes out close to fair.
+
+### The problem
+
+```text
+3 servers, 1 position each (random hashes):
+  S1 owns 55% of the ring, S2 owns 30%, S3 owns 15%
+S1 fails -> its whole 55% lands on the next server clockwise
+  -> that server now holds 70-85% of all keys and falls over too (cascading failure)
+```
+
+### Better design
+
+```text
+3 servers x 150 vnodes = 450 points on the ring
+  positions: hash("S1#0"), hash("S1#1"), ..., hash("S3#149")
+  each server owns ~33% of the ring, typically within a few percent
+S1 fails -> its 150 small arcs are spread over S2 and S3 roughly equally
+weighted: a server with twice the memory gets twice the vnodes
+```
+
+More points per server means smoother load, and a failed server's load is shared by all survivors instead of one neighbour.
+
+**Trade-offs:**
+- The ring is bigger (servers x vnodes entries) and lookups cost O(log of ring size), still microseconds.
+- Too many vnodes makes repair and streaming in databases more expensive; Cassandra lowered its default `num_tokens` from 256 to 16 in version 4.0, using a smarter token allocator for balance.
+
+**Key takeaway:** Always use virtual nodes; they fix uneven arcs, spread failure load and allow weighting by capacity.
+
+---
+
+## 4. Replication on the ring
+
+**Definition:** To keep R copies of a key, store it on the owner and on the next R-1 distinct physical servers clockwise; this ordered list is called the preference list.
+
+The ring already gives an order, so replica placement needs no extra metadata. The one catch with vnodes is that the next few points clockwise may belong to the same physical server, which would put two "replicas" on one machine.
+
+### The problem
+
+```text
+replication factor 3, walking the next 3 POINTS clockwise:
+  key k -> S2#17, S2#88, S4#3
+  two of the three copies are on S2 -> if S2 dies, only one copy is left
+```
+
+### Better design
+
+```text
+walk clockwise, skip points whose physical server is already chosen:
+  S2#17 (take S2) -> S2#88 (skip) -> S4#3 (take S4) -> S2#40 (skip) -> S1#9 (take S1)
+  preference list for k = [S2, S4, S1]
+rack/zone aware: also skip a server in a zone already used
+```
+
+Three copies on three different machines, ideally in three different zones, so one failure never removes more than one copy.
+
+**Trade-offs:**
+- Rack or zone awareness makes placement more complex and can unbalance load if zones have unequal capacity.
+
+**Key takeaway:** Replicas are the next N distinct physical servers (and zones) clockwise, not the next N points.
+
+---
+
+## 5. A Java implementation with TreeMap
+
+**Definition:** A `TreeMap<Long, String>` makes a natural ring: the keys are ring positions, and `ceilingEntry(hash)` finds the first position at or after a key's hash.
+
+A sorted map gives O(log n) lookups. If `ceilingEntry` returns null, the key's hash is past the last server, so you wrap around to `firstEntry()`. That one line is what turns a sorted list into a circle.
+
+### The problem
 
 ```java
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.*;
-import java.util.concurrent.ConcurrentSkipListMap;
+// Naive mod-N routing: most keys move when servers.size() changes
+String serverFor(String key, List<String> servers) {
+    int i = Math.abs(key.hashCode()) % servers.size();   // also a bug:
+    return servers.get(i);   // Math.abs(Integer.MIN_VALUE) is negative -> crash
+}
+```
 
-public final class ConsistentHashRing<N> {
-    private final ConcurrentSkipListMap<Long, N> ring = new ConcurrentSkipListMap<>();
-    private final int virtualNodes;
+Besides moving most keys on every resize, `String.hashCode()` is poorly spread for similar strings, and `Math.abs` can return a negative number.
 
-    public ConsistentHashRing(Collection<N> nodes, int virtualNodes) {
-        this.virtualNodes = virtualNodes;
-        nodes.forEach(this::addNode);
+### Better design
+
+```java
+public final class HashRing {
+    private final TreeMap<Long, String> ring = new TreeMap<>();
+    private final int vnodes;
+
+    public HashRing(int vnodes) { this.vnodes = vnodes; }
+
+    public void addServer(String server) {
+        for (int i = 0; i < vnodes; i++) ring.put(hash(server + "#" + i), server);
     }
 
-    public void addNode(N node) {
-        for (int i = 0; i < virtualNodes; i++) {
-            ring.put(hash(node + "#" + i), node);
-        }
+    public void removeServer(String server) {
+        for (int i = 0; i < vnodes; i++) ring.remove(hash(server + "#" + i), server);
     }
 
-    public void removeNode(N node) {
-        for (int i = 0; i < virtualNodes; i++) {
-            ring.remove(hash(node + "#" + i), node);
-        }
-    }
-
-    /** Primary owner: first vnode clockwise from the key's hash. */
-    public N getNode(String key) {
-        if (ring.isEmpty()) throw new IllegalStateException("empty ring");
-        Map.Entry<Long, N> e = ring.ceilingEntry(hash(key));
-        return (e != null ? e : ring.firstEntry()).getValue();
-    }
-
-    /** Preference list: next `replicas` distinct physical nodes clockwise. */
-    public List<N> getReplicas(String key, int replicas) {
-        LinkedHashSet<N> result = new LinkedHashSet<>();
-        long h = hash(key);
-        for (N n : ring.tailMap(h, true).values()) {
-            if (result.size() == replicas) break;
-            result.add(n);
-        }
-        for (N n : ring.headMap(h, false).values()) {   // wrap around
-            if (result.size() == replicas) break;
-            result.add(n);
-        }
-        return new ArrayList<>(result);
-    }
-
-    private static long hash(String s) {
-        try {
-            byte[] d = MessageDigest.getInstance("MD5").digest(s.getBytes(StandardCharsets.UTF_8));
-            long h = 0;
-            for (int i = 0; i < 8; i++) h = (h << 8) | (d[i] & 0xFF);
-            return h;   // any well-mixed 64-bit hash works; Murmur3/xxHash are faster
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
+    public String serverFor(String key) {
+        if (ring.isEmpty()) throw new IllegalStateException("no servers");
+        Map.Entry<Long, String> e = ring.ceilingEntry(hash(key));
+        return (e != null ? e : ring.firstEntry()).getValue();   // wrap around
     }
 }
 ```
 
-Notes for the interview:
-- Use a well-distributed hash (Murmur3, xxHash, or MD5 truncated); `String.hashCode()` clusters badly.
-- Signed `long` ordering is fine: it is still a total order over the circle.
-- `ConcurrentSkipListMap` allows lock-free reads while membership changes; alternatively, build an immutable sorted array and swap it atomically (copy-on-write), which is faster for lookups.
-- Hash collisions between vnodes are possible but rare in 64 bits; handle by skipping or re-salting.
-- In production, membership comes from a coordinator (gossip in Cassandra, ZooKeeper/etcd, or a config service), and every client must converge on the same ring.
-
-## Alternatives and refinements
-### Rendezvous hashing (highest random weight, HRW)
-For each key, compute `score = hash(key, node)` for every node and pick the node with the highest score (top N for replicas).
-- When a node leaves, only its keys move, each to its own second-best node, so load spreads evenly without any virtual nodes.
-- No ring structure to maintain; trivial to implement and naturally supports weights.
-- Cost: O(N) per lookup, fine for tens or hundreds of nodes, less so for thousands (hierarchical/skeleton variants fix this).
-- Used in: Apache Ignite's `RendezvousAffinityFunction`, GitHub's GLB Director forwarding tables, and many CDN and cache tiers.
-
 ```java
-<N> N rendezvous(String key, List<N> nodes) {
-    N best = null; long bestScore = Long.MIN_VALUE;
-    for (N n : nodes) {
-        long score = murmur64(key + "|" + n);
-        if (score > bestScore) { bestScore = score; best = n; }
+// Well-spread 64-bit hash: first 8 bytes of MD5 (Murmur3 or xxHash are faster)
+private static long hash(String s) {
+    try {
+        byte[] d = MessageDigest.getInstance("MD5").digest(s.getBytes(StandardCharsets.UTF_8));
+        return ByteBuffer.wrap(d).getLong();
+    } catch (NoSuchAlgorithmException e) {
+        throw new IllegalStateException(e);
     }
-    return best;
 }
+
+HashRing ring = new HashRing(150);
+List.of("cache-1", "cache-2", "cache-3").forEach(ring::addServer);
+ring.serverFor("user:42");   // same answer until the arc owning user:42 changes
 ```
 
-### Jump consistent hash
-Google's 2014 algorithm maps a key to a bucket number 0..N−1 with no memory and near-perfect balance, moving the minimal 1/(N+1) of keys when a bucket is added.
+Adding `cache-4` inserts 150 new points; only keys that fall just before those points change owner. Using `remove(key, value)` means a rare hash collision with another server's point is not removed by mistake.
 
-```java
-// Lamping & Veach, "A Fast, Minimal Memory, Consistent Hash Algorithm"
-static int jumpConsistentHash(long key, int numBuckets) {
-    long b = -1, j = 0;
-    while (j < numBuckets) {
-        b = j;
-        key = key * 2862933555777941757L + 1;
-        j = (long) ((b + 1) * ((double) (1L << 31) / (double) ((key >>> 33) + 1)));
-    }
-    return (int) b;
-}
+**Trade-offs:**
+- `TreeMap` is not thread-safe. In a real client, build a new map on membership change and swap it in atomically (copy-on-write), or use `ConcurrentSkipListMap`.
+- Every client must see the same server list, usually from a coordinator such as ZooKeeper or etcd, or through gossip.
+
+**Key takeaway:** A sorted map plus "ceiling, else wrap to first" is the whole algorithm; vnodes are just a loop.
+
+---
+
+## 6. Where it is used
+
+**Definition:** Consistent hashing is used wherever many clients must agree, without asking a central service, which server owns a key, while servers come and go.
+
+The idea comes from a 1997 paper by Karger and others, written for web caching, and it was central to Akamai's CDN. Amazon's Dynamo paper (2007) made it the standard design for distributed key-value stores.
+
+### The problem
+
+```text
+Memcached fleet behind 200 app servers, simple % N in each client
+one cache node replaced at 3 a.m. -> most keys remap -> cache hit rate drops sharply
+-> database receives a flood of misses -> latency alarms everywhere
 ```
 
-- O(log N) time, zero memory, very even distribution.
-- Limitation: buckets are numbered; you can only add or remove at the **end**. Removing an arbitrary node needs an extra indirection (bucket to node table, replace in place). Ideal for sharded storage where shards are numbered and replicated (each "bucket" is a replica group), less so for caches where arbitrary nodes die. Guava exposes it as `Hashing.consistentHash`.
+### Better design
 
-### Consistent hashing with bounded loads
-Google (Mirrokni, Thorup, Zadimoghaddam, 2017): give each node a capacity of `ceil((1 + epsilon) * average load)`. A key goes to its successor on the ring unless that node is full, in which case it continues clockwise to the next node with spare capacity. This caps the maximum load (for example at 1.25x average) while keeping most of consistent hashing's stability. Vimeo added it to HAProxy for video caching, and it is useful for load balancers where some keys are hot.
+```text
+Cassandra, ScyllaDB, Riak, DynamoDB  -> ring of token ranges with vnodes, replicas clockwise
+Memcached clients (ketama)            -> consistent hashing in the client library
+Envoy / NGINX / HAProxy               -> "ring hash" load balancing for sticky routing
+Discord, chat and gateway services    -> route each user/channel to one stateful server
+```
 
-### Maglev hashing
-Google's load balancer builds a fixed-size lookup table (e.g. 65,537 entries) by letting each backend fill slots by its own permutation. Lookups are O(1), balance is near-perfect, and backend changes disturb only a small fraction of entries. Used by L4 load balancers (Maglev, Envoy's Maglev LB policy) for connection affinity.
+Replacing a cache node now loses only that node's share of keys, so the database sees a small bump instead of a flood.
 
-### Comparison
-| Algorithm | Lookup | Memory | Balance | Arbitrary node removal | Typical use |
-|---|---|---|---|---|---|
-| Mod N | O(1) | None | Perfect | Moves ~all keys | Never for elastic clusters |
-| Ring + vnodes | O(log V·N) | O(V·N) | Good (improves with V) | Yes, minimal movement | Cassandra, Dynamo, memcached clients |
-| Rendezvous (HRW) | O(N) | O(N) | Excellent | Yes, minimal movement | Small/medium clusters, caches, CDNs |
-| Jump hash | O(log N) | None | Excellent | Only last bucket | Numbered shards (storage) |
-| Bounded loads | O(log) + probing | O(V·N) | Capped max load | Yes | Load balancing with hot keys |
-| Maglev | O(1) | Table (~65K) | Near perfect | Yes, small disruption | L4 load balancers |
-| Fixed slots (Redis Cluster) | O(1) | 16,384 slots | Depends on slot assignment | Move slots explicitly | Redis Cluster, Couchbase |
+### Consistent hashing vs. alternatives
 
-## Real-world systems
-- **Amazon Dynamo (2007 paper):** ring with virtual nodes, preference lists of N distinct nodes, sloppy quorum and hinted handoff. The paper later moved to equal-sized fixed partitions assigned to nodes, to make bootstrapping and archival simpler: a sign that fixed partitions plus a placement table is often easier to operate.
-- **Cassandra / ScyllaDB:** Murmur3 tokens on a 64-bit ring, vnodes, `NetworkTopologyStrategy` for rack/DC-aware replica placement; clients are token-aware and send requests straight to a replica.
-- **Memcached clients:** Ketama (libketama, spymemcached, Xmemcached) implements a client-side ring so that adding a cache server only invalidates ~1/N of keys.
-- **Redis Cluster:** not a ring; uses CRC16(key) mod 16,384 hash slots assigned to masters, with hash tags `{user42}` to force related keys into one slot. Same goal, different mechanism.
-- **Load balancers:** Envoy ring-hash and Maglev policies, Nginx `hash $key consistent`, HAProxy `hash-type consistent` with bounded loads, used for sticky sessions and cache affinity.
-- **Kafka:** partitioner is `murmur2(key) % numPartitions`, which is why adding partitions breaks per-key ordering for existing keys; plan partition counts up front.
-- **Discord, Akka Cluster Sharding, Orleans:** ring- or rendezvous-based placement of actors/sessions across nodes.
+- **Hash slots** (Redis Cluster): a fixed 16,384 slots, `CRC16(key) % 16384`, and an explicit slot-to-node table. Same goal, with an explicit map instead of a ring.
+- **Rendezvous hashing** (highest random weight): score every server with `hash(key, server)` and pick the highest. No ring, even spread, but O(N) per lookup.
+- **Jump consistent hash:** tiny, fast and almost perfectly even, but servers can only be added or removed at the end of a numbered list.
+- **Maglev hashing:** a lookup table built for very fast, even load balancing; used in Google's network load balancer.
 
-## How it shows up in interview problems
-- **Distributed cache (design Memcached/Redis cluster):** the canonical use. Explain mod-N failure, ring with vnodes, replication to the next distinct node, and how clients learn membership.
-- **Key-value store (design Dynamo):** ring + vnodes + preference list + quorum + hinted handoff + Merkle repair.
-- **Rate limiter / API gateway:** route all requests for one API key to the same limiter node (consistent hashing in the gateway) so counters are local.
-- **Chat / WebSocket gateways:** map users or rooms to gateway or session servers; on scale-out only a fraction of connections must move.
-- **URL shortener / object storage:** place keys on storage nodes; Ceph uses CRUSH, a hierarchical relative of rendezvous hashing.
-- **CDN / video:** map content to edge cache servers within a PoP so each object is cached once per PoP, not on every server.
-- **Job scheduler / sharded workers:** assign job partitions to workers stably as workers come and go.
+**Key takeaway:** Reach for consistent hashing when keys live on a changing set of servers and every client must compute the owner on its own.
 
-## Common pitfalls
-- Using mod N and then trying to scale the cache under load.
-- Too few virtual nodes, giving skewed load; or forgetting that a failed node's load all lands on one neighbour without vnodes.
-- A poor hash function (`hashCode()`), producing clustered positions.
-- Clients with inconsistent views of membership, so the same key is read and written on different nodes. Membership must come from one authoritative source or converge via gossip.
-- Replicas placed on vnodes of the same physical node or the same rack.
-- Assuming consistent hashing fixes hot keys: it balances key *counts*, not traffic to a single popular key (use salting, replication of hot keys, or bounded loads).
-- Forgetting data movement: for storage (not cache), the moved 1/N must be streamed before the new node serves reads.
+---
 
-## Interview questions
-1. **Why not use hash(key) % N for a distributed cache?** Changing N remaps nearly every key (about 80% from 4 to 5 nodes), causing a mass cache miss and a stampede on the database. Consistent hashing moves only about 1/N.
-2. **What problem do virtual nodes solve?** Uneven arcs with few nodes, and a dead node's entire load hitting one successor. Many vnodes per node smooth the distribution (deviation about 1/sqrt(V)), spread failover load, and allow weighting for bigger machines.
-3. **How do you choose replicas with consistent hashing?** Walk clockwise from the key's position and take the next N distinct physical nodes, skipping vnodes of already chosen nodes and preferably nodes in the same rack or zone.
-4. **What is the time complexity of a lookup?** O(log M) with a sorted structure (TreeMap or binary search over a sorted array), where M is the total number of vnodes.
-5. **Rendezvous hashing vs ring hashing?** Rendezvous computes a score per node and picks the highest: no vnodes needed, excellent balance and minimal movement, but O(N) per lookup. The ring is O(log M) and scales to many nodes, but needs vnodes for balance.
-6. **When would you use jump consistent hash?** For numbered shards that only grow or shrink at the end (storage replica groups), where you want zero memory and perfect balance; not for caches where arbitrary nodes fail.
-7. **Does consistent hashing solve hot keys?** No. It balances how many keys each node owns, not traffic per key. Handle hot keys with replication of the hot item, client-side caching, key salting, or bounded-load hashing.
-8. **How does Redis Cluster differ?** It uses 16,384 fixed hash slots (CRC16 mod 16,384) explicitly assigned to masters, and rebalancing moves slots; hash tags keep related keys in one slot for multi-key operations.
+## In an HLD interview
 
-## Cheat sheet
-- Mod N moves N/(N+1) of keys on growth (80% for 4 to 5). Consistent hashing moves about 1/N.
-- Ring: hash nodes and keys onto a circle; key goes to the first node clockwise; `TreeMap.ceilingEntry` then wrap to `firstEntry`.
-- Virtual nodes: 100–256 per node (Cassandra 4.0: 16 with smart allocation); deviation about 1/sqrt(V); spreads failover load; weights.
-- Replicas: next N distinct physical nodes clockwise, rack/zone aware.
-- Rendezvous: max hash(key, node), O(N), no vnodes. Jump hash: O(log N), no memory, append-only buckets. Bounded loads: cap at (1 + epsilon) x average. Maglev: O(1) table for L4 LBs.
-- Used by Dynamo, Cassandra, Ketama memcached clients, Envoy/HAProxy/Nginx hashing; Redis Cluster uses fixed slots instead.
-- It balances keys, not hot keys; membership must be consistent across clients.
+- **Distributed Cache:** consistent hashing with 100-200 vnodes in the client, so replacing a node loses only its share of keys and the database is not flooded.
+- **Chat/WhatsApp, Uber Ride Tracking:** route each conversation or driver to one stateful server on a ring so its connection state lives in one place; on failure, only that server's users reconnect elsewhere.
+- **URL Shortener / key-value storage:** a Dynamo-style ring with RF = 3, replicas on the next three distinct servers in different zones.
+- **Rate Limiter / API Gateway:** consistent-hash each user or API key to one limiter node so its counter is not split across nodes.
+- **What to SAY:** "I will not use hash mod N, because adding a fifth node would move 80% of keys. I place nodes on a hash ring with about 150 virtual nodes each, so adding a node moves about 1/N of keys, and replicas go to the next distinct nodes clockwise."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
+|---|---|---|
+| Mod-N problem | Changing N remaps most keys | What happens when I add one server? |
+| Hash ring | Next server clockwise owns the key | Which arc changes on a membership change? |
+| Virtual nodes | Many points per server | Is load even, and where does a failed server's load go? |
+| Replication on ring | Next N distinct servers clockwise | Are two replicas on the same machine or zone? |
+| TreeMap ring | `ceilingEntry`, else wrap to first | Is my hash well spread and my map swap thread-safe? |
+| Where used | Caches, Dynamo-style stores, sticky load balancing | Do clients need to agree on owners without a central lookup? |
+
+## Final memory aid
+
+- **Mod-N:** 4 to 5 servers moves 80% of keys
+- **Ring:** walk clockwise to the first server
+- **Change:** only one arc moves, about 1/N of keys
+- **Vnodes:** many small arcs, fair load, shared failover
+- **Replicas:** next N distinct machines clockwise
+- **Java:** `ceilingEntry`, else `firstEntry`

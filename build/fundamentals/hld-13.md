@@ -1,323 +1,382 @@
 === hld-security | HLD | Security for system design: authn, authz, TLS and secrets ===
-Security in a system-design interview is not about cryptography trivia; it is about putting the right control at the right layer: who is calling (authentication), what they may do (authorization), how data is protected in transit and at rest, where secrets live, and how the system resists abuse. This chapter covers sessions vs tokens, JWT and its pitfalls, OAuth2 and OIDC flows, RBAC/ABAC/ReBAC, API keys and request signing, TLS and mTLS, secrets and envelope encryption, password hashing, the OWASP API risks, DDoS protection, audit logging and compliance basics, with a Spring Security resource server example.
+Security in a system-design interview is not cryptography trivia; it is putting the right control at the right layer. You need to say who is calling (authentication), what they may do (authorization), how data is protected on the wire and on disk, where secrets live, and how the system resists abuse. Each idea below comes with a concrete mistake and the better design.
 
-## Core vocabulary
-- **Authentication (authn):** proving identity ("this is user 42", "this is the billing service").
-- **Authorization (authz):** deciding whether an authenticated principal may perform an action on a resource.
-- **Principal:** the authenticated entity: user, service, device or API client.
-- **Defence in depth:** multiple independent layers (edge, gateway, service, data) so one failure isn't a breach.
-- **Least privilege:** every identity gets only the permissions it needs, for only as long as it needs them.
-- **Zero trust:** the network location grants nothing; every request is authenticated and authorized, including service-to-service calls inside the VPC.
+## 1. Authentication vs. authorization
 
-## Authentication for users
-### Sessions vs tokens
-| | Server-side session | Self-contained token (JWT) |
+**Definition:** Authentication (authn) proves *who* is calling; authorization (authz) decides *what* that caller may do.
+
+At an airport, showing your passport is authentication; your boarding pass deciding which plane and seat you may use is authorization. A **principal** is whoever was authenticated: a user, a service, a device or an API client. Two guiding rules: **least privilege** (give each principal only what it needs) and **zero trust** (being inside the network proves nothing; every call is checked).
+
+### The problem
+
+```text
+Internet -> API gateway (checks login) -> order-service (trusts everything)
+Attacker inside the VPC, or a compromised pod -> calls order-service directly
+-> no checks at all
+```
+
+The team treated "inside the network" as "trusted".
+
+### Better design
+
+```text
+Gateway:  is the token valid? does it carry the right scope?   (coarse)
+Service:  does THIS user own THIS order?                        (fine-grained)
+Database: every query filtered by tenant_id                     (safety net)
+Service-to-service: mutual TLS, so each call proves which service sent it
+```
+
+Several independent layers (defence in depth) mean one mistake is not a breach.
+
+**Key takeaway:** Authenticate every hop and authorize at the layer that knows the resource.
+
+---
+
+## 2. Sessions vs. tokens
+
+**Definition:** With a session, the server stores login state and the client holds a random session ID; with a self-contained token, the client holds signed claims that any server can verify without a lookup.
+
+A session ID is like a cloakroom ticket: worthless on its own, the cloakroom has your coat. A token is like a signed letter of introduction: anyone who trusts the signature can read it, but you cannot easily take it back once issued.
+
+### The problem
+
+A browser single-page app stores a long-lived token in `localStorage`. One cross-site scripting (XSS) bug, where attacker JavaScript runs on your page, reads the token and sends it away. The attacker uses it for days, and there is no way to log them out.
+
+### Better design
+
+```text
+Browser --(cookie: sid; HttpOnly; Secure; SameSite=Lax)--> BFF (backend-for-frontend)
+BFF holds the OAuth tokens server-side --(Bearer token)--> APIs
+```
+
+`HttpOnly` stops JavaScript reading the cookie, `Secure` forces HTTPS, and `SameSite` limits cross-site request forgery (CSRF). Tokens never touch browser JavaScript. APIs, mobile apps and service-to-service calls use short-lived tokens.
+
+| | Session | Token (JWT) |
 |---|---|---|
-| What the client holds | Opaque random session ID in a cookie | Signed token containing claims |
-| Validation | Look up the session store (Redis) on each request | Verify signature and expiry locally, no lookup |
-| Revocation | Instant: delete the session | Hard: valid until expiry unless you add a denylist |
-| Scaling | Needs a shared session store | Stateless; any service can verify |
-| Size | ~32 bytes | 500 bytes to several KB on every request |
-| Best for | Browser apps on one domain (BFF) | APIs, mobile clients, service-to-service, federated systems |
+| Validation | Look up the session store (Redis) | Verify signature locally |
+| Revocation | Instant: delete the session | Hard until it expires |
+| Best for | Browser apps | APIs, mobile, services |
 
-Many modern architectures combine them: the browser talks to a **Backend-for-Frontend** using an `HttpOnly; Secure; SameSite` session cookie, and the BFF holds the OAuth tokens and calls APIs with them. Tokens never touch browser JavaScript, which removes the main XSS token-theft risk.
+**Key takeaway:** Sessions for browsers (easy logout), short-lived tokens for APIs.
 
-### Cookie hygiene
-`Set-Cookie: sid=...; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=3600`. `HttpOnly` blocks JavaScript access, `Secure` forces HTTPS, `SameSite` mitigates CSRF; add CSRF tokens for state-changing requests when cookies authenticate. Rotate the session ID on login (prevents session fixation) and expire idle sessions.
+---
 
-### JWT structure
-A JWT is `base64url(header).base64url(payload).base64url(signature)`:
-```
-header:  {"alg":"RS256","kid":"2026-10-key-1","typ":"JWT"}
-payload: {"iss":"https://auth.example.com","sub":"user_8812","aud":"orders-api",
-          "exp":1760015400,"iat":1760014500,"nbf":1760014500,
-          "jti":"8f1c...","scope":"orders:read orders:write","tenant":"acme"}
-signature: RS256(base64url(header) + "." + base64url(payload), privateKey)
-```
-- The payload is **encoded, not encrypted**: anyone can read it. Never put secrets or sensitive PII in it (use JWE if you must encrypt).
-- **Signing algorithms:** HS256 uses a shared secret (every verifier can also mint tokens, so use it only inside one trust boundary); RS256/ES256/EdDSA use a private key to sign and public keys to verify, which is the right choice when many services verify. The issuer publishes public keys at a **JWKS** endpoint, and the `kid` header selects the key, enabling key rotation without downtime.
+## 3. JWT and its pitfalls
 
-### Validating a JWT correctly
-1. Parse the header and **allow-list the algorithm** (reject `alg: none`, and never let a token switch RS256 to HS256 using the public key as an HMAC secret: the classic algorithm-confusion attack).
-2. Fetch the key by `kid` from a cached JWKS; verify the signature.
-3. Check `exp`, `nbf`, `iat` with a small clock-skew allowance (30–60 s).
-4. Check `iss` is your trusted issuer and `aud` is **this** API (a token minted for the reporting API must not work on the payments API).
-5. Only then read scopes and claims for authorization.
+**Definition:** A JWT (JSON Web Token) is `header.payload.signature`, each part base64url-encoded, where the signature proves the issuer created it and nobody changed it.
 
-### Revocation and lifetimes
-Stateless tokens cannot be "logged out". Mitigations:
-- **Short-lived access tokens** (5–15 minutes) plus **refresh tokens** (hours to days) stored securely; revoke the refresh token to end the session within one access-token lifetime.
-- **Refresh token rotation:** every refresh issues a new refresh token and invalidates the old one; reuse of an old one signals theft and revokes the whole family.
-- **Denylist by `jti`** in Redis with TTL equal to the remaining lifetime, checked at the gateway, for urgent revocation (compromised account, employee offboarding).
-- **Token introspection** (opaque tokens validated by calling the authorization server) when instant revocation outweighs the per-request lookup cost; cache the result briefly.
-- **Sender-constrained tokens** (DPoP, mTLS-bound tokens) so a stolen token is useless without the client's private key; increasingly common in financial-grade APIs.
+The payload holds **claims**: `iss` (issuer), `sub` (subject, the user), `aud` (audience, the API it is for), `exp` (expiry), and scopes. The payload is **encoded, not encrypted**: anyone holding the token can read it.
 
-## OAuth 2.0 and OpenID Connect
-**OAuth 2.0** is a delegation framework: a **client** gets an **access token** from an **authorization server** to call a **resource server** on behalf of a **resource owner** (or itself). It answers "what may this client access", not "who is the user". **OpenID Connect (OIDC)** is an identity layer on top: it adds an **ID token** (a JWT about the user's authentication: `sub`, `email`, `auth_time`, `nonce`), a `userinfo` endpoint and discovery metadata (`/.well-known/openid-configuration`).
+### The problem
 
-### Authorization Code + PKCE (users, all client types)
-```
- Browser/App            Authorization Server (IdP)              Client backend / API
-     │ 1. generate code_verifier (random), code_challenge = SHA256(verifier)
-     │ 2. redirect ──> /authorize?response_type=code&client_id=..&redirect_uri=..
-     │                  &scope=openid profile orders:read&state=xyz&code_challenge=..&code_challenge_method=S256
-     │ 3. user logs in (+ MFA), consents
-     │ <── 4. redirect to redirect_uri?code=AUTH_CODE&state=xyz  (check state matches)
-     │ 5. POST /token  code=AUTH_CODE, code_verifier, redirect_uri ──>
-     │ <── 6. access_token (+ refresh_token, + id_token if OIDC)
-     │ 7. call API with  Authorization: Bearer <access_token> ──────────────────────>
-```
-- **PKCE** stops an attacker who intercepts the authorization code (malicious app on a phone, leaked logs) from redeeming it, because they lack the `code_verifier`. OAuth 2.1 makes PKCE mandatory for all clients.
-- `state` prevents CSRF on the redirect; `nonce` binds the ID token to the request.
-- Exact-match `redirect_uri` registration prevents tokens being sent to attacker URLs.
-- **Deprecated:** the Implicit flow (tokens in URL fragments) and Resource Owner Password Credentials (app collects the user's password). Don't propose them.
-
-### Client Credentials (service-to-service)
-A service authenticates as itself (client ID + secret, or better a signed JWT assertion or mTLS) and receives an access token with its own scopes. No user involved: batch jobs, backend integrations, microservices calling each other.
-
-### Other flows worth naming
-- **Device Authorization Grant:** TVs and CLIs show a code that the user enters on a phone.
-- **Token Exchange (RFC 8693):** a service swaps the user's token for a downstream token with narrower audience and scopes, preserving "acting on behalf of user X" across hops without forwarding the original token everywhere.
-
-### SSO and federation
-**Single sign-on** lets one login at an identity provider (Okta, Entra ID, Keycloak, Auth0, Cognito) grant access to many applications. Enterprises federate via **SAML 2.0** (XML assertions, common for legacy enterprise apps) or **OIDC** (modern, JSON/JWT). **SCIM** provisions and deprovisions users automatically. Add **MFA** (TOTP, push, and phishing-resistant WebAuthn/passkeys) at the IdP so every app benefits.
-
-## Authorization
-### Models
-| Model | Decision based on | Example rule | Strengths | Weaknesses |
-|---|---|---|---|---|
-| RBAC | Roles assigned to users | `ADMIN` can delete products | Simple, auditable | Role explosion for fine-grained or per-resource rules |
-| ABAC | Attributes of subject, resource, action, environment | Allow if `user.dept == doc.dept` and time in business hours | Very expressive, contextual | Harder to reason about and audit |
-| ReBAC | Relationships in a graph | Alice can view doc D because she's in group G which is editor of folder F containing D | Natural for sharing (Drive, GitHub orgs) | Needs a dedicated, consistent relationship store |
-
-### Zanzibar and ReBAC at scale
-Google Zanzibar stores relation tuples like `doc:readme#viewer@group:eng#member` and answers `check(user, relation, object)` by graph traversal, at millions of checks per second with low latency. It handles the **new enemy problem** (a check must not use permissions older than a content change, so ACL removals take effect before new sensitive content is visible) with consistency tokens ("zookies"). Open-source descendants: SpiceDB, OpenFGA, Ory Keto. Mention it for Google Drive, Dropbox, Notion or GitHub-style sharing.
-
-### Where to enforce
-- **Gateway:** coarse checks: is the token valid, does it have the `orders:*` scope, is this tenant active. Cheap and central.
-- **Service:** fine-grained, resource-level checks ("does user 42 own order 991?"). Only the service knows the resource, so **object-level authorization must live in the service** (or call a policy engine).
-- **Data layer:** tenant isolation as a safety net: row-level security in PostgreSQL, a mandatory `tenant_id` predicate in every repository, per-tenant encryption keys or schemas.
-- **Policy engines:** externalise rules to OPA/Rego, Cedar (AWS Verified Permissions) or a Zanzibar-style service, evaluated as a sidecar or library for low latency, with decisions logged.
-
-## Machine and API client authentication
-### API keys
-Long random secrets that identify a client application. Good for developer platforms and simple partner integrations. Rules:
-- Generate with a CSPRNG, prefix them (`sk_live_...`) so leaks are detectable by secret scanners.
-- Store only a **hash** (SHA-256 is fine for high-entropy keys) plus the last 4 characters for display; show the key once at creation.
-- Scope keys (read-only vs read-write), support multiple active keys for rotation, and rate-limit per key.
-- An API key identifies an app, not a user, and travels in a header; it is a bearer secret, so TLS is mandatory.
-
-### HMAC request signing
-For high-value APIs and webhooks, the client signs the request so it can't be tampered with or replayed:
-```
-string_to_sign = METHOD + "\n" + PATH + "\n" + SORTED_QUERY + "\n" + TIMESTAMP + "\n" + SHA256(body)
-signature      = Base64(HMAC_SHA256(secret, string_to_sign))
-headers: X-Key-Id, X-Timestamp, X-Signature  (server rejects if |now - timestamp| > 5 min)
-```
 ```java
-Mac mac = Mac.getInstance("HmacSHA256");
-mac.init(new SecretKeySpec(secret, "HmacSHA256"));
-byte[] expected = mac.doFinal(stringToSign.getBytes(StandardCharsets.UTF_8));
-boolean ok = MessageDigest.isEqual(expected, Base64.getDecoder().decode(signatureHeader)); // constant time
+// decodes the payload and trusts it, never checking the signature
+String userId = decodeBase64(token.split("\\.")[1]).get("sub");
 ```
-The timestamp (plus an optional nonce cache) prevents replay; constant-time comparison prevents timing attacks. AWS SigV4, Stripe and GitHub webhooks all work this way.
 
-## Encryption in transit: TLS and mTLS
-- **TLS 1.3** gives confidentiality, integrity and server authentication with a 1-RTT handshake (0-RTT resumption, which is replayable, so only for idempotent requests). Use it everywhere, including internal traffic.
-- **Termination points:** at the CDN/load balancer (re-encrypt to backends, or you have plaintext inside the network), at the gateway, or end-to-end. In zero-trust designs, traffic is encrypted on every hop.
-- **HSTS** forces browsers to use HTTPS; automate certificates (ACME / Let's Encrypt, cert-manager) and monitor expiry, since expired certificates cause real outages.
-- **mTLS:** both sides present certificates, so the server knows exactly which service is calling. It is the backbone of service-to-service authentication.
+Common mistakes: not verifying the signature; accepting `"alg":"none"`; letting an attacker switch RS256 to HS256 and "sign" with your public key (algorithm confusion); not checking `aud`, so a token minted for the reporting API works on the payments API; putting secrets or personal data in the payload; and 24-hour tokens with no way to revoke them.
 
-### Service mesh identity
-Managing certificates for thousands of pods by hand is impossible. A service mesh (Istio, Linkerd) or SPIFFE/SPIRE issues each workload a short-lived certificate encoding its identity (`spiffe://prod.example.com/ns/payments/sa/payment-service`), rotates it automatically (hours), and the sidecar proxies enforce mTLS transparently. Authorization policies then say "only `order-service` may call `POST /payments`". Combine with user context propagated as a JWT so services know both **which service** and **on behalf of which user**.
-
-## Secrets management
-Secrets: DB passwords, API keys, signing keys, OAuth client secrets, encryption keys.
-- **Never** in source code, container images, plain environment files committed to Git, or logs. Run secret scanning in CI.
-- Use a **secrets manager**: HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault. Services authenticate with their platform identity (Kubernetes service account, IAM role), not with another secret.
-- **Dynamic secrets:** Vault can create a unique, short-lived database credential per service instance and revoke it at lease expiry; a leaked credential is worthless within an hour.
-- **Rotation:** automate it; support two valid versions during the switchover.
-- Spring: `spring-cloud-vault` or `spring-cloud-aws-secrets-manager` loads secrets as properties at startup and can refresh them.
-
-## Encryption at rest and envelope encryption
-Disk- or volume-level encryption (EBS, managed DB encryption) protects against stolen disks but not against an attacker with application or DB access. For sensitive fields (national IDs, card data, health data), add **application-level** or column-level encryption.
-
-**Envelope encryption** is how KMS-based systems scale:
-```
-1. App asks KMS: GenerateDataKey(keyId = CMK "pii-key")
-2. KMS returns: plaintext DEK + DEK encrypted under the CMK (the CMK never leaves the HSM)
-3. App encrypts data locally with the DEK (AES-256-GCM), then discards the plaintext DEK
-4. Store: ciphertext + encrypted DEK side by side
-5. Decrypt: send encrypted DEK to KMS (authorised + audited) -> plaintext DEK -> decrypt locally
-```
-Why: bulk data never goes to KMS (fast, no size limits), the master key lives in an HSM and is never exposed, every decrypt is access-controlled and audited, and **rotating the master key** only re-wraps small DEKs rather than re-encrypting terabytes. Per-tenant keys enable **crypto-shredding**: delete a tenant's key and all its data becomes unreadable, which helps satisfy deletion requests even in backups.
-
-Use authenticated encryption (AES-GCM, ChaCha20-Poly1305), a unique nonce per encryption, and never invent your own crypto. For searchable encrypted fields, store a keyed hash (HMAC) alongside for equality lookups, or **tokenize** (replace a card number with a token, with the real value in an isolated vault, which shrinks PCI scope dramatically).
-
-## Password storage
-- Never store plaintext or reversible encryption, and never use fast hashes (MD5, SHA-256) alone: GPUs try billions per second.
-- Use a **slow, salted, memory-hard** algorithm: **Argon2id** (preferred; e.g. 19–64 MB memory, 2–3 iterations), **bcrypt** (cost 12+; note its 72-byte input limit), or **scrypt**; PBKDF2 with high iterations when FIPS compliance requires it.
-- Tune cost so a hash takes ~100–500 ms on your servers, and re-hash on login when you raise the cost.
-- Unique random salt per password (built into these algorithms); an optional **pepper** (secret key kept in the KMS/HSM) adds protection if only the DB leaks.
-- Spring: `PasswordEncoderFactories.createDelegatingPasswordEncoder()` stores `{bcrypt}` / `{argon2}` prefixes so you can migrate algorithms gradually.
-- Also: breached-password checks, rate limiting and lockout on login, MFA, and preferably passkeys.
-
-## API threats: OWASP API Security Top 10 highlights
-| Risk | What goes wrong | Mitigation |
-|---|---|---|
-| Broken Object Level Authorization (BOLA/IDOR) | `GET /orders/1002` returns someone else's order | Check ownership/tenant on every object access in the service; non-guessable IDs as defence in depth |
-| Broken authentication | Weak tokens, no expiry, credential stuffing | Standard IdP, short-lived tokens, MFA, login rate limits |
-| Broken object property level authorization | Mass assignment (`"role":"admin"` in a PATCH), over-exposed fields | Explicit request DTOs and response DTOs; never bind entities directly |
-| Unrestricted resource consumption | Huge page sizes, expensive queries, unlimited uploads | Rate limits, pagination caps, payload size limits, timeouts, GraphQL depth limits |
-| Broken function level authorization | Regular user calls `/admin/*` endpoints | Deny by default, role checks per endpoint |
-| Server-Side Request Forgery (SSRF) | User-supplied URL makes your server fetch `http://169.254.169.254/` (cloud metadata) or internal admin services | Allow-list destinations, resolve and block private/link-local IP ranges (recheck after redirects, beware DNS rebinding), egress proxy, IMDSv2 |
-| Security misconfiguration | Verbose errors, open CORS `*` with credentials, default creds | Hardened defaults, config scanning, generic error messages |
-| Unsafe consumption of third-party APIs | Trusting partner responses blindly | Validate and sanitise external data, timeouts, TLS |
-
-### Input validation and injection
-Validate at the boundary (type, length, range, format, allow-lists) with Bean Validation (`@Valid`, `@Size`, `@Pattern`); use **parameterised queries** (JPA, `PreparedStatement`) to prevent SQL injection; encode output by context to prevent XSS; set a strict Content-Security-Policy; never deserialise untrusted data into arbitrary types; and scan uploads (type sniffing, size limits, malware scanning, serve from a separate domain).
-
-## DDoS protection and WAF
-- **Volumetric (L3/L4)** floods are absorbed by anycast networks and scrubbing (Cloudflare, AWS Shield, Akamai). Keep origins hidden and reachable only from the CDN's IP ranges.
-- **Application-layer (L7)** attacks look like real requests: a **WAF** applies managed rules (OWASP Core Rule Set), bot detection, challenges (CAPTCHA, proof-of-work), geo and reputation blocking, and per-IP/fingerprint rate limits at the edge.
-- **Design-level defences:** cache aggressively, make expensive endpoints authenticated, add rate limiting and load shedding, autoscale with caps (unbounded autoscaling turns an attack into a billing incident), and protect login/OTP/search endpoints specifically.
-
-## Audit logging
-Security-relevant events (logins, failed logins, permission changes, admin actions, data exports, access to sensitive records, key usage) go to an **audit log** separate from debug logs:
-- Who (principal, on behalf of whom), what (action, resource), when, where (IP, device, service), outcome, and a correlation ID.
-- **Append-only and tamper-evident:** write to a separate account or store with object lock (WORM), or hash-chain entries so deletion or modification is detectable.
-- Retain per regulation (often 1–7 years), restrict who can read it, and feed it to a SIEM for detection (impossible travel, privilege escalation, mass downloads).
-
-## PII and compliance basics
-- **Data minimisation:** don't collect what you don't need; classify data (public, internal, confidential, restricted) and tag columns.
-- **GDPR / India DPDP Act:** lawful basis and consent, right of access and erasure (design for deletion: know every store and backup containing a user's data; crypto-shredding helps), data residency constraints that drive region-pinned storage.
-- **PCI DSS:** keep card data out of your systems via a payment provider's hosted fields and tokens to minimise scope.
-- **HIPAA / SOC 2 / ISO 27001:** access controls, encryption, audit trails, change management.
-- **Masking and pseudonymisation:** mask PII in logs and non-production environments; analytics on pseudonymised IDs.
-
-## Spring Security resource server example
-A Spring Boot 3 API that validates JWTs from an OIDC provider, enforces scopes at the endpoint and ownership at the object:
+### Better design
 
 ```yaml
-spring:
-  security:
-    oauth2:
-      resourceserver:
-        jwt:
-          issuer-uri: https://auth.example.com/realms/prod   # discovers JWKS, validates iss
-          audiences: orders-api                              # Boot 3.2+: validates aud
+spring.security.oauth2.resourceserver.jwt:
+  issuer-uri: https://auth.example.com/realms/prod   # fetches public keys (JWKS), checks iss
+  audiences: orders-api                              # rejects tokens meant for other APIs
 ```
+
+Validate in this order: allow-listed algorithm, signature using the key named by `kid` from the issuer's cached **JWKS** (published public keys), then `exp`/`nbf` with a little clock-skew allowance, then `iss` and `aud`, and only then read scopes. Prefer RS256 or ES256 (private key signs, public key verifies) over HS256 when many services verify. Keep access tokens short (5-15 minutes) and use **refresh tokens** that are rotated on every use and can be revoked; for emergencies, keep a denylist of token IDs (`jti`) in Redis.
+
+**Trade-offs:**
+- Short tokens mean more refresh traffic; a denylist adds back a lookup.
+
+**Key takeaway:** Verify signature, algorithm, expiry, issuer and audience; keep JWTs short-lived and secret-free.
+
+---
+
+## 4. OAuth2 and OpenID Connect
+
+**Definition:** OAuth 2.0 lets a client app get an **access token** to call an API on a user's behalf (or its own); OpenID Connect (OIDC) adds an **ID token** that says who the user is.
+
+OAuth is a valet key: it lets the valet drive your car, not open the boot. OAuth alone answers "what may this app access"; OIDC answers "who logged in". The **authorization server** (identity provider, IdP) such as Keycloak, Okta, Entra ID or Cognito issues the tokens.
+
+### The problem
+
+A mobile app asks users to type their Google password into the app itself (the old "password grant"). The app now holds a password it should never see, and a malicious app could steal it.
+
+### Better design
+
+```text
+1. App makes code_verifier (random) and code_challenge = SHA-256(verifier)
+2. Redirect user to IdP /authorize?...&code_challenge=..&state=xyz
+3. User logs in at the IdP (with MFA); IdP redirects back with ?code=AUTH_CODE&state=xyz
+4. App POSTs code + code_verifier to IdP /token
+5. IdP returns access_token (+ refresh_token, + id_token for OIDC)
+6. App calls API: Authorization: Bearer <access_token>
+```
+
+This is **Authorization Code + PKCE**. PKCE (proof key for code exchange) means a stolen code is useless without the verifier, and current best practice requires it for all clients. `state` blocks CSRF on the redirect. For service-to-service calls with no user, use the **client credentials** flow: the service authenticates as itself and gets its own token. Do not propose the implicit or password grants; both are deprecated.
+
+**Key takeaway:** Users: authorization code + PKCE. Services: client credentials. OIDC adds identity on top.
+
+---
+
+## 5. RBAC and ABAC
+
+**Definition:** RBAC (role-based access control) grants permissions through roles; ABAC (attribute-based) decides from attributes of the user, resource, action and context.
+
+RBAC: "ADMIN can delete products". ABAC: "allow if user.department == document.department and it is business hours". For sharing models such as Google Drive, **ReBAC** (relationship-based, as in Google Zanzibar and open-source SpiceDB or OpenFGA) asks "is Alice a viewer of this folder through her group?".
+
+### The problem
+
+A team uses only roles: `REGION_NORTH_MANAGER`, `REGION_SOUTH_MANAGER`, `REGION_NORTH_MANAGER_READONLY`... soon there are 400 roles (role explosion), and nobody knows who can do what.
+
+### Better design
+
 ```java
-@Configuration
-@EnableMethodSecurity
-public class SecurityConfig {
-
-    @Bean
-    SecurityFilterChain api(HttpSecurity http) throws Exception {
-        return http
-            .csrf(csrf -> csrf.disable())                       // stateless bearer-token API
-            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-            .authorizeHttpRequests(auth -> auth
-                .requestMatchers("/actuator/health/**").permitAll()
-                .requestMatchers(HttpMethod.GET, "/api/orders/**").hasAuthority("SCOPE_orders:read")
-                .requestMatchers(HttpMethod.POST, "/api/orders/**").hasAuthority("SCOPE_orders:write")
-                .requestMatchers("/api/admin/**").hasRole("ADMIN")
-                .anyRequest().authenticated())                 // deny-by-default posture
-            .oauth2ResourceServer(o -> o.jwt(jwt -> jwt.jwtAuthenticationConverter(rolesConverter())))
-            .build();
-    }
-
-    private JwtAuthenticationConverter rolesConverter() {
-        var scopes = new JwtGrantedAuthoritiesConverter();      // "scope" claim -> SCOPE_x
-        var converter = new JwtAuthenticationConverter();
-        converter.setJwtGrantedAuthoritiesConverter(jwt -> {
-            Collection<GrantedAuthority> all = new ArrayList<>(scopes.convert(jwt));
-            List<String> roles = jwt.getClaimAsStringList("roles");
-            if (roles != null) roles.forEach(r -> all.add(new SimpleGrantedAuthority("ROLE_" + r)));
-            return all;
-        });
-        return converter;
-    }
-}
-
-@RestController
-@RequestMapping("/api/orders")
-class OrderController {
-    private final OrderService orders;
-    OrderController(OrderService orders) { this.orders = orders; }
-
-    @GetMapping("/{id}")
-    @PreAuthorize("@orderAuthz.canView(authentication, #id)")   // object-level check (BOLA)
-    OrderDto get(@PathVariable String id) { return orders.find(id); }
-}
-
-@Component("orderAuthz")
-class OrderAuthorization {
-    private final OrderRepository repo;
-    OrderAuthorization(OrderRepository repo) { this.repo = repo; }
-
-    boolean canView(Authentication auth, String orderId) {
-        Jwt jwt = (Jwt) auth.getPrincipal();
-        return repo.findOwnerAndTenant(orderId)
-                   .map(o -> o.ownerId().equals(jwt.getSubject())
-                          && o.tenantId().equals(jwt.getClaimAsString("tenant")))
-                   .orElse(false);                              // missing = deny (and return 404)
-    }
-}
-```
-The framework validates signature (via JWKS with caching and key rotation), expiry, issuer and audience; your code adds scopes and the object-level ownership check that no gateway can do for you.
-
-## Putting it together: a reference architecture
-```
-Internet ─> CDN/WAF (TLS, DDoS, bot rules, IP limits)
-        ─> API Gateway (JWT validation, scopes, per-key rate limits, request IDs, audit of admin calls)
-        ─> Services in mesh (mTLS via SPIFFE identities, authz policies, object-level checks)
-        ─> Data stores (encryption at rest, KMS envelope keys, row-level tenant isolation)
-Side systems: IdP (OIDC, MFA, SSO), Vault/KMS (secrets, keys), SIEM (audit + detection)
+@PreAuthorize("hasRole('MANAGER') and @authz.sameRegion(authentication, #reportId)")
+public Report getReport(String reportId) { ... }
 ```
 
-## How it shows up in interview problems
-- **API gateway:** JWT validation with JWKS caching, scopes, API keys hashed at rest, rate limits, WAF in front, mTLS to services.
-- **Payments:** tokenisation to shrink PCI scope, HMAC-signed webhooks, idempotency keys, mTLS to the PSP, envelope encryption, immutable audit trail, fail-closed limits against card testing.
-- **Dropbox / Google Drive:** ReBAC/Zanzibar sharing model, pre-signed URLs with short expiry, per-user encryption keys, virus scanning of uploads.
-- **Chat / WhatsApp:** end-to-end encryption (Signal protocol: the server routes ciphertext and never holds message keys), device keys, TLS to servers.
-- **URL shortener:** abuse prevention (malicious link scanning, Safe Browsing), rate limits, unguessable codes for private links.
-- **Notification / email:** signed unsubscribe links, SPF/DKIM/DMARC for email deliverability and anti-spoofing.
-- **E-commerce / BookMyShow:** session or BFF auth, BOLA checks on orders and bookings, bot protection on flash sales.
-- **Logging / metrics systems:** PII masking at ingestion, access controls on log search, audit log separation.
-- **Multi-tenant SaaS anything:** tenant ID in the token, enforced at the gateway, the service and the database (RLS).
+Use a few roles for broad capability and attributes (region, tenant, owner) for the fine rule. Complex policies can move to a policy engine such as OPA or Cedar.
 
-## Common pitfalls
-- Trusting the JWT payload without verifying signature, `aud` and `iss`, or accepting `alg: none`.
-- Long-lived access tokens with no revocation path.
-- Storing tokens in `localStorage` in browser apps (XSS steals them); prefer BFF + HttpOnly cookies.
-- Authorization only at the gateway, leaving BOLA in every service.
-- Shared HS256 secrets across many services.
-- Secrets in Git, Docker images or logs; no rotation.
-- Fast hashes (SHA-256/MD5) for passwords.
-- TLS terminated at the edge with plaintext inside the network for sensitive data.
-- Fetching user-supplied URLs without SSRF protection.
-- Audit logs that admins can edit or delete.
+**Trade-offs:**
+- ABAC is very expressive but harder to audit than a role list.
 
-## Interview questions
-1. **Sessions or JWTs?** Sessions for browser apps (easy revocation, small cookie, BFF pattern); short-lived JWTs for APIs and service-to-service where stateless verification matters; refresh-token rotation and a `jti` denylist for revocation.
-2. **How do you revoke a JWT?** Short expiry plus refresh tokens you can revoke; a denylist keyed by `jti` with TTL for emergencies; or opaque tokens with introspection when instant revocation is required.
-3. **Why PKCE?** It binds the authorization code to a secret only the original client knows, so an intercepted code can't be redeemed; mandatory in OAuth 2.1 for all clients.
-4. **OAuth vs OIDC?** OAuth delegates access (access tokens, scopes); OIDC adds authentication: an ID token about the user, userinfo and discovery.
-5. **How do services authenticate each other?** mTLS with workload identities issued and rotated by a mesh or SPIFFE, plus client-credentials or exchanged tokens carrying the user context and scopes.
-6. **Explain envelope encryption.** Data is encrypted with a per-object data key; the data key is encrypted by a master key held in KMS/HSM; rotating the master key only re-wraps data keys, and every decrypt is authorised and audited.
-7. **How do you store passwords?** Argon2id or bcrypt with per-password salt, cost tuned to ~250 ms, optional HSM-held pepper, rehash on login when parameters change; plus MFA and login rate limits.
-8. **What is BOLA and where must it be fixed?** Accessing another user's object by changing an ID; it must be enforced in the service that owns the resource by checking ownership/tenant on every access, because the gateway doesn't know who owns what.
+**Key takeaway:** Roles for coarse capability, attributes or relationships for per-resource rules.
 
-## Cheat sheet
-- Authn = who, authz = what. Zero trust: authenticate every hop; least privilege everywhere.
-- Browser: BFF + HttpOnly/Secure/SameSite cookie. APIs: short-lived JWT (RS256/ES256 via JWKS) + refresh rotation.
-- Validate JWT: allow-listed alg, signature by `kid`, `exp/nbf`, `iss`, `aud`; payload is readable, not secret.
-- OAuth2: auth code + PKCE for users, client credentials for services, token exchange for downstream; OIDC adds ID token; no implicit/password grants.
-- Authz: RBAC (roles), ABAC (attributes), ReBAC/Zanzibar (relationships); coarse at gateway, object-level in service, tenant isolation in DB.
-- API keys: random, prefixed, hashed at rest, scoped, rotatable. HMAC signing + timestamp for integrity and replay protection.
-- TLS 1.3 everywhere; mTLS + SPIFFE/mesh for service identity; HSTS; automate cert renewal.
-- Secrets in Vault/KMS, dynamic and rotated; envelope encryption with DEK/CMK; tokenise card data; crypto-shred for deletion.
-- Passwords: Argon2id/bcrypt, salt, pepper, MFA, passkeys.
-- OWASP API: BOLA, mass assignment, resource consumption, SSRF; validate input, parameterise queries.
-- Edge: CDN + WAF + bot defence; audit logs append-only; minimise and mask PII.
+---
+
+## 6. API keys and request signing
+
+**Definition:** An API key is a long random secret that identifies a client *application*; request signing has the client compute an HMAC (a keyed hash) over the request so the server can detect tampering and replay.
+
+An API key is a bearer secret: whoever holds it is trusted. Signing proves the request was made by the secret holder and was not changed in transit.
+
+### The problem
+
+A partner integration stores API keys in plain text in the database, and webhook calls carry no signature. A database leak exposes every key, and anyone who learns the webhook URL can send fake "payment succeeded" events.
+
+### Better design
+
+```text
+API keys: random from a CSPRNG, prefixed (sk_live_...) so secret scanners spot leaks,
+          store only SHA-256(key) + last 4 chars, show once, scoped, rotatable
+
+Signing:  to_sign = METHOD \n PATH \n TIMESTAMP \n SHA256(body)
+          X-Signature = Base64(HMAC_SHA256(secret, to_sign))
+          reject if |now - timestamp| > 5 min   (replay protection)
+```
+
+```java
+boolean ok = MessageDigest.isEqual(expectedSig, receivedSig);  // constant-time compare
+```
+
+Stripe and GitHub webhooks and AWS Signature V4 all follow this pattern.
+
+**Key takeaway:** Hash API keys at rest; sign high-value requests and webhooks with HMAC plus a timestamp.
+
+---
+
+## 7. TLS and mTLS
+
+**Definition:** TLS encrypts traffic and proves the server's identity with a certificate; mutual TLS (mTLS) makes the client present a certificate too.
+
+TLS 1.3 gives confidentiality, integrity and server authentication with a one-round-trip handshake. With mTLS, the server knows exactly which service is calling, not just that "someone inside the network" is.
+
+### The problem
+
+```text
+Internet --TLS--> Load balancer --plain HTTP--> services --plain--> database
+```
+
+TLS ends at the load balancer. Anyone who gets a foothold inside the network can read card data and tokens in plain text, and any pod can call the payment service.
+
+### Better design
+
+```text
+Internet --TLS 1.3--> LB --TLS--> order-svc --mTLS--> payment-svc --TLS--> DB
+Mesh (Istio/Linkerd) or SPIFFE issues each workload a short-lived certificate:
+  spiffe://prod/ns/payments/sa/payment-service   (rotated every few hours)
+Policy: only order-service may call POST /payments
+```
+
+The sidecar proxies handle certificates automatically. Add HSTS so browsers always use HTTPS, and automate certificate renewal; expired certificates cause real outages.
+
+**Key takeaway:** TLS on every hop; mTLS for service identity inside the network.
+
+---
+
+## 8. Secrets management
+
+**Definition:** Secrets management means storing passwords, keys and tokens in a dedicated, access-controlled, audited store and delivering them to services at runtime.
+
+Secrets include database passwords, API keys, signing keys and OAuth client secrets. They must never live in code.
+
+### The problem
+
+```properties
+# application.properties, committed to Git
+spring.datasource.password=Pr0d!Passw0rd
+payment.api.key=sk_live_51Hx...
+```
+
+Everyone with repository access, every old commit and every container image now holds production credentials, forever.
+
+### Better design
+
+```text
+Service authenticates with its platform identity (Kubernetes service account, IAM role)
+-> Vault / AWS Secrets Manager / Azure Key Vault
+-> returns the secret at startup (spring-cloud-vault), refreshed on rotation
+Vault "dynamic secrets": a unique DB login per instance, expiring in ~1 hour
+```
+
+Run secret scanning in CI, rotate automatically, and allow two valid versions during a switchover.
+
+**Key takeaway:** No secrets in Git, images or logs; fetch them at runtime and rotate them.
+
+---
+
+## 9. Encryption at rest
+
+**Definition:** Encryption at rest protects stored data; **envelope encryption** encrypts data with a data key and encrypts that data key with a master key kept in a KMS (key management service).
+
+Disk encryption only protects against a stolen disk. Sensitive fields (national IDs, health data) also need application-level encryption so a database dump alone is useless.
+
+### The problem
+
+The team encrypts every record by sending it to the KMS. Large files are slow, KMS request limits are hit, and rotating the master key would mean re-encrypting terabytes.
+
+### Better design
+
+```text
+1. App: KMS.GenerateDataKey(master key "pii") -> plaintext DEK + encrypted DEK
+2. App encrypts data locally with the DEK (AES-256-GCM), then forgets the plaintext DEK
+3. Store ciphertext + encrypted DEK together
+4. Read: send encrypted DEK to KMS (checked + audited) -> DEK -> decrypt locally
+```
+
+Bulk data never goes to the KMS, the master key never leaves its hardware security module (HSM), and rotating the master key only re-wraps small data keys. Per-tenant keys allow **crypto-shredding**: delete a tenant's key and its data, backups included, becomes unreadable. For card numbers, **tokenization** (store a token, keep the real number in an isolated vault) shrinks PCI scope.
+
+**Key takeaway:** Data key encrypts data, master key encrypts data keys; the master key stays in the KMS.
+
+---
+
+## 10. Password hashing
+
+**Definition:** Passwords are stored as the output of a slow, salted, one-way hash, never as plain text or reversible encryption.
+
+A **salt** is a random value stored per password so identical passwords hash differently. "Slow" is the point: it makes guessing expensive.
+
+### The problem
+
+```text
+password_hash = SHA-256(password)
+GPU cracking rigs try billions of SHA-256 guesses per second
+-> leaked table, most common passwords cracked within hours
+```
+
+Fast hashes are built for speed, which is exactly what an attacker wants.
+
+### Better design
+
+```java
+PasswordEncoder encoder = PasswordEncoderFactories.createDelegatingPasswordEncoder();
+String stored = encoder.encode(rawPassword);   // "{bcrypt}$2a$10$..." with salt built in
+boolean ok = encoder.matches(rawPassword, stored);
+```
+
+Use **Argon2id** (memory-hard; OWASP suggests at least 19 MiB of memory and 2 iterations) or **bcrypt** (cost 10 or more; note its 72-byte input limit). Tune so one hash takes roughly 100-500 ms, and re-hash on login when you raise the cost. The `{id}` prefix lets you migrate algorithms gradually. Add login rate limits, MFA and ideally passkeys.
+
+**Key takeaway:** Argon2id or bcrypt with a salt, never a fast hash.
+
+---
+
+## 11. Common API risks
+
+**Definition:** The OWASP API Security Top 10 lists the most frequent API weaknesses; a few appear in almost every design.
+
+The most important is **BOLA** (broken object level authorization, also called IDOR): the API checks that you are logged in but not that the object is yours.
+
+### The problem
+
+```http
+GET /api/orders/1002
+Authorization: Bearer <token for user 42>
+-> 200 OK, returns user 77's order
+```
+
+Other classics: **mass assignment** (a `PATCH` body containing `"role":"admin"` is bound straight onto the entity), **unrestricted resource consumption** (`?pageSize=1000000`), and **SSRF** (server-side request forgery: a "fetch this image URL" feature is pointed at `http://169.254.169.254/`, the cloud metadata endpoint, and leaks credentials).
+
+### Better design
+
+```java
+@GetMapping("/{id}")
+@PreAuthorize("@orderAuthz.isOwner(authentication, #id)")   // object-level check
+OrderResponse get(@PathVariable String id) { ... }
+```
+
+Check ownership and tenant on every object access *in the service*, because the gateway does not know who owns order 1002. Bind requests to explicit DTOs, never entities. Cap page sizes, payload sizes and query cost. For user-supplied URLs, allow-list destinations and block private and link-local IP ranges. Use parameterised queries against SQL injection.
+
+**Key takeaway:** Object-level authorization lives in the service; validate and cap every input.
+
+---
+
+## 12. Rate limits and WAF
+
+**Definition:** A WAF (web application firewall) at the edge filters malicious HTTP traffic; rate limits cap how fast any one client can call you.
+
+Volumetric DDoS floods are absorbed by CDN and scrubbing networks (Cloudflare, AWS Shield). Application-layer attacks look like real requests, so the WAF applies managed rules (such as the OWASP Core Rule Set), bot detection and per-IP limits.
+
+### The problem
+
+The login endpoint has no limits. An attacker replays millions of leaked email/password pairs (credential stuffing), and the OTP endpoint is abused to send thousands of paid SMS messages.
+
+### Better design
+
+```text
+CDN/WAF:  bot score, managed rules, per-IP limits, origin reachable only from CDN
+Gateway:  per user / API key limits, 429 + Retry-After
+Login:    per account AND per IP limits, CAPTCHA after N failures, fail closed
+Autoscale with a cap, so an attack does not become a surprise bill
+```
+
+**Key takeaway:** Block cheap attacks at the edge and protect login, OTP and search endpoints specifically.
+
+---
+
+## In an HLD interview
+
+- **API Gateway:** JWT validation with cached JWKS, scope checks, hashed API keys, rate limits, WAF in front, mTLS to services.
+- **Payment System:** tokenized card data, HMAC-signed webhooks, idempotency keys, envelope encryption, an append-only audit log, fail-closed limits on card attempts.
+- **Dropbox / Google Drive:** ReBAC sharing (Zanzibar style), short-lived pre-signed download URLs, per-user keys, virus scanning of uploads.
+- **Chat/WhatsApp, Amazon E-commerce, BookMyShow:** end-to-end encryption for chat (the server routes ciphertext only); BFF sessions and BOLA checks on orders and bookings.
+- **What to say:** "Users log in through OIDC with authorization code + PKCE; the gateway validates short-lived JWTs, each service enforces ownership, services talk over mTLS, and secrets come from Vault, never from config files."
+
+## At a glance
+
+| Concept | Core idea | Ask yourself |
+|---|---|---|
+| Authn vs authz | Who vs what | Is every hop checked, not just the edge? |
+| Sessions vs tokens | Server state vs signed claims | How do I log someone out? |
+| JWT | Signed, readable claims | Do I check alg, signature, exp, iss and aud? |
+| OAuth2 / OIDC | Delegated access + identity | Is this a user flow (PKCE) or a service flow? |
+| RBAC / ABAC | Roles vs attributes | Am I heading for role explosion? |
+| API keys / signing | Bearer secret vs HMAC proof | Are keys hashed, and can requests be replayed? |
+| TLS / mTLS | Encrypt and identify | Is any hop plain text? |
+| Secrets | Runtime store, rotated | Is any secret in Git or an image? |
+| Encryption at rest | Envelope with KMS | Can I rotate keys without re-encrypting everything? |
+| Password hashing | Slow and salted | Could a GPU crack this quickly? |
+| API risks | BOLA, mass assignment, SSRF | Does the service check who owns this object? |
+| Rate limits / WAF | Stop abuse at the edge | Are login and OTP protected? |
+
+## Final memory aid
+
+- **Authn = who, authz = what;** zero trust, least privilege
+- **Browser:** BFF + HttpOnly cookie; **APIs:** short-lived JWT
+- **JWT:** verify alg, signature, exp, iss, aud; payload is not secret
+- **OAuth:** code + PKCE for users, client credentials for services
+- **mTLS** inside, **TLS 1.3** everywhere
+- **Secrets** in Vault/KMS; **envelope encryption** for data
+- **Passwords:** Argon2id or bcrypt, never SHA-256
+- **BOLA** is fixed in the service, not the gateway

@@ -37,11 +37,19 @@ ${bold("AI")}
   kb doubts [lld 1]                answer open "#doubt" lines in notes (all topics if none given)
   kb pending [--run]               list what's waiting; --run evaluates and answers all of it
 
+${bold("Your own library")}   ${dim("AI-written study chapters on any subject, in the same simple style")}
+  kb add "<subject>"               plan and write a course, e.g. kb add "core java", kb add "operating systems", kb add "calculus"
+        --chapters 12 --level beginner|intermediate|advanced     size and depth (default 10, intermediate)
+  kb add "<subject>"               again: finish any chapters that are missing (safe to stop with Ctrl+C)
+  kb add "<subject>" --more 3      add 3 more chapters  ·  --redo 4  rewrite chapter 4
+  kb library [remove "<subject>" --yes]   list your libraries, or delete one
+  ${dim("Read them on the site under My library, or with kb read.")}
+
 ${bold("Your data")}   ${dim("answers, verdicts, notes, chats and read status live outside the repo")}
   kb data                          where your data folder is, and how to back it up privately
   kb reset --yes                   wipe all answers, verdicts, notes and chats (write-ups stay)
 
-${bold("Addresses")}   lld 1-20 · hld 1-20 · ai 1-20 · dsa 1-304 · read 1-37     ${dim('("lld1", "LLD-1" also work)')}
+${bold("Addresses")}   lld 1-20 · hld 1-20 · ai 1-20 · dsa 1-304 · read 1-37 (+ your library)     ${dim('("lld1", "LLD-1" also work)')}
 ${bold("Options")}     --provider anthropic|openai|ollama   --model <name>   (one run only)
 `;
 
@@ -52,6 +60,8 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--provider" || a === "--model") opts[a.slice(2)] = argv[++i];
     else if (a.startsWith("--provider=") || a.startsWith("--model=")) { const [k, v] = a.slice(2).split("="); opts[k] = v; }
+    else if (["--chapters", "--level", "--more", "--redo"].includes(a)) opts[a.slice(2)] = argv[++i];
+    else if (/^--(chapters|level|more|redo)=/.test(a)) { const [k, v] = a.slice(2).split("="); opts[k] = v; }
     else if (a === "--lan") opts.lan = true;
     else if (a === "--local") opts.local = true;
     else if (["--writeup", "--run", "--yes", "--done", "-h", "--help"].includes(a)) opts[a.replace(/^-+/, "")] = true;
@@ -287,6 +297,95 @@ const commands = {
     if (it.usedBy?.length) console.log("\n" + dim("Read before: " + it.usedBy.map((u) => `${u.key.toLowerCase().replace("-", " ")} ${u.title}`).join(" · ")));
   },
 
+  async add(o, args) {
+    const libgen = require("../lib/libgen");
+    const subject = args.join(" ").trim();
+    if (!subject) throw new Error('Name a subject, e.g. kb add "core java" or kb add "operating systems".');
+    const cfg = ai.resolve({ provider: o.provider, model: o.model });
+    const who = `${(ai.PROVIDERS[cfg.provider] || {}).name || cfg.provider} (${cfg.model})`;
+    let lib = libgen.find(subject);
+
+    if (!lib || o.more) {
+      const level = String(o.level || (lib && lib.meta.level) || "intermediate").toLowerCase();
+      if (!libgen.LEVELS.includes(level)) throw new Error(`--level must be one of: ${libgen.LEVELS.join(", ")}`);
+      const n = Math.min(30, Math.max(1, parseInt(o.more || o.chapters || 10, 10) || 10));
+      process.stdout.write(dim(`Planning ${lib ? `${n} more chapters for` : "a course on"} "${lib ? lib.meta.title : subject}" with ${who}… `));
+      const outline = await libgen.planOutline(subject, { provider: o.provider, model: o.model, chapters: n, level, existing: lib ? lib.meta.chapters : null });
+      console.log(green("done"));
+      const newChapters = lib ? outline.chapters.filter((c) => !lib.meta.chapters.some((x) => x.id === c.id)).slice(0, n) : outline.chapters.slice(0, n);
+      console.log(`\n${bold(lib ? lib.meta.title : outline.title || subject)} ${dim(`(${lib ? lib.meta.kind : outline.kind}, ${level})`)}`);
+      const startAt = lib ? lib.meta.chapters.length : 0;
+      newChapters.forEach((c, k) => console.log(`  ${String(startAt + k + 1).padStart(2)}. ${c.title}  ${dim(c.scope)}`));
+      if (!o.yes && process.stdin.isTTY) {
+        const ans = await askLine(`\nWrite ${newChapters.length} chapter(s) now? Each is one AI call (about 1-3 minutes). [Y/n] `);
+        if (/^n/i.test(ans.trim())) return console.log(dim("Nothing written. Run the same command again to re-plan."));
+      }
+      if (lib) libgen.saveMeta(lib, { ...lib.meta, chapters: [...lib.meta.chapters, ...newChapters] });
+      else lib = libgen.create(subject, { ...outline, chapters: newChapters }, level, cfg.model);
+    }
+
+    const library = require("../lib/library");
+    const done = new Set(library.written(lib).map((w) => w.index));
+    let todo = lib.meta.chapters.map((_, i) => i).filter((i) => !done.has(i));
+    if (o.redo) {
+      const k = parseInt(o.redo, 10) - 1;
+      if (!(k >= 0 && k < lib.meta.chapters.length)) throw new Error(`--redo takes a chapter number from 1 to ${lib.meta.chapters.length}.`);
+      todo = [k];
+    }
+    if (!todo.length) {
+      console.log(green(`"${lib.meta.title}" is complete: ${lib.meta.chapters.length} chapters.`) + dim(` Add more with: kb add "${lib.meta.subject}" --more 3`));
+      return console.log(dim(`Read it on the site under My library, or: kb read "${lib.meta.chapters[0].title}"`));
+    }
+    console.log(`\nWriting ${todo.length} chapter(s) of ${bold(lib.meta.title)} with ${who}. ${dim("Safe to stop with Ctrl+C; run it again to resume.")}`);
+    let failed = 0;
+    for (const i of todo) {
+      const ch = lib.meta.chapters[i];
+      const label = `  [${i + 1}/${lib.meta.chapters.length}] ${ch.title}`;
+      const t0 = Date.now();
+      let shown = 0;
+      process.stdout.write(label + " ");
+      try {
+        const r = await libgen.writeChapter(lib.meta.subject, lib, i, { provider: o.provider, model: o.model }, (chars) => {
+          const dots = Math.floor(chars / 1500);
+          if (dots > shown && process.stdout.isTTY) { process.stdout.write(dim(".".repeat(dots - shown))); shown = dots; }
+        });
+        console.log(" " + green(`done`) + dim(`, ${r.words.toLocaleString()} words, ${Math.round((Date.now() - t0) / 1000)}s`));
+      } catch (e) {
+        failed++;
+        console.log(" " + red("failed: " + e.message));
+        if (e.code === "NO_KEY") throw e;
+      }
+    }
+    const total = library.written(lib).length;
+    console.log(`\n${total === lib.meta.chapters.length ? green("Done.") : yellow(`${total} of ${lib.meta.chapters.length} chapters written.`)} ${dim(failed ? `Run kb add "${lib.meta.subject}" again to retry the rest.` : "")}`);
+    console.log(dim(`Saved in ${lib.dir}`));
+    console.log(`Read it on the site under ${bold("My library")} (reload the page), or in the terminal: ${bold("kb read")}`);
+  },
+
+  library(o, args) {
+    const library = require("../lib/library");
+    const libgen = require("../lib/libgen");
+    if (args[0] === "remove" || args[0] === "rm" || args[0] === "delete") {
+      const name = args.slice(1).join(" ").trim();
+      const lib = name && libgen.find(name);
+      if (!lib) throw new Error(`No library called "${name}". Run kb library to see them.`);
+      if (!o.yes) return console.log(`This deletes ${bold(lib.meta.title)} (${library.written(lib).length} chapters) and its read status and chats.\nRun ${bold(`kb library remove "${name}" --yes`)} to confirm.`);
+      const n = libgen.remove(lib);
+      return console.log(green(`Removed "${lib.meta.title}"`) + dim(n ? ` and ${n} progress file(s).` : "."));
+    }
+    const libs = library.all(store.userdata.LIBRARY);
+    if (!libs.length) return console.log(`No libraries yet. Create one with ${bold('kb add "core java"')} (or any subject).`);
+    const reads = new Map();
+    const doc = fs.existsSync(store.FUND_FILE) ? store.readJson(store.FUND_FILE) : { groups: [] };
+    for (const g of doc.groups.filter((x) => x.library)) reads.set(g.key, { read: g.items.filter((i) => i.readAt).length, first: g.items[0] && g.items[0].number });
+    for (const l of libs) {
+      const w = library.written(l).length, r = reads.get(l.slug) || { read: 0 };
+      console.log(`${bold(l.meta.title)}  ${dim(`${l.meta.kind || ""}, ${l.meta.level || ""}`)}`);
+      console.log(`  ${w}/${l.meta.chapters.length} chapters written · ${r.read} read${r.first ? dim(` · kb read ${r.first} opens the first`) : ""}${w < l.meta.chapters.length ? yellow(`  · finish with: kb add "${l.meta.subject}"`) : ""}`);
+    }
+    console.log(dim(`\nFolder: ${store.userdata.LIBRARY}`));
+  },
+
   pattern(o, args) {
     const dsa = store.readJson(store.DSA_FILE);
     const tps = dsa.topics || [];
@@ -346,6 +445,10 @@ const commands = {
   serve(o) { if (o.lan) process.env.KB_LAN = "1"; if (o.local) process.env.KB_LOCAL = "1"; require("../server"); },
 };
 const aliases = { patterns: "pattern", eval: "evaluate", ask: "clarify", ls: "list", "-h": "help", "--help": "help", start: "serve", config: "setup" };
+
+function askLine(q) {
+  return new Promise((res) => { const rl = readline.createInterface({ input: process.stdin, output: process.stdout }); rl.question(q, (a) => { rl.close(); res(a); }); });
+}
 
 function printTurn(m) {
   const who = m.role === "user" ? bold(cyan("you › ")) : bold(green("tutor › "));
