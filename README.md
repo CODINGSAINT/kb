@@ -514,10 +514,13 @@ server.js                Express: static files + JSON API + AI routes (Cache-Con
 bin/kb.js                the `kb` command
 lib/store.js             read/write content JSON; addresses like "lld 1"
 lib/ai.js                provider layer (Claude, OpenAI-compatible, Ollama), streaming, kb.config.json
-lib/tutor.js             evaluate / clarify / doubts, with the prompts, shared by the CLI and the server
+lib/tutor.js             evaluate / clarify / doubts, shared by the CLI and the server
+lib/core/shared.js       prompts, data-folder rules, #doubt handling: shared by the local app and the website
+lib/core/llm.js          provider calls with streaming (Claude, OpenAI-compatible, Ollama): shared by the local app and the website
 lib/voice.js             optional OpenAI speech-to-text / text-to-speech for the voice features
 lib/library.js, libgen.js  your own libraries: reading them, and planning/writing them with the AI (kb add)
-build/make-site.js       builds the read-only demo website into site/ (published to GitHub Pages by .github/workflows/pages.yml)
+build/make-site.js       builds the website into site/ (published to GitHub Pages by .github/workflows/pages.yml)
+build/site/web.js        the website's stand-in for the server: saves into the folder you choose, calls your AI provider from the browser
 lib/userdata.js          your data folder (../kb-data): answers, verdicts, notes, chats, read status kept outside the repo
 lib/images.js            answer images: save to the data folder, attach to prompts as real image inputs
 public/                  index.html, app.js, voice.js (mic, read-aloud, talk mode), diagram.js (rough.js renderer), styles.css, vendor/
@@ -603,11 +606,56 @@ Bits → Trie → Strings → Matrix & Math → Design.
 
 ## Live demo
 
-**[codingsaint.github.io/kb](https://codingsaint.github.io/kb/)** is a read-only copy of the site: browse every design topic (and reveal its
-reference design), all 37 read-first chapters and the 304 DSA problems with their pattern guides. Writing answers, AI grading, the tutor,
-voice and progress tracking need the app running on your own machine (see [Quick start](#quick-start-60-seconds)).
+**[codingsaint.github.io/kb](https://codingsaint.github.io/kb/)** runs KB in your browser, with nothing to install.
 
-It's built from `content/` by `npm run build:site` and published by a GitHub Action on every push to `main`
+- **Browse it read-only:** every design topic (and its reference design), all 37 read-first chapters, and the 304 DSA problems with their pattern guides.
+- **Or use it for real:** click **Use my kb-data folder** and choose a folder on your computer. From then on the site saves your answers, notes,
+  read status, tutor chats and answer images **into that folder**, using the same files as the local app. Nothing is uploaded to any server.
+  You need Chrome or Edge on a computer for this; other browsers and phones stay read-only.
+- **AI with your own key:** open **Set up AI**, pick Claude, OpenAI, an OpenAI-compatible provider (Groq, Gemini, OpenRouter: set the Base URL) or Ollama,
+  and paste a key. The browser calls the provider directly. The key stays in that browser, for the session or, if you tick **Remember**, on that device.
+  It is never written to your data folder.
+
+### Sync your progress between devices
+
+The data folder is plain files, so git does the syncing:
+
+```bash
+cd kb-data
+git init && git add -A && git commit -m "KB progress"
+git remote add origin https://github.com/<you>/kb-data.git     # a PRIVATE repository
+git push -u origin main
+```
+
+Commit and push when you like. On another computer, `git clone` (or `git pull`), open the site and choose the same folder.
+The local app (`npm start`) reads the same folder too, so you can switch between the website and the app freely.
+
+### Using Ollama from the website
+
+The page runs on GitHub's domain, so Ollama has to allow it. Start Ollama with `OLLAMA_ORIGINS` set to the site's address:
+
+```powershell
+# Windows: set it once, then quit Ollama from the tray icon and start it again
+setx OLLAMA_ORIGINS "https://codingsaint.github.io"
+```
+```bash
+# macOS / Linux
+OLLAMA_ORIGINS="https://codingsaint.github.io" ollama serve
+```
+
+If Chrome asks whether the site may access devices on your local network, click **Allow**.
+
+### Website or local app?
+
+| | Website | Local app (`npm start`) |
+|---|---|---|
+| Install | None | Node.js + `npm install` |
+| Answers, grading, tutor, notes, voice | ✓ (Chrome or Edge on a computer) | ✓ any browser, plus phones on your Wi-Fi |
+| Where your work is saved | The folder you choose | `../kb-data` (or `dataDir`) |
+| AI providers | Claude, OpenAI and OpenAI-compatible providers that allow browser calls; Ollama with `OLLAMA_ORIGINS` | Every provider |
+| `kb` command, `kb add` (generate your own library) | – (libraries you made locally show up and can be read) | ✓ |
+
+The site is built from `content/` by `npm run build:site` and published by a GitHub Action on every push to `main`
 (`.github/workflows/pages.yml`). The build never reads your data folder and refuses to publish if any answer, verdict, note, chat or
 read status slips into it. To publish your own fork: Settings → Pages → Source: **GitHub Actions**.
 
@@ -627,7 +675,7 @@ The code is free. AI features use your own provider account, so Claude or OpenAI
 In a data folder next to the repo (`../kb-data`), never inside it, so the public repo never contains them. You can keep that folder as its own private repo to back it up and sync it between computers.
 
 **Does my work leave my computer?**
-Only when you use an AI feature, and only to the provider you chose: that topic's write-up, your answer and the recent chat. With Ollama nothing leaves your machine. There's no KB server, account or analytics.
+Only when you use an AI feature, and only to the provider you chose: that topic's write-up, your answer and the recent chat. With Ollama nothing leaves your machine. There's no KB server, account or analytics. That holds on the [website](#live-demo) too: it saves into the folder you choose and calls your provider straight from the browser.
 
 **Do I have to answer in Java?**
 No. Write in any language or in plain prose with diagrams. The reference material is Java-flavoured, but the grader judges the design.
@@ -636,7 +684,7 @@ No. Write in any language or in plain prose with diagrams. The reference materia
 Yes. Content is plain JSON and Markdown. [AUTHORING.md](AUTHORING.md) documents the format, and the build scripts keep your answers when you rebuild.
 
 **Can I use it on my phone?**
-Yes. `npm start` serves it to devices on your home Wi-Fi (never the internet). Open `http://<your-computer's-IP>:4321`.
+Yes. `npm start` serves it to devices on your home Wi-Fi (never the internet). Open `http://<your-computer's-IP>:4321`. On the website, phones can browse everything but can't save (phone browsers can't open a folder).
 
 ## Contributing
 

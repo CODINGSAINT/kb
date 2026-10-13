@@ -6,11 +6,13 @@
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
   };
-  // Read-only demo (GitHub Pages build): set by demo.js, which serves content from static files.
-  const DEMO = window.KB_DEMO || null;
-  if (DEMO) document.body.classList.add("demo");
+  // On the website (GitHub Pages) web.js answers /api/... in the page. Until you choose a data folder
+  // it sets KB_DEMO and the site is read-only. Decided in init(), once web.js has checked the folder.
+  let DEMO = null;
   const demoCard = (what) => `<section class="card demo-card"><h2>Practise this for real</h2>
-    <p style="margin-top:0">This is a read-only demo. ${esc(what)} Run KB on your own machine: it's free, takes two minutes, and your answers stay on your computer.</p>
+    <p style="margin-top:0">This is a read-only demo. ${esc(what)}</p>
+    <p><b>On this site:</b> ${window.KB_WEB && window.KB_WEB.status === "unsupported" ? "open it in Chrome or Edge on a computer, then choose" : "click <b>Use my kb-data folder</b> at the top and choose"} a folder on your computer. Your work is saved there, AI calls go straight from your browser to the provider you pick, and you can sync the folder with a private git repo.</p>
+    <p><b>Or run it locally</b> (free, two minutes, works with every provider and adds <code>kb add</code>):</p>
     <pre><code>git clone ${esc(DEMO.repo)}.git
 cd kb && npm install && npm start</code></pre>
     <p class="muted small" style="margin-bottom:0">Works with Claude, OpenAI, Groq/Gemini (free tiers) or a free local Ollama model. <a href="${esc(DEMO.repo)}" target="_blank" rel="noopener">Setup guide on GitHub ↗</a></p></section>`;
@@ -110,6 +112,8 @@ cd kb && npm install && npm start</code></pre>
     $("#aiKey").value = "";
     $("#aiKey").placeholder = p.keyFromEnv ? `Using the environment variable (${p.keyHint})` : p.keySet ? `Saved (${p.keyHint}). Leave blank to keep it` : "Paste your API key";
     $("#aiKeyLink").href = p.keyUrl;
+    $("#aiRememberRow").hidden = !aiCfg.web || !p.needsKey;
+    $("#aiRemember").checked = !!aiCfg.remember;
     $("#aiUrlRow").hidden = !p.baseUrl;
     $("#aiUrl").value = p.baseUrl || "";
     $("#aiOllamaHelp").hidden = dlgProvider !== "ollama";
@@ -140,6 +144,7 @@ cd kb && npm install && npm start</code></pre>
     const patch = { provider: dlgProvider, [dlgProvider]: { model: $("#aiModel").value } };
     if ($("#aiKey").value.trim()) patch[dlgProvider].apiKey = $("#aiKey").value.trim();
     if (!$("#aiUrlRow").hidden) patch[dlgProvider].baseUrl = $("#aiUrl").value;
+    if (aiCfg.web) patch.remember = $("#aiRemember").checked;
     await api.post("/api/ai/config", patch);
     await loadAi();
     renderDlg();
@@ -615,7 +620,7 @@ cd kb && npm install && npm start</code></pre>
       const openN = ds.filter((d) => !d.a).length;
       box.innerHTML = ds.map((d, i) => `<div class="doubt"><div class="q">Q. ${esc(d.q)}</div>${d.a ? `<div class="a" id="da${i}"></div>` : `<div class="a open">${busy ? "Answering…" : "Unanswered"}</div>`}</div>`).join("")
         + (openN ? `<div class="row"><button class="btn" id="doubtAi" ${busy ? "disabled" : ""}>${busy ? "Answering…" : `Answer ${openN > 1 ? `${openN} doubts` : "doubt"} with AI`}</button>
-            <span class="muted small">or <code>${esc(doubtCmd)}</code></span>${errMsg ? `<span class="err small">${esc(errMsg)}</span>` : ""}</div>` : "");
+            <span class="muted small server-only">or <code>${esc(doubtCmd)}</code></span>${errMsg ? `<span class="err small">${esc(errMsg)}</span>` : ""}</div>` : "");
       ds.forEach((d, i) => d.a && viewer($("#da" + i), d.a));
       $("#doubtAi")?.addEventListener("click", answerDoubts);
     };
@@ -943,7 +948,7 @@ cd kb && npm install && npm start</code></pre>
           <div class="stat"><div class="k">DSA problems</div><div class="v">${dsaN}</div><div class="muted small">${(state.dsa?.topics || []).length} patterns</div></div>
           ${state.fund ? (() => { const f = state.fund.groups.flatMap((g) => g.items); const r = f.filter((x) => x.readAt).length; return `<div class="stat"><div class="k">Fundamentals read</div><div class="v">${r}/${f.length}</div><div class="bar"><span class="fill evaluated" style="width:${f.length ? (r * 100 / f.length) : 0}%"></span></div><div class="muted small"><a href="#/read/${esc(f[0].id)}">Start reading</a></div></div>`; })() : ""}
         </div>
-        ${aiCfg && !aiCfg.ready ? `<section class="card"><h2>Connect an AI tutor</h2><p style="margin-top:0">Evaluate answers and chat about any topic with Claude, OpenAI, or a free local model through Ollama. Your key stays on this machine.</p><button class="btn primary" id="homeAi">Set up AI</button></section>` : ""}
+        ${aiCfg && !aiCfg.ready ? `<section class="card"><h2>Connect an AI tutor</h2><p style="margin-top:0">Evaluate answers and chat about any topic with Claude, OpenAI, or a free local model through Ollama. ${aiCfg.web ? "Your key stays in this browser and is sent only to that provider." : "Your key stays on this machine."}</p><button class="btn primary" id="homeAi">Set up AI</button></section>` : ""}
         ${gen ? "" : `<section class="card"><h2>No day content yet</h2><p style="margin:0">Put your <code>study.md</code> in the project root, then generate day 1 — ask in chat (“generate day 1”) or run <code>node scripts/new-day.js 1</code> to scaffold it.</p></section>`}
       </div>`;
     $("#homeAi")?.addEventListener("click", () => openAiSettings());
@@ -978,6 +983,10 @@ cd kb && npm install && npm start</code></pre>
   window.addEventListener("hashchange", () => route(false));
 
   (async function init() {
+    if (window.KB_BOOT) await window.KB_BOOT;
+    DEMO = window.KB_DEMO || null;
+    if (DEMO) document.body.classList.add("demo");
+    else if (window.KB_WEB) document.body.classList.add("web");
     await loadAi();
     try { await loadNav(); } catch (e) { $("#nav").innerHTML = `<div class="empty-note">Couldn't reach the server.</div>`; }
     await route(true);
