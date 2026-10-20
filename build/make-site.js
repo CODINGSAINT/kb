@@ -67,7 +67,24 @@ write("data/meta.json", { days: dayFiles.map((f) => Number(/\d+/.exec(f)[0])), p
   const base = (process.env.KB_SITE_URL || "https://codingsaint.com/kb/").replace(/\/?$/, "/");
   const topicsJson = JSON.stringify(buildTopics(raw, fundRaw, { base }), null, 2) + "\n";
   write("topics.json", topicsJson);
-  write("topics", topicsJson); // extensionless copy so /kb/topics works too
+  // /kb/topics: GitHub Pages can't serve an extensionless file as JSON (browsers download it), so
+  // topics/index.html shows the same JSON as text. Scripts should read topics.json.
+  const escHtml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  write("topics/index.html", `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KB topics by week (JSON)</title>
+<link rel="alternate" type="application/json" href="../topics.json">
+<style>
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #1f2937; --muted: #6b7280; --link: #1c39bb; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #0f1115; --fg: #e5e7eb; --muted: #9ca3af; --link: #8ea2ff; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { padding: 10px 16px; border-bottom: 1px solid rgba(127,127,127,.25); color: var(--muted); font-family: system-ui, sans-serif; }
+  a { color: var(--link); }
+  pre { margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word; }
+</style></head>
+<body><header>KB topics by week · raw JSON for scripts: <a href="../topics.json">topics.json</a></header>
+<pre>${escHtml(topicsJson)}</pre></body></html>
+`);
 }
 
 const dsa = readJson(path.join(CONTENT, "dsa.json"));

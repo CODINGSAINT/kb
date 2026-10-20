@@ -619,8 +619,9 @@ Bits → Trie → Strings → Matrix & Math → Design.
 
 ### All topics as JSON
 
-The full plan, week by week, is published as data: **[codingsaint.com/kb/topics](https://codingsaint.com/kb/topics.json)**
-(also `/kb/topics.json`, and `http://localhost:4321/topics` in the local app). Each topic has its id, track, title, concepts,
+The full plan, week by week, is published as data: view it at **[codingsaint.com/kb/topics](https://codingsaint.com/kb/topics/)**,
+and read the raw file from scripts at **[codingsaint.com/kb/topics.json](https://codingsaint.com/kb/topics.json)**
+(in the local app: `http://localhost:4321/topics`). Each topic has its id, track, title, concepts,
 problem statement, day, a link to open it, and its read-first chapters. Weeks are 7 days (3 topics a day). No one's answers are ever in it.
 
 ### Sync your progress between devices
