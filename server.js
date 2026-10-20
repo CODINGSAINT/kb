@@ -87,6 +87,14 @@ function parseDay(req, res) {
 }
 
 // ---------- routes ----------
+// All design topics grouped by week, as JSON (shared content only, never your answers). See lib/topics.js.
+app.get(["/topics", "/topics.json"], (req, res) => {
+  const { buildTopics } = require("./lib/topics");
+  const { readRaw } = require("./lib/store");
+  const days = listDays().map((d) => { try { return readRaw(dayFile(d)); } catch (e) { return null; } }).filter(Boolean);
+  const fund = fs.existsSync(FUND_FILE) ? readRaw(FUND_FILE) : null;
+  res.json(buildTopics(days, fund, { base: `${req.protocol}://${req.get("host")}/` }));
+});
 app.get("/api/tracks", (req, res) => {
   const tracks = { LLD: [], HLD: [], AI: [] };
   for (const d of listDays()) {

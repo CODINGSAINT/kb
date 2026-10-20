@@ -515,6 +515,7 @@ bin/kb.js                the `kb` command
 lib/store.js             read/write content JSON; addresses like "lld 1"
 lib/ai.js                provider layer (Claude, OpenAI-compatible, Ollama), streaming, kb.config.json
 lib/tutor.js             evaluate / clarify / doubts, shared by the CLI and the server
+lib/topics.js            all topics grouped by week as JSON (/topics locally, /kb/topics on the website)
 lib/core/shared.js       prompts, data-folder rules, #doubt handling: shared by the local app and the website
 lib/core/llm.js          provider calls with streaming (Claude, OpenAI-compatible, Ollama): shared by the local app and the website
 lib/voice.js             optional OpenAI speech-to-text / text-to-speech for the voice features
@@ -615,6 +616,12 @@ Bits → Trie → Strings → Matrix & Math → Design.
 - **AI with your own key:** open **Set up AI**, pick Claude, OpenAI, an OpenAI-compatible provider (Groq, Gemini, OpenRouter: set the Base URL) or Ollama,
   and paste a key. The browser calls the provider directly. The key stays in that browser, for the session or, if you tick **Remember**, on that device.
   It is never written to your data folder.
+
+### All topics as JSON
+
+The full plan, week by week, is published as data: **[codingsaint.com/kb/topics](https://codingsaint.com/kb/topics.json)**
+(also `/kb/topics.json`, and `http://localhost:4321/topics` in the local app). Each topic has its id, track, title, concepts,
+problem statement, day, a link to open it, and its read-first chapters. Weeks are 7 days (3 topics a day). No one's answers are ever in it.
 
 ### Sync your progress between devices
 

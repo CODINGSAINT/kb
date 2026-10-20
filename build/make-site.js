@@ -58,6 +58,18 @@ let plannedTopics = 0;
 try { plannedTopics = require("../scripts/study-parser").parseStudy(fs.readFileSync(path.join(ROOT, "study.md"), "utf8")).count || 0; } catch (e) {}
 write("data/meta.json", { days: dayFiles.map((f) => Number(/\d+/.exec(f)[0])), plannedTopics });
 
+// Topics by week for anyone who wants the plan as data: /kb/topics.json and /kb/topics (see lib/topics.js).
+// KB_SITE_URL sets the address used in the links (default: the published site).
+{
+  const { buildTopics } = require("../lib/topics");
+  const raw = dayFiles.map((f) => readJson(path.join(CONTENT, f)));
+  const fundRaw = fs.existsSync(path.join(CONTENT, "fundamentals.json")) ? readJson(path.join(CONTENT, "fundamentals.json")) : null;
+  const base = (process.env.KB_SITE_URL || "https://codingsaint.com/kb/").replace(/\/?$/, "/");
+  const topicsJson = JSON.stringify(buildTopics(raw, fundRaw, { base }), null, 2) + "\n";
+  write("topics.json", topicsJson);
+  write("topics", topicsJson); // extensionless copy so /kb/topics works too
+}
+
 const dsa = readJson(path.join(CONTENT, "dsa.json"));
 for (const tp of dsa.topics || []) for (const p of tp.problems || []) strip(p);
 write("data/dsa.json", dsa);
