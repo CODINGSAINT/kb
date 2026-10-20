@@ -65,7 +65,8 @@ write("data/meta.json", { days: dayFiles.map((f) => Number(/\d+/.exec(f)[0])), p
   const raw = dayFiles.map((f) => readJson(path.join(CONTENT, f)));
   const fundRaw = fs.existsSync(path.join(CONTENT, "fundamentals.json")) ? readJson(path.join(CONTENT, "fundamentals.json")) : null;
   const base = (process.env.KB_SITE_URL || "https://codingsaint.com/kb/").replace(/\/?$/, "/");
-  const topicsJson = JSON.stringify(buildTopics(raw, fundRaw, { base }), null, 2) + "\n";
+  const dsaRaw = readJson(path.join(CONTENT, "dsa.json"));
+  const topicsJson = JSON.stringify(buildTopics(raw, fundRaw, { base, dsa: dsaRaw }), null, 2) + "\n";
   write("topics.json", topicsJson);
   // /kb/topics: GitHub Pages can't serve an extensionless file as JSON (browsers download it), so
   // topics/index.html shows the same JSON as text. Scripts should read topics.json.

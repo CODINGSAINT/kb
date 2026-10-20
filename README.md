@@ -622,8 +622,10 @@ Bits → Trie → Strings → Matrix & Math → Design.
 The full plan, week by week, is published as data: view it at **[codingsaint.com/kb/topics](https://codingsaint.com/kb/topics/)**,
 and read the raw file from scripts at **[codingsaint.com/kb/topics.json](https://codingsaint.com/kb/topics.json)**
 (in the local app: `http://localhost:4321/topics`). Each topic has its id, track, title, concepts,
-problem statement, day, a link to open it, and its read-first chapters. The LLD, HLD and AI fundamentals are included too:
-all of them under `fundamentals`, and each one in the week where a topic first needs it. Weeks are 7 days (3 topics a day). No one's answers are ever in it.
+problem statement, day, a link to open it, and its read-first chapters. All 304 DSA problems are in the same format, in pattern
+order at 5 a day (with difficulty, LeetCode link and the pattern guide as read-first). The LLD, HLD and AI fundamentals and the
+DSA pattern guides are listed under `fundamentals`, and each one also appears in the week where it's first needed.
+Weeks are 7 days. No one's answers are ever in it.
 
 ### Sync your progress between devices
 
