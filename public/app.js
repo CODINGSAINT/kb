@@ -11,11 +11,14 @@
   let DEMO = null;
   const demoCard = (what) => `<section class="card demo-card"><h2>Practise this for real</h2>
     <p style="margin-top:0">This is a read-only demo. ${esc(what)}</p>
-    <p><b>On this site:</b> ${window.KB_WEB && window.KB_WEB.status === "unsupported" ? "open it in Chrome or Edge on a computer, then choose" : "click <b>Use my kb-data folder</b> at the top and choose"} a folder on your computer. Your work is saved there, AI calls go straight from your browser to the provider you pick, and you can sync the folder with a private git repo.</p>
+    ${DEMO.google
+      ? `<p><b>On this site or the Android app:</b> sign in with Google. Your work is saved to your own Google Drive and follows you to every device, and you connect your AI provider (Claude, Grok, Gemini or OpenAI) once.</p>
+    <p><button type="button" class="btn primary" onclick="window.KB_SIGN_IN && window.KB_SIGN_IN()">Continue with Google</button></p>`
+      : `<p><b>On this site:</b> ${window.KB_WEB && window.KB_WEB.status === "unsupported" ? "open it in Chrome or Edge on a computer, then choose" : "click <b>Use my kb-data folder</b> at the top and choose"} a folder on your computer. Your work is saved there, AI calls go straight from your browser to the provider you pick, and you can sync the folder with a private git repo.</p>`}
     <p><b>Or run it locally</b> (free, two minutes, works with every provider and adds <code>kb add</code>):</p>
     <pre><code>git clone ${esc(DEMO.repo)}.git
 cd kb && npm install && npm start</code></pre>
-    <p class="muted small" style="margin-bottom:0">Works with Claude, OpenAI, Groq/Gemini (free tiers) or a free local Ollama model. <a href="${esc(DEMO.repo)}" target="_blank" rel="noopener">Setup guide on GitHub ↗</a></p></section>`;
+    <p class="muted small" style="margin-bottom:0">Works with Claude, OpenAI, Grok, Gemini (free tier) or a free local Ollama model. <a href="${esc(DEMO.repo)}" target="_blank" rel="noopener">Setup guide on GitHub ↗</a></p></section>`;
 
   const api = {
     async get(url) {
@@ -48,7 +51,7 @@ cd kb && npm install && npm start</code></pre>
     document.querySelectorAll(".toastui-editor-defaultUI").forEach((el) => el.classList.toggle("toastui-editor-dark", t === "dark"));
     document.querySelectorAll("[data-diagram]").forEach((el) => KBDiagram.render(el, el._spec, el.dataset.diagram));
   });
-  if (store.get("kb-sidebar-collapsed", false)) document.body.classList.add("sidebar-collapsed");
+  if (store.get("kb-sidebar-collapsed", window.innerWidth <= 780)) document.body.classList.add("sidebar-collapsed"); // phones start with it closed
   const toggleSidebar = () => {
     document.body.classList.toggle("sidebar-collapsed");
     store.set("kb-sidebar-collapsed", document.body.classList.contains("sidebar-collapsed"));
@@ -69,14 +72,14 @@ cd kb && npm install && npm start</code></pre>
   // ---------- AI settings ----------
   // The server keeps keys in kb.config.json; the browser only ever sees "…last4".
   let aiCfg = null, dlgProvider = null;
-  const shortName = (id) => ({ anthropic: "Claude", openai: "OpenAI", ollama: "Ollama", mock: "Mock" }[id] || id);
+  const shortName = (id) => ({ anthropic: "Claude", openai: "OpenAI", xai: "Grok", gemini: "Gemini", ollama: "Ollama", mock: "Mock" }[id] || id);
   async function loadAi() {
     if (DEMO) { aiCfg = { ready: false, demo: true, providers: {} }; return aiCfg; }
     try { aiCfg = await api.get("/api/ai/config"); } catch (e) { aiCfg = null; }
     const chip = $("#aiButton");
     chip.dataset.state = aiCfg && aiCfg.ready ? "on" : "off";
     $("#aiLabel").textContent = aiCfg && aiCfg.ready ? `${shortName(aiCfg.provider)} · ${aiCfg.model}` : "Set up AI";
-    chip.title = aiCfg && aiCfg.ready ? "AI settings: provider, model, API key" : "Connect Claude, OpenAI or a local Ollama model";
+    chip.title = aiCfg && aiCfg.ready ? "AI settings: provider, model, API key" : "Connect Claude, Grok, Gemini, OpenAI or a local Ollama model";
     state.onAiChange && state.onAiChange();
     return aiCfg;
   }
@@ -112,7 +115,8 @@ cd kb && npm install && npm start</code></pre>
     $("#aiKey").value = "";
     $("#aiKey").placeholder = p.keyFromEnv ? `Using the environment variable (${p.keyHint})` : p.keySet ? `Saved (${p.keyHint}). Leave blank to keep it` : "Paste your API key";
     $("#aiKeyLink").href = p.keyUrl;
-    $("#aiRememberRow").hidden = !aiCfg.web || !p.needsKey;
+    $("#aiRememberRow").hidden = !aiCfg.web || aiCfg.drive || !p.needsKey;
+    document.getElementById("aiDialog").classList.toggle("drive", !!aiCfg.drive);
     $("#aiRemember").checked = !!aiCfg.remember;
     $("#aiUrlRow").hidden = !p.baseUrl;
     $("#aiUrl").value = p.baseUrl || "";
@@ -981,6 +985,8 @@ cd kb && npm install && npm start</code></pre>
     if (window.innerWidth <= 780 && h[0]) document.body.classList.add("sidebar-collapsed");
   }
   window.addEventListener("hashchange", () => route(false));
+  // Signed in with Google: work saved on another device arrived. Refresh the sidebar and progress (not the open editor).
+  window.addEventListener("kb:remote-change", () => { if (!state.dirty) { loadNav().catch(() => {}); loadProgress(); } });
 
   (async function init() {
     if (window.KB_BOOT) await window.KB_BOOT;

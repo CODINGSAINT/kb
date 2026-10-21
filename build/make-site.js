@@ -102,13 +102,62 @@ write("data/fundamentals.json", fund);
 const idx = path.join(OUT, "index.html");
 let html = fs.readFileSync(idx, "utf8");
 html = html.replace(/<title>[^<]*<\/title>/, `<title>KB · AI interview coach</title>
-  <meta name="description" content="Practise LLD, HLD, AI system design and DSA: 60 design problems, 37 read-first chapters and 304 DSA problems by pattern. Choose your own data folder to save answers and get AI grading and a tutor with your own key." />`);
-html = html.replace('<script src="app.js"></script>', '<script src="core/shared.js"></script>\n  <script src="core/llm.js"></script>\n  <script src="web.js"></script>\n  <script src="app.js"></script>');
+  <meta name="description" content="Practise LLD, HLD, AI system design and DSA: 60 design problems, 37 read-first chapters and 304 DSA problems by pattern. Sign in with Google to save your progress to your own Drive, and get AI grading and a tutor with your own key (Claude, Grok, Gemini or OpenAI)." />`);
+html = html.replace('<script src="app.js"></script>', '<script src="config.js"></script>\n  <script src="core/shared.js"></script>\n  <script src="core/llm.js"></script>\n  <script src="drive.js"></script>\n  <script src="pro.js"></script>\n  <script src="web.js"></script>\n  <script src="app.js"></script>');
+// Installable app: manifest, theme colour and home-screen icon.
+html = html.replace("</head>", `  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="theme-color" content="#1c39bb" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <meta name="mobile-web-app-capable" content="yes" />
+</head>`);
 if (!html.includes("web.js")) throw new Error("Couldn't find app.js in index.html to add web.js before it.");
 fs.writeFileSync(idx, html);
-fs.copyFileSync(path.join(__dirname, "site", "web.js"), path.join(OUT, "web.js"));
+for (const f of ["web.js", "drive.js", "pro.js"]) fs.copyFileSync(path.join(__dirname, "site", f), path.join(OUT, f));
+
+// ---- site settings (public): Google sign-in client id and KB Pro, from site.config.json ----
+// KB_GOOGLE_CLIENT_ID overrides the file, e.g. to try a fork with your own OAuth client.
+const siteCfg = (() => { try { return readJson(path.join(ROOT, "site.config.json")); } catch (e) { return {}; } })();
+delete siteCfg._readme;
+if (process.env.KB_GOOGLE_CLIENT_ID) siteCfg.googleClientId = process.env.KB_GOOGLE_CLIENT_ID;
+if (siteCfg.googleClientId && !/\.apps\.googleusercontent\.com$/.test(siteCfg.googleClientId)) throw new Error("site.config.json: googleClientId should end in .apps.googleusercontent.com");
+write("config.js", `window.KB_SITE = ${JSON.stringify(siteCfg, null, 2)};\n`);
+
+// ---- installable app (PWA; also what the Android app opens) ----
+write("manifest.webmanifest", JSON.stringify({
+  name: "KB · AI interview coach", short_name: "KB", id: "./", start_url: "./?source=pwa", scope: "./",
+  display: "standalone", orientation: "any", background_color: "#ffffff", theme_color: "#1c39bb",
+  description: "Practise LLD, HLD, AI system design and DSA with an AI grader and tutor. Your progress lives in your Google Drive.",
+  categories: ["education", "productivity"],
+  icons: [
+    { src: "icons/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+    { src: "icons/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+    { src: "icons/maskable-192.png", sizes: "192x192", type: "image/png", purpose: "maskable" },
+    { src: "icons/maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+  ],
+}, null, 2));
 copyDir(path.join(ROOT, "lib", "core"), path.join(OUT, "core")); // the same prompts and data rules as the local app
 fs.writeFileSync(path.join(OUT, ".nojekyll"), ""); // serve files as-is
+
+// Offline cache: every file of the app and its content, versioned by their hash.
+{
+  const crypto = require("crypto");
+  const list = [];
+  (function walk(d) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const f = path.join(d, e.name);
+      const rel = path.relative(OUT, f).split(path.sep).join("/");
+      if (e.isDirectory()) { if (!["topics"].includes(rel)) walk(f); }
+      else if (!/(^|\/)\.|LICENSE|\.map$|^topics\.json$|^sw\.js$/.test(rel)) list.push(rel);
+    }
+  })(OUT);
+  list.sort();
+  const h = crypto.createHash("sha1");
+  for (const f of list) h.update(f).update(fs.readFileSync(path.join(OUT, f)));
+  const sw = fs.readFileSync(path.join(__dirname, "site", "sw.js"), "utf8")
+    .replace("__VERSION__", h.digest("hex").slice(0, 12))
+    .replace("__FILES__", JSON.stringify(["./", ...list]));
+  fs.writeFileSync(path.join(OUT, "sw.js"), sw);
+}
 
 // ---- safety check: nothing personal made it in ----
 const leaks = [];
