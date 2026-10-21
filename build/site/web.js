@@ -1,7 +1,10 @@
 // KB on the web (GitHub Pages): the app with no server.
 //
-//   - Without a folder it's a read-only demo.
-//   - Choose your kb-data folder (Chrome or Edge on a computer) and it becomes the full app: answers,
+//   - Signed out it's a read-only demo.
+//   - Sign in with Google (drive.js) and it becomes the full app on any browser and the Android app: your work and
+//     your AI settings, keys included, are kept in your own Google Drive and follow you to every device.
+//   - KB Pro (pro.js) gates practice beyond the free topics when pro.enabled is set in site.config.json.
+//   - Or choose your kb-data folder (Chrome or Edge on a computer) and it becomes the full app: answers,
 //     notes, read status, tutor chats and images are saved straight into that folder, in exactly the
 //     same files the local app uses. Keep the folder in a private git repo to sync between devices.
 //   - AI runs from this browser to the provider you pick, with your own key. The key stays in this
@@ -46,43 +49,57 @@
     set(store, k, v) { try { if (v == null) store.removeItem(k); else store.setItem(k, JSON.stringify(v)); } catch (e) {} },
   };
 
-  // ---------------------------------------------------------------- the data folder
-  let dir = null;            // FileSystemDirectoryHandle once connected
-  let status = CAN_PICK ? "none" : "unsupported"; // none | needs-permission | connected | unsupported
+  // ---------------------------------------------------------------- where your work is saved
+  // Two places, same files:
+  //   "drive":  signed in with Google; saved in KB's private app folder in your Google Drive (drive.js),
+  //             works on phones and every browser, and follows you to every device you sign in on.
+  //   "folder": a kb-data folder on this computer (Chrome or Edge on a computer), shared with the local app.
+  const D = window.KBDrive || { available: false };
+  let dir = null;            // FileSystemDirectoryHandle in folder mode
+  let mode = null;           // "drive" | "folder" | null
+  let status = "none";       // none | needs-permission | connected
   let savedHandle = null;
   const progress = new Map(); // progress id -> saved record
-  let libs = [];              // your `kb add` libraries, read from library/
+  let libs = [];              // your `kb add` libraries, read from library/ (folder mode)
 
   async function subdir(parts, create) {
     let d = dir;
     for (const p of parts) d = await d.getDirectoryHandle(p, { create });
     return d;
   }
-  async function readFile(parts) {
-    try {
-      const d = await subdir(parts.slice(0, -1), false);
-      return await (await d.getFileHandle(parts[parts.length - 1])).getFile();
-    } catch (e) { if (e.name === "NotFoundError" || e.name === "TypeMismatchError") return null; throw e; }
-  }
+  const folderFs = {
+    async readFile(parts) {
+      try {
+        const d = await subdir(parts.slice(0, -1), false);
+        return await (await d.getFileHandle(parts[parts.length - 1])).getFile();
+      } catch (e) { if (e.name === "NotFoundError" || e.name === "TypeMismatchError") return null; throw e; }
+    },
+    async writeFile(parts, data) {
+      const d = await subdir(parts.slice(0, -1), true);
+      const w = await (await d.getFileHandle(parts[parts.length - 1], { create: true })).createWritable();
+      await w.write(data);
+      await w.close(); // the browser writes to a temporary file and swaps it in on close
+    },
+    async removeFile(parts) {
+      try { await (await subdir(parts.slice(0, -1), false)).removeEntry(parts[parts.length - 1]); }
+      catch (e) { if (e.name !== "NotFoundError") throw e; }
+    },
+    async entries(parts) {
+      let d;
+      try { d = await subdir(parts, false); } catch (e) { return []; }
+      const out = [];
+      for await (const [name, h] of d.entries()) out.push([name, h]);
+      return out;
+    },
+  };
+  const fsb = () => (mode === "drive" ? D.fs : folderFs);
+  const readFile = (parts) => fsb().readFile(parts);
   const readText = async (parts) => { const f = await readFile(parts); return f ? f.text() : null; };
-  async function writeFile(parts, data) {
-    const d = await subdir(parts.slice(0, -1), true);
-    const w = await (await d.getFileHandle(parts[parts.length - 1], { create: true })).createWritable();
-    await w.write(data);
-    await w.close(); // the browser writes to a temporary file and swaps it in on close
-  }
-  async function removeFile(parts) {
-    try { await (await subdir(parts.slice(0, -1), false)).removeEntry(parts[parts.length - 1]); }
-    catch (e) { if (e.name !== "NotFoundError") throw e; }
-  }
-  async function entries(parts) {
-    let d;
-    try { d = await subdir(parts, false); } catch (e) { return []; }
-    const out = [];
-    for await (const [name, h] of d.entries()) out.push([name, h]);
-    return out;
-  }
+  const writeFile = (parts, data) => fsb().writeFile(parts, data);
+  const removeFile = (parts) => fsb().removeFile(parts);
+  const entries = (parts) => fsb().entries(parts);
   async function ensureReadme() {
+    if (mode !== "folder") return;
     if ((await readFile(["README.md"])) === null) await writeFile(["README.md"], C.DATA_README);
   }
 
@@ -111,10 +128,27 @@
   }
 
   async function connect(handle) {
-    dir = handle;
+    dir = handle; mode = "folder";
     await loadFolder();
     status = "connected";
   }
+  async function connectDrive() {
+    mode = "drive";
+    await loadFolder();
+    status = "connected";
+  }
+  // Another device saved while this one was open: reload what's on screen if nothing is being typed.
+  let lastPending = 0;
+  if (D.onChange) D.onChange(async (s) => {
+    if (mode !== "drive") return;
+    const wasBusy = lastPending;
+    lastPending = s.pending;
+    if (s.sync === "idle" && !wasBusy) {
+      const before = JSON.stringify([...progress.entries()]);
+      await loadFolder();
+      if (JSON.stringify([...progress.entries()]) !== before) window.dispatchEvent(new CustomEvent("kb:remote-change"));
+    }
+  });
 
   // Pick a folder (needs a click). Checks it isn't the app's own folder by mistake.
   async function chooseFolder() {
@@ -270,16 +304,22 @@
   // ---------------------------------------------------------------- AI settings (this browser only)
   // Model and base URL are remembered in localStorage. Keys are kept for this session
   // (sessionStorage) unless you tick "Remember", which keeps them in localStorage on this device.
+  // Signed in with Google: provider, models and keys live in settings.json in your Drive's KB app folder,
+  // so you connect a provider once and it works on every device you sign in on.
   const SETTINGS = "kb-web-ai", KEYS = "kb-web-keys";
   const PROVIDERS = L.PROVIDERS;
-  const remembered = () => !!local.get(localStorage, KEYS, null);
-  const keys = () => local.get(localStorage, KEYS, null) || local.get(sessionStorage, KEYS, {}) || {};
+  const onDrive = () => mode === "drive";
+  const remembered = () => onDrive() || !!local.get(localStorage, KEYS, null);
+  const keys = () => (onDrive() ? (D.settings.get("ai", {}).keys || {}) : local.get(localStorage, KEYS, null) || local.get(sessionStorage, KEYS, {}) || {});
   function setKeys(k, remember) {
+    if (onDrive()) { D.settings.set("ai", Object.assign(D.settings.get("ai", {}), { keys: k })); return; }
     local.set(localStorage, KEYS, remember ? k : null);
     local.set(sessionStorage, KEYS, remember ? null : k);
   }
+  const savedPrefs = () => (onDrive() ? (D.settings.get("ai", {}).prefs || {}) : local.get(localStorage, SETTINGS, {}));
+  const setPrefs = (p) => (onDrive() ? D.settings.set("ai", Object.assign(D.settings.get("ai", {}), { prefs: p })) : local.set(localStorage, SETTINGS, p));
   function settings() {
-    const saved = local.get(localStorage, SETTINGS, {});
+    const saved = savedPrefs();
     const k = keys();
     const cfg = { provider: saved.provider || "anthropic" };
     for (const [id, p] of Object.entries(PROVIDERS)) cfg[id] = Object.assign({}, p.defaults, saved[id] || {}, { apiKey: k[id] || "" });
@@ -290,13 +330,13 @@
     const provider = over.provider || cfg.provider;
     if (provider === "mock") return { provider, model: "mock", apiKey: "", baseUrl: "" };
     if (!PROVIDERS[provider]) throw new Error(`Unknown provider "${provider}".`);
-    const s = Object.assign({ provider }, cfg[provider], { keySource: cfg[provider].apiKey ? (remembered() ? "this browser (remembered)" : "this browser session") : "" });
+    const s = Object.assign({ provider }, cfg[provider], { keySource: cfg[provider].apiKey ? (onDrive() ? "your Google Drive" : remembered() ? "this browser (remembered)" : "this browser session") : "" });
     if (over.model) s.model = over.model;
     return s;
   }
   function publicConfig() {
     const cfg = settings();
-    const out = { provider: cfg.provider, ready: false, providers: {}, web: true, remember: remembered() };
+    const out = { provider: cfg.provider, ready: false, providers: {}, web: true, drive: onDrive(), remember: remembered() };
     for (const [id, p] of Object.entries(PROVIDERS)) {
       const r = resolve({ provider: id });
       out.providers[id] = { name: p.name, needsKey: p.needsKey, models: p.models, keyUrl: p.keyUrl,
@@ -308,7 +348,7 @@
     return out;
   }
   function saveConfig(patch) {
-    const saved = local.get(localStorage, SETTINGS, {});
+    const saved = savedPrefs();
     const k = keys();
     if (patch.provider) {
       if (!PROVIDERS[patch.provider] && patch.provider !== "mock") throw new Error(`Unknown provider "${patch.provider}"`);
@@ -323,7 +363,7 @@
       if (typeof p.apiKey === "string" && p.apiKey.trim()) k[id] = p.apiKey.trim();
       if (p.clearKey) delete k[id];
     }
-    local.set(localStorage, SETTINGS, saved);
+    setPrefs(saved);
     setKeys(k, patch.remember === undefined ? remembered() : !!patch.remember);
   }
   async function complete(opts) {
@@ -466,6 +506,25 @@
     return new Response(stream, { headers: { "Content-Type": "application/x-ndjson; charset=utf-8" } });
   }
 
+  // ---------------------------------------------------------------- KB Pro gate (pro.js)
+  // Writing answers, AI grading, the tutor and #doubt answers need Pro beyond the free topics.
+  // Reading, notes and read marks are always free.
+  const Pro = window.KBPro || { allowed: () => true, isPro: () => true, enabled: () => false };
+  async function dsaPatternOf(number) {
+    let n = 0;
+    const topics = (await getStatic("data/dsa.json")).topics || [];
+    for (let i = 0; i < topics.length; i++) { n += (topics[i].problems || []).length; if (number <= n) return i; }
+    return topics.length;
+  }
+  async function gate(addr) {
+    if (!addr || !Pro.enabled() || Pro.isPro()) return null;
+    const pat = addr.track === "DSA" ? await dsaPatternOf(addr.number) : 0;
+    if (Pro.allowed(addr, () => pat)) return null;
+    const e = Pro.lockedError();
+    setTimeout(() => Pro.open(e.message), 0);
+    return json({ error: e.message, code: e.code }, 402);
+  }
+
   async function handle(method, path, query, init) {
     const live = status === "connected";
     // ---- reading ----
@@ -521,6 +580,7 @@
       const t = day.topics && day.topics[b.topicIndex];
       if (!t) return json({ error: "bad topicIndex" }, 400);
       const field = m[2] === "notes" ? "notes" : "userAnswer";
+      if (field === "userAnswer") { const locked = await gate({ track: t.category, number: t.number }); if (locked) return locked; }
       return json({ ok: true, topic: await saveField("day", day, t, field, b[field]) });
     }
     m = /^\/api\/dsa\/(notes|answer)$/.exec(path);
@@ -529,6 +589,7 @@
       const p = dsa.topics && dsa.topics[b.topicIndex] && dsa.topics[b.topicIndex].problems && dsa.topics[b.topicIndex].problems[b.problemIndex];
       if (!p) return json({ error: "bad topicIndex/problemIndex" }, 400);
       const field = m[1] === "notes" ? "notes" : "userAnswer";
+      if (field === "userAnswer" && Pro.enabled() && !Pro.isPro() && !Pro.allowed({ track: "DSA" }, () => b.topicIndex)) { const locked = await gate({ track: "DSA", number: Infinity }); if (locked) return locked; }
       return json({ ok: true, problem: await saveField("dsa", dsa, p, field, b[field]) });
     }
 
@@ -536,6 +597,12 @@
     if (path === "/api/ai/test") {
       try { const r = await complete({ system: "Reply with exactly: OK", messages: [{ role: "user", content: "ping" }], maxTokens: 20 }); return json({ ok: true, reply: r.trim().slice(0, 60) }); }
       catch (e) { return aiFail(e); }
+    }
+    if (/^\/api\/ai\/(evaluate|doubts|chat)$/.test(path)) {
+      let addr = null;
+      try { addr = addrFrom(b); } catch (e) {}
+      const locked = await gate(addr);
+      if (locked) return locked;
     }
     if (path === "/api/ai/evaluate") {
       try { return json({ ok: true, item: await evaluate(addrFrom(b)) }); } catch (e) { return aiFail(e); }
@@ -565,18 +632,20 @@
       .catch((e) => (e.name === "AbortError" ? Promise.reject(e) : fail(e)));
   };
 
-  // ---------------------------------------------------------------- top bar: folder status
+
+  // ---------------------------------------------------------------- top bar: account / folder status
   const FOLDER_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
+  const G_ICON = '<svg viewBox="0 0 48 48" width="16" height="16" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.6-.4-3.9z"/><path fill="#FF3D00" d="m6.3 14.7 6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.6-.4-3.9z"/></svg>';
   const escH = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+  function modal(id) {
+    let dlg = document.getElementById(id);
+    if (!dlg) { dlg = document.createElement("dialog"); dlg.id = id; dlg.className = "ai-dialog folder-dialog"; document.body.appendChild(dlg); }
+    return dlg;
+  }
+
   function folderDialog() {
-    let dlg = document.getElementById("folderDialog");
-    if (!dlg) {
-      dlg = document.createElement("dialog");
-      dlg.id = "folderDialog";
-      dlg.className = "ai-dialog folder-dialog";
-      document.body.appendChild(dlg);
-    }
+    const dlg = modal("folderDialog");
     const n = progress.size;
     dlg.innerHTML = `<h2>Your data folder</h2>
       <p style="margin-top:0">Saving to <b>${escH(dir.name)}</b> on this computer: ${n} topic${n === 1 ? "" : "s"} with saved work${libs.length ? `, ${libs.length} librar${libs.length === 1 ? "y" : "ies"}` : ""}.
@@ -585,17 +654,78 @@
       <p class="small">Make the folder a <b>private</b> git repository and commit when you like:</p>
       <pre><code>cd ${escH(dir.name)}
 git add -A && git commit -m "KB progress" && git push</code></pre>
-      <p class="small">On another computer, clone it (or <code>git pull</code>), open this site and choose the same folder. The local app (<code>npm start</code>) reads the same folder too.</p>
+      <p class="small">On another computer, clone it (or <code>git pull</code>), open this site and choose the same folder. The local app (<code>npm start</code>) reads the same folder too.${D.available ? " Or sign in with Google instead to sync automatically, phones included." : ""}</p>
       <div class="dlg-actions"><button type="button" class="btn" data-act="disconnect">Stop using this folder</button><span class="spacer"></span>
         <button type="button" class="btn" data-act="switch">Choose another folder</button>
         <button type="button" class="btn primary" data-act="close">Done</button></div>`;
     dlg.onclick = async (e) => {
       const act = e.target.closest("[data-act]") && e.target.closest("[data-act]").dataset.act;
       if (act === "close") dlg.close();
-      if (act === "disconnect" && confirm("Stop using this folder on this site? Your files stay where they are; the site goes back to read-only.")) { await disconnect(); location.reload(); }
+      if (act === "disconnect" && confirm("Stop using this folder on this site? Your files stay where they are.")) { await disconnect(); location.reload(); }
       if (act === "switch") { try { if (await chooseFolder()) location.reload(); } catch (er) { alert(er.message); } }
     };
     dlg.showModal();
+  }
+
+  const ago = (t) => { if (!t) return "not yet"; const s = Math.round((Date.now() - t) / 1000); return s < 60 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+  function syncText(s) {
+    if (s.sync === "syncing") return "Syncing…";
+    if (s.sync === "paused") return s.pending ? `${s.pending} change${s.pending === 1 ? "" : "s"} waiting · tap to sync` : "Tap to sync";
+    if (s.sync === "offline") return "Offline · saved on this device";
+    if (s.sync === "error") return "Sync problem · tap to retry";
+    return "Synced";
+  }
+
+  function accountDialog() {
+    const dlg = modal("accountDialog");
+    const render = () => {
+      const s = D.state(), u = s.user || {};
+      const n = progress.size;
+      dlg.innerHTML = `<h2>Your account</h2>
+        <div class="acct-row">${u.picture ? `<img class="acct-pic" src="${escH(u.picture)}" alt="" referrerpolicy="no-referrer">` : `<span class="acct-pic acct-initial">${escH((u.name || u.email || "?")[0].toUpperCase())}</span>`}
+          <div><b>${escH(u.name || "")}</b><div class="muted small">${escH(u.email || "")}</div></div></div>
+        <p class="small">Your answers, notes, tutor chats and AI settings (including your API key) are saved in KB's private folder in <b>your</b> Google Drive.
+          KB can't see anything else in your Drive, and there is no KB server: only you, and the AI provider you pick, see your work.</p>
+        <p class="small"><b>${escH(syncText(s))}</b> · ${n} topic${n === 1 ? "" : "s"} with saved work · last synced ${escH(ago(s.lastSynced))}${s.error && s.sync === "error" ? `<br><span class="err-txt">${escH(s.error)}</span>` : ""}</p>
+        ${Pro.enabled() ? `<p class="small">${Pro.isPro() ? "<b>KB Pro</b>: every topic unlocked." : `Free plan: the first ${Pro.free.designPerTrack} topics of each design track and the first ${Pro.free.dsaPatterns} DSA patterns. <a href="#" data-act="pro">Unlock everything</a>`}</p>` : ""}
+        <div class="dlg-actions"><button type="button" class="btn" data-act="signout">Sign out</button>
+          <button type="button" class="btn" data-act="export">Export</button><span class="spacer"></span>
+          <button type="button" class="btn" data-act="sync">Sync now</button>
+          <button type="button" class="btn primary" data-act="close">Done</button></div>`;
+    };
+    render();
+    const off = D.onChange(() => dlg.open && render());
+    dlg.addEventListener("close", off, { once: true });
+    dlg.onclick = async (e) => {
+      const el = e.target.closest("[data-act]");
+      if (!el) return;
+      e.preventDefault();
+      const act = el.dataset.act;
+      if (act === "close") dlg.close();
+      if (act === "pro") { dlg.close(); Pro.open(); }
+      if (act === "sync") D.syncNow().catch((er) => alert(er.message));
+      if (act === "export") {
+        const blob = new Blob([JSON.stringify(D.exportData(), null, 2)], { type: "application/json" });
+        const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: `kb-data-${new Date().toISOString().slice(0, 10)}.json` });
+        a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      }
+      if (act === "signout") {
+        const s = D.state();
+        if (s.pending && !confirm(`${s.pending} change(s) haven't reached Google Drive yet and will be lost on this device. Sign out anyway?`)) return;
+        if (!s.pending && !confirm("Sign out of KB on this device? Your work stays in your Google Drive.")) return;
+        await D.signOut(); location.reload();
+      }
+    };
+    dlg.showModal();
+  }
+
+  async function googleSignIn(btn) {
+    if (btn) { btn.disabled = true; btn.querySelector("span").textContent = "Signing in…"; }
+    try { await D.signIn(); location.reload(); }
+    catch (e) {
+      if (btn) { btn.disabled = false; btn.querySelector("span").textContent = "Continue with Google"; }
+      if (!/closed/i.test(e.message)) alert(e.message);
+    }
   }
 
   function banner() {
@@ -604,23 +734,47 @@ git add -A && git commit -m "KB progress" && git push</code></pre>
     const b = document.createElement("div");
     b.className = "demo-banner";
     const gh = `<a href="${REPO}" target="_blank" rel="noopener" class="gh-link">GitHub &#8599;</a>`;
-    if (status === "connected") {
+    const gBtn = `<button type="button" class="btn primary small-btn g-btn" id="googleBtn" title="Save your work to your Google Drive and use KB on any device">${G_ICON}<span>Continue with Google</span></button>`;
+    const folderLink = CAN_PICK ? `<button type="button" class="link-btn" id="folderBtn" title="Save into a kb-data folder on this computer instead">${FOLDER_ICON}<span>Use a folder</span></button>` : "";
+    if (status === "connected" && mode === "drive") {
+      const u = D.user || {};
+      b.innerHTML = `<button type="button" class="folder-chip acct-chip" id="acctChip" data-sync="idle" title="Your account and sync">
+        ${u.picture ? `<img class="acct-pic sm" src="${escH(u.picture)}" alt="" referrerpolicy="no-referrer">` : `<span class="acct-pic sm acct-initial">${escH((u.name || u.email || "?")[0].toUpperCase())}</span>`}<span class="sync-txt">Synced</span></button>`;
+    } else if (status === "connected") {
       b.innerHTML = `<button type="button" class="folder-chip" id="folderChip" title="Your answers and notes are saved in this folder">${FOLDER_ICON}<span>${escH(dir.name)}</span></button>`;
     } else if (status === "needs-permission") {
-      b.innerHTML = `<span class="muted-txt">Read-only</span><button type="button" class="btn primary small-btn" id="folderBtn">${FOLDER_ICON}<span>Reopen ${escH(savedHandle.name)}</span></button>${gh}`;
-    } else if (status === "none") {
+      b.innerHTML = `<button type="button" class="btn primary small-btn" id="reopenBtn">${FOLDER_ICON}<span>Reopen ${escH(savedHandle.name)}</span></button>${D.available ? gBtn : ""}`;
+    } else if (D.available) {
+      b.innerHTML = `${gBtn}${folderLink}${gh}`;
+    } else if (CAN_PICK) {
       b.innerHTML = `<span class="muted-txt">Read-only demo</span><button type="button" class="btn primary small-btn" id="folderBtn" title="Save your answers, notes and tutor chats into a folder on this computer">${FOLDER_ICON}<span>Use my kb-data folder</span></button>${gh}`;
     } else {
       b.innerHTML = `<span class="muted-txt" title="Saving to a folder needs Chrome or Edge on a computer">Read-only · open in Chrome or Edge on a computer to save your work</span>${gh}`;
     }
     bar.insertBefore(b, document.getElementById("aiButton") || document.getElementById("themeToggle") || null);
-    const btn = document.getElementById("folderBtn");
-    if (btn) btn.addEventListener("click", async () => {
-      try { if (status === "needs-permission" ? await reconnect() : await chooseFolder()) location.reload(); }
-      catch (e) { alert(`Couldn't open the folder: ${e.message}`); }
-    });
-    const chip = document.getElementById("folderChip");
-    if (chip) chip.addEventListener("click", folderDialog);
+
+    const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
+    on("googleBtn", (e) => googleSignIn(e.currentTarget));
+    on("folderBtn", async () => { try { if (await chooseFolder()) location.reload(); } catch (e) { alert(`Couldn't open the folder: ${e.message}`); } });
+    on("reopenBtn", async () => { try { if (await reconnect()) location.reload(); } catch (e) { alert(`Couldn't open the folder: ${e.message}`); } });
+    on("folderChip", folderDialog);
+    const chip = document.getElementById("acctChip");
+    if (chip) {
+      const paint = (s) => { chip.dataset.sync = s.sync; chip.querySelector(".sync-txt").textContent = syncText(s); };
+      paint(D.state());
+      D.onChange(paint);
+      chip.addEventListener("click", () => {
+        const s = D.state();
+        // An expired Google token can only be renewed from a tap, so the tap renews it first.
+        if (s.sync === "paused" || s.sync === "error") D.resume().catch((er) => { if (!/closed/i.test(er.message)) accountDialog(); });
+        else accountDialog();
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------- installable app (PWA)
+  if ("serviceWorker" in navigator && location.protocol === "https:" && !window.__kbTestDir) {
+    window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch((e) => console.warn("KB: offline cache unavailable:", e.message)));
   }
 
   // ---------------------------------------------------------------- start
@@ -629,6 +783,7 @@ git add -A && git commit -m "KB progress" && git push</code></pre>
       // Tests can hand in a folder (e.g. the browser's private file system) instead of using the picker.
       const test = window.__kbTestDir ? await window.__kbTestDir : null;
       if (test) await connect(test);
+      else if (D.available && (await D.boot())) await connectDrive();
       else if (CAN_PICK) {
         savedHandle = await kv.get("dir");
         if (savedHandle) {
@@ -638,13 +793,17 @@ git add -A && git commit -m "KB progress" && git push</code></pre>
         }
       }
     } catch (e) {
-      console.warn("KB: couldn't open your data folder:", e);
-      status = savedHandle ? "needs-permission" : CAN_PICK ? "none" : "unsupported";
+      console.warn("KB: couldn't open your saved work:", e);
+      status = savedHandle ? "needs-permission" : "none";
     }
-    window.KB_DEMO = status === "connected" ? null : { repo: REPO };
-    window.KB_WEB = { status, folder: dir ? dir.name : null, repo: REPO };
+    // Where the KB Pro licence is kept: your Drive settings when signed in, else this browser.
+    if (mode === "drive") Pro.useStore && Pro.useStore((k) => D.settings.get(k, null), (k, v) => D.settings.set(k, v), () => (D.user && D.user.email) || "");
+    if (Pro.recheck) Pro.recheck();
+    window.KB_DEMO = status === "connected" ? null : { repo: REPO, google: !!D.available };
+    window.KB_WEB = { status: status === "none" && !CAN_PICK && !D.available ? "unsupported" : status, mode, folder: dir ? dir.name : null, repo: REPO, google: !!D.available };
   })();
   window.KB_BOOT = boot;
+  window.KB_SIGN_IN = () => googleSignIn(document.getElementById("googleBtn"));
   const onReady = () => boot.then(banner);
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", onReady); else onReady();
 })();

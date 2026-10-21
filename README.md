@@ -517,11 +517,16 @@ lib/ai.js                provider layer (Claude, OpenAI-compatible, Ollama), str
 lib/tutor.js             evaluate / clarify / doubts, shared by the CLI and the server
 lib/topics.js            all topics grouped by week as JSON (/topics locally, /kb/topics on the website)
 lib/core/shared.js       prompts, data-folder rules, #doubt handling: shared by the local app and the website
-lib/core/llm.js          provider calls with streaming (Claude, OpenAI-compatible, Ollama): shared by the local app and the website
+lib/core/llm.js          provider calls with streaming (Claude, Grok, Gemini, OpenAI-compatible, Ollama): shared by the local app and the website
 lib/voice.js             optional OpenAI speech-to-text / text-to-speech for the voice features
 lib/library.js, libgen.js  your own libraries: reading them, and planning/writing them with the AI (kb add)
 build/make-site.js       builds the website into site/ (published to GitHub Pages by .github/workflows/pages.yml)
-build/site/web.js        the website's stand-in for the server: saves into the folder you choose, calls your AI provider from the browser
+build/site/web.js        the website's stand-in for the server: saves to Google Drive or the folder you choose, calls your AI provider from the browser
+build/site/drive.js      Google sign-in and Drive sync (progress, AI settings and keys, images) with an offline copy
+build/site/pro.js        KB Pro: free limits, Lemon Squeezy licence key, the unlock dialog
+build/site/sw.js         offline cache for the website and Android app
+site.config.json         public site settings: Google client ID, KB Pro price/checkout/free limits
+android/                 the Android app (Trusted Web Activity, built with Bubblewrap)
 lib/userdata.js          your data folder (../kb-data): answers, verdicts, notes, chats, read status kept outside the repo
 lib/images.js            answer images: save to the data folder, attach to prompts as real image inputs
 public/                  index.html, app.js, voice.js (mic, read-aloud, talk mode), diagram.js (rough.js renderer), styles.css, vendor/
@@ -610,12 +615,16 @@ Bits → Trie → Strings → Matrix & Math → Design.
 **[codingsaint.github.io/kb](https://codingsaint.github.io/kb/)** runs KB in your browser, with nothing to install.
 
 - **Browse it read-only:** every design topic (and its reference design), all 37 read-first chapters, and the 304 DSA problems with their pattern guides.
-- **Or use it for real:** click **Use my kb-data folder** and choose a folder on your computer. From then on the site saves your answers, notes,
-  read status, tutor chats and answer images **into that folder**, using the same files as the local app. Nothing is uploaded to any server.
-  You need Chrome or Edge on a computer for this; other browsers and phones stay read-only.
-- **AI with your own key:** open **Set up AI**, pick Claude, OpenAI, an OpenAI-compatible provider (Groq, Gemini, OpenRouter: set the Base URL) or Ollama,
-  and paste a key. The browser calls the provider directly. The key stays in that browser, for the session or, if you tick **Remember**, on that device.
-  It is never written to your data folder.
+- **Or use it for real: Continue with Google.** Your answers, notes, read status, tutor chats and answer images are saved in KB's private
+  app folder in **your own Google Drive**, and follow you to every device you sign in on: any browser, phones included, and the Android app.
+  KB can't see anything else in your Drive, and there is no KB server.
+- **Connect AI once:** open **Set up AI**, pick Claude, Grok, Google Gemini (free tier), OpenAI or Ollama, and paste a key. When you're signed in
+  with Google, the provider and key are saved with your settings in your Drive, so you never paste it again on another device.
+  The browser calls the provider directly.
+- **Prefer files on your computer?** Click **Use a folder** (Chrome or Edge on a computer) and choose your kb-data folder: the site saves into it
+  using the same files as the local app, and keys stay in that browser only.
+- **Android app and iPhone:** see [android/README.md](android/README.md). On any phone you can also install the site from the browser menu
+  (*Add to Home screen*); it works offline.
 
 ### All topics as JSON
 
@@ -661,14 +670,55 @@ If Chrome asks whether the site may access devices on your local network, click 
 | | Website | Local app (`npm start`) |
 |---|---|---|
 | Install | None | Node.js + `npm install` |
-| Answers, grading, tutor, notes, voice | ✓ (Chrome or Edge on a computer) | ✓ any browser, plus phones on your Wi-Fi |
-| Where your work is saved | The folder you choose | `../kb-data` (or `dataDir`) |
-| AI providers | Claude, OpenAI and OpenAI-compatible providers that allow browser calls; Ollama with `OLLAMA_ORIGINS` | Every provider |
+| Answers, grading, tutor, notes, voice | ✓ any browser and the Android app (signed in with Google), or Chrome/Edge with a folder | ✓ any browser, plus phones on your Wi-Fi |
+| Where your work is saved | Your Google Drive (KB's private app folder), or the folder you choose | `../kb-data` (or `dataDir`) |
+| AI providers | Claude, Grok, Gemini, OpenAI and OpenAI-compatible providers that allow browser calls; Ollama with `OLLAMA_ORIGINS` | Every provider |
 | `kb` command, `kb add` (generate your own library) | – (libraries you made locally show up and can be read) | ✓ |
 
 The site is built from `content/` by `npm run build:site` and published by a GitHub Action on every push to `main`
 (`.github/workflows/pages.yml`). The build never reads your data folder and refuses to publish if any answer, verdict, note, chat or
 read status slips into it. To publish your own fork: Settings → Pages → Source: **GitHub Actions**.
+
+### Google sign-in, Drive sync and KB Pro (setting up the site)
+
+All of this is configured in **`site.config.json`** (public values only, committed to the repo) and needs no server.
+With `googleClientId` empty the site behaves as before (read-only demo plus *Use my kb-data folder*); with `pro.enabled` false everything is free.
+
+**1. Google sign-in (once, about 10 minutes)**
+
+1. [Google Cloud Console](https://console.cloud.google.com/) → create a project (e.g. *KB*) → *APIs & Services* → **Library** → enable **Google Drive API**.
+2. *Google Auth Platform* → **Branding**: app name *KB*, support email, logo, and links to the home page and privacy policy
+   (the privacy policy can be a short page saying what's below). Add `codingsaint.com` under authorised domains.
+3. **Data access** → add scopes `openid`, `email`, `profile` and `.../auth/drive.appdata`. All are *non-sensitive*,
+   so there's no security assessment, only a quick brand verification before going public.
+4. **Clients** → *Create client* → **Web application** → authorised JavaScript origins:
+   `https://www.codingsaint.com`, `https://codingsaint.com` (and `http://localhost:8080` to test a local build). No redirect URIs are needed.
+5. **Audience** → *Publish app* (while in *Testing*, only listed test users can sign in).
+6. Paste the client ID (`…apps.googleusercontent.com`) into `site.config.json` → `googleClientId`, commit and push.
+
+What KB stores, in the learner's Drive app folder (hidden from their Drive file list, visible under Drive → Settings → *Manage apps*):
+`progress.json` (all answers, verdicts, notes, chats, read marks), `settings.json` (AI provider, model, **API keys**, KB Pro licence)
+and `images/…` (pictures pasted into answers). Each device keeps a copy (IndexedDB) so the app opens instantly and works offline;
+changes upload a second or two later. Google's access token lasts an hour and a web page can't renew it without a tap,
+so after that the account chip says **Tap to sync** and nothing is lost meanwhile. *Your account → Export* downloads everything (keys removed).
+
+**2. KB Pro: one-time payment (Lemon Squeezy)**
+
+1. In Lemon Squeezy, create a product (single payment) and turn on **license keys** for it, with an activation limit of **1–2**
+   (a key is activated once per Google account and then works on all that account's devices).
+2. Set in `site.config.json` → `pro`: `"enabled": true`, `"price": "₹…"`, `"checkoutUrl"` (the product's share/checkout link),
+   and `"storeId"` / `"productId"` (so keys from your other products don't unlock KB).
+3. Choose what's free in `pro.free`: `designPerTrack` (first N LLD, HLD and AI topics) and `dsaPatterns` (first N DSA patterns).
+   Reading everything, notes and read marks are always free; Pro unlocks writing answers, AI grading, the tutor and `#doubt` answers everywhere else.
+4. **Referrals:** turn on Lemon Squeezy's affiliate programme. A friend's link `https://www.codingsaint.com/kb/?aff=CODE` is remembered
+   and passed on to checkout, so the referrer gets their commission.
+
+The buyer gets the key by email, pastes it once in KB, and it's saved to their account. KB re-checks it about once a week (refunds lock it again);
+offline it stays unlocked. The check runs in the browser against Lemon Squeezy's public licence API. As with any app that has no server,
+a determined developer could bypass it, and anyone can run the open-source app locally for free. Pro sells the hosted, synced,
+works-on-my-phone experience to people who'd rather pay than set things up.
+
+**3. Android app:** see [android/README.md](android/README.md).
 
 ## Who it's for
 
