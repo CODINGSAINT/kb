@@ -527,6 +527,7 @@ build/site/pro.js        KB Pro: free limits, Lemon Squeezy licence key, the unl
 build/site/sw.js         offline cache for the website and Android app
 site.config.json         public site settings: Google client ID, KB Pro price/checkout/free limits
 android/                 the Android app (Trusted Web Activity, built with Bubblewrap)
+payments/                KB Pro payments server for Razorpay (Cloudflare Worker), with tests
 lib/userdata.js          your data folder (../kb-data): answers, verdicts, notes, chats, read status kept outside the repo
 lib/images.js            answer images: save to the data folder, attach to prompts as real image inputs
 public/                  index.html, app.js, voice.js (mic, read-aloud, talk mode), diagram.js (rough.js renderer), styles.css, vendor/
@@ -702,7 +703,11 @@ and `images/…` (pictures pasted into answers). Each device keeps a copy (Index
 changes upload a second or two later. Google's access token lasts an hour and a web page can't renew it without a tap,
 so after that the account chip says **Tap to sync** and nothing is lost meanwhile. *Your account → Export* downloads everything (keys removed).
 
-**2. KB Pro: one-time payment (Lemon Squeezy)**
+**2. KB Pro: one-time payment (Lemon Squeezy for international buyers, Razorpay for India)**
+
+The Pro dialog shows Razorpay (UPI, cards, netbanking in ₹) to visitors in India and Lemon Squeezy to everyone else, with a link to switch. You can turn on either or both.
+
+*Lemon Squeezy:*
 
 1. In Lemon Squeezy, create a product (single payment) and turn on **license keys** for it, with an activation limit of **1–2**
    (a key is activated once per Google account and then works on all that account's devices).
@@ -717,6 +722,12 @@ The buyer gets the key by email, pastes it once in KB, and it's saved to their a
 offline it stays unlocked. The check runs in the browser against Lemon Squeezy's public licence API. As with any app that has no server,
 a determined developer could bypass it, and anyone can run the open-source app locally for free. Pro sells the hosted, synced,
 works-on-my-phone experience to people who'd rather pay than set things up.
+
+*Razorpay (India):* needs a small server for the order and signature check, so it comes with one: a Cloudflare Worker in
+[`payments/`](payments/README.md) (free tier). It issues a licence tied to the buyer's Google account and saves it to their settings
+straight away; *Restore purchase* brings it back on any device, and a refund locks it via Razorpay's webhook. Buying with Razorpay needs Google sign-in.
+Set up the Worker as in [payments/README.md](payments/README.md), then set `pro.razorpay`: `"enabled": true`, `"apiUrl"` (the Worker's address)
+and `"price": "₹…"`.
 
 **3. Android app:** see [android/README.md](android/README.md).
 

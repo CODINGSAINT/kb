@@ -55,7 +55,7 @@ Nothing extra to set up. Sign-in runs in Chrome, so the web OAuth client you cre
 
 ## KB Pro and Google Play's payment rules
 
-The app is *consumption-only*: people unlock KB Pro by entering a licence key they bought on the website.
+The app is *consumption-only*: people unlock KB Pro with *Restore purchase* (bought with Razorpay on the website) or by entering a licence key (Lemon Squeezy).
 The app shows no buy button and no link to a payment page; Play doesn't allow steering to outside payments
 from inside an app. `build/site/pro.js` detects the app from its start URL (`?source=twa`) and hides the buy link.
 You can still promote the website and Pro anywhere *outside* the app (YouTube, X, email).

@@ -332,6 +332,15 @@
     },
     syncNow() { return tokenValid() ? flush(true) : api.resume(); },
 
+    // For the KB Pro payment server, which checks with Google who you are. Call from a click:
+    // an expired token is renewed with the quick Google window.
+    async freshToken() {
+      if (!user) throw Object.assign(new Error("Sign in with Google first: KB Pro is tied to your Google account."), { code: "AUTH" });
+      if (!tokenValid()) await requestToken("");
+      return token.value;
+    },
+    accessToken() { return tokenValid() ? token.value : ""; },
+
     async signOut() {
       try { if (token && window.google && google.accounts) google.accounts.oauth2.revoke(token.value, () => {}); } catch (e) {}
       token = null; user = null;

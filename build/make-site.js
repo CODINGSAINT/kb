@@ -120,6 +120,8 @@ const siteCfg = (() => { try { return readJson(path.join(ROOT, "site.config.json
 delete siteCfg._readme;
 if (process.env.KB_GOOGLE_CLIENT_ID) siteCfg.googleClientId = process.env.KB_GOOGLE_CLIENT_ID;
 if (siteCfg.googleClientId && !/\.apps\.googleusercontent\.com$/.test(siteCfg.googleClientId)) throw new Error("site.config.json: googleClientId should end in .apps.googleusercontent.com");
+const rzpCfg = (siteCfg.pro && siteCfg.pro.razorpay) || {};
+if (rzpCfg.enabled && !/^https:\/\/[^/]+/.test(rzpCfg.apiUrl || "")) throw new Error("site.config.json: pro.razorpay.apiUrl should be the payments Worker's https:// address (see payments/README.md)");
 write("config.js", `window.KB_SITE = ${JSON.stringify(siteCfg, null, 2)};\n`);
 
 // ---- installable app (PWA; also what the Android app opens) ----
