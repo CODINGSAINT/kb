@@ -42,14 +42,37 @@ cd kb && npm install && npm start</code></pre>
 
   let state = { tracks: null, dsa: null, dirty: false, editors: [], revealed: new Set() };
 
+  document.querySelector('.skip-link')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    document.getElementById('content').focus();
+  });
+
   // ---------- theme / sidebar / practice ----------
   const isDark = () => document.documentElement.dataset.theme === "dark";
-  $("#themeToggle").addEventListener("click", () => {
-    const t = isDark() ? "light" : "dark";
+  const themeButton = $("#themeToggle");
+  const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+  const updateThemeLabel = () => {
+    const label = `Switch to ${isDark() ? "light" : "dark"} theme`;
+    themeButton.setAttribute("aria-label", label);
+    themeButton.title = label;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.content = isDark() ? "#0B0D12" : "#FFFFFF";
+  };
+  const applyTheme = (t) => {
     document.documentElement.dataset.theme = t;
-    try { localStorage.setItem("kb-theme", t); } catch (e) {}
+    updateThemeLabel();
     document.querySelectorAll(".toastui-editor-defaultUI").forEach((el) => el.classList.toggle("toastui-editor-dark", t === "dark"));
     document.querySelectorAll("[data-diagram]").forEach((el) => KBDiagram.render(el, el._spec, el.dataset.diagram));
+  };
+  updateThemeLabel();
+  themeButton.addEventListener("click", () => {
+    const t = isDark() ? "light" : "dark";
+    try { localStorage.setItem("kb-theme", t); } catch (e) {}
+    applyTheme(t);
+  });
+  systemTheme.addEventListener("change", (e) => {
+    try { const t = localStorage.getItem("kb-theme"); if (t === "light" || t === "dark") return; } catch (err) {}
+    applyTheme(e.matches ? "dark" : "light");
   });
   if (store.get("kb-sidebar-collapsed", window.innerWidth <= 780)) document.body.classList.add("sidebar-collapsed"); // phones start with it closed
   const toggleSidebar = () => {
@@ -912,7 +935,7 @@ cd kb && npm install && npm start</code></pre>
     document.title = `${tp.name} — KB`;
   }
 
-  // Signed-out home: the launch page. One idea in the first screen: you design it, KB grades it.
+  // Signed-out home: introduce a calm learning loop, with a real topic as an example.
   // The board on the right uses a real topic's diagram (HLD 1) drawn by the same renderer as the topic pages.
   function viewDemoHome() {
     const t = state.tracks || {};
@@ -923,7 +946,7 @@ cd kb && npm install && npm start</code></pre>
     const site = window.KB_SITE || {}, pro = site.pro || {};
     const web = window.KB_WEB || {};
     const canSave = !!web.google || web.status === "none";
-    const cta = web.google ? "Start practising free" : canSave ? "Use my kb-data folder" : "Get KB on GitHub";
+    const cta = web.google ? "Start learning free" : canSave ? "Use my kb-data folder" : "Get KB on GitHub";
     const link = (k, num, label) => { const it = (t[k] || []).find((x) => x.number === num); return it ? `<a href="#/t/${it.day}/${it.topicIndex}">${esc(label || it.title.replace(/^Design /, ""))}</a>` : ""; };
     const links = (k, nums) => nums.map((x) => link(k, x)).filter(Boolean).join(", ");
     const hld1 = (t.HLD || []).find((x) => x.number === 1);
@@ -933,43 +956,43 @@ cd kb && npm install && npm start</code></pre>
       <div class="lp">
         <section class="lp-hero">
           <div class="lp-pitch">
-            <h1 class="lp-title"><span>Design it.</span> <span>Get graded.</span> <span>Defend it.</span></h1>
-            <p class="lp-sub">Practise system design and DSA the way interviews actually go. Write your answer, and an AI interviewer marks it, points out the gaps and asks the follow-up a senior engineer would.</p>
+            <p class="cs-eyebrow">KB / A CODING SAINT PRODUCT</p><h1 class="lp-title"><span>Learn the idea</span><span>Try it yourself</span><span>Understand why</span></h1>
+            <p class="lp-sub">A little reading. A real problem. Space to think. Build your understanding of system design, AI and DSA with practical exercises, clear references and an AI tutor you can question.</p>
             <div class="lp-cta">
               <button type="button" class="btn primary lp-go" id="lpStart">${esc(cta)}</button>
-              <a class="lp-browse" href="#lp-inside">See all ${n("LLD") + n("HLD") + n("AI") + dsaN} problems</a>
+              <a class="lp-browse" href="#lp-inside">Explore the learning tracks ↓</a>
             </div>
-            <p class="lp-trust">${web.google ? "Sign in with Google. Your progress is saved in your own Google Drive, and you use your own Claude, Grok or Gemini key (Gemini has a free tier)." : "Your work stays on your computer, and you use your own AI key."}</p>
+            <p class="lp-trust">${web.google ? "Sign in with Google. Your progress is saved in your own Google Drive, and you use your own Claude, Grok or Gemini key (Gemini has a free tier)." : "Explore the library free. Save your work in a folder on your computer, or connect your own AI provider when you’re ready."}</p>
           </div>
-          <figure class="lp-board" aria-label="Example: an answer to Design a URL shortener, graded by KB">
-            <figcaption class="lp-board-head"><b>${hld1 ? esc(hld1.title) : "URL Shortener"}</b><span>High-level design</span></figcaption>
+          <figure class="lp-board" aria-label="Illustrative practice session using the URL shortener topic">
+            <div class="cs-example-label">A LOOK INSIDE KB <span>Illustrative session</span></div><figcaption class="lp-board-head"><b>${hld1 ? esc(hld1.title) : "URL Shortener"}</b><span>High-level design</span></figcaption>
             <div class="lp-diagram" id="lpDiagram"></div>
-            <div class="lp-hand" aria-hidden="true">
+            <div class="lp-hand">
               <p>Base62 codes from pre-allocated ID ranges, so no two servers collide.</p>
               <p>Reads hit Redis first; 100:1 read/write.</p>
             </div>
             <div class="lp-verdict" id="lpVerdict">
-              <p class="lp-v-head">Verdict: <b>Solid</b></p>
+              <p class="lp-v-head">Example feedback / <b>Solid</b></p>
               <p class="lp-v-line lp-ok">ID ranges avoid a hot counter. Good call.</p>
               <p class="lp-v-line lp-gap">Missing: what happens to redirects when Redis is cold after a deploy?</p>
-              <p class="lp-v-line lp-q">Interviewer would ask: how do you expire links without scanning the table?</p>
+              <p class="lp-v-line lp-q">Think it through: how would you expire links without scanning the table?</p>
             </div>
           </figure>
         </section>
 
         <section class="lp-steps" aria-labelledby="lpHow">
-          <h2 id="lpHow">How a session goes</h2>
+          <p class="cs-eyebrow">ONE IDEA AT A TIME</p><h2 id="lpHow">A little practice, a clearer picture</h2>
           <ol>
             <li><b>Read first</b><span>${f.length} short chapters cover the ideas a problem needs, before you see it.</span></li>
             <li><b>Write your design</b><span>Text, code or a pasted whiteboard photo. No hints yet.</span></li>
-            <li><b>Get graded</b><span>A verdict, what you got right, and the gaps an interviewer would find.</span></li>
-            <li><b>Defend it</b><span>Argue with the tutor by text or voice until the gaps are closed.</span></li>
+            <li><b>Get feedback</b><span>See what works, where the gaps are and what to explore next.</span></li>
+            <li><b>Think it through</b><span>Question the tutor by text or voice. Explore the trade-offs together.</span></li>
             <li><b>Compare</b><span>Only then open the reference design and see what you'd change.</span></li>
           </ol>
         </section>
 
         <section class="lp-inside" id="lp-inside" aria-labelledby="lpInside">
-          <h2 id="lpInside">What's inside</h2>
+          <p class="cs-eyebrow">FIND YOUR NEXT QUESTION</p><h2 id="lpInside">Four paths to deeper understanding</h2>
           <dl>
             <div><dt><span class="lp-n">${n("LLD")}</span> low-level design problems</dt><dd>Classes, patterns and Java code: ${links("LLD", [2, 3, 4, 7])} and more.</dd></div>
             <div><dt><span class="lp-n">${n("HLD")}</span> high-level design problems</dt><dd>Scale, storage and trade-offs: ${links("HLD", [1, 2, 6, 5])} and more.</dd></div>
@@ -989,14 +1012,15 @@ cd kb && npm install && npm start</code></pre>
         <section class="lp-faq" aria-labelledby="lpFaq">
           <h2 id="lpFaq">Questions</h2>
           <details><summary>Do I need to pay for AI?</summary><p>You connect your own provider once. Google Gemini has a free tier that's enough for daily practice; Claude, Grok and OpenAI keys work too. Requests go straight from your device to that provider.</p></details>
-          <details><summary>Where is my work saved?</summary><p>In a private KB folder in your own Google Drive, plus a copy on your device so it works offline. KB has no server and can't see anything else in your Drive.</p></details>
+          <details><summary>Where is my work saved?</summary><p>${web.google ? "When you sign in, your work is saved in KB’s private folder in your Google Drive, with a copy on your device for offline use." : "Choose a local data folder to save your work on this computer. You can also run KB locally. Browsing the library does not require a folder."}</p></details>
           <details><summary>Can I run it on my own machine?</summary><p>Yes. KB is open source: clone it from <a href="${esc((web.repo || "https://github.com/CODINGSAINT/kb"))}" target="_blank" rel="noopener">GitHub</a>, run <code>npm start</code>, and add a free local model with Ollama.</p></details>
         </section>
 
         <section class="lp-end">
-          <p>Your next interview will ask you to design something. Practise that today.</p>
+          <p>Pick a problem. Make it your own.</p>
           <button type="button" class="btn primary lp-go" id="lpStart2">${esc(cta)}</button>
         </section>
+        <footer class="cs-footer"><a href="https://www.codingsaint.com/"><span class="cs-wordmark">coding<strong>saint</strong><svg class="cs-mark" viewBox="0 0 20 40" aria-hidden="true"><circle cx="11" cy="9" r="5" fill="#C81E3A"/><path d="M6 22h10c0 10-5 15-11 17l-2-5c5-2 6-5 3-12Z" fill="currentColor"/></svg></span></a><p>Simple, short tutorials. Lasting understanding.</p><a href="https://www.codingsaint.com/courses/">Explore our courses ↗</a><a href="https://www.youtube.com/@codingsaint">YouTube ↗</a></footer>
       </div>`;
     if (hld1) api.get(`/api/days/${hld1.day}`).then((d) => {
       const tp = d.topics && d.topics[hld1.topicIndex];
@@ -1012,7 +1036,7 @@ cd kb && npm install && npm start</code></pre>
     $("#lpStart").addEventListener("click", start);
     $("#lpStart2").addEventListener("click", start);
     $(".lp-browse").addEventListener("click", (e) => { e.preventDefault(); $("#lp-inside").scrollIntoView({ behavior: "smooth", block: "start" }); });
-    document.title = "KB · design it, get graded, defend it";
+    document.title = "KB · Learn by doing · Coding Saint";
   }
 
   async function viewHome() {
@@ -1024,20 +1048,19 @@ cd kb && npm install && npm start</code></pre>
     const days = new Set(TRACKS.flatMap((tr) => (t[tr.key] || []).map((i) => i.day)));
     $("#content").innerHTML = `
       <div class="home">
-        <h1>KB</h1>
-        <p class="muted" style="margin-top:0">Pick a topic from the sidebar. Press <kbd>\\</kbd> to toggle it.</p>
+        <div class="workspace-intro"><p class="cs-eyebrow">YOUR LEARNING WORKSPACE</p><h1>Keep building understanding</h1><p class="muted">Read a little. Attempt a problem. Reflect on what you learn.</p></div><div class="workspace-paths">${TRACKS.map((tr) => { const first = (t[tr.key] || [])[0]; return first ? `<a href="#/t/${first.day}/${first.topicIndex}"><span>${esc(tr.key)}</span><b>${esc(tr.name.replace(/^.*? — /, ""))}</b><span aria-hidden="true">↗</span></a>` : ""; }).join("")}${state.dsa?.topics?.length ? `<a href="#/pattern/0"><span>DSA</span><b>Patterns & algorithms</b><span aria-hidden="true">↗</span></a>` : ""}</div><h2 class="progress-heading">Your progress, one step at a time</h2>
         <div class="grid">
           <div class="stat"><div class="k">Attempted</div><div class="v">${p.answeredPct}%</div><div class="bar"><span class="fill answered" style="width:${p.answeredPct}%"></span></div><div class="muted small">${p.answered} of ${p.totalTopics}</div></div>
           <div class="stat"><div class="k">Evaluated</div><div class="v">${p.evaluatedPct}%</div><div class="bar"><span class="fill evaluated" style="width:${p.evaluatedPct}%"></span></div><div class="muted small">${p.evaluated} of ${p.totalTopics}</div></div>
           <div class="stat"><div class="k">Days generated</div><div class="v">${days.size}</div><div class="muted small">${gen} design topics</div></div>
           <div class="stat"><div class="k">DSA problems</div><div class="v">${dsaN}</div><div class="muted small">${(state.dsa?.topics || []).length} patterns</div></div>
-          ${state.fund ? (() => { const f = state.fund.groups.flatMap((g) => g.items); const r = f.filter((x) => x.readAt).length; return `<div class="stat"><div class="k">Fundamentals read</div><div class="v">${r}/${f.length}</div><div class="bar"><span class="fill evaluated" style="width:${f.length ? (r * 100 / f.length) : 0}%"></span></div><div class="muted small"><a href="#/read/${esc(f[0].id)}">Start reading</a></div></div>`; })() : ""}
+          ${state.fund ? (() => { const f = state.fund.groups.flatMap((g) => g.items); const r = f.filter((x) => x.readAt).length; return `<div class="stat"><div class="k">Fundamentals read</div><div class="v">${r}/${f.length}</div><div class="bar"><span class="fill evaluated" style="width:${f.length ? (r * 100 / f.length) : 0}%"></span></div><div class="muted small"><a href="#/read/${esc(f[0]?.id || "")}">Start reading</a></div></div>`; })() : ""}
         </div>
         ${aiCfg && !aiCfg.ready ? `<section class="card"><h2>Connect an AI tutor</h2><p style="margin-top:0">Evaluate answers and chat about any topic with Claude, OpenAI, or a free local model through Ollama. ${aiCfg.web ? "Your key stays in this browser and is sent only to that provider." : "Your key stays on this machine."}</p><button class="btn primary" id="homeAi">Set up AI</button></section>` : ""}
         ${gen ? "" : `<section class="card"><h2>No day content yet</h2><p style="margin:0">Put your <code>study.md</code> in the project root, then generate day 1 — ask in chat (“generate day 1”) or run <code>node scripts/new-day.js 1</code> to scaffold it.</p></section>`}
       </div>`;
     $("#homeAi")?.addEventListener("click", () => openAiSettings());
-    document.title = "KB — Study Practice";
+    document.title = "KB · Your learning workspace · Coding Saint";
   }
 
   // ---------- router ----------
