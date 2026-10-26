@@ -1,13 +1,13 @@
 // Verify that the three answers publish the implementation actually exercised by Java checks.
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const root=path.resolve(__dirname,'..'),read=p=>fs.readFileSync(path.join(root,p),'utf8').replace(/\r\n/g,'\n');
-const lessons=[['Chess',1,['values','legal','attacks','apply','game'],'chess'],['Parking',2,['values','tariff','enter','payment','exit'],'parking'],['Elevators',3,['contracts','look','tick','dispatch','ownership'],'elevator']];
+const lessons=[['Chess',1,['legal','game','apply'],'chess'],['Parking',2,['enter','payment','exit'],'parking'],['Elevators',3,['look','tick','ownership'],'elevator']];
 let excerpts=0;
 for(const [file,n,regions,prefix]of lessons){
   const topic=JSON.parse(read(`content/day-${String(n).padStart(2,'0')}.json`)).topics.find(t=>t.category==='LLD');
   const source=read(`examples/lld-three/${file}.java`);
   const snippets=[...topic.markdown.matchAll(/```java\n\/\/ source: (\w+\.java)#(\w+)\n([\s\S]*?)\n```/g)];
-  assert.equal(snippets.length,regions.length,`${file}: all five mechanism excerpts required`);
+  assert.equal(snippets.length,regions.length,`${file}: expected ${regions.length} source excerpts`);
   assert.deepEqual(snippets.map(m=>m[2]).sort(),[...regions].sort(),`${file}: expected regions`);
   for(const [,name,region,snippet]of snippets){
     assert.equal(name,file+'.java');
@@ -16,9 +16,11 @@ for(const [file,n,regions,prefix]of lessons){
     assert.equal(snippet,match[1].trimEnd(),`${file}#${region}: article differs from executable source`);excerpts++;
   }
   const figures=[...topic.markdown.matchAll(/!\[[^\]]+\]\((lld-figures\/[^)]+\.svg)\)/g)].map(m=>m[1]);
-  assert.equal(new Set(figures).size,5,`${file}: domain and four worked illustrations`);
+  assert.equal(new Set(figures).size,4,`${file}: expected worked illustrations`);
   assert(figures.every(f=>f.startsWith(`lld-figures/${prefix}-`)),`${file}: mismatched assets`);
   assert(!/\{\{java:/.test(topic.markdown),`${file}: unresolved manuscript token`);
+  assert(!topic.markdown.includes(`${prefix}-domain.svg`),`${file}: redundant code-like class picture`);
+  assert(!/designgurus|educative|algomaster|awesome-low-level-design|grokking/i.test(topic.markdown),`${file}: competitor research belongs in internal notes`);
   for(const f of figures)assert(fs.existsSync(path.join(root,'public',f)),`missing ${f}`);
   assert.equal(read(`public/reference-code/lld-three/${file}.java`),source,`${file}: download drift`);
 }

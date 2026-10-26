@@ -15,338 +15,355 @@ E|n0|n6|outside lock
 ---
 ## Problem
 
-Design a paid, multi-floor parking lot with several entry and exit gates. Allocate suitable spots, issue tickets, calculate charges, process payment and release a spot when its vehicle actually leaves. Explain what happens when gates race or payment outcomes are uncertain.
+Design the software for a parking lot. A vehicle arrives, gets a suitable parking spot and receives a ticket. Before leaving, the driver pays the fee. The spot becomes available when the vehicle leaves.
+
+The design must also handle ordinary problems: two cars arriving together, a payment screen being clicked twice, or a payment taking too long to respond.
 
 ## Requirements
 
-- Motorcycles, cars and trucks; motorcycle, compact and large spots across multiple floors.
-- Multiple gates use the same allocation authority; one active visit owns each occupied spot.
-- Entry returns a ticket identifying the visit and spot. Displays show availability without granting reservations.
-- A versioned tariff calculates fees in INR minor units. The customer approves the amount before collection.
-- Successful payment grants a ten-minute exit window; expired windows require only any unpaid difference.
-- Unknown payment outcomes are reconciled; retries must not collect twice.
-- The implementation is single-process and in-memory. Hardware adapters and durable multi-server storage are explicit extensions.
+- Support motorcycles, cars and trucks across several floors.
+- Give each vehicle one suitable, available spot and one ticket.
+- Let several entry and exit gates use the same parking information.
+- Charge ₹40 for the first hour and ₹20 for each extra hour that has started.
+- Give the driver ten minutes to leave after a successful payment.
+- Keep earlier payments when calculating any extra amount due.
+- Handle repeated requests without issuing another ticket or charging again.
 
-## 1. The answer I would present
+We will first solve this for one running Java application. The last section explains what changes when several servers share the work.
 
-I would separate **physical allocation**, **the parking visit**, and **financial collection**. A `Spot` is one physical location. A `Session` records one vehicle's stay and owns that spot until exit. An `Attempt` records one collection intent and its outcome. Combining all three into `spot.occupied` and `ticket.paid` loses the information needed for retries, partial progress and old exit events.
+## 1. Start with one car
 
-My aggregate boundary is a `Lot` instance. Its short synchronized operations protect spot/session ownership and payment-state transitions. The provider call happens outside that monitor, because a slow card transaction must not stop another entrance from issuing a ticket. This is a deliberate simple implementation for a modest number of gates, not a claim that one Java monitor coordinates different servers.
+Imagine a car arriving at Gate A at 09:00. The lot gives it compact spot **C17** and ticket **S17**.
 
-I select the smallest compatible spot first, then the lowest floor, walking order and stable ID. A motorcycle can use any of the three types; a car uses compact or large; a truck uses large. This preserves large capacity before optimizing walking distance. If the business prefers the nearest floor regardless of spot size, it replaces the allocation policy without changing ownership or ticket issuance.
+Those two IDs mean different things. C17 identifies a place in the building. S17 identifies this car's visit. Tomorrow another car can use C17, but it must get a different ticket.
 
-The base design uses immutable vehicle/spot values rather than empty subclasses such as `CompactSpot` and `LargeSpot`. Different data does not by itself require inheritance. Policies have interfaces where behaviour really changes: allocation, tariff and external payment. Admin identity, accessible-permit eligibility, EV charging, pre-booked reservations and season passes can be added, but they do not need to complicate the first paid-visit flow.
+| What happens | What the software records |
+| --- | --- |
+| Car enters at 09:00 | S17 started at 09:00 and is using C17. |
+| Driver pays ₹40 at 09:59 | S17 has paid ₹40 and may leave before 10:09. |
+| Car leaves at 10:01 | Close S17 and make C17 available. |
+| Another car arrives | Create a new visit, even if it gets C17. |
 
-## 2. The domain model, contracts and pricing decision
+[![Two entry gates share a parking lot with occupied, available and disabled bays; ticket S17 currently holds spot C17](lld-figures/parking-layout.svg)](lld-figures/parking-layout.svg)
 
-| Type | Responsibility | Correctness detail |
-|---|---|---|
-| `Spot` | ID, floor, order and size category | Physical identity remains stable between visits |
-| `Vehicle` | Canonical registration and kind | One active visit per registration in this lot |
-| `Session` | Entry, assigned spot, tariff snapshot, state, cumulative paid amount and exit deadline | The visit owns occupancy |
-| `AllocationPolicy` | Select a compatible candidate from currently free spots | Pure and fast; cannot secretly reserve another resource |
-| `Tariff` | Calculate total charge for the stay | Versioned, immutable policy retained at entry |
-| `Quote` | Total, paid credit, amount due, tariff version and quote time | A display quote is revalidated before payment |
-| `PaymentPort` | Collect or look up one provider operation | Definitive decline differs from unknown/not found |
-| `Attempt` | Stable payment key, session, accepted quote, amount, status and receipt reference | Retry identity includes the approved amount |
-| `Lot` | Serialize ownership and state changes; return immutable views | Provider I/O stays outside its monitor |
+The main rule is simple: **a spot stays occupied until the car leaves. Paying the fee does not free it.**
 
-The central maps are `spotId -> sessionId`, `sessionId -> Session`, `entryKey -> sessionId`, `registration -> activeSessionId` and `paymentKey -> Attempt`. A floor groups locations and display results; I do not need a separate locking object for every floor in this version. That avoids a second lock order until throughput justifies it.
+## 2. Give each class one clear job
 
-The public contract is:
+We need these objects:
 
-```text
-enter(entryKey, vehicle) -> SessionView(ticket identity, spot, entry time)
-quote(sessionId) -> Quote(totalMinor, paidMinor, dueMinor, tariffVersion, quotedAt)
-pay(sessionId, paymentKey, approvedDueMinor) -> PaymentView
-reconcile(paymentKey) -> PaymentView
-confirmExit(sessionId, exitEventId) -> CLOSED SessionView
-```
+| Class | Its job | Example |
+| --- | --- | --- |
+| `Vehicle` | Identify the vehicle and its size. | Car CAR-17 |
+| `Spot` | Describe one physical parking space. | C17, floor 0, compact |
+| `Session` | Remember one visit: vehicle, spot, arrival, payment and exit. | Ticket S17 |
+| `Attempt` | Remember one attempt to collect money. | Payment P17 for ₹40 |
+| `Lot` | Keep these records together and handle entry, payment and exit. | The lot shared by both gates |
 
-Session and payment are separate state machines. An attempt may be DECLINED while the visit remains PARKED. A visit may have paid credit while a later top-up is unknown. Closing the visit is a physical exit decision, not a synonym for provider acceptance.
+`Session` is the name used in the Java code for a parking visit. The ticket shows its ID. We keep the visit separate from the payment because a driver may need a second payment after staying longer.
 
-Here are the exact contracts from the runnable example:
+Three small interfaces cover rules that can change:
 
-```java
-// source: Parking.java#values
-    public enum VehicleKind { MOTORCYCLE, CAR, TRUCK }
-    public enum SpotKind { MOTORCYCLE, COMPACT, LARGE }
-    public enum SessionState { PARKED, PAYMENT_PENDING, PAYMENT_UNKNOWN, PAID, CLOSED }
-    public enum PaymentState { PENDING, UNKNOWN, CONFIRMED, DECLINED }
-    public record Vehicle(String registration, VehicleKind kind) {
-        public Vehicle {
-            registration=Objects.requireNonNull(registration).trim().toUpperCase(Locale.ROOT);
-            if(registration.isBlank())throw new IllegalArgumentException("Blank registration");
-            Objects.requireNonNull(kind);
-        }
-    }
-    public record Spot(String id,int floor,int order,SpotKind kind) {
-        public Spot { if(id==null||id.isBlank()||floor<0||order<0)throw new IllegalArgumentException("Invalid spot");Objects.requireNonNull(kind); }
-    }
-    public record Quote(long totalMinor,long paidMinor,long dueMinor,String tariffVersion,Instant quotedAt) {}
-    public record SessionView(String id,Vehicle vehicle,Spot spot,Instant enteredAt,SessionState state,
-                              long paidMinor,Instant exitBy) {}
-    public record PaymentView(String key,String sessionId,long amountMinor,PaymentState state,String reference,Quote quote) {}
-    public record ProviderReply(PaymentState state,String reference) {
-        public ProviderReply {
-            Objects.requireNonNull(state);
-            if(state==PaymentState.CONFIRMED && (reference==null||reference.isBlank()))
-                throw new IllegalArgumentException("Confirmation requires provider evidence");
-        }
-    }
-    public interface PaymentPort {
-        ProviderReply charge(String paymentKey,long amountMinor);
-        ProviderReply lookup(String paymentKey);
-    }
-    public interface Tariff { String version(); long totalMinor(Duration stay); }
-```
+- `AllocationPolicy` chooses a spot. Our rule uses the smallest suitable size first, then floor, location order and ID to break ties.
+- `Tariff` calculates the total fee. A visit keeps the rate it received on entry.
+- `PaymentPort` lets our code ask a payment service to collect money or check an earlier payment.
 
-### A precise tariff instead of ambiguous “hourly pricing”
+An **interface** describes what a component can do. It lets us change a rule or payment service without rewriting the whole lot.
 
-I choose ₹40 for the first started hour and ₹20 for each additional started hour. An immediate exit still incurs the first-hour minimum. All arithmetic is in paise: ₹40 is 4,000; ₹20 is 2,000. Currency is fixed to INR in this model, so an amount is never accidentally added to a different currency.
+[![Lot uses a spot-selection rule, records visits and payments, and calls a separate payment service](designs/lld-2.svg)](designs/lld-2.svg)
 
-| Duration | Started hours | Total |
-|---|---:|---:|
-| 0 minutes | Minimum one | ₹40 |
-| Exactly 60 minutes | 1 | ₹40 |
-| 60 minutes plus one nanosecond | 2 | ₹60 |
-| 2 hours 35 minutes | 3 | ₹80 |
+The allocation rule accepts these combinations:
 
-`Duration.toHours()` truncates; using it alone would undercharge partial hours. Floating-point rupee calculations introduce unnecessary rounding risk. The implementation ceilings at nanosecond precision and checks arithmetic overflow:
+| Vehicle | Suitable spots |
+| --- | --- |
+| Motorcycle | Motorcycle, compact or large |
+| Car | Compact or large |
+| Truck | Large |
 
-```java
-// source: Parking.java#tariff
-    /** One currency (INR/paise). First hour is charged even for an immediate exit. */
-    public record HourlyTariff(String version,long firstHourMinor,long extraHourMinor) implements Tariff {
-        public HourlyTariff {
-            if(version==null||version.isBlank()||firstHourMinor<0||extraHourMinor<0)throw new IllegalArgumentException("Invalid tariff");
-        }
-        @Override public long totalMinor(Duration stay) {
-            if(stay.isNegative())throw new IllegalArgumentException("Clock precedes entry");
-            // Ceiling at nanosecond precision: exactly 60 minutes is one hour, 60m+1ns is two.
-            long seconds=stay.getSeconds(),hours=seconds/3600;
-            if(seconds%3600!=0 || stay.getNano()!=0)hours=Math.addExact(hours,1);
-            hours=Math.max(1,hours);
-            return Math.addExact(firstHourMinor,Math.multiplyExact(hours-1,extraHourMinor));
-        }
-    }
-```
+A car should normally get a compact spot before a large one. That leaves large spots for trucks. If the business later prefers the nearest floor instead, we change `AllocationPolicy`.
 
-I retain the tariff chosen at entry. Changing tomorrow's rate does not silently alter an already accepted visit. A business that prices by current exit rates could choose that policy instead, but it would need to communicate and record that contract explicitly.
+The gates and display boards do not keep their own separate lists of free spots. They ask `Lot`. Otherwise Gate A could think C17 is free while Gate B has already given it away.
 
-## 3. Final design, physical layout and the race
+## 3. Entry: choose a spot and reserve it together
 
-[![The lot allocates spots and owns sessions; each session retains its tariff, accepted payment attempts and physical exit state.](designs/lld-2.svg)](designs/lld-2.svg)
+Gate A sends an entry request containing the vehicle and request ID **E17**. This ID identifies the action at the gate; S17 will identify the visit created by that action.
 
-[![Detailed parking classes show immutable spot and vehicle values, visit ownership, policy interfaces and the external payment boundary.](lld-figures/parking-domain.svg)](lld-figures/parking-domain.svg)
+The entry method does this:
 
-[![Two gates can display the same last compact spot on a multi-floor lot, but only the lot's atomic allocation can promise it to a vehicle.](lld-figures/parking-layout.svg)](lld-figures/parking-layout.svg)
+1. If E17 was already handled, return its existing ticket. If E17 is being reused for a different vehicle, reject it.
+2. Check that this vehicle is not already inside under another ticket.
+3. Find a suitable spot that is available and has not been disabled.
+4. Create S17 and record that C17 belongs to this visit.
+5. Return the ticket.
 
-*The map is an observation. The `spotId -> sessionId` claim is ownership. A count of one does not reserve a particular location for either gate.*
+Why must choosing and reserving happen together? Suppose C17 is the last compact spot. Both gates might read a display that says “one spot free.” If both choose C17 before either records its use, two cars receive the same space.
 
-Availability for a vehicle type is not a separate pool of capacity. The same free large spot can appear compatible with a motorcycle, car and truck. Adding those three “available” counts would triple-count one physical space. I would display counts by physical spot category and let the selection policy resolve compatibility.
+A **lock** prevents this. Only one entry method at a time may choose and reserve a spot. The next method checks availability again after getting the lock.
 
-## 4. Complete entry, payment and exit execution
+[![Gate A reserves the last suitable spot while Gate B waits, then Gate B checks the updated records instead of also assigning C17](lld-figures/parking-race.svg)](lld-figures/parking-race.svg)
 
-### Entry: choose and claim under one authority
+In Java, `synchronized` puts that lock around this method. These are the records it uses:
 
-An entrance sends `entryKey=E17` for car KA01AB1234. Inside the lot monitor I first check whether E17 already produced a visit. If so, the same vehicle gets the existing ticket; a different payload under E17 is rejected. A registration already inside under another key is also rejected.
-
-I then select from non-disabled, unoccupied spots, validate the policy's result and create one session identity. The occupancy claim, session, active-registration index and retry mapping are recorded together before returning the ticket. The injected ID source is checked for collisions before any map changes.
+- `entries`: entry request ID → visit ID, so a retry can find its ticket.
+- `sessions`: visit ID → visit details.
+- `occupancy`: spot ID → visit ID, so each occupied spot has a known owner.
+- `activeVehicles`: registration → visit ID, so one vehicle cannot enter twice.
 
 ```java
 // source: Parking.java#enter
-        public synchronized SessionView enter(String entryKey,Vehicle vehicle) {
-            requireKey(entryKey);Objects.requireNonNull(vehicle);
-            String previous=entries.get(entryKey);
-            if(previous!=null) {
-                Session s=session(previous);
-                if(!s.vehicle.equals(vehicle))throw new IllegalArgumentException("Entry key payload conflict");
-                return s.view();
+        public synchronized SessionView enter(String entryKey, Vehicle vehicle) {
+            requireKey(entryKey);
+            Objects.requireNonNull(vehicle);
+
+            String previous = entries.get(entryKey);
+            if (previous != null) {
+                Session visit = session(previous);
+                if (!visit.vehicle.equals(vehicle)) {
+                    throw new IllegalArgumentException("Entry key payload conflict");
+                }
+                return visit.view();
             }
-            if(activeVehicles.containsKey(vehicle.registration))throw new IllegalStateException("Vehicle already inside");
-            List<Spot> free=spots.values().stream().filter(s->!disabled.contains(s.id)&&!occupancy.containsKey(s.id)).toList();
-            Spot spot=allocator.choose(vehicle,free);
-            if(!free.contains(spot)||!fits(vehicle.kind,spot.kind))throw new IllegalStateException("Allocation policy returned invalid spot");
-            String id=Objects.requireNonNull(ids.get());
-            if(id.isBlank()||sessions.containsKey(id))throw new IllegalStateException("Session identity collision");
-            Session s=new Session(id,vehicle,spot,clock.instant(),tariff);
-            sessions.put(id,s);occupancy.put(spot.id,id);activeVehicles.put(vehicle.registration,id);entries.put(entryKey,id);
-            return s.view();
+            if (activeVehicles.containsKey(vehicle.registration)) {
+                throw new IllegalStateException("Vehicle already inside");
+            }
+
+            List<Spot> free = spots.values().stream()
+                .filter(spot -> !disabled.contains(spot.id))
+                .filter(spot -> !occupancy.containsKey(spot.id))
+                .toList();
+            Spot spot = allocator.choose(vehicle, free);
+            if (!free.contains(spot) || !fits(vehicle.kind, spot.kind)) {
+                throw new IllegalStateException("Allocation policy returned invalid spot");
+            }
+
+            String id = Objects.requireNonNull(ids.get());
+            if (id.isBlank() || sessions.containsKey(id)) {
+                throw new IllegalStateException("Session identity collision");
+            }
+            Session visit = new Session(id, vehicle, spot, clock.instant(), tariff);
+            sessions.put(id, visit);
+            occupancy.put(spot.id, id);
+            activeVehicles.put(vehicle.registration, id);
+            entries.put(entryKey, id);
+            return visit.view();
         }
 ```
 
-There is no separate “check free now, occupy later” window. Suppose both gates previously saw C17 free:
+The final line returns a `SessionView`: a copy of the details the caller may read. The caller cannot edit the lot's records through that response. The helper `requireKey` checks that the request ID is present; `allocator.choose` applies the selection rule described above.
 
-| Order | Gate A | Gate B | Authoritative observation |
-|---|---|---|---|
-| 1 | Calls `enter(E17, carA)` | Calls `enter(E18, carB)` | Both may have seen a stale display |
-| 2 | Enters the lot monitor | Waits | A selects and claims C17 |
-| 3 | Returns ticket S17 | Acquires the monitor | B sees C17 owned by S17 |
-| 4 | Opens its barrier using S17 | Selects another compatible spot or gets full | At most one active session owns C17 |
+Notice that all four records are updated before the method returns. Another gate cannot observe a reserved spot with no ticket behind it.
 
-[![The two-gate timeline serializes selection and occupancy insertion in one critical section; the second gate rechecks after the first commit.](lld-figures/parking-race.svg)](lld-figures/parking-race.svg)
+If the response is lost, Gate A retries **E17**. It receives **S17** again. It does not get another spot. A request ID is useful only if the gate reuses it for a retry; inventing a new ID each time loses that protection.
 
-A thread-safe map alone would not make that sequence atomic. A static singleton would not fix it either; singleton controls construction, not a multi-step invariant, and it makes testing two independent lots harder.
+## 4. Payment: explain the amount, then collect it once
 
-If the physical entrance fails after ticket issuance, the allocation remains recorded. Retrying the same entry key returns that allocation; it does not leak a second spot. An operator/device reconciliation path can cancel a provably unused admission, but it must not free a spot merely because a network reply timed out.
+Before charging, show the driver a quote. For S17 at 09:59, the amount due is ₹40.
 
-### Payment: reserve the intent, call outside the lock, record the outcome
+The rule “each extra hour that has started” needs a precise meaning:
 
-The customer sees a quote and approves its `dueMinor`. `pay` revalidates that amount under the monitor. If a tariff boundary changed the amount between display and payment, it returns a changed-quote failure before calling the provider. It does not charge an unexpected higher fee simply because the server can calculate one.
+| Time parked | Fee |
+| --- | ---: |
+| Less than one hour | ₹40 |
+| Exactly one hour | ₹40 |
+| One hour and one second | ₹60 |
+| Two hours and 35 minutes | ₹80 |
 
-Inside the first critical section I record one attempt and mark the session PAYMENT_PENDING. Only then do I release the monitor and call `PaymentPort.charge` with the stable key. A duplicate arriving while that call is blocked sees PENDING and returns; it does not launch another collection. A different key is rejected until the outstanding intent is resolved.
+An immediate exit still pays the first-hour minimum. The Java implementation handles even smaller time boundaries, but the business rule is the same.
 
-After I/O, a second short critical section applies the result:
+Money is stored as whole **paise**, not a decimal number of rupees: ₹40 is 4,000 paise. That keeps the calculation exact.
 
-- **CONFIRMED:** add this amount once to cumulative paid credit, record receipt evidence and grant the exit window.
-- **DECLINED:** retain the occupied spot and paid credit, return the session to PARKED, and allow a newly approved attempt with a new key.
-- **UNKNOWN:** retain the original attempt and ownership. Do not collect again or claim the car is entitled to leave.
+The payment call is `pay("S17", "P17", 4000)`. It means: “For visit S17, collect the approved 4,000 paise under payment ID P17.” If the current amount has changed, the method asks for a new approval before collecting it.
 
-[![Payment preparation and finalization use short lot critical sections, while the slow provider call runs outside them so another entry gate can continue.](lld-figures/parking-payment.svg)](lld-figures/parking-payment.svg)
+### Do not make every gate wait for one card payment
 
-The following method includes those boundaries, duplicate handling, amount approval and zero-due handling:
+A payment service may take several seconds to reply. The lot must still allow other vehicles to enter during that time.
 
-```java
-// source: Parking.java#payment
-        public PaymentView pay(String sessionId,String paymentKey,long approvedDueMinor) {
-            Attempt work;
-            synchronized(this) {
-                requireKey(paymentKey);if(approvedDueMinor<0)throw new IllegalArgumentException("Negative approval");
-                Session s=session(sessionId);Attempt old=attempts.get(paymentKey);
-                if(old!=null) {
-                    if(!old.sessionId.equals(sessionId)||old.amount!=approvedDueMinor)throw new IllegalArgumentException("Payment key payload conflict");
-                    return old.view(); // A duplicate cannot start a second provider call.
-                }
-                if(s.state==SessionState.CLOSED)throw new IllegalStateException("Session closed");
-                if(s.state==SessionState.PAYMENT_PENDING||s.state==SessionState.PAYMENT_UNKNOWN)
-                    throw new IllegalStateException("Resolve original payment first");
-                if(s.state==SessionState.PAID && clock.instant().isBefore(s.exitBy)) {
-                    if(approvedDueMinor!=0)throw new IllegalStateException("Quote changed; approve the current amount");
-                    Attempt covered=new Attempt(paymentKey,sessionId,quote(sessionId));covered.state=PaymentState.CONFIRMED;covered.reference="ALREADY_COVERED";
-                    attempts.put(paymentKey,covered);return covered.view(); // Does not extend grace.
-                }
-                Quote q=quote(sessionId);
-                if(q.dueMinor!=approvedDueMinor)throw new IllegalStateException("Quote changed; approve the current amount");
-                work=new Attempt(paymentKey,sessionId,q);
-                attempts.put(paymentKey,work);s.activePayment=paymentKey;s.state=SessionState.PAYMENT_PENDING;
-                if(work.amount==0)return finish(paymentKey,new ProviderReply(PaymentState.CONFIRMED,"COVERED_BY_PRIOR_PAYMENTS"));
-            }
-            ProviderReply reply;
-            try { reply=payments.charge(work.key,work.amount); }
-            catch(RuntimeException uncertain) { reply=new ProviderReply(PaymentState.UNKNOWN,null); }
-            return finish(work.key,reply); // Provider I/O completed without holding the lot lock.
-        }
-        public PaymentView reconcile(String paymentKey) {
-            synchronized(this) {
-                Attempt a=attempt(paymentKey);
-                if(a.state==PaymentState.CONFIRMED||a.state==PaymentState.DECLINED)return a.view();
-            }
-            ProviderReply reply;
-            try {reply=payments.lookup(paymentKey);}catch(RuntimeException uncertain){reply=new ProviderReply(PaymentState.UNKNOWN,null);}
-            return finish(paymentKey,reply);
-        }
-```
+So payment has three steps:
 
-For this contract, a provider's DECLINED means a definitive rejected operation. “Reference not found yet,” a transport timeout or an in-progress lookup must be UNKNOWN/PENDING, not a definitive decline. Otherwise a retry with a new key could collect while the original operation later succeeds.
+1. Under the lot's lock, save P17 and mark the visit as awaiting its result.
+2. Release the lock and call the payment service using P17.
+3. Take the lock again and save the result. Add the payment to S17 only once.
 
-`reconcile` looks up the original payment key. Confirmation then applies the amount once. A later duplicate reconciliation returns the recorded final result. A provider violating its own final-outcome contract needs an operational exception investigation; it is not legitimate for application code to guess which inconsistent receipt represents truth.
+[![Payment records are updated under a short lock while the slow payment-service call runs outside it, allowing another gate to continue](lld-figures/parking-payment.svg)](lld-figures/parking-payment.svg)
 
-### Exit: verify entitlement and release only this visit's spot
+A repeated P17 request returns the saved attempt. It does not start another collection. The payment service must also use P17 to recognise a repeated call.
 
-Payment does not physically remove a vehicle. `confirmExit` is called from a trusted exit event after validating the ticket, with a unique event identity. It requires PAID and `now < exitBy`, checks that the occupancy map still names this session, removes that ownership and closes the session in one operation.
+### A slow response does not tell us whether money moved
+
+There are three useful outcomes:
+
+| Result | What we do |
+| --- | --- |
+| Confirmed | Add ₹40 to the visit's paid amount and give it an exit deadline. |
+| Definitely declined | Keep the car parked. The driver may start another payment. |
+| Unknown, for example after a timeout | Keep P17 unresolved and ask the service about P17. Do not start another charge. |
+
+Consider the last case. The bank may have collected ₹40 even though our application missed the reply. Immediately trying again with a new payment ID could collect another ₹40.
+
+Instead, `reconcile("P17")` asks what happened to the original payment. If it confirms collection, we record that result. If it still cannot tell us, the attempt stays unresolved. “We have not found the result yet” must not be treated as “definitely declined.”
+
+This repeat-safe behaviour is called **idempotency**. The name is less important than the promise: retrying the same action must not issue another ticket or collect another payment.
+
+## 5. Exit: use the payment, then release the right spot
+
+S17 was paid at 09:59. Its ten-minute exit period lasts until 10:09. If the car leaves at 10:01, it pays nothing more, even though the second parking hour has started.
+
+If the car is still there at 10:10, the exit period has expired. The total fee is now ₹60, but the visit has already paid ₹40:
+
+**Amount still due = ₹60 − ₹40 = ₹20.**
+
+After collecting that ₹20, the visit has paid ₹60 in total and gets a new ten-minute exit period. Retrying the old P17 payment must not renew its old deadline.
+
+[![A forty-rupee payment at 09:59 permits exit before 10:09; at 10:10 only twenty rupees more is due after crediting the earlier payment](lld-figures/parking-fees.svg)](lld-figures/parking-fees.svg)
+
+At exactly 10:09, the old period has ended. If it expires while the total fee is still covered by earlier payments, the system can grant a fresh period without asking the payment service to collect zero rupees.
+
+When the car leaves, a trusted gate event calls `confirmExit("S17", "X17")`. The method checks payment, deadline and spot ownership before closing the visit:
 
 ```java
 // source: Parking.java#exit
-        public synchronized SessionView confirmExit(String sessionId,String exitEventId) {
-            requireKey(exitEventId);Session s=session(sessionId);String previous=exits.get(exitEventId);
-            if(previous!=null&&!previous.equals(sessionId))throw new IllegalArgumentException("Exit event payload conflict");
-            if(s.state==SessionState.CLOSED)return s.view();
-            if(s.state!=SessionState.PAID||!clock.instant().isBefore(s.exitBy))
+        public synchronized SessionView confirmExit(String sessionId, String exitEventId) {
+            requireKey(exitEventId);
+            Session visit = session(sessionId);
+            String previous = exits.get(exitEventId);
+            if (previous != null && !previous.equals(sessionId)) {
+                throw new IllegalArgumentException("Exit event payload conflict");
+            }
+            if (visit.state == SessionState.CLOSED) {
+                return visit.view();
+            }
+            if (visit.state != SessionState.PAID || !clock.instant().isBefore(visit.exitBy)) {
                 throw new IllegalStateException("Payment or additional payment required");
-            if(!sessionId.equals(occupancy.get(s.spot.id)))throw new IllegalStateException("Spot ownership mismatch");
-            occupancy.remove(s.spot.id);activeVehicles.remove(s.vehicle.registration,sessionId);
-            s.state=SessionState.CLOSED;exits.put(exitEventId,sessionId);return s.view();
+            }
+            if (!sessionId.equals(occupancy.get(visit.spot.id))) {
+                throw new IllegalStateException("Spot ownership mismatch");
+            }
+
+            occupancy.remove(visit.spot.id);
+            activeVehicles.remove(visit.vehicle.registration, sessionId);
+            visit.state = SessionState.CLOSED;
+            exits.put(exitEventId, sessionId);
+            return visit.view();
         }
 ```
 
-If a delayed exit event for S17 arrives after S17 closed and C17 was allocated to S18, it returns S17's closed result. It never blindly sets C17 to free. Checking visit identity, not just spot ID, prevents a stale callback from releasing a new customer's allocation.
+`exitEventId` identifies the gate event. It must not be reused for a different visit. The `occupancy` check also matters: it confirms that this ticket still owns this spot.
 
-### Paid grace and additional fees, worked end to end
+For example, suppose S17 has closed and C17 now holds a new visit, S18. A delayed exit message for S17 must not free C17 again. The method sees that S17 is already closed and returns its old result. S18 is left alone.
 
-The chosen rule grants ten minutes from payment confirmation. A vehicle enters at 09:00 and pays at 09:59: the collected amount is ₹40 and its deadline is 10:09. It may leave at 10:01 without a new charge even though a second billing hour has begun. At exactly the deadline the grant is expired because the validity interval is half-open.
-
-If it remains until 10:10, the chargeable stay totals ₹60 and paid credit is ₹40. The next approved amount is **₹20**, not another ₹60. Once that top-up succeeds the session's paid credit is ₹60 and a new ten-minute exit grant begins. Repeating the original payment key does not extend its deadline or charge again.
-
-[![The fee timeline shows a forty-rupee payment at 09:59, an exit grant until 10:09, and only twenty rupees additional due at 10:10 after crediting the earlier payment.](lld-figures/parking-fees.svg)](lld-figures/parking-fees.svg)
-
-If the grace expires while the accumulated tariff is still fully covered, a newly requested zero-due grant needs no provider call. The system records that no-charge attempt and its new deadline. This avoids inventing a zero-value card transaction while retaining a traceable decision.
-
-## 5. Concurrency, failures and a production extension
-
-### The exact lock boundary and its cost
-
-The lot monitor covers selection/claim, identity checks, quote-to-attempt preparation, payment finalization and exit release. It does not cover card-network calls, barrier motor waits or display listeners. The executable test blocks a provider call and proves a second entrance can still progress.
-
-The simple allocator scans N spots and selects a minimum in O(N). Entry also builds a free candidate list. Availability queries scan rather than trusting a mutable count. This is intentional for a readable in-memory solution. If measurements justify it, I would maintain ordered free-spot indexes per size/floor; their updates must still occur atomically with the ownership transition.
-
-Moving to floor-level locks increases concurrency but adds cross-floor selection and registry coordination. I would define a stable lock order and handle a lost claim by retrying selection. Replacing one monitor with several locks without a consistency protocol can create a faster double-booking bug.
-
-### What survives a crash, and what does not
-
-The included example is in-memory. It cannot honestly recover paid visits after a process restart. A durable version stores sessions, occupancy, entry identities, accepted quotes and payment intents transactionally. The provider key is recorded before collection; unresolved intents are scanned and reconciled on recovery. An external charge cannot be reversed by rolling back a local transaction.
-
-For multiple server replicas, the authoritative database enforces one active occupancy per spot and, under this policy, one active visit per registration. Conditional writes/row locks and unique request identities replace the JVM monitor's global role. The repository transaction performs find/claim/session creation together; a display cache cannot become the allocation authority.
-
-### Operational cases with defined outcomes
-
-| Event | Chosen outcome |
-|---|---|
-| No compatible spot although some other type is free | Reject as no compatible capacity; do not issue a ticket |
-| Same entry key and same vehicle | Return the recorded visit |
-| Same entry/payment identity with another payload | Conflict; do not reinterpret old intent |
-| Card declined | Spot remains occupied; another approved attempt can follow |
-| Card result unknown | Block a new collection; reconcile original reference |
-| Payment succeeds but barrier is unavailable | Retain PAID/grace and gate evidence; retry access or operator recovery |
-| Grace expires | Quote the remaining difference and require approval |
-| Old exit event after reassignment | Return old closed result without touching new ownership |
-| Admin disables an occupied spot | Reject in this base API; evacuation/maintenance is a separate workflow |
-| Clock precedes entry | Reject invalid billing duration rather than manufacture a negative charge |
-
-Time comes from an injected `Clock`. That makes exact boundaries testable and supplies absolute timestamps for records. A deployed service also needs a trusted time/clock-adjustment policy; wall-clock timestamps and monotonic elapsed timers solve different problems.
-
-The [complete implementation](reference-code/lld-three/Parking.java) and [checks](reference-code/lld-three/ThreeChecks.java) cover simultaneous entrances, amount approval, duplicate/in-flight payments, declined and unknown outcomes, reconciliation, grace credits, tariff snapshots and stale exit replay. No real provider or personal vehicle data is used.
+The car's registration is also removed from the active-vehicle list, so it may enter again on a later visit.
 
 ## 6. Interviewer follow-ups
 
-**Why is this not a Singleton?** The physical business may have one lot, but that does not require global process state. Constructor injection lets two lots, two tests or two simulations coexist. Exclusivity is enforced by the ownership operation, not by restricting how many Java objects can be constructed.
+### What if the gate fails after we issue a ticket?
 
-**Where do floor, entrance and exit objects belong?** A floor is useful for layout/query grouping, and gate adapters translate device events into the lot's commands. They do not each keep independent occupancy truth. I can add `FloorView`, `EntranceAdapter` and `ExitAdapter` without letting three components disagree about which session owns a spot.
+Keep the ticket and reservation. Retry the same entry request instead of issuing another ticket. If the car never entered, an attendant can check the gate evidence and cancel the unused visit. A missing network reply alone is not enough evidence to free the spot.
 
-**How would I support EV or accessible spaces?** I would add capabilities and eligibility constraints, then extend the compatibility/allocation policy. Vehicle size, charging need and permit eligibility are different dimensions; a deep inheritance tree for every combination would grow unnecessarily. The atomic claim remains the same.
+### What if payment succeeds but the exit barrier does not open?
 
-**How would I handle a lost ticket?** An authorized attendant resolves the active visit from verified vehicle/entry evidence, applies a documented lost-ticket tariff or adjustment, and creates one approved payment intent. It does not create a second session or free an arbitrary spot by registration string alone. This needs staff authorization and audit beyond the base public commands.
+Keep the confirmed payment and the occupied spot. The gate can retry access for the same ticket, or an attendant can resolve the fault. If the exit period expires, the chosen business rule decides whether to extend it or charge a difference. A broken barrier must not erase the payment record.
 
-**What if two exits try to charge one ticket?** Preparation serializes at the session. One intent becomes pending; an identical retry observes it and another identity conflicts. The provider key supplies downstream deduplication/reconciliation as well. The exit operation later closes only this session once.
+### Why not keep just a `paid` flag on the ticket?
 
-**Could a slow allocation strategy hold the whole lot?** Yes, which is why the injected strategy's contract is pure, bounded, local computation. A remote occupancy query is not allowed inside it. If selection becomes expensive, I introduce transactional indexes or candidate hints followed by an authoritative claim, not network I/O under the monitor.
+A flag cannot tell us how much was paid, whether another payment is needed, or whether an earlier collection is still uncertain. S17 may already have paid ₹40 while a ₹20 top-up is pending. Separate payment attempts let us remember both facts.
 
-**How would I issue receipts?** `PaymentView` includes the retained quote, accepted amount, payment key, status and provider reference. A receipt is produced from confirmed evidence and tariff version. An UNKNOWN response may show a pending acknowledgement, but cannot be printed as a successful collection receipt.
+### What changes when we have several servers?
 
-**What would I monitor?** Allocation conflicts/full responses, occupancy reconciliation, pending-payment age, duplicate intents, provider latency and failures, grace top-ups and gate failures. A successful HTTP response count alone cannot reveal occupied spots with no active visit or captured payments with unresolved local state.
+`synchronized` protects threads using this `Lot` object. It does not lock another server's memory. Several servers need a shared database that checks and records the spot assignment together. The database must reject a second active claim for C17, even if both servers tried it at once.
+
+For recovery after a restart, save tickets, spot claims and payment attempts in that database. Save a payment ID before calling the payment service. On recovery, check unresolved IDs with the service instead of blindly charging again. The supplied Java example keeps records in memory; this database step is an extension.
+
+### Where are the replaceable design patterns?
+
+`AllocationPolicy` and `Tariff` use **Strategy**: each puts a changeable rule behind an interface. For example, “smallest suitable spot” can become “nearest suitable spot.” Neither change should rewrite entry, payment or exit. We do not need a separate subclass for every vehicle/spot combination.
+
+### What does the complete payment method look like?
+
+The implementation below follows the three payment steps above. `Attempt` is the saved payment request. `finish` records its outcome once. A repeated key returns the saved result, and an unresolved attempt prevents a second collection under a new key.
+
+```java
+// source: Parking.java#payment
+        public PaymentView pay(String sessionId, String paymentKey, long approvedDueMinor) {
+            Attempt work;
+            synchronized (this) {
+                requireKey(paymentKey);
+                if (approvedDueMinor < 0) {
+                    throw new IllegalArgumentException("Negative approval");
+                }
+                Session visit = session(sessionId);
+                Attempt old = attempts.get(paymentKey);
+                if (old != null) {
+                    if (!old.sessionId.equals(sessionId) || old.amount != approvedDueMinor) {
+                        throw new IllegalArgumentException("Payment key payload conflict");
+                    }
+                    return old.view(); // A duplicate cannot start a second provider call.
+                }
+                if (visit.state == SessionState.CLOSED) {
+                    throw new IllegalStateException("Session closed");
+                }
+                if (visit.state == SessionState.PAYMENT_PENDING
+                        || visit.state == SessionState.PAYMENT_UNKNOWN) {
+                    throw new IllegalStateException("Resolve original payment first");
+                }
+                if (visit.state == SessionState.PAID && clock.instant().isBefore(visit.exitBy)) {
+                    if (approvedDueMinor != 0) {
+                        throw new IllegalStateException("Quote changed; approve the current amount");
+                    }
+                    Attempt covered = new Attempt(paymentKey, sessionId, quote(sessionId));
+                    covered.state = PaymentState.CONFIRMED;
+                    covered.reference = "ALREADY_COVERED";
+                    attempts.put(paymentKey, covered);
+                    return covered.view(); // Does not extend grace.
+                }
+
+                Quote current = quote(sessionId);
+                if (current.dueMinor != approvedDueMinor) {
+                    throw new IllegalStateException("Quote changed; approve the current amount");
+                }
+                work = new Attempt(paymentKey, sessionId, current);
+                attempts.put(paymentKey, work);
+                visit.activePayment = paymentKey;
+                visit.state = SessionState.PAYMENT_PENDING;
+                if (work.amount == 0) {
+                    return finish(paymentKey, new ProviderReply(
+                        PaymentState.CONFIRMED, "COVERED_BY_PRIOR_PAYMENTS"));
+                }
+            }
+
+            ProviderReply reply;
+            try {
+                reply = payments.charge(work.key, work.amount);
+            } catch (RuntimeException uncertain) {
+                reply = new ProviderReply(PaymentState.UNKNOWN, null);
+            }
+            return finish(work.key, reply); // The payment-service call held no lot lock.
+        }
+        public PaymentView reconcile(String paymentKey) {
+            synchronized (this) {
+                Attempt saved = attempt(paymentKey);
+                if (saved.state == PaymentState.CONFIRMED || saved.state == PaymentState.DECLINED) {
+                    return saved.view();
+                }
+            }
+            ProviderReply reply;
+            try {
+                reply = payments.lookup(paymentKey);
+            } catch (RuntimeException uncertain) {
+                reply = new ProviderReply(PaymentState.UNKNOWN, null);
+            }
+            return finish(paymentKey, reply);
+        }
+```
+
+For N spots, the simple entry implementation scans the available spots in O(N) time. That is a clear starting design for a small lot. If this becomes slow, keep searchable lists by spot type and floor. Updating those lists must still happen together with assigning or releasing a spot.
 
 ## 7. Closing answer
 
-“I would use a visit-based model with an atomic spot claim, immutable tariff/quote evidence and one stable identity per entry, payment and exit. The short lot lock protects ownership; slow collection happens outside it. Unknown financial outcomes are reconciled, paid credit is preserved across top-ups, and only an authorized physical exit releases the visit's spot. Allocation and tariff strategies make business changes replaceable without moving correctness into displays or device panels.”
+“I would give each visit its own ticket and make the lot responsible for assigning spots. Choosing a spot and recording its use happen under one lock, so two gates cannot promise the same space. Payments have their own IDs, so retries do not collect twice. We remember the amount already paid and free the spot only when that visit leaves. Different allocation and pricing rules fit behind small interfaces.”
 
-For an interview presentation I would first establish those three identities, draw the layout and domain ownership, implement entry atomically, then work through a payment timeout and the grace-period arithmetic. That demonstrates the object model and the failure semantics behind it instead of ending with a list of patterns.
+That is the complete path: **arrive → assign a spot → pay → leave → reuse the spot**. The extra checks protect the same path when requests repeat or devices fail.
 
-### Sources and further reading
-
-- [Grokking/Design Gurus public parking-lot case study](https://www.designgurus.io/course-play/grokking-the-object-oriented-design-interview/doc/design-a-parking-lot) and [Educative's public design article](https://www.educative.io/blog/design-a-parking-lot): public comparison material for typical actors, class design and flows.
-- [AlgoMaster's public parking-lot problem](https://github.com/ashishps1/awesome-low-level-design/blob/main/problems/parking-lot.md): another public model for comparison. The design/code/illustrations here are original.
-- [Java 21 Duration](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/Duration.html) and [Strategy](https://refactoring.guru/design-patterns/strategy) for the implementation contracts behind time arithmetic and replaceable policies.
-- [Run the three references](reference-code/lld-three/README.md).
+The [complete Java implementation](reference-code/lld-three/Parking.java) includes the helper classes and pricing calculation used by these code excerpts.
 
 === LLD 3 ===
 N|n0|SystemController|0|0|220|rect
@@ -366,346 +383,341 @@ E|n6|n1|implements
 ---
 ## Problem
 
-Design the low-level software for a building with several elevators. A person can request an upward or downward ride from a floor; a passenger inside a car can select a destination. Show how the system assigns calls, orders stops, operates doors and handles a car becoming unavailable.
+Design the software that handles requests for several elevators in a building. Someone waiting on a floor presses Up or Down. Someone inside a car selects a destination. The system must choose a car, decide its next stop and open the doors at the right time.
 
-The interesting question is not how to put floor numbers in a queue. It is how a request remains owned until an eligible car actually offers the requested ride, while every movement respects the car's state.
-
-This answer includes a runnable Java 21 **floor-event simulator**. Its ticks are logical events, not seconds. It does not drive motors, model a car between floors, or implement a certified safety controller. Separating that boundary makes the scheduling answer more precise: software may request travel, but real hardware must independently enforce its safety interlocks.
+We will use a Java simulation to make those decisions clear. It moves between whole floors; real motors, brakes and their safety controls belong to the device controller.
 
 ## Requirements
 
-I would clarify these points, then proceed with the following explicit contract rather than waiting for the interviewer to supply every detail.
+- Support several cars in one building.
+- Keep floor Up/Down requests separate from destinations selected inside a car.
+- Avoid adding the same active request again when a button is pressed repeatedly.
+- Serve stops in a sensible direction instead of reversing for every new request.
+- Prevent travel with open doors, an obstruction, a failed travel permission or an overload.
+- Let another car collect waiting passengers if the assigned car becomes unavailable.
 
-| Question | Decision for this design | Why it affects the model |
-| --- | --- | --- |
-| Conventional buttons or destination dispatch? | Conventional hall Up/Down buttons; destination chosen inside the car | A hall call does not yet know the destination or passenger count. |
-| Building and fleet? | One building, 2–100 indexed floors, several independently identified cars | Floor 0 has no Down button; the top floor has no Up button. |
-| What does another press mean? | Coalesce an active `(floor, direction)` call | Ten presses are not evidence of ten passengers. Opposite directions remain separate. |
-| What is a successful pickup? | The assigned, available car opens at that floor, for that direction, with spare capacity | Merely passing the floor or assigning a car must not extinguish the call. |
-| How are stops ordered? | Directional collective service using a LOOK-style sweep | Serve eligible stops along a direction, then reverse when no further demand requires continuing. |
-| How is a car selected? | Earliest simulated pickup over the known plan; stable car ID breaks ties | Nearest floor alone ignores direction and existing stops. |
-| Which state can block travel? | Door not closed, obstruction, failed interlock, overload or out-of-service mode | Scheduling preference cannot override a movement guard. |
-| What happens on a fault? | Release unserved hall calls for reassignment; retain cabin destinations for operator recovery | Waiting passengers can use another car; onboard passengers cannot be transferred in a map. |
-| Concurrency model? | One controller owns mutable fleet state; short synchronized event methods | Assignment, stop insertion and acknowledgement remain one coherent operation. |
+## 1. Start with one elevator journey
 
-Fire service, emergency evacuation, express/zoned cars, real acceleration and braking, access control and persistence are extensions. They require explicit additional policies; they are not silently claimed by this implementation.
+Car A is at floor 0. It has cabin requests for floors **3 and 7**. Someone on floor **2 presses Up**, and someone on floor **5 presses Down**.
 
-## 1. The answer I would present
+The useful stop order is:
 
-“I would split the system into a **fleet dispatcher** and **per-car control state**. The dispatcher owns the hall-call ledger and selects a car. Each car owns its cabin stops, assigned hall stops, direction, door state and measured load. The car follows a directional sweep, but can advance only when the movement guards allow it. A hall call is completed by a validated pickup event, not by dispatching it.”
+**2 Up → 3 → 7 → 5 Down.**
 
-That split answers two different decisions. **Dispatch** means choosing *which car*. **Scheduling** means deciding *which stop that car serves next*. A class called `ElevatorManager` that does both through one unsorted request list hides this distinction.
+A picks up the person at 2 while travelling upward, then serves its cabin requests at 3 and 7. It passes floor 5 on the way up because that person wants to go down. After 7, it reverses and offers a downward ride at 5.
 
-[![Selected fleet design: the controller assigns hall calls, each car owns its sweep plan, and door/load guards control travel](designs/lld-3.svg)](designs/lld-3.svg)
+[![Car A serves the Up call at two and cabin destinations three and seven before returning to serve Down at five](lld-figures/elevator-sweep.svg)](lld-figures/elevator-sweep.svg)
 
-Consider a ten-floor building. Car A is at 0 with cabin destinations 3 and 6. Car B is at 3 with a cabin destination of 1. Someone at 2 presses Up. B is physically closer, but its current service is downward. The implemented estimator chooses A: pickup takes **4 model ticks for A versus 9 for B**. Those are derived from the same stop and door rules used to run the simulator, rather than an unexplained distance multiplier.
+Stopping at 5 on the upward trip must not clear the Down request. Passing the correct floor is not enough; the car must offer the requested direction.
 
-[![Two elevator shafts show A below an Up call at floor two and B travelling down; the known-plan simulation predicts four versus nine pickup events](lld-figures/elevator-building.svg)](lld-figures/elevator-building.svg)
+This example shows two separate decisions: **which car should take a call**, and **which stop that car should serve next**. The first is the building's job. The second belongs to each car's plan.
 
-For A: move 0→1, move 1→2, begin opening, finish opening and acknowledge pickup. For B: move 3→2→1, open, finish opening, begin closing, finish closing, move 1→2, begin opening, finish opening. Future arrivals, travel time and variable dwell are not included. In a real building the score would use measured time estimates; the ownership contract would stay the same.
+## 2. Give the building and each car different jobs
 
-## 2. The object model and invariants
-
-### Hall calls and cabin calls are different facts
-
-`HallKey(2, UP)` means “someone at floor 2 wants an upward ride.” `cabinCall("A", 7)` means “someone already in A wants floor 7.” The first belongs to the building until served; the second belongs to A. A hall call is assignable to another car. A cabin destination is not.
-
-The application deliberately has no `HallRequest(source, destination)` constructor. That would invent information the conventional interface cannot collect. Destination-control elevators would be a valid **different requirement**, with a different request contract.
-
-```java
-// source: Elevators.java#contracts
-    public enum Direction { UP, DOWN, IDLE }
-    public enum Door { CLOSED, OPENING, OPEN, CLOSING }
-    public enum Mode { NORMAL, OUT_OF_SERVICE }
-    public enum CallState { WAITING, ASSIGNED, SERVED }
-    public enum Action { IDLE, MOVED, OPENING, OPENED, CLOSING, CLOSED, BLOCKED, OUT_OF_SERVICE }
-    public record HallKey(int floor,Direction direction) {}
-    public record HallTask(long callId,HallKey key,long epoch) {}
-    public record CallView(long id,HallKey key,long createdTick,CallState state,String carId,long epoch) {}
-    public record CarSnapshot(String id,int floor,int capacity,int load,Direction heading,Direction boarding,
-                              Door door,Mode mode,boolean obstructed,boolean interlock,
-                              List<Integer> cabin,List<HallTask> hall) {
-        public CarSnapshot { cabin=List.copyOf(cabin);hall=List.copyOf(hall); }
-    }
-    public record Tick(String carId,Action action,int from,int to,Direction heading,List<HallTask> pickups) {
-        public Tick {pickups=List.copyOf(pickups);}
-    }
-    public interface DispatchPolicy { String choose(HallTask candidate,List<CarSnapshot> cars); }
-    private record Goal(int floor,Direction boarding) {}
-```
-
-`CarSnapshot` and `Tick` defensively copy their lists. A dispatch policy can inspect a snapshot without receiving a reference to a mutable queue. `HallTask` includes an **epoch**, the version of an assignment. It prevents an old car's late acknowledgement from completing a call that has since been reassigned.
-
-[![Elevator object model separates the system call ledger and dispatch strategy from each car's private plan, door state and load](lld-figures/elevator-domain.svg)](lld-figures/elevator-domain.svg)
-
-| Owner | State and responsibilities | State it must not own |
-| --- | --- | --- |
-| `SystemController` | Cars, active hall-key index, call identities, assignment versions, event clock | Passenger guesses inferred from button presses |
-| `Request` | ID, original creation tick, floor/direction, state, assigned car, epoch | A mutable reference into another car's queue |
-| `Car` | Floor, travel heading, boarding direction, doors, mode, sensor load, interlock and plan | Global completion decisions about another car's request |
-| `SweepPlan` | Deduplicated cabin destinations and assigned hall tasks; next eligible goal | Motor commands or global car selection |
-| `DispatchPolicy` / `EtaPolicy` | Pure choice from immutable snapshots | Changes to ownership while calculating a score |
-
-The key invariants are concrete enough to test:
-
-1. At most one active hall call exists for a particular `(floor, direction)`.
-2. An assigned call has one current car and epoch; the car's task matches both.
-3. A cabin destination is removed when that car opens there. A hall call is removed only by a matching pickup acknowledgement.
-4. `MOVED` implies normal mode, closed doors, clear obstruction, satisfied interlock and load no greater than capacity.
-5. A full car can still transport its onboard passengers, but cannot be assigned another pickup. An overloaded car cannot travel.
-6. Reassignment retains the call's original identity and creation age; stale owners cannot complete it.
-7. A snapshot cannot mutate the live plan.
-
-**Direction is not door state.** A car may be stationary with its door open while boarding Up passengers. `boarding` records the ride being offered at that stop; `heading` selects the sweep. Keeping those facts explicit prevents “door open at floor 2” from accidentally completing both Up and Down calls.
-
-## 3. Final design and public contract
-
-The complete source is [Elevators.java](reference-code/lld-three/Elevators.java); the exact executable scenarios are in [ThreeChecks.java](reference-code/lld-three/ThreeChecks.java). Code excerpts below are taken directly from that compiling implementation.
-
-| Command | Meaning and observable result |
+| Class | Its job |
 | --- | --- |
-| `hallCall(floor, direction)` | Validate the button; return the existing active call or create and dispatch one. |
-| `cabinCall(carId, floor)` | Deduplicate a destination in that car. Reject an out-of-service car. |
-| `tick()` | Advance each car by one model event, validate generated pickup acknowledgements, then retry waiting dispatch. |
-| `load(carId, passengers)` | Apply a sensor reading; at/full capacity release unserved hall assignments. |
-| `obstruction(carId, true)` | Block travel/reopen during closing and release hall assignments so other cars can serve them. |
-| `interlock(carId, false)` | Forbid travel and release unserved hall assignments. |
-| `outOfService(carId)` | Stop that car's simulation; requeue hall calls while retaining cabin stops. |
-| `snapshot(carId)` / `call(id)` | Return immutable observations, including assignment identity/version. |
+| `SystemController` | Remember active floor calls, choose cars and handle events. |
+| `Request` | Remember one floor/direction request and its current assignment. |
+| `Car` | Keep one car's floor, direction, doors, load and plan. |
+| `SweepPlan` | Decide that car's next stop. |
+| `DispatchPolicy` | Provide a rule for choosing a car. |
+| `EtaPolicy` | Choose the car predicted to offer pickup first. |
 
-### Coalesce first, assign atomically
+[![The system controller keeps floor calls and chooses cars, while each car owns its stop plan and supplies a read-only snapshot for selection](designs/lld-3.svg)](designs/lld-3.svg)
 
-`active` indexes a hall key to its current call ID. This is separate from `requests`, the history/ledger. An additional Up press at floor 2 returns the same call while it is waiting or assigned. After service, a new press creates a new identity. That also makes a late acknowledgement for a previous visit harmless.
+### A floor call does not tell us the destination
 
-```java
-// source: Elevators.java#dispatch
-        public synchronized CallView hallCall(int floor,Direction direction) {
-            validFloor(floor);
-            if(direction==null||direction==Direction.IDLE||floor==0&&direction==Direction.DOWN||floor==floors-1&&direction==Direction.UP)
-                throw new IllegalArgumentException("Impossible hall direction");
-            HallKey key=new HallKey(floor,direction);Long existing=active.get(key);
-            if(existing!=null)return requests.get(existing).view();
-            Request r=new Request(++nextId,key,tick);requests.put(r.id,r);active.put(key,r.id);dispatch();return r.view();
-        }
-        private void dispatch() {
-            // Linked insertion order is oldest-first; an existing active call retains its age.
-            for(Request r:requests.values())if(r.state==CallState.WAITING) {
-                HallTask candidate=new HallTask(r.id,r.key,r.epoch+1);
-                String id=policy.choose(candidate,cars.values().stream().map(Car::snapshot).toList());
-                if(id==null)continue;Car c=car(id);
-                if(c.mode!=Mode.NORMAL||c.load>=c.capacity||c.obstructed||!c.interlock)throw new IllegalStateException("Policy returned ineligible car");
-                r.epoch++;r.carId=id;r.state=CallState.ASSIGNED;
-                c.plan.hall.put(r.id,new HallTask(r.id,r.key,r.epoch));
-            }
-        }
-```
+`hallCall(2, UP)` means someone at 2 wants to go upward. It does not say whether the person wants floor 3, 7 or 9. That destination becomes known after boarding, through a cabin button such as `cabinCall("A", 7)`.
 
-All those mutations happen inside the controller monitor. A policy must be pure and must not perform network I/O while it is invoked there. This implementation calculates from a bounded local snapshot. A slower external optimizer would need a separate calculation phase and a version check before accepting its proposal.
+A floor call can be moved to another car's plan. A cabin destination stays with its car because the passenger is already inside it.
 
-The policy scores every eligible car by cloning its snapshot, inserting a probe task and running the **same** `Car.tick()` rules until the probe is picked up. It returns infinity for an unavailable, full, obstructed or interlock-blocked car. If no car is eligible, the call remains `WAITING`; it is not discarded and no fake car ID is assigned.
+Another press of the active `2 Up` button returns the same call. It does not prove another passenger arrived. A simultaneous `2 Down` call is different and remains active until a car offers that direction.
 
-### Why these patterns fit
+### What a car remembers
 
-`DispatchPolicy` is **Strategy**: replace ETA selection with a measured-time, energy-aware or zone-aware policy without rewriting ownership. Door and call enums describe explicit **state machines**. This small implementation uses guarded transitions rather than one class per state; a large maintenance controller could extract state objects if transitions become too complex. A pattern name is justified by a real variation point, not by a requirement to use every pattern.
+- Its current floor and travel direction.
+- The direction being offered when its doors open.
+- Door state: closed, opening, open or closing.
+- Measured load and capacity.
+- Whether it is available, whether a door obstruction is detected, and whether travel is permitted.
+- Cabin destinations and assigned floor calls.
 
-Cars are instances, not a process-wide Singleton. Two building controllers can run independently in one test. Displays subscribe to observations in a production adapter; they do not mutate a stop list to make a button light look correct.
+The code calls the travel-permission signal `interlock`. For this model it is a boolean supplied by the device side. The scheduling code must respect it rather than assume closed doors always mean travel is permitted.
 
-## 4. Directional scheduling, with a complete trace
+## 3. Choose a car by its journey, not just its distance
 
-### Why a queue or a sorted set alone is insufficient
+Consider a separate two-car example:
 
-A FIFO queue can make a car reverse for each new arrival. A single globally sorted floor set always picking the minimum can send an upward-moving car backward while passengers still need a higher floor. Two sets without hall direction can open for Down passengers on the way Up and wrongly mark them served.
+- A is at 0, with cabin destinations 3 and 6.
+- B is at 3, heading towards its cabin destination 1.
+- A person at 2 presses Up.
 
-The selected rule is a **LOOK-style directional sweep**, also called directional collective service here. LOOK reverses at the last required stop instead of travelling to the building endpoint merely because it exists. The implementation additionally distinguishes the boarding direction of hall calls.
+B is only one floor away. But it must finish its downward stop, close its doors, return to 2 and open again. A can offer an upward pickup sooner.
 
-While going Up, select the nearest cabin or Up hall stop at/above the current floor. If there are no such stops but Down calls remain above, continue to the highest of those floors and offer a downward ride there. If there is no reason to continue upward, reverse and apply the symmetric Down rule. An idle car chooses a nearest demand, with a stable lower-floor tie break, to start its sweep.
+[![Two elevator shafts show why car A can collect an Up call sooner than nearby car B, which first needs to finish a downward stop](lld-figures/elevator-building.svg)](lld-figures/elevator-building.svg)
+
+Our simulator counts **ticks**, meaning individual actions rather than seconds. Moving one floor is one action. Beginning to open and finishing opening are separate actions.
+
+| Car | Actions before pickup at 2 | Count |
+| --- | --- | ---: |
+| A | 0→1, 1→2, start opening, finish opening | 4 |
+| B | 3→2, 2→1, start opening, finish opening, start closing, finish closing, 1→2, start opening, finish opening | 9 |
+
+`EtaPolicy` tries the current plan on a copy of each car's state. It picks the eligible car with the smaller count; a stable car ID breaks a tie. Trying a copy does not move the actual car.
+
+This estimate uses the calls already known. It does not predict future passengers or real travel/dwell time. A real system can replace the estimate with measured timings while keeping the same request and car classes.
+
+If every car is full, blocked or unavailable, the request stays waiting. It is tried again when a car's state changes or the next simulation tick runs.
+
+## 4. Decide the next stop without unnecessary reversals
+
+Return to A's first journey: cabin destinations 3 and 7, floor calls `2 Up` and `5 Down`.
+
+While going up, choose the nearest cabin destination or Up call at or above the current floor. Keep serving those stops before reversing. Once there is no further upward demand, reverse and follow the corresponding Down rule.
+
+If there are only Down calls above the car, travel to the highest of them and start serving downward there. The reverse case works the same way below the car. An idle car starts towards a nearest request, using the lower floor to break a tie.
+
+This is a **LOOK-style sweep**: the car turns around when the remaining requests call for it. It does not travel to the top or bottom merely because that is the end of the building.
+
+In the Java method, `ceiling(floor)` means the first requested floor at or above this floor. `floor(floor)` means the first at or below it. Cabin destinations appear in both directions because those passengers are already inside. Floor calls appear only in their requested direction.
 
 ```java
 // source: Elevators.java#look
-        Goal next(int floor,Direction heading) {
-            TreeSet<Integer> up=new TreeSet<>(cabin);up.addAll(halls(Direction.UP));
-            TreeSet<Integer> down=new TreeSet<>(cabin);down.addAll(halls(Direction.DOWN));
-            if(up.isEmpty()&&down.isEmpty())return null;
-            if(heading==Direction.IDLE) {
-                TreeSet<Integer> all=new TreeSet<>(up);all.addAll(down);
-                int closest=all.stream().min(Comparator.comparingInt((Integer f)->Math.abs(f-floor)).thenComparingInt(f->f)).orElseThrow();
-                if(closest==floor)return new Goal(floor,halls(Direction.UP).contains(floor)?Direction.UP:
-                    halls(Direction.DOWN).contains(floor)?Direction.DOWN:Direction.IDLE);
-                return next(floor,closest>floor?Direction.UP:Direction.DOWN);
+        Goal next(int floor, Direction heading) {
+            TreeSet<Integer> up = new TreeSet<>(cabin);
+            up.addAll(halls(Direction.UP));
+            TreeSet<Integer> down = new TreeSet<>(cabin);
+            down.addAll(halls(Direction.DOWN));
+            if (up.isEmpty() && down.isEmpty()) {
+                return null;
             }
-            if(heading==Direction.UP) {
-                Integer matching=up.ceiling(floor);
-                if(matching!=null)return new Goal(matching,Direction.UP);
-                if(!down.isEmpty()&&down.last()>floor)return new Goal(down.last(),Direction.DOWN);
-                if(down.contains(floor))return new Goal(floor,Direction.DOWN);
-                return next(floor,Direction.DOWN);
+            if (heading == Direction.IDLE) {
+                TreeSet<Integer> all = new TreeSet<>(up);
+                all.addAll(down);
+                int closest = all.stream()
+                    .min(Comparator.comparingInt((Integer f) -> Math.abs(f - floor))
+                        .thenComparingInt(f -> f))
+                    .orElseThrow();
+                if (closest == floor) {
+                    Direction boarding = halls(Direction.UP).contains(floor) ? Direction.UP
+                        : halls(Direction.DOWN).contains(floor) ? Direction.DOWN : Direction.IDLE;
+                    return new Goal(floor, boarding);
+                }
+                return next(floor, closest > floor ? Direction.UP : Direction.DOWN);
             }
-            Integer matching=down.floor(floor);
-            if(matching!=null)return new Goal(matching,Direction.DOWN);
-            if(!up.isEmpty()&&up.first()<floor)return new Goal(up.first(),Direction.UP);
-            if(up.contains(floor))return new Goal(floor,Direction.UP);
-            return next(floor,Direction.UP);
+            if (heading == Direction.UP) {
+                Integer matching = up.ceiling(floor);
+                if (matching != null) {
+                    return new Goal(matching, Direction.UP);
+                }
+                if (!down.isEmpty() && down.last() > floor) {
+                    return new Goal(down.last(), Direction.DOWN);
+                }
+                if (down.contains(floor)) {
+                    return new Goal(floor, Direction.DOWN);
+                }
+                return next(floor, Direction.DOWN);
+            }
+            Integer matching = down.floor(floor);
+            if (matching != null) {
+                return new Goal(matching, Direction.DOWN);
+            }
+            if (!up.isEmpty() && up.first() < floor) {
+                return new Goal(up.first(), Direction.UP);
+            }
+            if (up.contains(floor)) {
+                return new Goal(floor, Direction.UP);
+            }
+            return next(floor, Direction.UP);
         }
 ```
 
-The `ceiling`/`floor` operations include the current floor, so a request at the present floor can open the doors without an unnecessary trip. A cabin stop is eligible in either direction because its rider is already onboard. A hall call is eligible only for the direction offered there.
+`Goal` contains a target floor and the direction to offer when opening there. That direction matters when clearing a floor call.
 
-[![A directional sweep serves Up at two, cabin stops three and seven, then Down at five; passing floor five upward does not complete its Down call](lld-figures/elevator-sweep.svg)](lld-figures/elevator-sweep.svg)
+The first journey now has a clear explanation:
 
-Here is an entire plan, not just a queue declaration:
+| At this point | Decision |
+| --- | --- |
+| A starts at 0 | Travel towards the first matching stop, 2 Up. |
+| Doors open at 2 | Clear 2 Up if there is room. Keep any 2 Down call. |
+| Doors open at 3 | Remove the cabin destination 3. |
+| A passes 5 while going Up | Keep 5 Down active. |
+| Doors open at 7 | Remove cabin destination 7; then reverse. |
+| Doors open at 5 while offering Down | Clear 5 Down. With nothing left, close and become idle. |
 
-| Step | Car state / pending demand | Decision |
-| --- | --- | --- |
-| Start | A at 0, cabin `{3,7}`, hall `2↑` and `5↓` | Head Up; 2 is the first matching stop. |
-| Open at 2 | Spare capacity, boarding Up | Serve `2↑`; remove only that hall task. |
-| Continue | Cabin 3 and 7 remain, hall `5↓` remains | Open at 3 for its cabin destination. |
-| Pass 5 | Still heading Up, cabin 7 remains | Keep `5↓` active. Passing is not pickup. |
-| Open at 7 | Last upward demand is satisfied | The next demand is below; reverse. |
-| Open at 5 Down | Current owner/epoch, capacity and direction match | Serve `5↓`; with no demand left, become idle after closing. |
+One global queue of floors would lose these distinctions. FIFO order can cause repeated reversals; always taking the lowest floor can send an upward journey backwards too soon.
 
-The resulting opening sequence is exactly **`2:UP, 3:UP, 7:UP, 5:DOWN`**, asserted in the runnable checks. If both `2↑` and `2↓` exist, opening Up completes only `2↑`. The Down call remains independently visible and assigned.
+## 5. Doors, capacity and a failed car
 
-This policy does not claim optimality under arbitrary future traffic. Calls are considered oldest-first when waiting for assignment, and reassignment preserves age. Continuous new upward demand can still delay a Down call. A production fairness extension would cap a sweep or impose a maximum waiting-time threshold and re-evaluate assignments. Its tests would need adversarial ongoing arrivals, not just a static batch.
+### A route does not give permission to move
 
-## 5. Door transitions, faults and recovery
+The door follows this cycle:
 
-### Scheduling never bypasses the movement guard
+**Closed → Opening → Open → Closing → Closed.**
 
-An arrival begins opening; a later tick completes it. Opening is the event at which cabin stops and eligible hall pickups can be acknowledged. After an unblocked dwell event the doors begin closing, then become closed on the next event. These discrete events make every transition visible in a trace.
+If something blocks the closing door, it reopens. While an open door is blocked, it stays open. A car moves only when it is available, its doors are closed, the obstruction signal is clear, travel is permitted and the load is not over capacity.
 
-[![Door cycle has closed, opening, open and closing states; an obstruction reopens, overload holds, and movement requires all guards](lld-figures/elevator-doors.svg)](lld-figures/elevator-doors.svg)
+[![Four door states show the normal cycle and obstruction reopening; movement also requires clear sensors, travel permission and a load within capacity](lld-figures/elevator-doors.svg)](lld-figures/elevator-doors.svg)
+
+**Full and overloaded mean different things.** A full car can carry its current passengers to their destinations, but should not receive new pickups. An overloaded car must not travel.
+
+The simulation receives load readings through `load(carId, passengers)`. Button presses do not change that reading. It does not guess how many people entered or left.
+
+Here is one step of the car's control logic. Each branch performs one action and returns an event describing what happened:
 
 ```java
 // source: Elevators.java#tick
         Tick tick() {
-            int from=floor;Action action;List<HallTask> pickups=List.of();
-            if(mode==Mode.OUT_OF_SERVICE)action=Action.OUT_OF_SERVICE;
-            else if(door==Door.OPENING) {
-                door=Door.OPEN;action=Action.OPENED;plan.cabin.remove(floor);
-                if(load<capacity)pickups=plan.hall.values().stream()
-                    .filter(h->h.key.floor==floor&&h.key.direction==boarding).toList();
-            }else if(door==Door.OPEN) {
-                if(obstructed||load>capacity)action=Action.BLOCKED;
-                else {door=Door.CLOSING;action=Action.CLOSING;}
-            }else if(door==Door.CLOSING) {
-                if(obstructed||load>capacity){door=Door.OPENING;action=Action.OPENING;}
-                else {door=Door.CLOSED;action=Action.CLOSED;}
-            }else if(load>capacity){door=Door.OPENING;action=Action.OPENING;}
-            else if(obstructed||!interlock)action=Action.BLOCKED;
-            else {
-                Goal next=plan.next(floor,heading);
-                if(next==null){heading=Direction.IDLE;action=Action.IDLE;}
-                else if(next.floor==floor){boarding=next.boarding;heading=boarding;door=Door.OPENING;action=Action.OPENING;}
-                else {heading=next.floor>floor?Direction.UP:Direction.DOWN;floor+=heading==Direction.UP?1:-1;action=Action.MOVED;}
+            int from = floor;
+            Action action;
+            List<HallTask> pickups = List.of();
+            if (mode == Mode.OUT_OF_SERVICE) {
+                action = Action.OUT_OF_SERVICE;
+            } else if (door == Door.OPENING) {
+                door = Door.OPEN;
+                action = Action.OPENED;
+                plan.cabin.remove(floor);
+                if (load < capacity) {
+                    pickups = plan.hall.values().stream()
+                        .filter(h -> h.key.floor == floor && h.key.direction == boarding)
+                        .toList();
+                }
+            } else if (door == Door.OPEN) {
+                if (obstructed || load > capacity) {
+                    action = Action.BLOCKED;
+                } else {
+                    door = Door.CLOSING;
+                    action = Action.CLOSING;
+                }
+            } else if (door == Door.CLOSING) {
+                if (obstructed || load > capacity) {
+                    door = Door.OPENING;
+                    action = Action.OPENING;
+                } else {
+                    door = Door.CLOSED;
+                    action = Action.CLOSED;
+                }
+            } else if (load > capacity) {
+                door = Door.OPENING;
+                action = Action.OPENING;
+            } else if (obstructed || !interlock) {
+                action = Action.BLOCKED;
+            } else {
+                Goal next = plan.next(floor, heading);
+                if (next == null) {
+                    heading = Direction.IDLE;
+                    action = Action.IDLE;
+                } else if (next.floor == floor) {
+                    boarding = next.boarding;
+                    heading = boarding;
+                    door = Door.OPENING;
+                    action = Action.OPENING;
+                } else {
+                    heading = next.floor > floor ? Direction.UP : Direction.DOWN;
+                    floor += heading == Direction.UP ? 1 : -1;
+                    action = Action.MOVED;
+                }
             }
-            return new Tick(id,action,from,floor,heading,pickups);
+            return new Tick(id, action, from, floor, heading, pickups);
         }
 ```
 
-The guard is stronger than checking `door == CLOSED`: the car must also be in normal mode, have a clear obstruction input, a true interlock and no overload. A closed-door interlock fault produces `BLOCKED`; it does not pretend the car arrived at the next floor. A closing obstruction transitions to `OPENING`. While open, obstruction or overload holds the door open. In this floor-event model an overload detected while closed begins opening at the current model floor.
+Opening the doors completes cabin stops. It offers floor pickups only for the requested direction and only with room. The controller checks the assignment before marking those calls served.
 
-**Full and overloaded are different.** At `load == capacity`, the car may leave with its existing passengers and service cabin stops, but it offers no hall pickup. At `load > capacity`, it cannot move. Button presses do not update load; a separate sensor event supplies the measurement. The demo does not simulate passenger boarding counts or automatically decrement them at cabin stops.
+The model knows only whole-floor positions. For example, it can begin reopening after an overload at its current model floor. Handling a real car between floors belongs to the device controller, not this floor-step simulation.
 
-Real hardware reports richer position and sensor states, including between-floor conditions. A production adapter must map them into a certified controller's commands and acknowledgements. The model's one-floor movement is an interview scheduling abstraction, not an emergency-stop procedure.
+### Give a waiting call to another car without losing it
 
-### Reassign a call without accepting a stale completion
+Suppose call 41 is `2 Up`, assigned to A. A becomes unavailable before offering pickup. The controller keeps call 41, removes it from A's plan and gives it to B.
 
-Suppose call 41 at `2↑` is assigned to A at epoch 1. A fails. The controller marks the call waiting at epoch 2 and removes its old task. Dispatch assigns B at epoch 3. A delayed “picked up 41, epoch 1” must not turn off B's hall call.
+But A might still send a delayed message saying it served call 41. We need to recognise that A's assignment is old.
 
-[![Assignment timeline shows A at epoch one, waiting at epoch two, B at epoch three and an old acknowledgement rejected without resetting call age](lld-figures/elevator-ownership.svg)](lld-figures/elevator-ownership.svg)
+We attach an **assignment number**, called `epoch` in the code:
+
+1. A owns call 41 with number 1.
+2. Releasing that assignment moves the number to 2.
+3. B receives the call with number 3.
+4. A's late message for number 1 is rejected.
+
+[![Call 41 keeps its identity and waiting age while assignment numbers change, so a late message from the old car cannot clear the replacement's call](lld-figures/elevator-ownership.svg)](lld-figures/elevator-ownership.svg)
+
+The acknowledgement must match the current car and assignment number. It must also come from a car with open doors at the correct floor, offering the correct direction, with room to board.
 
 ```java
 // source: Elevators.java#ownership
-        public synchronized boolean acknowledgePickup(long callId,String carId,long epoch) {
-            Request r=requests.get(callId);Car c=car(carId);
-            if(r==null||r.state!=CallState.ASSIGNED||!carId.equals(r.carId)||r.epoch!=epoch)return false;
-            if(c.door!=Door.OPEN||c.floor!=r.key.floor||c.boarding!=r.key.direction||c.load>=c.capacity||c.mode!=Mode.NORMAL)return false;
-            r.state=CallState.SERVED;active.remove(r.key,r.id);
-            c.plan.hall.remove(callId,new HallTask(callId,r.key,epoch));return true;
+        public synchronized boolean acknowledgePickup(long callId, String carId, long epoch) {
+            Request request = requests.get(callId);
+            Car car = car(carId);
+            if (request == null || request.state != CallState.ASSIGNED
+                    || !carId.equals(request.carId) || request.epoch != epoch) {
+                return false;
+            }
+            if (car.door != Door.OPEN || car.floor != request.key.floor
+                    || car.boarding != request.key.direction || car.load >= car.capacity
+                    || car.mode != Mode.NORMAL) {
+                return false;
+            }
+            request.state = CallState.SERVED;
+            active.remove(request.key, request.id);
+            car.plan.hall.remove(callId, new HallTask(callId, request.key, epoch));
+            return true;
         }
         public synchronized void outOfService(String carId) {
-            Car c=car(carId);c.mode=Mode.OUT_OF_SERVICE;releaseHallCalls(c);dispatch();
+            Car car = car(carId);
+            car.mode = Mode.OUT_OF_SERVICE;
+            releaseHallCalls(car);
+            dispatch();
             // Cabin destinations remain: existing passengers require an operator recovery procedure.
         }
-        private void releaseHallCalls(Car c) {
-            for(HallTask h:new ArrayList<>(c.plan.hall.values())) {
-                Request r=requests.get(h.callId);
-                if(r!=null&&r.state==CallState.ASSIGNED&&c.id.equals(r.carId)&&r.epoch==h.epoch) {
-                    r.state=CallState.WAITING;r.carId=null;r.epoch++;
+        private void releaseHallCalls(Car car) {
+            for (HallTask task : new ArrayList<>(car.plan.hall.values())) {
+                Request request = requests.get(task.callId);
+                if (request != null && request.state == CallState.ASSIGNED
+                        && car.id.equals(request.carId) && request.epoch == task.epoch) {
+                    request.state = CallState.WAITING;
+                    request.carId = null;
+                    request.epoch++;
                 }
             }
-            c.plan.hall.clear();
+            car.plan.hall.clear();
         }
 ```
 
-The check requires the current call state, owner and epoch **and** actual car state: correct floor, open door, offered direction, spare capacity and normal mode. An acknowledgement is evidence to validate, not a command to erase a request unconditionally. A retry after successful service returns false and has no further effect.
+The call keeps its original creation time, so reassignment does not make a long-waiting person look newly arrived. A full car, a blocked door or a failed travel permission also releases unserved floor calls for another car.
 
-Fault release does not delete the request or replace its creation tick. Waiting age therefore remains observable. Cabin stops stay in the failed car because those passengers require an operator recovery procedure. Another car can collect waiting people at floor 2; it cannot fulfil a destination for someone trapped in A merely by inheriting the number 6.
-
-### Failure and recovery decisions
-
-| Event | Exact selected behavior | Why |
-| --- | --- | --- |
-| Repeated hall press | Return the active call identity | Coalesces button noise without inventing occupancy. |
-| Bottom Down / top Up | Reject before creating a call | The ride direction is impossible in this building. |
-| All cars unavailable/full | Retain `WAITING`; retry on subsequent state/tick events | No request is lost or assigned to an ineligible car. |
-| Car becomes full | Release its unserved hall tasks, retain cabin stops | Protect capacity while continuing onboard service. |
-| Obstruction during closing | Reopen; release hall tasks for other cars | Does not move or endlessly claim pickups it cannot offer. |
-| Interlock fails | Block movement and release hall assignments | A scheduling score cannot override a sensor guard. |
-| Assigned car fails | Preserve call/age; increment epoch and reassign | Enables recovery while invalidating old ownership. |
-| Old car sends pickup | Reject mismatched owner/epoch | Prevents a late event from clearing the replacement's work. |
-| Application restarts | In-memory demo has no recovery claim | A production ledger needs durable events, sequence numbers and sensor reconciliation. |
-
-The runnable checks cover the exact four-stop trace, coalescing, opposite directions at one floor, the 4-versus-9 dispatch example, full/overload behavior, obstruction reopening, fault reassignment and late acknowledgement rejection. Fifty seeded finite workloads check that their static call batches drain. Every observed movement is checked against the pre-movement door/mode/load/interlock state. Those checks substantiate this simulator's contract; they are not a proof of real elevator safety or arbitrary-traffic fairness.
+Cabin destinations remain in an unavailable car. Another elevator can collect people waiting at floor 2; copying the destination 7 cannot transfer passengers already inside A. Those passengers need an operator's recovery procedure.
 
 ## 6. Interviewer follow-ups
 
-### Why not choose the nearest car?
+### When should the floor button go out?
 
-Distance is only a lower bound on pickup effort. A car one floor away going in the wrong direction may need to finish a trip, open and close, then return. The worked example demonstrates that counterexample with executable event counts. ETA selection still uses an estimate over current knowledge; it cannot predict unknown passengers or future requests.
+When the currently assigned car offers pickup: doors open, correct floor and direction, available with spare capacity. Assigning a car or passing the floor is not enough. After service, a new button press creates a new call identity.
 
-### Why not give every car a thread?
+### Why not run one independent thread for every car?
 
-The important concurrency boundary is ownership, not thread count. Here one controller serializes short events, so adding a call to the ledger and to a car plan is atomic. Separate device threads can deliver events into that owner. If each car has its own event loop, assignment becomes a message protocol with an acknowledged epoch; direct concurrent mutation of both maps would be the wrong shortcut.
+Separate device threads are possible, but shared requests still need one clear owner. Here the controller's short synchronized methods keep assigning a call and adding it to a plan together. A larger design could give each car a message queue; it would still need acknowledged assignments and their numbers.
 
-### What is the complexity?
+### Could a call wait too long while new requests keep arriving?
 
-Let `C` be cars, `R` retained ledger records, `S` active stops/tasks per car and `T` simulated events until pickup. The straightforward implementation rebuilds directional sets in `O(S log S)` during next-goal selection. One ETA choice is bounded by `O(C × T × S log S)` with a 10,000-event cutoff; dispatch can do this for each waiting call. It scans the retained ledger, so even a tick with no new waiting calls has `O(R)` dispatch overhead. Memory includes history `O(R)` plus car plans. That is acceptable for this deliberately small interview simulator, not a fleet-scale performance claim.
+Yes. Considering waiting calls oldest-first does not by itself stop a busy sweep from extending forever. To provide a waiting-time guarantee, add a maximum waiting-time rule or limit how far new arrivals may extend a sweep. The current finite-plan simulation does not claim that guarantee under endless traffic.
 
-For a larger service, keep a separate pending index, archive completed requests, maintain directional floor indexes incrementally and replace event replay with a validated route-time estimator. The snapshot/strategy interface provides that seam; the current code does not silently implement it.
+### Is replaying every route efficient enough?
 
-### Can an Up request starve while demand keeps arriving?
+It is easy to explain for a small building. For each waiting call, the selector tries each car's known plan. More cars, stops and waiting requests make that work grow. The implementation also retains served-call history, which needs archiving in a long-running system. If measurement shows a problem, keep a separate waiting list and replace replay with a faster route-time estimate through `DispatchPolicy`.
 
-Oldest-first assignment alone is not a complete fairness guarantee once a call has been placed into a car's sweep. I would bound waiting time, cap a sweep's extension and periodically reconsider overdue pickups, preserving assignment epochs. Define the desired bound and traffic assumptions before claiming starvation freedom. The current tests use finite batches and support only that narrower progress claim.
+### How would destination-dispatch elevators differ?
 
-### What if two cars reach the same floor together?
+They ask for the destination before boarding. The dispatcher can group passengers by destination, but the request now contains more information and repeated presses may have a different meaning. Car, door and load rules still help; the conventional Up/Down request model needs to change.
 
-Only the current owner and epoch can acknowledge that hall call. Two independently assigned directions can be served separately. An unassigned car opening nearby does not erase the call. A deliberate opportunistic-pickup feature would first transfer ownership atomically and publish a new epoch; it should not be smuggled into a display callback.
+### What happens after a controller restart?
 
-### How do destination dispatch and priority passengers change this?
-
-Destination dispatch knows the destination before boarding, so it can group compatible trips and assign a particular car to a passenger request. That changes the request identity and coalescing semantics. Priority service also needs a defined precedence and starvation policy. Both can reuse car/door guards but require their own dispatcher contract; simply adding a `priority` integer to the current hall key is insufficient.
-
-### Would persistence make this production-ready?
-
-Persistence is necessary for surviving a controller restart, but not sufficient. I would durably record call/assignment events, use monotonic per-device event sequences, reconcile the recovered plan against actual car/door/sensor state, and keep the hardware safety controller authoritative. Restart must not replay an old movement command blindly. Fire, maintenance and rescue modes need approved operating procedures beyond this model.
-
-### Which types actually need extension points?
-
-Car selection clearly varies, so `DispatchPolicy` is an interface. The sweep and door transitions are fixed for this scoped answer, so they remain private implementation details. If the requirements introduce multiple scheduling rules or device protocols, extract those boundaries then. Avoid inheritance trees such as `UpElevator` and `DownElevator`: one physical car changes direction throughout its lifetime.
+A production system needs saved calls/assignments and must compare them with current device state before continuing. It must not blindly replay an old travel command. This Java example keeps its state in memory and implements the scheduling rules, not restart recovery or emergency operating procedures.
 
 ## 7. Closing answer
 
-“I would keep an explicit hall-call ledger, a replaceable fleet dispatch policy and a private directional plan per car. The car's state machine enforces the travel guards. Completion requires an open-door pickup by the current owner/version; faults requeue hall work without losing age or erasing onboard destinations. That gives a complete conventional-elevator scheduling answer with clear concurrency, recovery and hardware boundaries.”
+“I would separate choosing a car from ordering that car's stops. Floor requests remember a direction; cabin requests stay with the car. Each car follows a directional sweep, and its door/load checks decide whether it may move. A call is served only by a valid pickup from its current assignment. If a car fails, waiting calls move to another car without losing their identity or waiting age.”
 
-In the interview I would spend the first minutes establishing hall versus cabin calls, draw the fleet and door states, walk the four-stop trace, then show stale-assignment recovery. I would use the remaining time for ETA cost and fairness trade-offs. That sequence explains the decisions behind the code instead of presenting a pile of class names.
-
-### Sources and further reading
-
-- [Design Gurus' public elevator-design answer](https://www.designgurus.io/answers/detail/how-to-design-an-elevator) and [Educative's public elevator lesson outline](https://www.educative.io/courses/grokking-the-low-level-design-interview-using-ood-principles/class-diagram-for-the-elevator-system) for comparison of typical objects and interview coverage. The paid lesson was not used as an implementation source.
-- [AlgoMaster's public elevator-system problem](https://github.com/ashishps1/awesome-low-level-design/blob/main/problems/elevator-system.md) for a public request/controller model. The directional algorithm, Java implementation and figures here are original.
-- [Strategy](https://refactoring.guru/design-patterns/strategy) and [State](https://refactoring.guru/design-patterns/state) for the two variation/transition concepts used in the answer.
-- [Run the three references](reference-code/lld-three/README.md).
+The [complete Java implementation](reference-code/lld-three/Elevators.java) includes car selection, request handling and the helpers used by these excerpts.
 
 === LLD 4 ===
 N|n0|BookingService|0|0|200|rect

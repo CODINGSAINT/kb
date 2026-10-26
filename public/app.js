@@ -61,7 +61,7 @@ cd kb && npm install && npm start</code></pre>
   const applyTheme = (t) => {
     document.documentElement.dataset.theme = t;
     updateThemeLabel();
-    document.querySelectorAll(".toastui-editor-defaultUI").forEach((el) => el.classList.toggle("toastui-editor-dark", t === "dark"));
+    document.querySelectorAll(".toastui-editor-defaultUI, .toastui-editor-dark, [data-kb-viewer]").forEach((el) => el.classList.toggle("toastui-editor-dark", t === "dark"));
     document.querySelectorAll("[data-diagram]").forEach((el) => KBDiagram.render(el, el._spec, el.dataset.diagram));
   };
   updateThemeLabel();
@@ -297,6 +297,7 @@ cd kb && npm install && npm start</code></pre>
   // ---------- shared widgets ----------
   function destroyEditors() { state.editors.forEach((e) => { try { e.destroy(); } catch (x) {} }); state.editors = []; }
   function viewer(el, md) {
+    el.dataset.kbViewer = "";
     const v = toastui.Editor.factory({ el, viewer: true, usageStatistics: false, initialValue: md || "", theme: isDark() ? "dark" : "light" });
     state.editors.push(v);
     return v;

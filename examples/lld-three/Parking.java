@@ -99,23 +99,41 @@ public final class Parking {
             for(Spot s:initial)if(spots.putIfAbsent(s.id,s)!=null)throw new IllegalArgumentException("Duplicate spot");
         }
         // region:enter
-        public synchronized SessionView enter(String entryKey,Vehicle vehicle) {
-            requireKey(entryKey);Objects.requireNonNull(vehicle);
-            String previous=entries.get(entryKey);
-            if(previous!=null) {
-                Session s=session(previous);
-                if(!s.vehicle.equals(vehicle))throw new IllegalArgumentException("Entry key payload conflict");
-                return s.view();
+        public synchronized SessionView enter(String entryKey, Vehicle vehicle) {
+            requireKey(entryKey);
+            Objects.requireNonNull(vehicle);
+
+            String previous = entries.get(entryKey);
+            if (previous != null) {
+                Session visit = session(previous);
+                if (!visit.vehicle.equals(vehicle)) {
+                    throw new IllegalArgumentException("Entry key payload conflict");
+                }
+                return visit.view();
             }
-            if(activeVehicles.containsKey(vehicle.registration))throw new IllegalStateException("Vehicle already inside");
-            List<Spot> free=spots.values().stream().filter(s->!disabled.contains(s.id)&&!occupancy.containsKey(s.id)).toList();
-            Spot spot=allocator.choose(vehicle,free);
-            if(!free.contains(spot)||!fits(vehicle.kind,spot.kind))throw new IllegalStateException("Allocation policy returned invalid spot");
-            String id=Objects.requireNonNull(ids.get());
-            if(id.isBlank()||sessions.containsKey(id))throw new IllegalStateException("Session identity collision");
-            Session s=new Session(id,vehicle,spot,clock.instant(),tariff);
-            sessions.put(id,s);occupancy.put(spot.id,id);activeVehicles.put(vehicle.registration,id);entries.put(entryKey,id);
-            return s.view();
+            if (activeVehicles.containsKey(vehicle.registration)) {
+                throw new IllegalStateException("Vehicle already inside");
+            }
+
+            List<Spot> free = spots.values().stream()
+                .filter(spot -> !disabled.contains(spot.id))
+                .filter(spot -> !occupancy.containsKey(spot.id))
+                .toList();
+            Spot spot = allocator.choose(vehicle, free);
+            if (!free.contains(spot) || !fits(vehicle.kind, spot.kind)) {
+                throw new IllegalStateException("Allocation policy returned invalid spot");
+            }
+
+            String id = Objects.requireNonNull(ids.get());
+            if (id.isBlank() || sessions.containsKey(id)) {
+                throw new IllegalStateException("Session identity collision");
+            }
+            Session visit = new Session(id, vehicle, spot, clock.instant(), tariff);
+            sessions.put(id, visit);
+            occupancy.put(spot.id, id);
+            activeVehicles.put(vehicle.registration, id);
+            entries.put(entryKey, id);
+            return visit.view();
         }
         // endregion:enter
         public synchronized Quote quote(String sessionId) {
@@ -126,42 +144,75 @@ public final class Parking {
             return new Quote(total,s.paid,Math.max(0,total-s.paid),s.tariff.version(),now);
         }
         // region:payment
-        public PaymentView pay(String sessionId,String paymentKey,long approvedDueMinor) {
+        public PaymentView pay(String sessionId, String paymentKey, long approvedDueMinor) {
             Attempt work;
-            synchronized(this) {
-                requireKey(paymentKey);if(approvedDueMinor<0)throw new IllegalArgumentException("Negative approval");
-                Session s=session(sessionId);Attempt old=attempts.get(paymentKey);
-                if(old!=null) {
-                    if(!old.sessionId.equals(sessionId)||old.amount!=approvedDueMinor)throw new IllegalArgumentException("Payment key payload conflict");
+            synchronized (this) {
+                requireKey(paymentKey);
+                if (approvedDueMinor < 0) {
+                    throw new IllegalArgumentException("Negative approval");
+                }
+                Session visit = session(sessionId);
+                Attempt old = attempts.get(paymentKey);
+                if (old != null) {
+                    if (!old.sessionId.equals(sessionId) || old.amount != approvedDueMinor) {
+                        throw new IllegalArgumentException("Payment key payload conflict");
+                    }
                     return old.view(); // A duplicate cannot start a second provider call.
                 }
-                if(s.state==SessionState.CLOSED)throw new IllegalStateException("Session closed");
-                if(s.state==SessionState.PAYMENT_PENDING||s.state==SessionState.PAYMENT_UNKNOWN)
-                    throw new IllegalStateException("Resolve original payment first");
-                if(s.state==SessionState.PAID && clock.instant().isBefore(s.exitBy)) {
-                    if(approvedDueMinor!=0)throw new IllegalStateException("Quote changed; approve the current amount");
-                    Attempt covered=new Attempt(paymentKey,sessionId,quote(sessionId));covered.state=PaymentState.CONFIRMED;covered.reference="ALREADY_COVERED";
-                    attempts.put(paymentKey,covered);return covered.view(); // Does not extend grace.
+                if (visit.state == SessionState.CLOSED) {
+                    throw new IllegalStateException("Session closed");
                 }
-                Quote q=quote(sessionId);
-                if(q.dueMinor!=approvedDueMinor)throw new IllegalStateException("Quote changed; approve the current amount");
-                work=new Attempt(paymentKey,sessionId,q);
-                attempts.put(paymentKey,work);s.activePayment=paymentKey;s.state=SessionState.PAYMENT_PENDING;
-                if(work.amount==0)return finish(paymentKey,new ProviderReply(PaymentState.CONFIRMED,"COVERED_BY_PRIOR_PAYMENTS"));
+                if (visit.state == SessionState.PAYMENT_PENDING
+                        || visit.state == SessionState.PAYMENT_UNKNOWN) {
+                    throw new IllegalStateException("Resolve original payment first");
+                }
+                if (visit.state == SessionState.PAID && clock.instant().isBefore(visit.exitBy)) {
+                    if (approvedDueMinor != 0) {
+                        throw new IllegalStateException("Quote changed; approve the current amount");
+                    }
+                    Attempt covered = new Attempt(paymentKey, sessionId, quote(sessionId));
+                    covered.state = PaymentState.CONFIRMED;
+                    covered.reference = "ALREADY_COVERED";
+                    attempts.put(paymentKey, covered);
+                    return covered.view(); // Does not extend grace.
+                }
+
+                Quote current = quote(sessionId);
+                if (current.dueMinor != approvedDueMinor) {
+                    throw new IllegalStateException("Quote changed; approve the current amount");
+                }
+                work = new Attempt(paymentKey, sessionId, current);
+                attempts.put(paymentKey, work);
+                visit.activePayment = paymentKey;
+                visit.state = SessionState.PAYMENT_PENDING;
+                if (work.amount == 0) {
+                    return finish(paymentKey, new ProviderReply(
+                        PaymentState.CONFIRMED, "COVERED_BY_PRIOR_PAYMENTS"));
+                }
             }
+
             ProviderReply reply;
-            try { reply=payments.charge(work.key,work.amount); }
-            catch(RuntimeException uncertain) { reply=new ProviderReply(PaymentState.UNKNOWN,null); }
-            return finish(work.key,reply); // Provider I/O completed without holding the lot lock.
+            try {
+                reply = payments.charge(work.key, work.amount);
+            } catch (RuntimeException uncertain) {
+                reply = new ProviderReply(PaymentState.UNKNOWN, null);
+            }
+            return finish(work.key, reply); // The payment-service call held no lot lock.
         }
         public PaymentView reconcile(String paymentKey) {
-            synchronized(this) {
-                Attempt a=attempt(paymentKey);
-                if(a.state==PaymentState.CONFIRMED||a.state==PaymentState.DECLINED)return a.view();
+            synchronized (this) {
+                Attempt saved = attempt(paymentKey);
+                if (saved.state == PaymentState.CONFIRMED || saved.state == PaymentState.DECLINED) {
+                    return saved.view();
+                }
             }
             ProviderReply reply;
-            try {reply=payments.lookup(paymentKey);}catch(RuntimeException uncertain){reply=new ProviderReply(PaymentState.UNKNOWN,null);}
-            return finish(paymentKey,reply);
+            try {
+                reply = payments.lookup(paymentKey);
+            } catch (RuntimeException uncertain) {
+                reply = new ProviderReply(PaymentState.UNKNOWN, null);
+            }
+            return finish(paymentKey, reply);
         }
         // endregion:payment
         private synchronized PaymentView finish(String key,ProviderReply reply) {
@@ -176,15 +227,28 @@ public final class Parking {
             a.state=outcome;a.reference=reply==null?null:reply.reference;return a.view();
         }
         // region:exit
-        public synchronized SessionView confirmExit(String sessionId,String exitEventId) {
-            requireKey(exitEventId);Session s=session(sessionId);String previous=exits.get(exitEventId);
-            if(previous!=null&&!previous.equals(sessionId))throw new IllegalArgumentException("Exit event payload conflict");
-            if(s.state==SessionState.CLOSED)return s.view();
-            if(s.state!=SessionState.PAID||!clock.instant().isBefore(s.exitBy))
+        public synchronized SessionView confirmExit(String sessionId, String exitEventId) {
+            requireKey(exitEventId);
+            Session visit = session(sessionId);
+            String previous = exits.get(exitEventId);
+            if (previous != null && !previous.equals(sessionId)) {
+                throw new IllegalArgumentException("Exit event payload conflict");
+            }
+            if (visit.state == SessionState.CLOSED) {
+                return visit.view();
+            }
+            if (visit.state != SessionState.PAID || !clock.instant().isBefore(visit.exitBy)) {
                 throw new IllegalStateException("Payment or additional payment required");
-            if(!sessionId.equals(occupancy.get(s.spot.id)))throw new IllegalStateException("Spot ownership mismatch");
-            occupancy.remove(s.spot.id);activeVehicles.remove(s.vehicle.registration,sessionId);
-            s.state=SessionState.CLOSED;exits.put(exitEventId,sessionId);return s.view();
+            }
+            if (!sessionId.equals(occupancy.get(visit.spot.id))) {
+                throw new IllegalStateException("Spot ownership mismatch");
+            }
+
+            occupancy.remove(visit.spot.id);
+            activeVehicles.remove(visit.vehicle.registration, sessionId);
+            visit.state = SessionState.CLOSED;
+            exits.put(exitEventId, sessionId);
+            return visit.view();
         }
         // endregion:exit
         public synchronized SessionView view(String sessionId){return session(sessionId).view();}

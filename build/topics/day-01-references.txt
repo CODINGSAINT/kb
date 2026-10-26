@@ -16,141 +16,91 @@ E|n6|n1|restores
 ---
 ## Problem
 
-Design a two-player chess game in Java. Explain the classes, how a move is validated and committed, how special moves work, and how the game detects checkmate or stalemate. Support undo without corrupting the position.
+Design a two-player chess game in Java. Players should be able to move pieces, capture an opponent's pieces and finish a game through checkmate, stalemate, resignation or an agreed draw.
+
+The main challenge is deciding whether a move is allowed. A piece may move in the correct shape and still expose its own king. The design must catch that before changing the game.
 
 ## Requirements
 
-- Standard 8×8 chess, two players, White first, all six piece types and captures.
-- Castling, en passant and all four promotion choices.
-- Reject moves out of turn, through blocking pieces, or leaving the moving side's king in check.
-- Detect check, checkmate and stalemate; support resignation and an agreed draw.
-- Retain enough history to undo an accepted action exactly.
-- One game engine in one JVM. UI, matchmaking, computer search, clocks and tournament draw adjudication are separate extensions.
+- Use the usual 8×8 board, with White moving first.
+- Support all six piece types, captures, castling, en passant and promotion.
+- Reject moves out of turn and moves that leave the player's king in check.
+- Distinguish check, checkmate and stalemate.
+- Allow an accepted action to be undone without losing the previous board or rule information.
+- Keep the example focused on the game rules. Online matchmaking, clocks and computer opponents can be added later.
 
-## 1. The answer I would present
+## 1. Start with one move
 
-I would make `Game` the only mutable entry point. It owns the current `Position`, result, monotonically increasing version and undo frames. The rules engine proposes a new immutable position; it never partially edits the live game. A successful command replaces the position and records its predecessor. An illegal command changes nothing.
+Imagine White moving the pawn from **e2 to e4**. The letter identifies the column and the number identifies the row. White's pawns start on row 2 and move towards higher row numbers.
 
-My most important separation is **movement geometry versus legal movement**. A rook can travel horizontally or vertically until it meets a blocker. That describes a candidate move. Whether moving that rook exposes its king depends on the entire resulting position, so legality belongs to the rules engine, not to an isolated rook object.
+Before accepting the move, the game checks:
 
-The operation is therefore: validate whose turn it is, validate the move's geometry and special preconditions, apply every effect to a trial position, inspect the moving side's king, and only then commit. This same trial operation is used to enumerate legal replies and detect mate. I do not write a second, subtly different implementation for “checking whether a move would work.”
+1. Is it White's turn?
+2. Is there a White pawn on e2?
+3. Are e3 and e4 empty, so the pawn can advance two squares?
+4. Would White's king still be safe after the move?
 
-I choose a 64-cell array and immutable `Piece(side, kind)` values. It is easy to inspect, inexpensive for a human-versus-human engine, and straightforward to copy. I choose a `RuleSet` interface with a standard-chess implementation, rather than six mutable piece subclasses that also carry turn and history state. Piece-specific behaviour still exists; it is organized by kind inside the rule component. A variant replaces or extends that component without changing command sequencing in `Game`.
+Only then does it change the board and give Black the turn.
 
-This answer implements movement, core end conditions, resignation and agreement. Threefold/fivefold repetition, fifty/seventy-five-move adjudication and dead-position detection are not silently assumed to work: the position retains the necessary counters, but a complete tournament adjudicator is additional work. That distinction makes the scope precise.
+[![After the pawn moves from e2 to e4, the board and turn change together; e3 is remembered for the next turn's special pawn-capture rule](lld-figures/chess-position.svg)](lld-figures/chess-position.svg)
 
-## 2. The object model and its invariants
+There is more to remember than the piece locations. The game also remembers whose turn it is, whether castling is still allowed, and whether the last move created an en-passant opportunity. We will explain those special rules below.
 
-| Type | Information and responsibility | Mutation rule |
-|---|---|---|
-| `Square` | Validated zero-based file/rank; converts `e4` to `(4,3)` | Immutable value |
-| `Piece` | Side and kind; no independently mutable square or `hasMoved` flag | Immutable value |
-| `Move` | Source, destination, optional promotion kind | A request, not proof of legality |
-| `Position` | Board, turn, castling rights, en-passant target and counters | Immutable snapshot; board array never escapes |
-| `RuleSet` | Legal-move enumeration, applying a legal move, check detection | Stateless policy |
-| `StandardRules` | Standard movement, attacks, special moves and trial application | Produces a new position |
-| `Game` | Current snapshot, version, result and undo frames | Commands serialize here |
-| `Frame` | Position and result before an accepted action | Retained only in this game's history |
-| `Game.View` | Snapshot returned to the caller, including current check status | Cannot mutate the engine |
+**The central rule is: try a move on a copy first. Accept that copy only if the move is legal.** A rejected move must leave the real game unchanged.
 
-I store a piece's location in the board, not both in the board and in a mutable `Piece.position`. Otherwise moving the board entry and forgetting the piece field creates two conflicting answers to “where is this rook?” Immutability also makes a shallow copy of the array sufficient: sharing a `Piece` value cannot let a trial move alter the live game.
+## 2. Give each class one clear job
 
-The position includes more than visible pieces. A king and rook that moved away and returned look unchanged on the board, but castling is no longer permitted. Two identical boards with different turns or en-passant rights can have different legal moves. These values travel together in `Position`, including during undo.
+| Class | Its job | Example |
+| --- | --- | --- |
+| `Square` | Identify a valid place on the board. | e4 |
+| `Piece` | Remember a piece's colour and type. | White pawn |
+| `Move` | Describe the move a player wants to make. | e2 → e4 |
+| `Position` | Keep the board, turn and other rule information together. | The complete game position after e2–e4 |
+| `StandardRules` | Decide which moves standard chess allows. | Check a rook's path and king safety |
+| `Game` | Accept player actions, remember history and report the result. | Apply a move or undo it |
 
-[![The board after e2-e4 has Black to move, en-passant target e3, retained castling rights and updated counters; these are one position snapshot.](lld-figures/chess-position.svg)](lld-figures/chess-position.svg)
+`Game` uses the rules through a `RuleSet` interface. That means it asks the rules to validate a move rather than putting every chess rule inside `Game`.
 
-*A move changes one complete position. Restoring only the squares is not enough to restore the rules.*
+[![Game keeps the current position and history, while the rules decide which moves are allowed and the piece and move objects hold their own data](designs/lld-1.svg)](designs/lld-1.svg)
 
-The invariants are concrete: exactly one king per side; only the side to move can act; no accepted move leaves that side's king attacked; promotion cannot create a king or pawn; and a rejected action preserves board, rights, counters, history and version. Kings are not captured to signal victory. Checkmate is detected before any such capture could occur.
+### Keep one answer to “where is this piece?”
 
-These are the value types from the executable Java 21 implementation:
+The board stores which piece occupies each square. A `Piece` does not also keep a separate, changeable square field. Otherwise one field could say the rook is on e2 while the board says f2.
 
-```java
-// source: Chess.java#values
-    public enum Side { WHITE, BLACK;
-        public Side other() { return this == WHITE ? BLACK : WHITE; }
-        int step() { return this == WHITE ? 1 : -1; }
-    }
-    public enum Kind { KING, QUEEN, ROOK, BISHOP, KNIGHT, PAWN }
-    public record Piece(Side side, Kind kind) {
-        public Piece { Objects.requireNonNull(side); Objects.requireNonNull(kind); }
-    }
-    public record Square(int file, int rank) {
-        public Square {
-            if (file < 0 || file > 7 || rank < 0 || rank > 7)
-                throw new IllegalArgumentException("Square outside board");
-        }
-        public static Square at(String s) {
-            if (s == null || !s.matches("[a-h][1-8]")) throw new IllegalArgumentException("Bad square");
-            return new Square(s.charAt(0) - 'a', s.charAt(1) - '1');
-        }
-        int index() { return rank * 8 + file; }
-        @Override public String toString() { return "" + (char)('a' + file) + (rank + 1); }
-    }
-    public record Move(Square from, Square to, Kind promotion) {
-        public Move { Objects.requireNonNull(from); Objects.requireNonNull(to); }
-        public static Move of(String from, String to) { return new Move(Square.at(from), Square.at(to), null); }
-        public static Move promote(String from, String to, Kind kind) { return new Move(Square.at(from), Square.at(to), kind); }
-    }
-    public enum Result { ACTIVE, WHITE_WINS, BLACK_WINS, STALEMATE, AGREED_DRAW }
-```
+We also avoid changing an existing `Position`. A move creates a new one. This is called **immutability**: once created, that position's contents stay the same. The piece values can safely be shared between board copies because those values cannot be edited either.
 
-The `Side` argument to a game command represents an identity already resolved by the calling application. An eventual HTTP endpoint must map its authenticated player to that side; letting a browser simply claim `WHITE` would not be authorization.
+This makes undo easier. We can keep the previous position instead of writing a different reverse operation for every kind of move.
 
-## 3. Final design and the public contract
+## 3. A piece's movement is only the first check
 
-[![Game owns the current Position and undo frames, delegates rules through RuleSet, and returns immutable views; StandardRules implements the policy.](designs/lld-1.svg)](designs/lld-1.svg)
+These are the normal movement rules:
 
-[![Detailed Java responsibilities: Game serializes commands, RuleSet separates standard rules, Position stores immutable board state, and Move and Piece are values.](lld-figures/chess-domain.svg)](lld-figures/chess-domain.svg)
+| Piece | Normal movement | What else matters |
+| --- | --- | --- |
+| Rook | Any number of squares along a row or column | Cannot jump over a piece |
+| Bishop | Any number of squares diagonally | Cannot jump over a piece |
+| Queen | Along a row, column or diagonal | Cannot jump over a piece |
+| Knight | Two squares one way and one square across | Can jump over other pieces |
+| King | One square in any direction | Cannot move onto an attacked square |
+| Pawn | One square forward; two from its starting row | Captures one square diagonally forward |
 
-My public commands are `move(actor, expectedVersion, move)`, `undo(expectedVersion)`, `resign(actor, expectedVersion)` and `agreeDraw(consentingSides, expectedVersion)`. Each returns a `Game.View`. A version conflict, terminal game and illegal move are distinguishable failures. In this local engine the Java exception types separate stale/terminal state from invalid input; an API adapter could map them to typed error codes.
+A move cannot land on a friendly piece. Capturing an opponent replaces that opponent on the destination square. A king is never captured to end the game; checkmate ends it first.
 
-`Position.at(square)` exposes an immutable piece or empty square. It does not expose the backing array or a mutable collection. The code's FEN parser is for fixtures/imports: it validates representation and king presence, but does not prove that an arbitrary imported position is historically reachable. Ordinary gameplay starts from `Position.initial()` and advances only through the rules engine.
+Now consider a White king on e1, a White rook on e2 and a Black rook on e8. The White rook blocks the Black rook's line towards the king.
 
-I serialize a command on the `Game` instance, not on a static global monitor. Two separate games should proceed independently. The snapshot can be read safely after the lock is released because it cannot subsequently be mutated.
+Moving the White rook from e2 to f2 follows a rook's normal movement rule. But it removes that protection and exposes the king. The move must be rejected.
 
-## 4. From a move request to a committed answer
+[![Moving the White rook sideways from e2 to f2 opens the e-file towards its king, so the trial position is rejected and the original stays unchanged](lld-figures/chess-pin.svg)](lld-figures/chess-pin.svg)
 
-### A normal move, with every state change accounted for
+That gives us the complete validation process:
 
-For White's `e2-e4` at version 0:
+1. Check the piece, turn, movement and path.
+2. Apply all effects to a trial position.
+3. Find the moving side's king in that position.
+4. Check whether the opponent attacks it.
+5. Reject the trial if the king is attacked; otherwise return it.
 
-1. `Game` verifies ACTIVE, version 0 and White's turn.
-2. The rules engine finds a White pawn on e2, confirms e4 is empty, and checks e3 is empty for the two-square advance.
-3. It copies the board, clears e2 and places the pawn on e4.
-4. The new position has Black to move and en-passant target e3. A pawn move resets the halfmove counter; the fullmove number stays 1 until Black completes a move.
-5. White's king is tested in the resulting position. If safe, Black's legal replies determine the new result.
-6. `Game` pushes the old position/result, commits the new ones and advances the version to 1.
-
-If the same client submits a second command still expecting version 0, it loses the version check. The engine does not apply a second move to the old observation. Request-ID deduplication for a network retry can be added in the application layer; a version check alone rejects stale work rather than returning an earlier response.
-
-### Why an attack map is a separate operation
-
-For a rook or bishop, an attack ray stops at the first occupied square. A pawn attacks its forward diagonals even when they are empty; it does not attack the square straight ahead. A king attacks its adjacent squares. These questions are answered without recursively asking whether the attacking piece could make a fully legal move.
-
-A pinned enemy piece is still relevant to king safety. If attack detection called legal-move generation, legal generation would call attack detection again, producing circular reasoning or incorrectly allowing a king onto a protected square. The engine implements attack geometry directly:
-
-```java
-// source: Chess.java#attacks
-        public boolean attacked(Position p, Square target, Side by) {
-            for (int i=0;i<64;i++) {
-                Piece piece=p.board[i]; if (piece==null || piece.side!=by) continue;
-                Square from=square(i); int dx=target.file-from.file, dy=target.rank-from.rank;
-                boolean attacks=switch(piece.kind) {
-                    case PAWN -> Math.abs(dx)==1 && dy==by.step();
-                    case KNIGHT -> Math.abs(dx)*Math.abs(dy)==2;
-                    case KING -> Math.max(Math.abs(dx),Math.abs(dy))==1;
-                    case ROOK -> (dx==0 || dy==0) && pathClear(p,from,target);
-                    case BISHOP -> Math.abs(dx)==Math.abs(dy) && pathClear(p,from,target);
-                    case QUEEN -> (dx==0 || dy==0 || Math.abs(dx)==Math.abs(dy)) && pathClear(p,from,target);
-                };
-                if (!from.equals(target) && attacks) return true;
-            }
-            return false;
-        }
-```
-
-To construct legal moves, the engine first applies geometry and occupancy checks, then applies the complete trial and tests king safety. The code below is shared by user moves and mate detection:
+The Java implementation calls the first check `pseudoLegal`: it means “the piece movement and its immediate conditions look valid.” It still needs the king-safety check.
 
 ```java
 // source: Chess.java#legal
@@ -181,78 +131,28 @@ To construct legal moves, the engine first applies geometry and occupancy checks
         @Override public boolean inCheck(Position p, Side side) { return attacked(p, king(p, side), side.other()); }
 ```
 
-The straightforward enumerator considers destinations for each owned piece. That is deliberately readable rather than an optimized search-engine move generator. For a fixed 64-square board it is acceptable; if generalized to B squares, the brute-force candidate pairs plus attack/path checks are materially more expensive than a constant-time lookup. I would not promise engine-search throughput from this representation.
+`play` checks one requested move. `legalMoves` tries the possible destinations and collects the moves that pass the same checks. We reuse that list when deciding whether a player has any way out of check.
 
-### A legal-looking rook move that must be rejected
+### An attacked square is not the same as a legal move
 
-Put the White king on e1, a White rook on e2, the Black rook on e8 and the Black king on a8. `Re2-f2` is geometrically valid and the destination is empty. But the trial opens the e-file from the Black rook to White's king. The move is rejected, the turn remains White and the game version stays unchanged.
+For example, a pawn attacks its forward diagonals even when they are empty. A king must not move onto one of them. The pawn does not need to be able to move into that square at this moment for the square to be attacked.
 
-[![Before, the White rook on e2 blocks the Black rook on e8; after the proposed move to f2, the e-file reaches the White king on e1, so the trial is rejected.](lld-figures/chess-pin.svg)](lld-figures/chess-pin.svg)
+So `attacked` checks how pieces attack squares directly. It does not call `legalMoves` again. Otherwise legal-move checking would call attack checking, which would call legal-move checking, and the two operations would depend on each other endlessly.
 
-*The right-hand board is a rejected trial, not the next live position. This is the difference between candidate movement and legal movement.*
+An enemy piece still counts when finding attacked squares even if moving it would expose its own king. This matters when checking where a king may safely move.
 
-## 5. Special moves, results and exact recovery
+## 4. Accept the move without losing the old game
 
-### Castling is a coordinated king-and-rook move
+Return to e2–e4. Once the move passes the checks, `Game`:
 
-For White's kingside castle I require the king on e1, the correct White rook on h1, the kingside right still present and f1/g1 empty. The king cannot start in check, cross an attacked f1 or finish on attacked g1. The trial moves the king to g1 and rook to f1 together. Queenside similarly checks the path and relevant rights; b1 must be empty for the rook's path, although the king does not cross it.
+1. Checks Black's replies in the trial position to find the new result.
+2. Saves the old position and result in its history.
+3. Replaces the current position and result with the accepted ones.
+4. Increases the game's version number.
 
-I test the transit square using a position where the king has actually left e1. Reusing only the original board can miss an attack line uncovered by that departure. Destination safety is tested after the full castle, including the rook move.
+The code calculates the new result before changing the live fields. If validation fails, it has changed neither the position nor the history.
 
-[![A Black rook attacks f1 down the f-file: e1 and g1 can be safe while crossing f1 makes White's kingside castle illegal.](lld-figures/chess-castling.svg)](lld-figures/chess-castling.svg)
-
-Rights are persistent historical facts. Moving a king clears both rights. Moving an original rook clears that side's corresponding right, and capturing a rook on its original square clears the associated right. Returning a rook to h1 does not recreate permission. Tracking only the current placement would incorrectly allow it.
-
-### En passant changes a third square
-
-The en-passant target exists only immediately after a two-square pawn advance. A diagonal pawn move into that empty target must find the opposing pawn on the adjacent rank. Applying the move removes that pawn, even though it is not on the destination square. Every other accepted move clears the old target.
-
-The difficult case is a horizontal pin: White king h5, White pawn g5, Black pawn f5 and Black rook a5. Black has just advanced f7-f5. A trial `g5xf6 e.p.` clears both g5 and f5, exposing the rook's entire fifth-rank line to h5. Leaving the captured pawn on f5 during validation would wrongly hide the attack.
-
-[![En passant from g5 to f6 removes the pawn on f5 as well as vacating g5; that opens the fifth rank from Black rook a5 to White king h5, making the capture illegal.](lld-figures/chess-en-passant.svg)](lld-figures/chess-en-passant.svg)
-
-### Promotion is part of this move, not a later edit
-
-A pawn reaching the last rank must choose queen, rook, bishop or knight. I reject a missing choice and reject KING/PAWN. Legal-move generation produces all four variants, because underpromotion can change check, stalemate or a tactical result. Capturing on the promotion square and replacing the pawn happen in the same trial.
-
-These effects share one application function. Notice that counters and castling rights are updated here, so legality trials, actual moves and history cannot disagree about what the move means:
-
-```java
-// source: Chess.java#apply
-        private Position applyUnchecked(Position p, Move m) {
-            Piece[] b=p.board.clone(); Piece moving=p.at(m.from), captured=p.at(m.to);
-            boolean pawn=moving.kind==Kind.PAWN;
-            boolean ep=pawn && m.from.file!=m.to.file && captured==null;
-            if (ep) { Square capture=new Square(m.to.file,m.from.rank);captured=b[capture.index()];b[capture.index()]=null; }
-            b[m.from.index()]=null;
-            b[m.to.index()]=m.promotion==null?moving:new Piece(moving.side,m.promotion);
-            if (moving.kind==Kind.KING && Math.abs(m.to.file-m.from.file)==2) {
-                int rookFrom=m.to.file==6?7:0, rookTo=m.to.file==6?5:3;
-                b[new Square(rookTo,m.from.rank).index()]=b[new Square(rookFrom,m.from.rank).index()];
-                b[new Square(rookFrom,m.from.rank).index()]=null;
-            }
-            int rights=p.castlingRights;
-            if (moving.kind==Kind.KING) rights &= ~(right(moving.side,true)|right(moving.side,false));
-            if (moving.kind==Kind.ROOK) rights=clearRookRight(rights,m.from,moving.side);
-            if (captured!=null && captured.kind==Kind.ROOK) rights=clearRookRight(rights,m.to,captured.side);
-            Square epTarget=pawn && Math.abs(m.to.rank-m.from.rank)==2
-                ? new Square(m.from.file,(m.from.rank+m.to.rank)/2):null;
-            return new Position(b,p.turn.other(),rights,epTarget,
-                pawn||captured!=null?0:p.halfmoveClock+1,p.fullmoveNumber+(p.turn==Side.BLACK?1:0));
-        }
-```
-
-### Checkmate and stalemate use the same legal-reply search
-
-After an accepted move, the opponent is now the side to move. If it has a legal reply, the game remains ACTIVE, with `check` exposed separately in the view. With no legal replies, an attacked king means checkmate; an unattacked king means stalemate. “No moves” alone does not distinguish them.
-
-For example, `f2-f3, e7-e5, g2-g4, Qd8-h4` leaves White in check with no legal reply: Black wins. In the fixture Black king a8, White queen c7 and White king c6, with Black to move, Black has no legal move but is not attacked: stalemate. These two cases are executable tests, not just names in a result enum.
-
-### Undo restores a snapshot but never rewinds concurrency identity
-
-I choose a stack of immutable before-positions/results. An undo restores the board, turn, rights, en-passant target and counters in one assignment. It also restores ACTIVE when undoing a mating move. That is simpler than reverse-engineering every special move.
-
-The version still increases on undo. If a position from version 0 reappears at version 2, an old version-0 command must not become valid again. This prevents an ABA-style stale-command bug even though the board looks identical.
+The **version number** is a count of accepted changes. A caller sends the version it was looking at. If the game has already changed, the old request is rejected rather than applied to a board the player did not see.
 
 ```java
 // source: Chess.java#game
@@ -279,55 +179,121 @@ The version still increases on undo. If a position from version 0 reappears at v
         }
 ```
 
-A make/unmake delta is an alternative when implementing deep search, but it must retain every overwritten value, captured square, promotion origin and castling rook movement. I would adopt it only with exact restoration tests and a measured need. An interface for every noun would not improve this correctness boundary.
+`synchronized` lets only one action at a time change this `Game` object. Different games have different locks, so a move in one game does not block every other game.
 
-### What the runnable implementation actually establishes
+### Check, checkmate and stalemate
 
-The [complete Chess.java](reference-code/lld-three/Chess.java) and [executable checks](reference-code/lld-three/ThreeChecks.java) need only Java 21. They include the rule engine above, game commands and immutable views. The tested scope deliberately excludes clocks and full tournament draw adjudication.
+| Situation for the player whose turn it is | Result |
+| --- | --- |
+| King is attacked, but a legal reply exists | Check; the game continues |
+| King is attacked and no legal reply exists | Checkmate; that player loses |
+| King is not attacked, but no legal reply exists | Stalemate; a draw |
 
-| Scenario | Expected result |
-|---|---|
-| Initial position, one/two/three plies | 20 / 400 / 8,902 legal move sequences |
-| Blocked rook, wrong turn or stale version | Rejected without changing the live position |
-| Pinned rook moves sideways | Rejected because the king becomes attacked |
-| King moves into a pinned knight's attack | Rejected; attack semantics are not legal-move semantics |
-| Castle through f1 under attack | Rejected even if g1 is safe |
-| En passant exposes the fifth rank | Rejected after removing both relevant pawns |
-| Pawn reaches last rank | Exactly four promotion choices; underpromotion retained |
-| Fool's mate versus stalemate fixture | Distinct winner/stalemate outcomes |
-| Undo a castle or checkmate | Entire position restored; version increases |
+For example, `f2–f3, e7–e5, g2–g4, Qd8–h4` is Fool's mate. White's king is attacked and White has no legal reply. The result is a Black win.
 
-The move-tree counts are useful regression checks because they exercise many combinations, but they are not proof of every chess rule. The special fixtures target cases those opening counts do not cover.
+For a stalemate example, place Black's king on a8, White's queen on c7 and White's king on c6, with Black to move. Black cannot make a legal move, but a8 is not attacked. That is a draw, not a White win.
+
+### Undo restores the whole position
+
+History stores the previous board **and** its turn, castling rights, special pawn-capture information and counters. Undo restores them together. It can also restore an active game after undoing checkmate or resignation.
+
+The version number still increases after undo. Suppose version 0's board returns at version 2. An old request for version 0 must remain old, even though the board looks familiar again.
+
+## 5. Special moves need complete changes
+
+### Castling moves two pieces
+
+For White's kingside castle, the king goes from e1 to g1 and the rook goes from h1 to f1. The rules require:
+
+- The king and that rook have not lost their castling right.
+- The correct rook is present and the squares between them are empty.
+- The king is not in check.
+- The king does not cross or finish on an attacked square.
+
+[![A Black rook attacks f1, making castling illegal even though White's starting square e1 and destination g1 can be safe](lld-figures/chess-castling.svg)](lld-figures/chess-castling.svg)
+
+Checking only the destination would miss the attacked crossing square f1. We check that crossing with the king moved off e1, then test the final position with both king and rook moved.
+
+Queenside castling follows the same idea. The king crosses d1 and finishes on c1; b1 must also be empty for the rook's path.
+
+Castling rights do not come back when a king or rook returns to its starting square. The game remembers that right separately from the board layout. Capturing a rook on its original square also removes its corresponding right.
+
+### En passant removes a pawn from a different square
+
+En passant is a special pawn capture available immediately after an opponent's two-square pawn move. The capturing pawn moves diagonally into an empty square and removes the opposing pawn beside it.
+
+Suppose Black just moved f7–f5 and White has a pawn on g5. White may try g5–f6 en passant. The captured Black pawn is removed from **f5**, not f6. After any other accepted move, this opportunity expires.
+
+That removed square can matter to king safety. In the picture, both pawns were blocking the fifth row. The capture removes those blockers and exposes White's king on h5 to the rook on a5.
+
+[![En passant from g5 to f6 removes the pawn on f5 and opens the fifth row from the Black rook to the White king, so this capture is illegal](lld-figures/chess-en-passant.svg)](lld-figures/chess-en-passant.svg)
+
+### Promotion belongs to the same move
+
+A pawn reaching the last row must become a queen, rook, bishop or knight. The player chooses which. We do not always assume queen, because choosing a knight or another piece can change the result.
+
+Moving the pawn, capturing any piece there and replacing the pawn happen before checking the resulting position. The choice is part of `Move`, so replay and undo know exactly what happened.
+
+The following method applies all these effects to a copy. It is called only after the movement checks have passed:
+
+```java
+// source: Chess.java#apply
+        private Position applyUnchecked(Position p, Move m) {
+            Piece[] b=p.board.clone(); Piece moving=p.at(m.from), captured=p.at(m.to);
+            boolean pawn=moving.kind==Kind.PAWN;
+            boolean ep=pawn && m.from.file!=m.to.file && captured==null;
+            if (ep) { Square capture=new Square(m.to.file,m.from.rank);captured=b[capture.index()];b[capture.index()]=null; }
+            b[m.from.index()]=null;
+            b[m.to.index()]=m.promotion==null?moving:new Piece(moving.side,m.promotion);
+            if (moving.kind==Kind.KING && Math.abs(m.to.file-m.from.file)==2) {
+                int rookFrom=m.to.file==6?7:0, rookTo=m.to.file==6?5:3;
+                b[new Square(rookTo,m.from.rank).index()]=b[new Square(rookFrom,m.from.rank).index()];
+                b[new Square(rookFrom,m.from.rank).index()]=null;
+            }
+            int rights=p.castlingRights;
+            if (moving.kind==Kind.KING) rights &= ~(right(moving.side,true)|right(moving.side,false));
+            if (moving.kind==Kind.ROOK) rights=clearRookRight(rights,m.from,moving.side);
+            if (captured!=null && captured.kind==Kind.ROOK) rights=clearRookRight(rights,m.to,captured.side);
+            Square epTarget=pawn && Math.abs(m.to.rank-m.from.rank)==2
+                ? new Square(m.from.file,(m.from.rank+m.to.rank)/2):null;
+            return new Position(b,p.turn.other(),rights,epTarget,
+                pawn||captured!=null?0:p.halfmoveClock+1,p.fullmoveNumber+(p.turn==Side.BLACK?1:0));
+        }
+```
+
+The `halfmoveClock` counts moves since the last pawn move or capture. The `fullmoveNumber` increases after Black's turn. These counters are retained in the position, although tournament rules for automatic or claimed draws need additional logic beyond this example.
 
 ## 6. Interviewer follow-ups
 
-**Why not put `canMove` on each piece subclass?** That is a valid geometry organization. It does not remove the need for whole-position king-safety validation. I chose immutable kind/side values plus a rules component to avoid mutable inheritance state and make copying reliable. A polymorphic geometry strategy could be substituted without moving turn/history ownership out of Game.
+### Why not give each piece a `canMove` method?
 
-**Is check a separate terminal state?** No. A checked player may have many legal replies. I expose it as a property of an ACTIVE position; only checkmate or another final result prevents further moves.
+That is a reasonable way to organise the movement rules. It does not replace the whole-board king-safety check. Here, pieces hold colour/type values and `StandardRules` handles the rules together. Either organisation can work if `Game` still owns the turn, history and accepted changes.
 
-**How would I add clocks?** A `ClockPolicy` accounts for elapsed time when the owning game accepts a command and can produce a timeout result. It is not a field on individual pieces and it should not make pure movement tests sleep. I would define which event stops each player's clock and how a timeout races an arriving move under the same game command boundary.
+### How do resignation and an agreed draw work?
 
-**What changes with two servers?** The per-object monitor no longer covers all writers. I would persist a game version and conditionally update it in the authoritative store, or route that game to one elected owner with appropriate failover. The pure RuleSet/Position boundary stays useful; adding a concurrent map to each server would not establish global ordering.
+Resignation ends the game in the opponent's favour. An agreed draw needs both players' consent. These actions also save a history entry and increase the version. An online application must verify who the caller is; a browser cannot simply claim to be White or claim both players agreed.
 
-**How would I replay a game?** Store the initial position/rules version and accepted commands, including promotion choices and final actions. Replay those commands, not just pairs of squares. Position snapshots accelerate recovery; command identities can let a network retry return its original result rather than create another action.
+### Is copying the board too expensive?
 
-**What belongs in a repetition key?** Piece placement, side to move, castling rights and legally relevant en-passant availability affect equivalent play. Halfmove/fullmove counters serve other purposes. Simply serializing the board or including every incidental counter gives the wrong equivalence relation.
+For a human game, copying 64 references per position is a clear, practical starting point. Keeping H history entries uses space for roughly 64 × H board entries. A computer opponent exploring millions of positions may need a faster representation and carefully tested move/reverse-move operations. That is a different workload.
 
-**Does a 64-cell copy waste memory?** Each retained position has a fixed-size array and small metadata. For a human game with H history entries, history is O(64H), which is reasonable for this scope. A search engine evaluating millions of nodes has a different workload; bitboards and reversible deltas become measured optimizations rather than compulsory interview decoration.
+### How would two servers avoid accepting conflicting moves?
 
-**How does this support variants?** Game depends on RuleSet. Chess960 changes castling layout/semantics and initialization inside an appropriate rules implementation; it should not require edits to undo, version checks or player identity. A variant with additional state may also require an extended position model—I would not promise every possible game variant fits the exact same fields.
+The Java lock works only inside this process. With several servers, save a game version in a shared database and update the position only if the expected version still matches. Two requests using the same old version cannot both succeed. The rules can still produce a trial position before that update.
+
+### How would you save and replay a game?
+
+Save the starting position and accepted actions, including promotion choices, resignation and draw agreement. Reapply those actions through the rules. Occasional full position snapshots make loading faster. Saving only source/destination squares would lose some decisions needed for an exact replay.
+
+### What is deliberately outside this implementation?
+
+The listed movement rules, checkmate/stalemate, resignation, agreement and undo are implemented. Player clocks, computer search, repetition-based draws, move-count draw rules and dead-position detection are separate additions. They must be implemented and tested before calling this a full tournament engine.
 
 ## 7. Closing answer
 
-“I would build an immutable position model and put all accepted changes behind a versioned Game. The rules component separates attacks from candidate movement, applies the complete trial—including special captures—and commits only when king safety holds. Legal replies give me checkmate and stalemate without a second rules implementation. Snapshots make undo exact, while a monotonic game version prevents stale commands from becoming valid again. That gives us a readable, tested engine before optimizing for search or adding network ownership.”
+“I would keep the board and rule information together in a position. A move is tried on a copy, checked for king safety, and accepted through one Game object. The same rules find legal replies for checkmate and stalemate. Previous positions make undo reliable, and a version number stops an old request from changing a newer game. Special moves are applied completely before deciding whether the king is safe.”
 
-In a 45-minute round I would spend roughly five minutes fixing scope, eight on position ownership and class relationships, fifteen on the trial/commit code, ten on special moves and terminal cases, and the remainder defending undo and concurrency. The answer above supplies the details behind that presentation; the interview narrative is a prioritization of the finished solution.
-
-### Sources and further reading
-
-- [FIDE Laws of Chess, Articles 3 and 5](https://handbook.fide.com/chapter/e012023): rule reference for attacks, special moves and endings.
-- [Design Gurus: public chess-design example](https://www.designgurus.io/answers/detail/how-to-design-chess) and [AlgoMaster's public chess problem](https://github.com/ashishps1/awesome-low-level-design/blob/main/problems/chess-game.md): comparison of common interview coverage. The implementation and drawings here are original.
-- [Run all three reference implementations](reference-code/lld-three/README.md).
+The [complete Java implementation](reference-code/lld-three/Chess.java) includes the movement helpers and attack checks used by these excerpts.
 
 === HLD 1 ===
 N|n0|Clients and routing|0|0|200|rect
