@@ -23,15 +23,43 @@ Explain how to get reliable, typed, structured output from LLMs in Java: mapping
 - Provider-native JSON or structured-output modes vs. prompt-based format instructions.
 - Validation (Jakarta Bean Validation), retry-with-feedback, and fallbacks.
 
-## Key concepts and learning objective
+## Learn through a concrete example
+
+A support assistant should return `category`, `priority` and `summary`. Free prose is difficult for downstream code to consume. Structured output asks for a typed shape, but a parseable object can still contain an invalid category or an unsupported decision.
+
+Separate **syntax validation** (is it valid JSON?), **schema validation** (are required fields/types present?) and **business validation** (is this category allowed and justified?). A Java record describes a shape; it does not establish truth.
+
+## See conversion and semantic checks
+
+![Parsing is one step before business validation.](lessons/ai-8-flow.svg)
+
+*Parsing is one step before business validation.*
+
+![Successful deserialization does not grant authority.](lessons/ai-8-failure.svg)
+
+*Successful deserialization does not grant authority.*
+
+### Define a useful contract
+
+```java
+record Classification(String category, String summary, boolean needsReview) {}
+
+Classification result = client.prompt()
+    .user(ticketText).call().entity(Classification.class);
+// Then validate category allow-list, summary bounds and review rules.
+```
+
+Represent missing evidence explicitly rather than forcing the model to invent required facts. An empty list of citations and `abstained=true` can be valid for an unanswerable question. `null`, empty string and unknown are different concepts; define which fields allow each.
+
+## Design details and alternatives
+
+### Key concepts and learning objective
 
 **Question to answer:** How can model output become a reliable application object instead of fragile text parsing?
 
 There are three separate checks: syntactic JSON validity, schema conformance and business correctness. Native provider schemas can constrain format when supported; framework converters can guide/parse output but cannot prove that a cited document exists or that an amount is valid.
 
-Read this as a system-building exercise, not a glossary to memorize. The running example is an authenticated documentation assistant: it receives a question, finds permitted evidence, answers with source identifiers, and optionally looks up live business data through a narrow read-only tool. Every added component must solve an observed limitation of the simpler version. Begin with a deterministic baseline so that a model is used where language interpretation helps rather than for arithmetic, authorization or database invariants.
-
-## Architecture and contracts
+### Architecture and contracts
 
 ```text
 Task + schema -> provider -> parse -> schema/type validation -> domain invariants -> accept, bounded repair or reject
@@ -42,19 +70,11 @@ SupportAnswer(summary,List<Citation>,needsHuman); Citation(sourceId,quote); Vali
 
 Use Java records for DTOs, entity(YourRecord.class) or an explicit converter, then Bean Validation/application checks. Treat code fragments as integration sketches unless included in the runnable examples project.
 
-Separate policy from integration. Identity, permitted evidence, operation state and budgets belong to the application. The model proposes text or actions; its proposal is not proof of a business fact or permission. Preserve input/source/model/prompt versions so that a bad answer can be reproduced without relying on whichever provider default exists later. Keep the distinction between raw conversation history, the selected prompt context and provider-side caching explicit.
-
-## Worked reasoning and capacity example
+### Worked reasoning and capacity example
 
 If 2% of 10,000 daily responses fail parsing, there are 200 repair candidates. One repair attempt adds up to 200 extra calls/day, and still needs a terminal failure policy. Measure cost and correctness rather than retrying until something parses.
 
-Treat every number here as an illustrative assumption unless it is a unit conversion. A context window is a model-specific token limit, not a fixed page/word count. Count the instructions, examples, history, tool schemas/results, evidence and output reservation that the actual endpoint accounts for. Some providers also account for reasoning or multimodal inputs differently; read the selected provider contract and usage metadata. Do not copy a model name, price or maximum context size from a video as a permanent product guarantee.
-
-For latency, split retrieval/enrichment, queue wait, time-to-first-token and total generation. Streaming changes when the user sees text but does not make validation of the final object optional. For cost, sum observed input/output usage over all calls, including retries, judges, rewrites and agent steps. Divide by successful supported tasks as well as by requests. A failed workflow can be expensive even when it returns no final answer.
-
-## Java and Spring AI implementation outline
-
-The following is an **illustrative fragment**, not a complete standalone application unless included in `examples/reference-invariants`. Names such as repositories, authorization services and run decisions represent application-owned ports. Spring AI fragments target the documented **1.1 API family**; this is an explicit educational compatibility baseline, not a claim that it is the newest release. Pin a BOM and read migration documentation before adopting a different family.
+### Java and Spring AI implementation outline
 
 ```java
 record Extraction(String summary, java.util.List<String> sourceIds) {}
@@ -62,75 +82,42 @@ Extraction draft = client.prompt().user(question).call().entity(Extraction.class
 // Next: validate size limits, source existence, authorization and business rules.
 ```
 
-Keep request-specific state out of singleton bean fields. Construct a fresh request specification, derive identity from the authenticated request and pass only authorized bounded data to adapters. Place credentials in environment/secret configuration, never in an example prompt, source file or response. When an API supports multiple result forms, choose the one that retains the metadata needed for this use case instead of discarding finish reason/usage by default.
-
-A minimal application test injects a deterministic model/tool adapter with scripted outputs. That test checks wiring, state, authorization and validation without paying for a provider call. A separate integration test checks the pinned SDK/API shape. A quality evaluation checks whether real model outputs satisfy a versioned task rubric. These are three different kinds of evidence; passing one does not prove the others.
-
-## Design decisions and alternatives
+### Design decisions and alternatives
 
 Prefer small purpose-specific DTOs with bounded lists/strings and explicit optional fields. Enumerations should represent real business values, while unknown/abstained is explicit. Preserve original response identity for debugging under retention policy.
 
-Compare the added mechanism with the simplest baseline on the same inputs. Keep changes attributable: prompt text, model version, chunker, index settings, reranker and tool policy should not all change at once. Document which guarantee the new layer buys and which failure modes it introduces. A framework abstracts common plumbing, while provider-specific support for tools, streaming, schemas, context limits and data residency still needs explicit capability checks.
-
-Prefer a fixed workflow when the task has a stable sequence of steps. If an agent selects actions, bound model calls, tool calls, result bytes, elapsed time and spend. For independent subtasks, parallelism can reduce wall-clock latency but increases simultaneous quota use and may increase total cost. Do not hand every tool and every document to every worker simply because they are available.
-
-## Failure scenario and safe recovery
+### Failure scenario and safe recovery
 
 The response is valid JSON but invents an authorized-looking order ID. Resolve identifiers against the authenticated repository before any action. Never let a successful entity() conversion directly trigger a refund.
 
-Classify the stage that failed. A retrieval miss, unauthorized document, provider timeout, malformed schema, invalid business value and failed external side effect need different handling. Do not turn every exception into a vague “please retry” message. Before retrying, determine whether anything irreversible or billable may already have happened and reuse the original operation identity where the downstream contract supports it.
-
-| Stage | Example symptom | Required response |
-|---|---|---|
-| Input/context | Oversized or unauthorized material | Reject or reduce before sending it to a model |
-| Retrieval | No permitted supporting evidence | Ask for clarification or abstain; do not fabricate a citation |
-| Provider | Timeout, throttling or unavailable capability | Bounded retry/fallback under the same run budget |
-| Parsing | Incomplete or invalid structure | Bounded repair or explicit validation failure |
-| Business validation | Invented ID or inconsistent amount | Reject independent of how fluent the answer sounds |
-| Tool effect | Timeout after possible completion | Query/reconcile operation identity before another action |
-
-Cancellation should propagate through long streams, search calls and tools where supported. Persist necessary workflow state before acknowledging a pending action. When the deadline expires, return an honest partial/incomplete outcome with the evidence already established; do not let a model invent successful completion to make the response sound finished.
-
-## Security, privacy and provenance
+### Security, privacy and provenance
 
 A schema can describe the shape of a tool argument but not establish the caller’s authority to use that argument.
 
-User text, retrieved passages, file contents, tool descriptions and tool results can all contain hostile instructions. Label their origin and keep them as data. Security comes from deterministic resource authorization, narrow capabilities, bounded execution and controlled destinations, with model-oriented guardrails as an additional imperfect layer. A model can request an operation; only the application can authorize and execute it.
-
-Scope evidence, caches and conversation keys by tenant and authenticated user. A high similarity score cannot justify sharing a cached answer from another tenant. Propagate source updates, permission revocations and deletions into indexes and derived summaries under a documented lifecycle policy. Keep citations to stable source revisions so an answer can be checked against the material actually used.
-
-Log trace IDs, operation identities, model/prompt/index versions, counts, durations and validated failure categories by default. Raw prompts, provider tokens, signed URLs and private passages need explicit handling and retention, not indiscriminate debug logging. A secret removed from the final answer can still have leaked through a tool request or a log before that answer was produced.
-
-## Hands-on lab and evaluation
+### Hands-on lab and evaluation
 
 **Build:** Feed malformed JSON, missing fields, unknown enum values, oversized lists and semantically invalid IDs through the pipeline. Show which layer rejects each case.
 
 **Measure:** Track syntax success, schema success, domain validity, repair rate, repair cost and accepted incorrect outputs on a labelled set.
 
-Create a versioned fixture set containing representative supported questions, missing-evidence questions, ambiguous requests and adversarial inputs. State expected evidence and permitted behavior before running the model. Include at least one case in which the correct behavior is to ask for clarification, refuse access, or stop at a budget rather than return a polished answer. Keep development/few-shot examples separate from the held-out set.
-
-Record per-case outcomes and compare against the baseline. Exact tests work for identifiers, schema constraints, authorization and conservation rules. Human/calibrated rubric checks are useful for relevance and evidence support, but a model judge can prefer fluent unsupported prose. Preserve disagreements and evaluate by tenant/language/document type instead of hiding them in one aggregate score. Report dataset size and limitations rather than promising a universal accuracy percentage.
-
-## Follow-up questions with explained answers
-
-**What does the model actually contribute?** There are three separate checks: syntactic JSON validity, schema conformance and business correctness. Native provider schemas can constrain format when supported; framework converters can guide/parse output but cannot prove that a cited document exists or that an amount is valid.
-
-**What belongs in application code?** The contracts and policies around SupportAnswer(summary,List<Citation>,needsHuman); Citation(sourceId,quote); ValidationResult(errors). In particular, identity and permission cannot come from a generated argument.
-
-**What is the important trade-off?** Prefer small purpose-specific DTOs with bounded lists/strings and explicit optional fields. Enumerations should represent real business values, while unknown/abstained is explicit. Preserve original response identity for debugging under retention policy.
-
-**What breaks the naive implementation?** The response is valid JSON but invents an authorized-looking order ID. Resolve identifiers against the authenticated repository before any action. Never let a successful entity() conversion directly trigger a refund.
-
-**How would you test the fix?** Track syntax success, schema success, domain validity, repair rate, repair cost and accepted incorrect outputs on a labelled set. Use scripted failures for deterministic checks and a separate versioned corpus for model quality.
-
-Close the exercise by tracing the input, authorized evidence, proposed output/action and final validation result. Point to the run budget and the stop condition. If you cannot identify who enforces authority, what supports each factual claim and how the workflow terminates, the design is still a demonstration rather than a dependable product feature.
-
-## Further reading
+### Further reading
 
 - [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
 - [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+
+## Work through repair and evolution
+
+Allow at most a bounded repair attempt for malformed output and count it in the same request budget. Repeatedly asking until parsing succeeds can hide cost and still produce semantic errors. A strict provider schema improves shape compliance where supported, but resource authorization remains outside generation.
+
+Version the output contract. Adding a required field can break old consumers or archived responses. Keep raw-output retention restricted and redacted where needed; diagnostics should preserve enough schema/version information without collecting every private ticket in general logs.
+
+## Practise, then check your reasoning
+
+1. **Does `entity()` authorize a refund?** No. The domain service validates and executes approved actions.
+2. **Should a missing date become today's date?** Only if the contract explicitly defines that default; otherwise preserve unknown.
+3. **Exercise:** feed valid JSON with an illegal category, malformed JSON, missing evidence and oversized text. Assert four distinct outcomes and verify bounded repair. A test that only checks successful deserialization misses the important failures.
 
 === AI 9 ===
 N|user|User msg + conversationId|0|130|210
@@ -157,15 +144,41 @@ Explain conversation memory for LLM apps: LLMs are stateless, so "memory" means 
 - Conversation IDs, multi-user isolation, persistence, retention.
 - Context-window management: windowing, summarisation, retrieval-based memory.
 
-## Key concepts and learning objective
+## Learn through a concrete example
+
+“What did I ask earlier?” requires prior conversation content. Most model calls are stateless from the application's perspective; memory means selecting and supplying stored context. It is not an unlimited transcript and does not update model weights.
+
+A **conversation ID** identifies stored history, a **memory window** selects retained messages, and a **summary** compresses older content with possible information loss. A user's ownership of the conversation must be verified independently of the ID they submit.
+
+## See scoped memory and a collision
+
+![Only selected, owned history enters the model request.](lessons/ai-9-flow.svg)
+
+*Only selected, owned history enters the model request.*
+
+![Conversation scoping is a security decision before the model call.](lessons/ai-9-failure.svg)
+
+*Conversation scoping is a security decision before the model call.*
+
+### Work a context window
+
+Ten turns averaging 600 tokens are about 6,000 tokens before system messages, evidence and output reserve. Keeping the last ten **messages** is not the same as the last ten **turns**, and neither directly limits tokens. Budget actual selected context and preserve complete tool-call/result pairs where required.
+
+```text
+Storage scope: tenantId + userId + conversationId
+Request context: instructions + selected history + question + evidence
+Persisted turn: requestId + sequence + final output + state
+```
+
+## Design details and alternatives
+
+### Key concepts and learning objective
 
 **Question to answer:** How can a chat remember prior turns without leaking another user’s conversation or exhausting context?
 
 Persisted conversation history is application state. Each model request includes a selected view of it; provider-side caches do not replace this store. Window memory drops old turns; summaries compress them; retrieval can recover relevant past facts but adds ranking and privacy concerns.
 
-Read this as a system-building exercise, not a glossary to memorize. The running example is an authenticated documentation assistant: it receives a question, finds permitted evidence, answers with source identifiers, and optionally looks up live business data through a narrow read-only tool. Every added component must solve an observed limitation of the simpler version. Begin with a deterministic baseline so that a model is used where language interpretation helps rather than for arithmetic, authorization or database invariants.
-
-## Architecture and contracts
+### Architecture and contracts
 
 ```text
 Authenticate conversation ownership -> append user turn -> select bounded history -> model/tool turns -> validate -> append final assistant turn
@@ -176,19 +189,11 @@ ConversationKey(tenant,user,conversation); Message(role,body,sequence,toolCallId
 
 A chat-memory advisor can select and insert messages, but the application must authorize the conversation before invoking it. Use the API matching the pinned Spring AI baseline; newer session APIs have different names.
 
-Separate policy from integration. Identity, permitted evidence, operation state and budgets belong to the application. The model proposes text or actions; its proposal is not proof of a business fact or permission. Preserve input/source/model/prompt versions so that a bad answer can be reproduced without relying on whichever provider default exists later. Keep the distinction between raw conversation history, the selected prompt context and provider-side caching explicit.
-
-## Worked reasoning and capacity example
+### Worked reasoning and capacity example
 
 Twenty turns averaging 500 tokens each already consume 10,000 tokens before task instructions, retrieval and output allowance. Summaries should have their own budget and revision, not grow without bound.
 
-Treat every number here as an illustrative assumption unless it is a unit conversion. A context window is a model-specific token limit, not a fixed page/word count. Count the instructions, examples, history, tool schemas/results, evidence and output reservation that the actual endpoint accounts for. Some providers also account for reasoning or multimodal inputs differently; read the selected provider contract and usage metadata. Do not copy a model name, price or maximum context size from a video as a permanent product guarantee.
-
-For latency, split retrieval/enrichment, queue wait, time-to-first-token and total generation. Streaming changes when the user sees text but does not make validation of the final object optional. For cost, sum observed input/output usage over all calls, including retries, judges, rewrites and agent steps. Divide by successful supported tasks as well as by requests. A failed workflow can be expensive even when it returns no final answer.
-
-## Java and Spring AI implementation outline
-
-The following is an **illustrative fragment**, not a complete standalone application unless included in `examples/reference-invariants`. Names such as repositories, authorization services and run decisions represent application-owned ports. Spring AI fragments target the documented **1.1 API family**; this is an explicit educational compatibility baseline, not a claim that it is the newest release. Pin a BOM and read migration documentation before adopting a different family.
+### Java and Spring AI implementation outline
 
 ```java
 record ConversationKey(String tenant, String user, String conversation) {}
@@ -198,75 +203,42 @@ interface ConversationRepository {
 // Persist roles/tool-call relationships in the real message schema.
 ```
 
-Keep request-specific state out of singleton bean fields. Construct a fresh request specification, derive identity from the authenticated request and pass only authorized bounded data to adapters. Place credentials in environment/secret configuration, never in an example prompt, source file or response. When an API supports multiple result forms, choose the one that retains the metadata needed for this use case instead of discarding finish reason/usage by default.
-
-A minimal application test injects a deterministic model/tool adapter with scripted outputs. That test checks wiring, state, authorization and validation without paying for a provider call. A separate integration test checks the pinned SDK/API shape. A quality evaluation checks whether real model outputs satisfy a versioned task rubric. These are three different kinds of evidence; passing one does not prove the others.
-
-## Design decisions and alternatives
+### Design decisions and alternatives
 
 Key memory by tenant plus authenticated user plus conversation, not a user-supplied conversation ID alone. Store raw history separately from derived summaries, with deletion and retention rules for each.
 
-Compare the added mechanism with the simplest baseline on the same inputs. Keep changes attributable: prompt text, model version, chunker, index settings, reranker and tool policy should not all change at once. Document which guarantee the new layer buys and which failure modes it introduces. A framework abstracts common plumbing, while provider-specific support for tools, streaming, schemas, context limits and data residency still needs explicit capability checks.
-
-Prefer a fixed workflow when the task has a stable sequence of steps. If an agent selects actions, bound model calls, tool calls, result bytes, elapsed time and spend. For independent subtasks, parallelism can reduce wall-clock latency but increases simultaneous quota use and may increase total cost. Do not hand every tool and every document to every worker simply because they are available.
-
-## Failure scenario and safe recovery
+### Failure scenario and safe recovery
 
 Two tabs append to one conversation concurrently. Sequence or version the append, and build the response against a known history snapshot. A tool result must match the tool call that produced it; dropping one half creates invalid context.
 
-Classify the stage that failed. A retrieval miss, unauthorized document, provider timeout, malformed schema, invalid business value and failed external side effect need different handling. Do not turn every exception into a vague “please retry” message. Before retrying, determine whether anything irreversible or billable may already have happened and reuse the original operation identity where the downstream contract supports it.
-
-| Stage | Example symptom | Required response |
-|---|---|---|
-| Input/context | Oversized or unauthorized material | Reject or reduce before sending it to a model |
-| Retrieval | No permitted supporting evidence | Ask for clarification or abstain; do not fabricate a citation |
-| Provider | Timeout, throttling or unavailable capability | Bounded retry/fallback under the same run budget |
-| Parsing | Incomplete or invalid structure | Bounded repair or explicit validation failure |
-| Business validation | Invented ID or inconsistent amount | Reject independent of how fluent the answer sounds |
-| Tool effect | Timeout after possible completion | Query/reconcile operation identity before another action |
-
-Cancellation should propagate through long streams, search calls and tools where supported. Persist necessary workflow state before acknowledging a pending action. When the deadline expires, return an honest partial/incomplete outcome with the evidence already established; do not let a model invent successful completion to make the response sound finished.
-
-## Security, privacy and provenance
+### Security, privacy and provenance
 
 A summary generated by an LLM can turn uncertainty into a false permanent fact. Keep provenance and allow users to correct retained information.
 
-User text, retrieved passages, file contents, tool descriptions and tool results can all contain hostile instructions. Label their origin and keep them as data. Security comes from deterministic resource authorization, narrow capabilities, bounded execution and controlled destinations, with model-oriented guardrails as an additional imperfect layer. A model can request an operation; only the application can authorize and execute it.
-
-Scope evidence, caches and conversation keys by tenant and authenticated user. A high similarity score cannot justify sharing a cached answer from another tenant. Propagate source updates, permission revocations and deletions into indexes and derived summaries under a documented lifecycle policy. Keep citations to stable source revisions so an answer can be checked against the material actually used.
-
-Log trace IDs, operation identities, model/prompt/index versions, counts, durations and validated failure categories by default. Raw prompts, provider tokens, signed URLs and private passages need explicit handling and retention, not indiscriminate debug logging. A secret removed from the final answer can still have leaked through a tool request or a log before that answer was produced.
-
-## Hands-on lab and evaluation
+### Hands-on lab and evaluation
 
 **Build:** Create two users with the same supplied conversation ID and verify isolation. Run simultaneous turns, delete a conversation and confirm summaries/retrieval copies follow the deletion policy.
 
 **Measure:** Measure cross-user leakage, retained facts, summary drift, context tokens and correctness after truncation. Use adversarial conversations that try to claim another tenant’s identity.
 
-Create a versioned fixture set containing representative supported questions, missing-evidence questions, ambiguous requests and adversarial inputs. State expected evidence and permitted behavior before running the model. Include at least one case in which the correct behavior is to ask for clarification, refuse access, or stop at a budget rather than return a polished answer. Keep development/few-shot examples separate from the held-out set.
-
-Record per-case outcomes and compare against the baseline. Exact tests work for identifiers, schema constraints, authorization and conservation rules. Human/calibrated rubric checks are useful for relevance and evidence support, but a model judge can prefer fluent unsupported prose. Preserve disagreements and evaluate by tenant/language/document type instead of hiding them in one aggregate score. Report dataset size and limitations rather than promising a universal accuracy percentage.
-
-## Follow-up questions with explained answers
-
-**What does the model actually contribute?** Persisted conversation history is application state. Each model request includes a selected view of it; provider-side caches do not replace this store. Window memory drops old turns; summaries compress them; retrieval can recover relevant past facts but adds ranking and privacy concerns.
-
-**What belongs in application code?** The contracts and policies around ConversationKey(tenant,user,conversation); Message(role,body,sequence,toolCallId); MemoryPolicy(maxTokens,retention). In particular, identity and permission cannot come from a generated argument.
-
-**What is the important trade-off?** Key memory by tenant plus authenticated user plus conversation, not a user-supplied conversation ID alone. Store raw history separately from derived summaries, with deletion and retention rules for each.
-
-**What breaks the naive implementation?** Two tabs append to one conversation concurrently. Sequence or version the append, and build the response against a known history snapshot. A tool result must match the tool call that produced it; dropping one half creates invalid context.
-
-**How would you test the fix?** Measure cross-user leakage, retained facts, summary drift, context tokens and correctness after truncation. Use adversarial conversations that try to claim another tenant’s identity. Use scripted failures for deterministic checks and a separate versioned corpus for model quality.
-
-Close the exercise by tracing the input, authorized evidence, proposed output/action and final validation result. Point to the run budget and the stop condition. If you cannot identify who enforces authority, what supports each factual claim and how the workflow terminates, the design is still a demonstration rather than a dependable product feature.
-
-## Further reading
+### Further reading
 
 - [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
 - [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+
+## Work through concurrent turns
+
+Two tabs send follow-ups to the same conversation simultaneously. Without sequencing, both can answer against the same old history and append in an arbitrary order. Serialize per conversation, use optimistic version checks or explicitly represent branching. Do not pretend arrival timestamps alone define user intent.
+
+A summary can accidentally omit an allergy, a constraint or a quoted negation. Keep critical application facts in typed authoritative state; do not entrust them only to a generated summary. Deletion must consider messages, summaries, vectors and caches under the retention policy.
+
+## Practise, then check your reasoning
+
+1. **Can a conversation ID supplied by the model establish ownership?** No. Resolve it against authenticated application identity.
+2. **Does pruning history change old stored messages?** It need not; prompt selection and storage retention are separate policies.
+3. **Exercise:** create two users with identical visible conversation labels, race two turns and delete one conversation. Verify isolation, deterministic order and removal from every memory representation you actually use.
 
 === AI 10 ===
 N|app|Spring app|0|130|130
@@ -293,15 +265,35 @@ Explain vector stores: what they add beyond storing arrays of floats (ANN indexe
 - Choosing a store for an enterprise Java stack.
 - Spring AI `VectorStore`, `SearchRequest`, the portable filter expression DSL.
 
-## Key concepts and learning objective
+## Learn through a concrete example
+
+A vector store holds embeddings and associated document metadata so the application can retrieve neighbours. It is an index of selected evidence, not a replacement for document lifecycle, access control or a source-of-truth database.
+
+An **index namespace** separates logical collections, a **metadata filter** constrains candidates, and a **document revision** tells you what was embedded. **Approximate search** improves speed by potentially missing some exact nearest neighbours; measure recall rather than assuming an index configuration is universally best.
+
+## See indexing and revision cleanup
+
+![Text, embedding model and permissions remain traceable together.](lessons/ai-10-flow.svg)
+
+*Text, embedding model and permissions remain traceable together.*
+
+![Upsert alone does not remove chunks that disappeared from a new revision.](lessons/ai-10-failure.svg)
+
+*Upsert alone does not remove chunks that disappeared from a new revision.*
+
+### Calculate and choose
+
+One million vectors × 1,536 dimensions × four bytes is about 6.144 GB raw values. Index graph/list structures, stored text, metadata, replicas and write headroom add to that. If your documents are small and the corpus modest, an existing database with vector support may be simpler than a new distributed dependency.
+
+## Design details and alternatives
+
+### Key concepts and learning objective
 
 **Question to answer:** How should embeddings be indexed, filtered, updated and migrated in a real application?
 
 A vector store combines numerical vectors, metadata and an index. Exact search establishes a correctness baseline; approximate methods such as HNSW/IVF trade search recall, memory, build time and latency. The storage engine may also support lexical indexes; vectors are not a separate mandatory database category.
 
-Read this as a system-building exercise, not a glossary to memorize. The running example is an authenticated documentation assistant: it receives a question, finds permitted evidence, answers with source identifiers, and optionally looks up live business data through a narrow read-only tool. Every added component must solve an observed limitation of the simpler version. Begin with a deterministic baseline so that a model is used where language interpretation helps rather than for arithmetic, authorization or database invariants.
-
-## Architecture and contracts
+### Architecture and contracts
 
 ```text
 Document revision -> stable chunk IDs -> batch embedding -> versioned index upsert -> filtered search -> source lookup; tombstones and reindex govern updates
@@ -312,19 +304,11 @@ IndexVersion(embeddingModel,dimension,chunkerVersion,metric); SearchRequest(quer
 
 VectorStore accepts Documents and SearchRequest-like queries in the selected release. Keep store-specific configuration outside domain code; validate metadata filter behavior with integration tests.
 
-Separate policy from integration. Identity, permitted evidence, operation state and budgets belong to the application. The model proposes text or actions; its proposal is not proof of a business fact or permission. Preserve input/source/model/prompt versions so that a bad answer can be reproduced without relying on whichever provider default exists later. Keep the distinction between raw conversation history, the selected prompt context and provider-side caching explicit.
-
-## Worked reasoning and capacity example
+### Worked reasoning and capacity example
 
 Five million vectors x 1,536 x 4 bytes = 30.72 GB raw floats. HNSW graph links, metadata, original text, replicas and write buffers add to that. Capacity tests must include the chosen index configuration.
 
-Treat every number here as an illustrative assumption unless it is a unit conversion. A context window is a model-specific token limit, not a fixed page/word count. Count the instructions, examples, history, tool schemas/results, evidence and output reservation that the actual endpoint accounts for. Some providers also account for reasoning or multimodal inputs differently; read the selected provider contract and usage metadata. Do not copy a model name, price or maximum context size from a video as a permanent product guarantee.
-
-For latency, split retrieval/enrichment, queue wait, time-to-first-token and total generation. Streaming changes when the user sees text but does not make validation of the final object optional. For cost, sum observed input/output usage over all calls, including retries, judges, rewrites and agent steps. Divide by successful supported tasks as well as by requests. A failed workflow can be expensive even when it returns no final answer.
-
-## Java and Spring AI implementation outline
-
-The following is an **illustrative fragment**, not a complete standalone application unless included in `examples/reference-invariants`. Names such as repositories, authorization services and run decisions represent application-owned ports. Spring AI fragments target the documented **1.1 API family**; this is an explicit educational compatibility baseline, not a claim that it is the newest release. Pin a BOM and read migration documentation before adopting a different family.
+### Java and Spring AI implementation outline
 
 ```java
 record IndexVersion(String embeddingModel, int dimensions, String chunkerVersion) {}
@@ -332,75 +316,42 @@ record IndexVersion(String embeddingModel, int dimensions, String chunkerVersion
 // Build a replacement index before changing the live query encoder.
 ```
 
-Keep request-specific state out of singleton bean fields. Construct a fresh request specification, derive identity from the authenticated request and pass only authorized bounded data to adapters. Place credentials in environment/secret configuration, never in an example prompt, source file or response. When an API supports multiple result forms, choose the one that retains the metadata needed for this use case instead of discarding finish reason/usage by default.
-
-A minimal application test injects a deterministic model/tool adapter with scripted outputs. That test checks wiring, state, authorization and validation without paying for a provider call. A separate integration test checks the pinned SDK/API shape. A quality evaluation checks whether real model outputs satisfy a versioned task rubric. These are three different kinds of evidence; passing one does not prove the others.
-
-## Design decisions and alternatives
+### Design decisions and alternatives
 
 Start with a store that fits operating skills and consistency needs. Use stable content/revision keys for repeatable ingestion; rebuild into a new collection when model/chunker changes. Swap an index alias after validation rather than mixing incompatible vectors.
 
-Compare the added mechanism with the simplest baseline on the same inputs. Keep changes attributable: prompt text, model version, chunker, index settings, reranker and tool policy should not all change at once. Document which guarantee the new layer buys and which failure modes it introduces. A framework abstracts common plumbing, while provider-specific support for tools, streaming, schemas, context limits and data residency still needs explicit capability checks.
-
-Prefer a fixed workflow when the task has a stable sequence of steps. If an agent selects actions, bound model calls, tool calls, result bytes, elapsed time and spend. For independent subtasks, parallelism can reduce wall-clock latency but increases simultaneous quota use and may increase total cost. Do not hand every tool and every document to every worker simply because they are available.
-
-## Failure scenario and safe recovery
+### Failure scenario and safe recovery
 
 Deletion removes source text but leaves indexed chunks retrievable. Tombstone or delete every related chunk and enforce source authorization/version checks on read; track cleanup completion.
 
-Classify the stage that failed. A retrieval miss, unauthorized document, provider timeout, malformed schema, invalid business value and failed external side effect need different handling. Do not turn every exception into a vague “please retry” message. Before retrying, determine whether anything irreversible or billable may already have happened and reuse the original operation identity where the downstream contract supports it.
-
-| Stage | Example symptom | Required response |
-|---|---|---|
-| Input/context | Oversized or unauthorized material | Reject or reduce before sending it to a model |
-| Retrieval | No permitted supporting evidence | Ask for clarification or abstain; do not fabricate a citation |
-| Provider | Timeout, throttling or unavailable capability | Bounded retry/fallback under the same run budget |
-| Parsing | Incomplete or invalid structure | Bounded repair or explicit validation failure |
-| Business validation | Invented ID or inconsistent amount | Reject independent of how fluent the answer sounds |
-| Tool effect | Timeout after possible completion | Query/reconcile operation identity before another action |
-
-Cancellation should propagate through long streams, search calls and tools where supported. Persist necessary workflow state before acknowledging a pending action. When the deadline expires, return an honest partial/incomplete outcome with the evidence already established; do not let a model invent successful completion to make the response sound finished.
-
-## Security, privacy and provenance
+### Security, privacy and provenance
 
 Two models with equal vector dimension are not interchangeable. Distance thresholds are metric/model dependent and must be calibrated on your corpus.
 
-User text, retrieved passages, file contents, tool descriptions and tool results can all contain hostile instructions. Label their origin and keep them as data. Security comes from deterministic resource authorization, narrow capabilities, bounded execution and controlled destinations, with model-oriented guardrails as an additional imperfect layer. A model can request an operation; only the application can authorize and execute it.
-
-Scope evidence, caches and conversation keys by tenant and authenticated user. A high similarity score cannot justify sharing a cached answer from another tenant. Propagate source updates, permission revocations and deletions into indexes and derived summaries under a documented lifecycle policy. Keep citations to stable source revisions so an answer can be checked against the material actually used.
-
-Log trace IDs, operation identities, model/prompt/index versions, counts, durations and validated failure categories by default. Raw prompts, provider tokens, signed URLs and private passages need explicit handling and retention, not indiscriminate debug logging. A secret removed from the final answer can still have leaked through a tool request or a log before that answer was produced.
-
-## Hands-on lab and evaluation
+### Hands-on lab and evaluation
 
 **Build:** Create an exact-search baseline, compare ANN recall on a labelled subset, then change embedding dimensions and demonstrate a staged reindex plus rollback.
 
 **Measure:** Recall@k, filtered recall, insert/update lag, deletion propagation, memory and query p99 under concurrent ingestion. Benchmark skewed tenants, not only uniform random vectors.
 
-Create a versioned fixture set containing representative supported questions, missing-evidence questions, ambiguous requests and adversarial inputs. State expected evidence and permitted behavior before running the model. Include at least one case in which the correct behavior is to ask for clarification, refuse access, or stop at a budget rather than return a polished answer. Keep development/few-shot examples separate from the held-out set.
-
-Record per-case outcomes and compare against the baseline. Exact tests work for identifiers, schema constraints, authorization and conservation rules. Human/calibrated rubric checks are useful for relevance and evidence support, but a model judge can prefer fluent unsupported prose. Preserve disagreements and evaluate by tenant/language/document type instead of hiding them in one aggregate score. Report dataset size and limitations rather than promising a universal accuracy percentage.
-
-## Follow-up questions with explained answers
-
-**What does the model actually contribute?** A vector store combines numerical vectors, metadata and an index. Exact search establishes a correctness baseline; approximate methods such as HNSW/IVF trade search recall, memory, build time and latency. The storage engine may also support lexical indexes; vectors are not a separate mandatory database category.
-
-**What belongs in application code?** The contracts and policies around IndexVersion(embeddingModel,dimension,chunkerVersion,metric); SearchRequest(query,tenant,filter,k); DocumentRevision. In particular, identity and permission cannot come from a generated argument.
-
-**What is the important trade-off?** Start with a store that fits operating skills and consistency needs. Use stable content/revision keys for repeatable ingestion; rebuild into a new collection when model/chunker changes. Swap an index alias after validation rather than mixing incompatible vectors.
-
-**What breaks the naive implementation?** Deletion removes source text but leaves indexed chunks retrievable. Tombstone or delete every related chunk and enforce source authorization/version checks on read; track cleanup completion.
-
-**How would you test the fix?** Recall@k, filtered recall, insert/update lag, deletion propagation, memory and query p99 under concurrent ingestion. Benchmark skewed tenants, not only uniform random vectors. Use scripted failures for deterministic checks and a separate versioned corpus for model quality.
-
-Close the exercise by tracing the input, authorized evidence, proposed output/action and final validation result. Point to the run budget and the stop condition. If you cannot identify who enforces authority, what supports each factual claim and how the workflow terminates, the design is still a demonstration rather than a dependable product feature.
-
-## Further reading
+### Further reading
 
 - [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
 - [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+
+## Work through filter correctness
+
+Filtering before candidate selection and filtering a small top-k afterward can produce different recall and security properties. A post-filter cannot repair a design that exposes forbidden text to another processing step. Test tenant/resource filters with intentionally nearest forbidden vectors, not merely random fixtures.
+
+Changing embedding models requires a versioned migration. Even equal-dimensional vectors can represent different spaces. Build a new index, test retrieval, switch query embedding and index together, and keep a rollback plan. Index backup and source re-ingestion are different recovery strategies with different time/cost.
+
+## Practise, then check your reasoning
+
+1. **Is vector distance comparable across arbitrary models?** No. Use a compatible model/index and calibrated task evaluation.
+2. **Does deleting a document row guarantee vector deletion?** Only if your lifecycle explicitly performs and verifies that propagation.
+3. **Exercise:** reindex a document with fewer chunks, delete another and inject a forbidden nearest match. Verify no orphaned evidence, no forbidden disclosure and a measured retrieval recall after migration.
 
 === AI 11 ===
 N|q|User query|0|0|120
@@ -430,15 +381,37 @@ Take RAG from demo to production: the techniques that move answer quality from "
 - Query transformation: rewriting, multi-query, HyDE, conversational compression.
 - Operational concerns: incremental ingestion, dedup, ACLs, evals and monitoring.
 
-## Key concepts and learning objective
+## Learn through a concrete example
+
+A demonstration answers correctly from one PDF. Production adds thousands of documents, changing permissions, conflicting revisions and questions whose answers are absent. Production RAG makes evidence lifecycle and measurable failure behaviour part of the design rather than treating retrieval as a single library call.
+
+**Recall@k** measures whether relevant evidence appears among retrieved candidates. A **reranker** reorders candidates with a more expensive relevance judgement. **Groundedness** evaluates whether the answer is supported by selected evidence. Improve the failing stage instead of blindly increasing every limit.
+
+## See retrieval stages and a permission change
+
+![Each stage leaves evidence for diagnosis and versioned evaluation.](lessons/ai-11-flow.svg)
+
+*Each stage leaves evidence for diagnosis and versioned evaluation.*
+
+![Evidence lifecycle extends beyond the primary document store.](lessons/ai-11-failure.svg)
+
+*Evidence lifecycle extends beyond the primary document store.*
+
+### Trace and calculate quality
+
+On 100 answerable questions, relevant evidence may appear for 85. If 75 of those produce supported answers, retrieval recall is 85% while supported end-to-end success is 75% on that set. The conditional generation success is 75/85, about 88.2%. These diagnose different problems; one “accuracy” number hides them.
+
+Reserve a separate unanswerable set. A system that confidently answers every question can score well on answer-present cases while failing dangerously when evidence is missing. Evaluate abstention precision/recall and critical security failures separately.
+
+## Design details and alternatives
+
+### Key concepts and learning objective
 
 **Question to answer:** What turns a successful RAG demo into a dependable multi-tenant documentation product?
 
 Production RAG is a lifecycle of ingestion, revisioning, retrieval, authorization, evaluation and operations. Hybrid search retrieves lexical and semantic candidates; reranking orders a small candidate set; context assembly removes duplicates and respects token budget.
 
-Read this as a system-building exercise, not a glossary to memorize. The running example is an authenticated documentation assistant: it receives a question, finds permitted evidence, answers with source identifiers, and optionally looks up live business data through a narrow read-only tool. Every added component must solve an observed limitation of the simpler version. Begin with a deterministic baseline so that a model is used where language interpretation helps rather than for arithmetic, authorization or database invariants.
-
-## Architecture and contracts
+### Architecture and contracts
 
 ```text
 Source connector -> revision/ACL capture -> parse/chunk/embed -> staged index -> retrieval -> authorization -> rerank -> citation generation -> support verification
@@ -449,19 +422,11 @@ IngestRun(sourceRevision,chunkerVersion,indexVersion,status); AnswerTrace(queryI
 
 Use a simple QuestionAnswerAdvisor path as a baseline, then application-owned retrieval/reranking when policy requires it. Do not copy unversioned advisor constructors into a pinned build.
 
-Separate policy from integration. Identity, permitted evidence, operation state and budgets belong to the application. The model proposes text or actions; its proposal is not proof of a business fact or permission. Preserve input/source/model/prompt versions so that a bad answer can be reproduced without relying on whichever provider default exists later. Keep the distinction between raw conversation history, the selected prompt context and provider-side caching explicit.
-
-## Worked reasoning and capacity example
+### Worked reasoning and capacity example
 
 Assume 100 queries/s x 8 retrieved chunks x 600 tokens = 480,000 evidence tokens/s before history and output. Reranking all corpus chunks is impossible; first-stage retrieval must bound the candidate pool.
 
-Treat every number here as an illustrative assumption unless it is a unit conversion. A context window is a model-specific token limit, not a fixed page/word count. Count the instructions, examples, history, tool schemas/results, evidence and output reservation that the actual endpoint accounts for. Some providers also account for reasoning or multimodal inputs differently; read the selected provider contract and usage metadata. Do not copy a model name, price or maximum context size from a video as a permanent product guarantee.
-
-For latency, split retrieval/enrichment, queue wait, time-to-first-token and total generation. Streaming changes when the user sees text but does not make validation of the final object optional. For cost, sum observed input/output usage over all calls, including retries, judges, rewrites and agent steps. Divide by successful supported tasks as well as by requests. A failed workflow can be expensive even when it returns no final answer.
-
-## Java and Spring AI implementation outline
-
-The following is an **illustrative fragment**, not a complete standalone application unless included in `examples/reference-invariants`. Names such as repositories, authorization services and run decisions represent application-owned ports. Spring AI fragments target the documented **1.1 API family**; this is an explicit educational compatibility baseline, not a claim that it is the newest release. Pin a BOM and read migration documentation before adopting a different family.
+### Java and Spring AI implementation outline
 
 ```java
 record RetrievalTrace(String queryId, String indexVersion,
@@ -469,75 +434,42 @@ record RetrievalTrace(String queryId, String indexVersion,
 // Log identities and counts, not raw private passages by default.
 ```
 
-Keep request-specific state out of singleton bean fields. Construct a fresh request specification, derive identity from the authenticated request and pass only authorized bounded data to adapters. Place credentials in environment/secret configuration, never in an example prompt, source file or response. When an API supports multiple result forms, choose the one that retains the metadata needed for this use case instead of discarding finish reason/usage by default.
-
-A minimal application test injects a deterministic model/tool adapter with scripted outputs. That test checks wiring, state, authorization and validation without paying for a provider call. A separate integration test checks the pinned SDK/API shape. A quality evaluation checks whether real model outputs satisfy a versioned task rubric. These are three different kinds of evidence; passing one does not prove the others.
-
-## Design decisions and alternatives
+### Design decisions and alternatives
 
 Evaluate retrieval failures before adding a larger model. Track data freshness and ACL updates as first-class work. Cache keys include tenant, permitted corpus version, prompt/model version and query normalization.
 
-Compare the added mechanism with the simplest baseline on the same inputs. Keep changes attributable: prompt text, model version, chunker, index settings, reranker and tool policy should not all change at once. Document which guarantee the new layer buys and which failure modes it introduces. A framework abstracts common plumbing, while provider-specific support for tools, streaming, schemas, context limits and data residency still needs explicit capability checks.
-
-Prefer a fixed workflow when the task has a stable sequence of steps. If an agent selects actions, bound model calls, tool calls, result bytes, elapsed time and spend. For independent subtasks, parallelism can reduce wall-clock latency but increases simultaneous quota use and may increase total cost. Do not hand every tool and every document to every worker simply because they are available.
-
-## Failure scenario and safe recovery
+### Failure scenario and safe recovery
 
 A shared semantic answer cache serves a correct answer to a user lacking access to the supporting documents. Partition caches by authorization domain and verify access on hits; similarity alone is not a safe cache key.
 
-Classify the stage that failed. A retrieval miss, unauthorized document, provider timeout, malformed schema, invalid business value and failed external side effect need different handling. Do not turn every exception into a vague “please retry” message. Before retrying, determine whether anything irreversible or billable may already have happened and reuse the original operation identity where the downstream contract supports it.
-
-| Stage | Example symptom | Required response |
-|---|---|---|
-| Input/context | Oversized or unauthorized material | Reject or reduce before sending it to a model |
-| Retrieval | No permitted supporting evidence | Ask for clarification or abstain; do not fabricate a citation |
-| Provider | Timeout, throttling or unavailable capability | Bounded retry/fallback under the same run budget |
-| Parsing | Incomplete or invalid structure | Bounded repair or explicit validation failure |
-| Business validation | Invented ID or inconsistent amount | Reject independent of how fluent the answer sounds |
-| Tool effect | Timeout after possible completion | Query/reconcile operation identity before another action |
-
-Cancellation should propagate through long streams, search calls and tools where supported. Persist necessary workflow state before acknowledging a pending action. When the deadline expires, return an honest partial/incomplete outcome with the evidence already established; do not let a model invent successful completion to make the response sound finished.
-
-## Security, privacy and provenance
+### Security, privacy and provenance
 
 A more complex pipeline can be harder to debug and less reliable. Keep a measurable baseline and change one retrieval/generation component at a time.
 
-User text, retrieved passages, file contents, tool descriptions and tool results can all contain hostile instructions. Label their origin and keep them as data. Security comes from deterministic resource authorization, narrow capabilities, bounded execution and controlled destinations, with model-oriented guardrails as an additional imperfect layer. A model can request an operation; only the application can authorize and execute it.
-
-Scope evidence, caches and conversation keys by tenant and authenticated user. A high similarity score cannot justify sharing a cached answer from another tenant. Propagate source updates, permission revocations and deletions into indexes and derived summaries under a documented lifecycle policy. Keep citations to stable source revisions so an answer can be checked against the material actually used.
-
-Log trace IDs, operation identities, model/prompt/index versions, counts, durations and validated failure categories by default. Raw prompts, provider tokens, signed URLs and private passages need explicit handling and retention, not indiscriminate debug logging. A secret removed from the final answer can still have leaked through a tool request or a log before that answer was produced.
-
-## Hands-on lab and evaluation
+### Hands-on lab and evaluation
 
 **Build:** Replay a golden dataset against two chunkers and a hybrid pipeline. Add a document deletion, permission revocation, embedding outage and a cold-index rollback scenario.
 
 **Measure:** Supported-answer rate, retrieval recall, citation correctness, abstention, p99 latency, indexing freshness and unauthorized evidence exposure. Slice metrics by tenant, language and document type.
 
-Create a versioned fixture set containing representative supported questions, missing-evidence questions, ambiguous requests and adversarial inputs. State expected evidence and permitted behavior before running the model. Include at least one case in which the correct behavior is to ask for clarification, refuse access, or stop at a budget rather than return a polished answer. Keep development/few-shot examples separate from the held-out set.
-
-Record per-case outcomes and compare against the baseline. Exact tests work for identifiers, schema constraints, authorization and conservation rules. Human/calibrated rubric checks are useful for relevance and evidence support, but a model judge can prefer fluent unsupported prose. Preserve disagreements and evaluate by tenant/language/document type instead of hiding them in one aggregate score. Report dataset size and limitations rather than promising a universal accuracy percentage.
-
-## Follow-up questions with explained answers
-
-**What does the model actually contribute?** Production RAG is a lifecycle of ingestion, revisioning, retrieval, authorization, evaluation and operations. Hybrid search retrieves lexical and semantic candidates; reranking orders a small candidate set; context assembly removes duplicates and respects token budget.
-
-**What belongs in application code?** The contracts and policies around IngestRun(sourceRevision,chunkerVersion,indexVersion,status); AnswerTrace(queryId,evidenceIds,promptVersion,modelVersion). In particular, identity and permission cannot come from a generated argument.
-
-**What is the important trade-off?** Evaluate retrieval failures before adding a larger model. Track data freshness and ACL updates as first-class work. Cache keys include tenant, permitted corpus version, prompt/model version and query normalization.
-
-**What breaks the naive implementation?** A shared semantic answer cache serves a correct answer to a user lacking access to the supporting documents. Partition caches by authorization domain and verify access on hits; similarity alone is not a safe cache key.
-
-**How would you test the fix?** Supported-answer rate, retrieval recall, citation correctness, abstention, p99 latency, indexing freshness and unauthorized evidence exposure. Slice metrics by tenant, language and document type. Use scripted failures for deterministic checks and a separate versioned corpus for model quality.
-
-Close the exercise by tracing the input, authorized evidence, proposed output/action and final validation result. Point to the run budget and the stop condition. If you cannot identify who enforces authority, what supports each factual claim and how the workflow terminates, the design is still a demonstration rather than a dependable product feature.
-
-## Further reading
+### Further reading
 
 - [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
 - [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+
+## Work through release changes
+
+Change one variable at a time: chunking, embedding model, hybrid weights, reranker or prompt. Version the corpus and expected evidence, then compare by topic, document age, language and answerability. A larger k increases latency/context and may add contradictory evidence; it is not an automatic quality improvement.
+
+Cache keys need tenant, permission/freshness scope and relevant corpus/prompt/model versions. Similar questions are not sufficient grounds for sharing answers across users. Preserve source spans in traces so support review can inspect a claim without rerunning today's changed index.
+
+## Practise, then check your reasoning
+
+1. **Should generation be blamed when the source was never retrieved?** First diagnose retrieval; the generator cannot reliably cite missing evidence.
+2. **Is a retrieval score a confidence score for the final answer?** No.
+3. **Exercise:** create answer-present, absent, conflicting-version and revoked-source cases. Record retrieval candidates, packed evidence and final claims. Explain each failure at the responsible stage and compare one improvement against the same versioned suite.
 
 === AI 12 ===
 N|req|ChatClientRequest|0|130|180
@@ -563,15 +495,43 @@ Explain Spring AI advisors, the interceptor or middleware chain around every `Ch
 - Ordering via `getOrder()`, and sharing data between advisors via the advisor context.
 - Writing custom `CallAdvisor` / `StreamAdvisor` implementations.
 
-## Key concepts and learning objective
+## Learn through a concrete example
+
+Several endpoints need memory, evidence retrieval and telemetry before model invocation. Copying all of that into every controller causes inconsistent behaviour. An **advisor** participates in the model-request processing chain, adding or inspecting context and responses according to its contract.
+
+Advisors are integration middleware, not permission to hide business decisions in invisible interceptors. Their order, state scope and error behaviour need to be visible in the application's design. This chapter uses the pinned Spring AI 1.1 family; later versions may change chain/tool integration.
+
+## See composition and ordering
+
+![Understand what each advisor receives and contributes.](lessons/ai-12-flow.svg)
+
+*Understand what each advisor receives and contributes.*
+
+![Inspect the final prompt context and filter boundaries, not just individual components.](lessons/ai-12-failure.svg)
+
+*Inspect the final prompt context and filter boundaries, not just individual components.*
+
+### Build a chain you can explain
+
+Write an input/output table before adding advisors: memory receives an owned conversation identity and returns selected messages; retrieval receives an authorized query and returns versioned passages; telemetry records metadata with redacted content. Avoid keeping request-specific mutable data on a singleton advisor instance.
+
+```text
+Request context:
+  principal: application-owned, never model-generated
+  conversation: resolved and authorized before memory lookup
+  evidence: source IDs and current access scope
+  budget: remaining tokens and deadline after all augmentation
+```
+
+## Design details and alternatives
+
+### Key concepts and learning objective
 
 **Question to answer:** Where should cross-cutting prompt transformations live without making their order invisible?
 
 Advisors wrap the model interaction and can transform requests and responses. Their order determines whether logging sees raw or redacted text, whether memory precedes retrieval and which errors are visible. A call path and a streaming path may have different contracts.
 
-Read this as a system-building exercise, not a glossary to memorize. The running example is an authenticated documentation assistant: it receives a question, finds permitted evidence, answers with source identifiers, and optionally looks up live business data through a narrow read-only tool. Every added component must solve an observed limitation of the simpler version. Begin with a deterministic baseline so that a model is used where language interpretation helps rather than for arithmetic, authorization or database invariants.
-
-## Architecture and contracts
+### Architecture and contracts
 
 ```text
 Authorization before client -> redaction/budget policy -> memory/context enrichment -> model/tool execution -> output validation -> redacted observations
@@ -582,19 +542,11 @@ AdvisorPolicy(order,requestTransform,responseTransform); RequestContext(tenant,t
 
 Use the CallAdvisor/StreamAdvisor interfaces for the selected release and call the next chain exactly as its contract requires. Interface signatures are version-sensitive; the manuscript distinguishes conceptual sequence from compilable example code.
 
-Separate policy from integration. Identity, permitted evidence, operation state and budgets belong to the application. The model proposes text or actions; its proposal is not proof of a business fact or permission. Preserve input/source/model/prompt versions so that a bad answer can be reproduced without relying on whichever provider default exists later. Keep the distinction between raw conversation history, the selected prompt context and provider-side caching explicit.
-
-## Worked reasoning and capacity example
+### Worked reasoning and capacity example
 
 Three sequential enrichment calls at 100 ms each add at least 300 ms before the model begins. Parallelize only truly independent authorized work; do not hide this latency behind an innocuous advisor name.
 
-Treat every number here as an illustrative assumption unless it is a unit conversion. A context window is a model-specific token limit, not a fixed page/word count. Count the instructions, examples, history, tool schemas/results, evidence and output reservation that the actual endpoint accounts for. Some providers also account for reasoning or multimodal inputs differently; read the selected provider contract and usage metadata. Do not copy a model name, price or maximum context size from a video as a permanent product guarantee.
-
-For latency, split retrieval/enrichment, queue wait, time-to-first-token and total generation. Streaming changes when the user sees text but does not make validation of the final object optional. For cost, sum observed input/output usage over all calls, including retries, judges, rewrites and agent steps. Divide by successful supported tasks as well as by requests. A failed workflow can be expensive even when it returns no final answer.
-
-## Java and Spring AI implementation outline
-
-The following is an **illustrative fragment**, not a complete standalone application unless included in `examples/reference-invariants`. Names such as repositories, authorization services and run decisions represent application-owned ports. Spring AI fragments target the documented **1.1 API family**; this is an explicit educational compatibility baseline, not a claim that it is the newest release. Pin a BOM and read migration documentation before adopting a different family.
+### Java and Spring AI implementation outline
 
 ```java
 // Conceptual chain; adapt actual interfaces to the pinned Spring AI release.
@@ -602,75 +554,42 @@ The following is an **illustrative fragment**, not a complete standalone applica
 // Tests must verify both request and response order, including exceptions.
 ```
 
-Keep request-specific state out of singleton bean fields. Construct a fresh request specification, derive identity from the authenticated request and pass only authorized bounded data to adapters. Place credentials in environment/secret configuration, never in an example prompt, source file or response. When an API supports multiple result forms, choose the one that retains the metadata needed for this use case instead of discarding finish reason/usage by default.
-
-A minimal application test injects a deterministic model/tool adapter with scripted outputs. That test checks wiring, state, authorization and validation without paying for a provider call. A separate integration test checks the pinned SDK/API shape. A quality evaluation checks whether real model outputs satisfy a versioned task rubric. These are three different kinds of evidence; passing one does not prove the others.
-
-## Design decisions and alternatives
+### Design decisions and alternatives
 
 Use advisors for reusable integration concerns, not as a substitute for domain-service authorization. Document chain order and state ownership. Keep request context immutable or narrowly scoped so concurrent calls cannot contaminate each other.
 
-Compare the added mechanism with the simplest baseline on the same inputs. Keep changes attributable: prompt text, model version, chunker, index settings, reranker and tool policy should not all change at once. Document which guarantee the new layer buys and which failure modes it introduces. A framework abstracts common plumbing, while provider-specific support for tools, streaming, schemas, context limits and data residency still needs explicit capability checks.
-
-Prefer a fixed workflow when the task has a stable sequence of steps. If an agent selects actions, bound model calls, tool calls, result bytes, elapsed time and spend. For independent subtasks, parallelism can reduce wall-clock latency but increases simultaneous quota use and may increase total cost. Do not hand every tool and every document to every worker simply because they are available.
-
-## Failure scenario and safe recovery
+### Failure scenario and safe recovery
 
 A debug logger is ordered before redaction and captures private evidence. Tests should assert log fields and chain ordering, not merely that the model returns a string.
 
-Classify the stage that failed. A retrieval miss, unauthorized document, provider timeout, malformed schema, invalid business value and failed external side effect need different handling. Do not turn every exception into a vague “please retry” message. Before retrying, determine whether anything irreversible or billable may already have happened and reuse the original operation identity where the downstream contract supports it.
-
-| Stage | Example symptom | Required response |
-|---|---|---|
-| Input/context | Oversized or unauthorized material | Reject or reduce before sending it to a model |
-| Retrieval | No permitted supporting evidence | Ask for clarification or abstain; do not fabricate a citation |
-| Provider | Timeout, throttling or unavailable capability | Bounded retry/fallback under the same run budget |
-| Parsing | Incomplete or invalid structure | Bounded repair or explicit validation failure |
-| Business validation | Invented ID or inconsistent amount | Reject independent of how fluent the answer sounds |
-| Tool effect | Timeout after possible completion | Query/reconcile operation identity before another action |
-
-Cancellation should propagate through long streams, search calls and tools where supported. Persist necessary workflow state before acknowledging a pending action. When the deadline expires, return an honest partial/incomplete outcome with the evidence already established; do not let a model invent successful completion to make the response sound finished.
-
-## Security, privacy and provenance
+### Security, privacy and provenance
 
 Retries wrapped around the entire advisor chain may repeat retrieval, memory writes or tool effects. Assign retry ownership deliberately.
 
-User text, retrieved passages, file contents, tool descriptions and tool results can all contain hostile instructions. Label their origin and keep them as data. Security comes from deterministic resource authorization, narrow capabilities, bounded execution and controlled destinations, with model-oriented guardrails as an additional imperfect layer. A model can request an operation; only the application can authorize and execute it.
-
-Scope evidence, caches and conversation keys by tenant and authenticated user. A high similarity score cannot justify sharing a cached answer from another tenant. Propagate source updates, permission revocations and deletions into indexes and derived summaries under a documented lifecycle policy. Keep citations to stable source revisions so an answer can be checked against the material actually used.
-
-Log trace IDs, operation identities, model/prompt/index versions, counts, durations and validated failure categories by default. Raw prompts, provider tokens, signed URLs and private passages need explicit handling and retention, not indiscriminate debug logging. A secret removed from the final answer can still have leaked through a tool request or a log before that answer was produced.
-
-## Hands-on lab and evaluation
+### Hands-on lab and evaluation
 
 **Build:** Add one timing advisor and one bounded context enrichment step, then write a test that records before/after order for success, exception and cancellation.
 
 **Measure:** Order correctness, exception propagation, stream cancellation, context isolation and redaction coverage. Record advisor latency in traces without raw sensitive content.
 
-Create a versioned fixture set containing representative supported questions, missing-evidence questions, ambiguous requests and adversarial inputs. State expected evidence and permitted behavior before running the model. Include at least one case in which the correct behavior is to ask for clarification, refuse access, or stop at a budget rather than return a polished answer. Keep development/few-shot examples separate from the held-out set.
-
-Record per-case outcomes and compare against the baseline. Exact tests work for identifiers, schema constraints, authorization and conservation rules. Human/calibrated rubric checks are useful for relevance and evidence support, but a model judge can prefer fluent unsupported prose. Preserve disagreements and evaluate by tenant/language/document type instead of hiding them in one aggregate score. Report dataset size and limitations rather than promising a universal accuracy percentage.
-
-## Follow-up questions with explained answers
-
-**What does the model actually contribute?** Advisors wrap the model interaction and can transform requests and responses. Their order determines whether logging sees raw or redacted text, whether memory precedes retrieval and which errors are visible. A call path and a streaming path may have different contracts.
-
-**What belongs in application code?** The contracts and policies around AdvisorPolicy(order,requestTransform,responseTransform); RequestContext(tenant,traceId,budget); ValidatedResponse. In particular, identity and permission cannot come from a generated argument.
-
-**What is the important trade-off?** Use advisors for reusable integration concerns, not as a substitute for domain-service authorization. Document chain order and state ownership. Keep request context immutable or narrowly scoped so concurrent calls cannot contaminate each other.
-
-**What breaks the naive implementation?** A debug logger is ordered before redaction and captures private evidence. Tests should assert log fields and chain ordering, not merely that the model returns a string.
-
-**How would you test the fix?** Order correctness, exception propagation, stream cancellation, context isolation and redaction coverage. Record advisor latency in traces without raw sensitive content. Use scripted failures for deterministic checks and a separate versioned corpus for model quality.
-
-Close the exercise by tracing the input, authorized evidence, proposed output/action and final validation result. Point to the run budget and the stop condition. If you cannot identify who enforces authority, what supports each factual claim and how the workflow terminates, the design is still a demonstration rather than a dependable product feature.
-
-## Further reading
+### Further reading
 
 - [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
 - [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+
+## Work through hidden costs
+
+If memory adds 3,000 tokens and retrieval adds 8,000 after an earlier 4,000-token budget check, that check no longer protects a 12,000-token limit with output reserve. Validate the assembled prompt near the final model boundary. Record which component contributed tokens so tuning is explainable.
+
+Retries can re-enter parts of a chain depending on the API. Memory writes or external side effects should not repeat blindly. Test ordering with spies/stubs and a known request, then inspect the actual assembled evidence and final result. The repository's general API compile check does not establish every advisor configuration's runtime behaviour.
+
+## Practise, then check your reasoning
+
+1. **Does registering both memory and retrieval automatically guarantee their intended order?** Inspect the selected API's ordering contract and verify the effective chain.
+2. **Should an advisor read an arbitrary conversation ID from generated text?** No. Use application-authorized context.
+3. **Exercise:** build two advisors that annotate a request trace, reverse their order and observe the difference. Then inject two concurrent users and verify no memory or evidence crosses requests.
 
 === AI 13 ===
 N|user|User|0|0|110
@@ -698,15 +617,49 @@ Explain tool (function) calling: how an LLM requests the execution of your code 
 - Read vs. write tools, confirmations, idempotency, errors and timeouts.
 - Security: least privilege, never trusting model-supplied arguments blindly.
 
-## Key concepts and learning objective
+## Learn through a concrete example
+
+A customer asks “Where is order O123?” The model can interpret the question, but the order service knows the current status. A **tool** is an application function described to the model. The model proposes its name and arguments; application code decides whether and how to execute it.
+
+Start with a read-only lookup. Do not expose a general SQL executor or arbitrary HTTP client when one narrow domain operation meets the need. A tool description improves selection; it is not an authorization rule.
+
+## See proposal and enforcement
+
+![Authenticated application identity governs access to model-proposed arguments.](lessons/ai-13-flow.svg)
+
+*Authenticated application identity governs access to model-proposed arguments.*
+
+![Resource authorization runs even when arguments look syntactically valid.](lessons/ai-13-failure.svg)
+
+*Resource authorization runs even when arguments look syntactically valid.*
+
+### Define the narrow boundary
+
+```java
+import org.springframework.ai.tool.annotation.Tool;
+
+// Integration excerpt: authorizedOrders enforces identity outside model arguments.
+final class OrderTools {
+    private final AuthorizedOrderLookup authorizedOrders;
+    OrderTools(AuthorizedOrderLookup lookup) { this.authorizedOrders = lookup; }
+    @Tool(description = "Read the current user's authorized order status")
+    OrderStatus lookupOrder(String orderId) {
+        return authorizedOrders.lookupForCurrentPrincipal(orderId);
+    }
+}
+```
+
+The model does not get to supply `isAdmin=true` or choose another principal. In asynchronous work, propagate or explicitly bind the verified principal through an application-owned context; do not rely on a thread-local surviving arbitrary executor changes.
+
+## Design details and alternatives
+
+### Key concepts and learning objective
 
 **Question to answer:** How can an assistant look up a live order without being allowed to act on arbitrary accounts?
 
 The model proposes a tool name and arguments. The application validates schema, derives authenticated identity, authorizes the resource and executes the tool. Tool result text returns as untrusted data for a later model step; the model never becomes the security principal.
 
-Read this as a system-building exercise, not a glossary to memorize. The running example is an authenticated documentation assistant: it receives a question, finds permitted evidence, answers with source identifiers, and optionally looks up live business data through a narrow read-only tool. Every added component must solve an observed limitation of the simpler version. Begin with a deterministic baseline so that a model is used where language interpretation helps rather than for arithmetic, authorization or database invariants.
-
-## Architecture and contracts
+### Architecture and contracts
 
 ```text
 Model proposes call -> allow-list -> parse/validate -> authorize with server identity -> operation ledger -> execute -> bounded result -> model continuation
@@ -717,19 +670,11 @@ OrderLookup(orderId); ToolContext(tenant,user,requestId); ToolResult(status,data
 
 Spring AI @Tool can expose a narrow method and .tools(instance) can register it for a request. Wrap it in application authorization and bound the result; never expose a generic SQL or shell execution tool to this assistant.
 
-Separate policy from integration. Identity, permitted evidence, operation state and budgets belong to the application. The model proposes text or actions; its proposal is not proof of a business fact or permission. Preserve input/source/model/prompt versions so that a bad answer can be reproduced without relying on whichever provider default exists later. Keep the distinction between raw conversation history, the selected prompt context and provider-side caching explicit.
-
-## Worked reasoning and capacity example
+### Worked reasoning and capacity example
 
 A loop with at most four model steps and two tools per step can still request eight side effects. Bound tool count, elapsed time, output bytes and spend independently, not just recursion depth.
 
-Treat every number here as an illustrative assumption unless it is a unit conversion. A context window is a model-specific token limit, not a fixed page/word count. Count the instructions, examples, history, tool schemas/results, evidence and output reservation that the actual endpoint accounts for. Some providers also account for reasoning or multimodal inputs differently; read the selected provider contract and usage metadata. Do not copy a model name, price or maximum context size from a video as a permanent product guarantee.
-
-For latency, split retrieval/enrichment, queue wait, time-to-first-token and total generation. Streaming changes when the user sees text but does not make validation of the final object optional. For cost, sum observed input/output usage over all calls, including retries, judges, rewrites and agent steps. Divide by successful supported tasks as well as by requests. A failed workflow can be expensive even when it returns no final answer.
-
-## Java and Spring AI implementation outline
-
-The following is an **illustrative fragment**, not a complete standalone application unless included in `examples/reference-invariants`. Names such as repositories, authorization services and run decisions represent application-owned ports. Spring AI fragments target the documented **1.1 API family**; this is an explicit educational compatibility baseline, not a claim that it is the newest release. Pin a BOM and read migration documentation before adopting a different family.
+### Java and Spring AI implementation outline
 
 ```java
 final class OrderTools {
@@ -741,72 +686,40 @@ final class OrderTools {
 // AuthorizedOrders is an application port, not a model-provided identity.
 ```
 
-Keep request-specific state out of singleton bean fields. Construct a fresh request specification, derive identity from the authenticated request and pass only authorized bounded data to adapters. Place credentials in environment/secret configuration, never in an example prompt, source file or response. When an API supports multiple result forms, choose the one that retains the metadata needed for this use case instead of discarding finish reason/usage by default.
-
-A minimal application test injects a deterministic model/tool adapter with scripted outputs. That test checks wiring, state, authorization and validation without paying for a provider call. A separate integration test checks the pinned SDK/API shape. A quality evaluation checks whether real model outputs satisfy a versioned task rubric. These are three different kinds of evidence; passing one does not prove the others.
-
-## Design decisions and alternatives
+### Design decisions and alternatives
 
 Begin with read-only lookup tools. Side effects need operation IDs and a review/confirmation policy appropriate to the action. Descriptions should explain inputs and output semantics but cannot grant permissions.
 
-Compare the added mechanism with the simplest baseline on the same inputs. Keep changes attributable: prompt text, model version, chunker, index settings, reranker and tool policy should not all change at once. Document which guarantee the new layer buys and which failure modes it introduces. A framework abstracts common plumbing, while provider-specific support for tools, streaming, schemas, context limits and data residency still needs explicit capability checks.
-
-Prefer a fixed workflow when the task has a stable sequence of steps. If an agent selects actions, bound model calls, tool calls, result bytes, elapsed time and spend. For independent subtasks, parallelism can reduce wall-clock latency but increases simultaneous quota use and may increase total cost. Do not hand every tool and every document to every worker simply because they are available.
-
-## Failure scenario and safe recovery
+### Failure scenario and safe recovery
 
 A malicious user asks for another account’s order and provides a plausible userId argument. The tool ignores model-supplied identity and checks order ownership using the authenticated context.
 
-Classify the stage that failed. A retrieval miss, unauthorized document, provider timeout, malformed schema, invalid business value and failed external side effect need different handling. Do not turn every exception into a vague “please retry” message. Before retrying, determine whether anything irreversible or billable may already have happened and reuse the original operation identity where the downstream contract supports it.
-
-| Stage | Example symptom | Required response |
-|---|---|---|
-| Input/context | Oversized or unauthorized material | Reject or reduce before sending it to a model |
-| Retrieval | No permitted supporting evidence | Ask for clarification or abstain; do not fabricate a citation |
-| Provider | Timeout, throttling or unavailable capability | Bounded retry/fallback under the same run budget |
-| Parsing | Incomplete or invalid structure | Bounded repair or explicit validation failure |
-| Business validation | Invented ID or inconsistent amount | Reject independent of how fluent the answer sounds |
-| Tool effect | Timeout after possible completion | Query/reconcile operation identity before another action |
-
-Cancellation should propagate through long streams, search calls and tools where supported. Persist necessary workflow state before acknowledging a pending action. When the deadline expires, return an honest partial/incomplete outcome with the evidence already established; do not let a model invent successful completion to make the response sound finished.
-
-## Security, privacy and provenance
+### Security, privacy and provenance
 
 A read-only label is descriptive metadata. Enforce read-only behavior in the implementation and database credentials.
 
-User text, retrieved passages, file contents, tool descriptions and tool results can all contain hostile instructions. Label their origin and keep them as data. Security comes from deterministic resource authorization, narrow capabilities, bounded execution and controlled destinations, with model-oriented guardrails as an additional imperfect layer. A model can request an operation; only the application can authorize and execute it.
-
-Scope evidence, caches and conversation keys by tenant and authenticated user. A high similarity score cannot justify sharing a cached answer from another tenant. Propagate source updates, permission revocations and deletions into indexes and derived summaries under a documented lifecycle policy. Keep citations to stable source revisions so an answer can be checked against the material actually used.
-
-Log trace IDs, operation identities, model/prompt/index versions, counts, durations and validated failure categories by default. Raw prompts, provider tokens, signed URLs and private passages need explicit handling and retention, not indiscriminate debug logging. A secret removed from the final answer can still have leaked through a tool request or a log before that answer was produced.
-
-## Hands-on lab and evaluation
+### Hands-on lab and evaluation
 
 **Build:** Implement a read-only stock/order tool; test nonexistent IDs, foreign-tenant IDs, oversized arguments, duplicate calls and a provider timeout following a completed tool.
 
 **Measure:** Task success, correct tool selection, unauthorized attempts blocked, argument validity, duplicate effects and tool latency/error classification.
 
-Create a versioned fixture set containing representative supported questions, missing-evidence questions, ambiguous requests and adversarial inputs. State expected evidence and permitted behavior before running the model. Include at least one case in which the correct behavior is to ask for clarification, refuse access, or stop at a budget rather than return a polished answer. Keep development/few-shot examples separate from the held-out set.
-
-Record per-case outcomes and compare against the baseline. Exact tests work for identifiers, schema constraints, authorization and conservation rules. Human/calibrated rubric checks are useful for relevance and evidence support, but a model judge can prefer fluent unsupported prose. Preserve disagreements and evaluate by tenant/language/document type instead of hiding them in one aggregate score. Report dataset size and limitations rather than promising a universal accuracy percentage.
-
-## Follow-up questions with explained answers
-
-**What does the model actually contribute?** The model proposes a tool name and arguments. The application validates schema, derives authenticated identity, authorizes the resource and executes the tool. Tool result text returns as untrusted data for a later model step; the model never becomes the security principal.
-
-**What belongs in application code?** The contracts and policies around OrderLookup(orderId); ToolContext(tenant,user,requestId); ToolResult(status,data,errorCode). In particular, identity and permission cannot come from a generated argument.
-
-**What is the important trade-off?** Begin with read-only lookup tools. Side effects need operation IDs and a review/confirmation policy appropriate to the action. Descriptions should explain inputs and output semantics but cannot grant permissions.
-
-**What breaks the naive implementation?** A malicious user asks for another account’s order and provides a plausible userId argument. The tool ignores model-supplied identity and checks order ownership using the authenticated context.
-
-**How would you test the fix?** Task success, correct tool selection, unauthorized attempts blocked, argument validity, duplicate effects and tool latency/error classification. Use scripted failures for deterministic checks and a separate versioned corpus for model quality.
-
-Close the exercise by tracing the input, authorized evidence, proposed output/action and final validation result. Point to the run budget and the stop condition. If you cannot identify who enforces authority, what supports each factual claim and how the workflow terminates, the design is still a demonstration rather than a dependable product feature.
-
-## Further reading
+### Further reading
 
 - [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
 - [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+
+## Work through write tools
+
+A refund tool needs stronger handling than a status lookup: validate amount, eligibility, current state, operation identity and required user review. Persist intent and reconcile provider uncertainty. A model retry after a lost response must not create another refund.
+
+Limit tool count, payload size and duration. Validate tool results before sending them back; external results can contain instructions and should remain data. For the pinned 1.1 API family, use its documented execution behaviour rather than copying a newer-version advisor loop without verification.
+
+## Practise, then check your reasoning
+
+1. **Does `@Tool` make a method safe?** No. It exposes a callable contract; domain authorization and validation remain necessary.
+2. **Should tools return raw database rows?** Return minimal typed data needed for the task, excluding secrets and unrelated personal fields.
+3. **Exercise:** test owned order, forbidden order, malformed ID, service timeout and repeated refund intent. Assert no unauthorized reads and at most one committed financial effect.
+
