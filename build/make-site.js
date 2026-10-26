@@ -76,8 +76,8 @@ write("data/meta.json", { days: dayFiles.map((f) => Number(/\d+/.exec(f)[0])), p
 <title>KB topics by week (JSON)</title>
 <link rel="alternate" type="application/json" href="../topics.json">
 <style>
-  :root { color-scheme: light dark; --bg: #ffffff; --fg: #1f2937; --muted: #6b7280; --link: #1c39bb; }
-  @media (prefers-color-scheme: dark) { :root { --bg: #0f1115; --fg: #e5e7eb; --muted: #9ca3af; --link: #8ea2ff; } }
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #0b0d12; --muted: #5a5f6b; --link: #1f1a4d; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #0b0d12; --fg: #ffffff; --muted: #a0a6b0; --link: #ffffff; } }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   header { padding: 10px 16px; border-bottom: 1px solid rgba(127,127,127,.25); color: var(--muted); font-family: system-ui, sans-serif; }
   a { color: var(--link); }
@@ -101,12 +101,11 @@ write("data/fundamentals.json", fund);
 // ---- page: load the web layer first, and describe the site for search and link previews ----
 const idx = path.join(OUT, "index.html");
 let html = fs.readFileSync(idx, "utf8");
-html = html.replace(/<title>[^<]*<\/title>/, `<title>KB · AI interview coach</title>
-  <meta name="description" content="Practise LLD, HLD, AI system design and DSA: 60 design problems, 37 read-first chapters and 304 DSA problems by pattern. Sign in with Google to save your progress to your own Drive, and get AI grading and a tutor with your own key (Claude, Grok, Gemini or OpenAI)." />`);
+html = html.replace(/<title>[^<]*<\/title>/, "<title>KB · Learn by doing · Coding Saint</title>");
 html = html.replace('<script src="app.js"></script>', '<script src="config.js"></script>\n  <script src="core/shared.js"></script>\n  <script src="core/llm.js"></script>\n  <script src="drive.js"></script>\n  <script src="pro.js"></script>\n  <script src="web.js"></script>\n  <script src="app.js"></script>');
 // Installable app: manifest, theme colour and home-screen icon.
 html = html.replace("</head>", `  <link rel="manifest" href="manifest.webmanifest" />
-  <meta name="theme-color" content="#1c39bb" />
+  <meta name="theme-color" content="#1F1A4D" />
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
   <meta name="mobile-web-app-capable" content="yes" />
 </head>`);
@@ -126,9 +125,9 @@ write("config.js", `window.KB_SITE = ${JSON.stringify(siteCfg, null, 2)};\n`);
 
 // ---- installable app (PWA; also what the Android app opens) ----
 write("manifest.webmanifest", JSON.stringify({
-  name: "KB · AI interview coach", short_name: "KB", id: "./", start_url: "./?source=pwa", scope: "./",
-  display: "standalone", orientation: "any", background_color: "#ffffff", theme_color: "#1c39bb",
-  description: "Practise LLD, HLD, AI system design and DSA with an AI grader and tutor. Your progress lives in your Google Drive.",
+  name: "KB · Learning by Coding Saint", short_name: "KB", id: "./", start_url: "./?source=pwa", scope: "./",
+  display: "standalone", orientation: "any", background_color: "#ffffff", theme_color: "#1F1A4D",
+  description: "Explore system design, AI and DSA through practical learning, clear references and an AI tutor.",
   categories: ["education", "productivity"],
   icons: [
     { src: "icons/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },

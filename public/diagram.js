@@ -70,7 +70,7 @@
     // Re-render once the UI font has loaded so label metrics are right.
     if (document.fonts && document.fonts.status !== "loaded" && !container._fontWait) {
       container._fontWait = true;
-      document.fonts.load('16px "Inter Variable"').then(() => container.isConnected && render(container, spec, seedKey));
+      document.fonts.load('16px "Manrope"').then(() => container.isConnected && render(container, spec, seedKey));
     }
     container.innerHTML = "";
     if (!spec || !Array.isArray(spec.nodes) || !spec.nodes.length) {
@@ -92,8 +92,8 @@
     svg.setAttribute("role", "img");
     svg.setAttribute("aria-label", "Diagram: " + nodes.map((n) => n.label).join(", "));
     container.appendChild(svg);
-    // Clean, flat style: rounded boxes in pale Persian blue, datastores in pale cyan,
-    // thin slate connectors with solid arrowheads.
+    // Clean, flat style using the active Coding Saint theme tokens.
+    // Muted connectors distinguish data flow from the node outlines.
     const accent = css("--accent"), accentSoft = css("--accent-soft"), sub = css("--sub"), subSoft = css("--sub-soft"), text_ = css("--text");
     const el = (tag, attrs, parent = svg) => {
       const e = document.createElementNS(NS, tag);
