@@ -35,29 +35,52 @@ public final class Elevators {
             return floors;
         }
         // region:look
-        Goal next(int floor,Direction heading) {
-            TreeSet<Integer> up=new TreeSet<>(cabin);up.addAll(halls(Direction.UP));
-            TreeSet<Integer> down=new TreeSet<>(cabin);down.addAll(halls(Direction.DOWN));
-            if(up.isEmpty()&&down.isEmpty())return null;
-            if(heading==Direction.IDLE) {
-                TreeSet<Integer> all=new TreeSet<>(up);all.addAll(down);
-                int closest=all.stream().min(Comparator.comparingInt((Integer f)->Math.abs(f-floor)).thenComparingInt(f->f)).orElseThrow();
-                if(closest==floor)return new Goal(floor,halls(Direction.UP).contains(floor)?Direction.UP:
-                    halls(Direction.DOWN).contains(floor)?Direction.DOWN:Direction.IDLE);
-                return next(floor,closest>floor?Direction.UP:Direction.DOWN);
+        Goal next(int floor, Direction heading) {
+            TreeSet<Integer> up = new TreeSet<>(cabin);
+            up.addAll(halls(Direction.UP));
+            TreeSet<Integer> down = new TreeSet<>(cabin);
+            down.addAll(halls(Direction.DOWN));
+            if (up.isEmpty() && down.isEmpty()) {
+                return null;
             }
-            if(heading==Direction.UP) {
-                Integer matching=up.ceiling(floor);
-                if(matching!=null)return new Goal(matching,Direction.UP);
-                if(!down.isEmpty()&&down.last()>floor)return new Goal(down.last(),Direction.DOWN);
-                if(down.contains(floor))return new Goal(floor,Direction.DOWN);
-                return next(floor,Direction.DOWN);
+            if (heading == Direction.IDLE) {
+                TreeSet<Integer> all = new TreeSet<>(up);
+                all.addAll(down);
+                int closest = all.stream()
+                    .min(Comparator.comparingInt((Integer f) -> Math.abs(f - floor))
+                        .thenComparingInt(f -> f))
+                    .orElseThrow();
+                if (closest == floor) {
+                    Direction boarding = halls(Direction.UP).contains(floor) ? Direction.UP
+                        : halls(Direction.DOWN).contains(floor) ? Direction.DOWN : Direction.IDLE;
+                    return new Goal(floor, boarding);
+                }
+                return next(floor, closest > floor ? Direction.UP : Direction.DOWN);
             }
-            Integer matching=down.floor(floor);
-            if(matching!=null)return new Goal(matching,Direction.DOWN);
-            if(!up.isEmpty()&&up.first()<floor)return new Goal(up.first(),Direction.UP);
-            if(up.contains(floor))return new Goal(floor,Direction.UP);
-            return next(floor,Direction.UP);
+            if (heading == Direction.UP) {
+                Integer matching = up.ceiling(floor);
+                if (matching != null) {
+                    return new Goal(matching, Direction.UP);
+                }
+                if (!down.isEmpty() && down.last() > floor) {
+                    return new Goal(down.last(), Direction.DOWN);
+                }
+                if (down.contains(floor)) {
+                    return new Goal(floor, Direction.DOWN);
+                }
+                return next(floor, Direction.DOWN);
+            }
+            Integer matching = down.floor(floor);
+            if (matching != null) {
+                return new Goal(matching, Direction.DOWN);
+            }
+            if (!up.isEmpty() && up.first() < floor) {
+                return new Goal(up.first(), Direction.UP);
+            }
+            if (up.contains(floor)) {
+                return new Goal(floor, Direction.UP);
+            }
+            return next(floor, Direction.UP);
         }
         // endregion:look
     }
@@ -73,27 +96,57 @@ public final class Elevators {
         CarSnapshot snapshot(){return new CarSnapshot(id,floor,capacity,load,heading,boarding,door,mode,obstructed,interlock,new ArrayList<>(plan.cabin),new ArrayList<>(plan.hall.values()));}
         // region:tick
         Tick tick() {
-            int from=floor;Action action;List<HallTask> pickups=List.of();
-            if(mode==Mode.OUT_OF_SERVICE)action=Action.OUT_OF_SERVICE;
-            else if(door==Door.OPENING) {
-                door=Door.OPEN;action=Action.OPENED;plan.cabin.remove(floor);
-                if(load<capacity)pickups=plan.hall.values().stream()
-                    .filter(h->h.key.floor==floor&&h.key.direction==boarding).toList();
-            }else if(door==Door.OPEN) {
-                if(obstructed||load>capacity)action=Action.BLOCKED;
-                else {door=Door.CLOSING;action=Action.CLOSING;}
-            }else if(door==Door.CLOSING) {
-                if(obstructed||load>capacity){door=Door.OPENING;action=Action.OPENING;}
-                else {door=Door.CLOSED;action=Action.CLOSED;}
-            }else if(load>capacity){door=Door.OPENING;action=Action.OPENING;}
-            else if(obstructed||!interlock)action=Action.BLOCKED;
-            else {
-                Goal next=plan.next(floor,heading);
-                if(next==null){heading=Direction.IDLE;action=Action.IDLE;}
-                else if(next.floor==floor){boarding=next.boarding;heading=boarding;door=Door.OPENING;action=Action.OPENING;}
-                else {heading=next.floor>floor?Direction.UP:Direction.DOWN;floor+=heading==Direction.UP?1:-1;action=Action.MOVED;}
+            int from = floor;
+            Action action;
+            List<HallTask> pickups = List.of();
+            if (mode == Mode.OUT_OF_SERVICE) {
+                action = Action.OUT_OF_SERVICE;
+            } else if (door == Door.OPENING) {
+                door = Door.OPEN;
+                action = Action.OPENED;
+                plan.cabin.remove(floor);
+                if (load < capacity) {
+                    pickups = plan.hall.values().stream()
+                        .filter(h -> h.key.floor == floor && h.key.direction == boarding)
+                        .toList();
+                }
+            } else if (door == Door.OPEN) {
+                if (obstructed || load > capacity) {
+                    action = Action.BLOCKED;
+                } else {
+                    door = Door.CLOSING;
+                    action = Action.CLOSING;
+                }
+            } else if (door == Door.CLOSING) {
+                if (obstructed || load > capacity) {
+                    door = Door.OPENING;
+                    action = Action.OPENING;
+                } else {
+                    door = Door.CLOSED;
+                    action = Action.CLOSED;
+                }
+            } else if (load > capacity) {
+                door = Door.OPENING;
+                action = Action.OPENING;
+            } else if (obstructed || !interlock) {
+                action = Action.BLOCKED;
+            } else {
+                Goal next = plan.next(floor, heading);
+                if (next == null) {
+                    heading = Direction.IDLE;
+                    action = Action.IDLE;
+                } else if (next.floor == floor) {
+                    boarding = next.boarding;
+                    heading = boarding;
+                    door = Door.OPENING;
+                    action = Action.OPENING;
+                } else {
+                    heading = next.floor > floor ? Direction.UP : Direction.DOWN;
+                    floor += heading == Direction.UP ? 1 : -1;
+                    action = Action.MOVED;
+                }
             }
-            return new Tick(id,action,from,floor,heading,pickups);
+            return new Tick(id, action, from, floor, heading, pickups);
         }
         // endregion:tick
     }
@@ -163,25 +216,41 @@ public final class Elevators {
             dispatch();return List.copyOf(results);
         }
         // region:ownership
-        public synchronized boolean acknowledgePickup(long callId,String carId,long epoch) {
-            Request r=requests.get(callId);Car c=car(carId);
-            if(r==null||r.state!=CallState.ASSIGNED||!carId.equals(r.carId)||r.epoch!=epoch)return false;
-            if(c.door!=Door.OPEN||c.floor!=r.key.floor||c.boarding!=r.key.direction||c.load>=c.capacity||c.mode!=Mode.NORMAL)return false;
-            r.state=CallState.SERVED;active.remove(r.key,r.id);
-            c.plan.hall.remove(callId,new HallTask(callId,r.key,epoch));return true;
+        public synchronized boolean acknowledgePickup(long callId, String carId, long epoch) {
+            Request request = requests.get(callId);
+            Car car = car(carId);
+            if (request == null || request.state != CallState.ASSIGNED
+                    || !carId.equals(request.carId) || request.epoch != epoch) {
+                return false;
+            }
+            if (car.door != Door.OPEN || car.floor != request.key.floor
+                    || car.boarding != request.key.direction || car.load >= car.capacity
+                    || car.mode != Mode.NORMAL) {
+                return false;
+            }
+            request.state = CallState.SERVED;
+            active.remove(request.key, request.id);
+            car.plan.hall.remove(callId, new HallTask(callId, request.key, epoch));
+            return true;
         }
         public synchronized void outOfService(String carId) {
-            Car c=car(carId);c.mode=Mode.OUT_OF_SERVICE;releaseHallCalls(c);dispatch();
+            Car car = car(carId);
+            car.mode = Mode.OUT_OF_SERVICE;
+            releaseHallCalls(car);
+            dispatch();
             // Cabin destinations remain: existing passengers require an operator recovery procedure.
         }
-        private void releaseHallCalls(Car c) {
-            for(HallTask h:new ArrayList<>(c.plan.hall.values())) {
-                Request r=requests.get(h.callId);
-                if(r!=null&&r.state==CallState.ASSIGNED&&c.id.equals(r.carId)&&r.epoch==h.epoch) {
-                    r.state=CallState.WAITING;r.carId=null;r.epoch++;
+        private void releaseHallCalls(Car car) {
+            for (HallTask task : new ArrayList<>(car.plan.hall.values())) {
+                Request request = requests.get(task.callId);
+                if (request != null && request.state == CallState.ASSIGNED
+                        && car.id.equals(request.carId) && request.epoch == task.epoch) {
+                    request.state = CallState.WAITING;
+                    request.carId = null;
+                    request.epoch++;
                 }
             }
-            c.plan.hall.clear();
+            car.plan.hall.clear();
         }
         // endregion:ownership
         public synchronized void load(String carId,int passengers){if(passengers<0)throw new IllegalArgumentException("Negative load");Car c=car(carId);c.load=passengers;if(passengers>=c.capacity)releaseHallCalls(c);dispatch();}

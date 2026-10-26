@@ -1,10 +1,10 @@
 # Chess, Parking Lot and Elevator: worked LLD answers
 
-## Parking Lot clarity review
+## Clearer worked answers and table colours
 
-The follow-up changes **Parking Lot only**. It follows one vehicle/ticket through entry, payment and exit; explains terms after their everyday meaning; keeps the complete answer and useful physical/flow diagrams; and removes competitor links and the duplicate code-like class picture from the lesson. The Java excerpts are selectable text with readable spacing, copied from the complete source. Research provenance stays in this repository note.
+The Parking Lot sample established the accepted teaching style. Chess and Elevator now use the same approach: begin with a concrete example, explain class responsibilities in plain language, introduce terms after their meaning, and then work through the implementation and difficult cases. Useful board/building/flow diagrams remain; the duplicate class pictures and competitor links are removed from these customer lessons. Java excerpts are selectable text copied from the complete source. Research provenance stays in this repository note.
 
-Chess, Elevator and the other 57 references are unchanged by this follow-up. The single-article correction is for owner review before applying the style elsewhere or publishing it. Earlier technical checks below do not establish learner approval.
+Only these three references are rewritten; the other 57 remain unchanged. The shared Markdown table style now uses theme colours for body-cell text, fixing the fee table's dark text on a dark background. Verify the actual fee values and the other articles' tables in light and dark themes. Earlier technical checks below do not establish learner approval.
 
 This revision replaces only **LLD-1, LLD-2 and LLD-3**. Each reference presents a chosen solution, ownership/contracts, complete worked execution, failure/recovery decisions, trade-offs and answered follow-ups. Other LLD, HLD, AI and prerequisite material is outside this revision.
 
