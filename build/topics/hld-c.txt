@@ -27,7 +27,29 @@ Design a distributed job scheduler (like a cloud cron, Airflow's scheduler core,
 - Millions of jobs; tens of thousands firing per minute at peaks (on-the-hour spikes).
 - No missed runs when nodes die. Avoid duplicate runs (or make them harmless).
 
-## Architecture
+## Learn through a concrete example
+
+A report should run at 09:00, but two scheduler replicas wake together. Both may enqueue it unless one authority claims that occurrence. A **schedule** defines future intent; an **execution** is one occurrence; an **attempt** is one worker's try. Keeping these separate makes retries and audit history understandable.
+
+Start with a durable jobs table and leases. A **lease** expires after a bounded time so another worker can recover abandoned work. A **fencing token** increases with each ownership grant so an old worker can be rejected after losing its lease.
+
+## See scheduling and stale ownership
+
+![Schedule identity plus intended fire time deduplicates dispatch.](lessons/hld-15-flow.svg)
+
+*Schedule identity plus intended fire time deduplicates dispatch.*
+
+![The side-effect boundary must reject stale fencing tokens.](lessons/hld-15-failure.svg)
+
+*The side-effect boundary must reject stale fencing tokens.*
+
+### Calculate backlog
+
+At 100 jobs/s and a 5-second average runtime, nominal concurrency is about 500. If workers sustain only 80 completions/s, backlog grows 20/s. A larger polling batch does not fix insufficient execution capacity. Keep queue depth, oldest-ready age and running lease age separate.
+
+## Design details and alternatives
+
+### Architecture
 
 - **Job store** (SQL or a partitioned KV) with an index on `next_run_at`.
 - **Scheduler**: poll for due jobs (`next_run_at <= now`) in small batches, enqueue a *run* to a queue, and compute the next `next_run_at` (for cron) in the same transaction.
@@ -35,7 +57,7 @@ Design a distributed job scheduler (like a cloud cron, Airflow's scheduler core,
 - **Workers** pull runs from the queue, heartbeat while running, write results, and ack. Failed runs are retried with backoff, then go to a DLQ.
 - An optional **timing wheel** in memory holds jobs due in the next minute for precise firing.
 
-## Key design decisions & trade-offs
+### Key design decisions & trade-offs
 
 **1. Claiming due jobs safely.** Multiple scheduler replicas could pick up the same row. Either use partition ownership via leases, or atomically claim with `UPDATE … SET status='ENQUEUED', owner=? WHERE id=? AND status='SCHEDULED'` / `SELECT … FOR UPDATE SKIP LOCKED`.
 
@@ -49,17 +71,13 @@ Design a distributed job scheduler (like a cloud cron, Airflow's scheduler core,
 
 **6. DAG dependencies.** For workflows, a run becomes ready only when its upstream runs succeed. Store dependencies and evaluate on completion events.
 
-## Scope, guarantees and sizing assumptions
+### Scope, guarantees and sizing assumptions
 
 **Correctness requirement:** A schedule firing has a stable identity and stale workers cannot commit after lease ownership changes.
 
 Assume 10 million scheduled jobs distributed evenly over a day: 116 due/s. A million jobs scheduled at midnight create a burst orders of magnitude larger. With 1 KB metadata each, 10 GB raw metadata excludes run history.
 
-These are illustrative planning assumptions, not published traffic statistics or benchmark results. Recalculate the model when retention, payload size, tenant mix or peak factor changes. Show units throughout: average QPS is operations divided by seconds, bandwidth is bytes per operation multiplied by operations per second, and stored bytes are arrivals multiplied by retention and record size. Keep decimal GB/TB distinct from binary GiB/TiB when comparing vendor capacity. Replication, indexes, compaction/write amplification, backups and spare capacity are separate multipliers, not free implementation details.
-
-Use the estimate to identify the first bottleneck, not to justify every distributed component. Ask which single key or customer can dominate the average. Measure a simple durable baseline before adding partitions. If a design serves a different workload than the stated assumption, explain the change rather than quietly inventing a larger number.
-
-## API contracts and data ownership
+### API contracts and data ownership
 
 ```text
 POST /schedules with timezone and misfire policy; cancel schedule; GET /runs/{id}; worker claim/heartbeat/complete
@@ -73,76 +91,35 @@ Primary access/partitioning boundary:
 due_time bucket for discovery; job_id/run_id for state and execution idempotency
 ```
 
-Specify authentication, authorization, body limits and idempotency at the API boundary. The same idempotency key with the same payload returns the original result; the same key with a different payload is a conflict. Persist the payload fingerprint and outcome where retries can cross process restarts. Return stable resource/operation IDs so clients can query a pending or unknown outcome. Use cursor-based continuation for changing datasets and define the sort/snapshot semantics.
-
-An API sketch is incomplete without its authoritative records. Distinguish transactional state from projections and caches. A projection can be rebuilt; the committed ownership/history cannot. Define who may mutate each record and which fields must change atomically. A convenient cache key is not necessarily a safe database partition key, and a healthy load balancer does not choose primary-versus-replica reads on behalf of the database client.
-
-## Build the architecture in stages
-
-**Stage 1 — Correct baseline.** Keep one service boundary around the core transaction, durable records indexed for the dominant access path, explicit dependency adapters and basic operational metrics. Exercise the stated invariant with concurrent requests before introducing asynchronous replicas. Avoid coupling the primary user result to optional analytics, notifications or recommendation work.
-
-**Stage 2 — Measured scaling.** Add stateless request handlers and connection pools to absorb concurrent work. Cache only data whose freshness/authorization policy allows it. Introduce a durable queue when asynchronous work has an independent lifetime; define acceptance and completion separately. Autoscaling handlers cannot fix a single hot partition or an overwhelmed external provider.
+### Build the architecture in stages
 
 **Stage 3 — Partition and isolate.** Partition around due_time bucket for discovery; job_id/run_id for state and execution idempotency. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
 
-**Stage 4 — Regional resilience when required.** State the recovery point objective (acceptable lost acknowledged data) and recovery time objective (acceptable outage duration). A second region is useful only if it has usable data, credentials, capacity and a tested failover route. Prefer one write authority per conflicting resource until the product genuinely needs multi-writer conflict resolution.
-
-## Trace the critical request
+### Trace the critical request
 
 Persist schedule; find due buckets; atomically create/claim a unique firing; assign a worker lease and fencing epoch; execute with a run identity; heartbeat within a bounded lifetime; conditionally commit completion; compute next firing under the chosen recurrence policy.
 
-At each hop name the input, output, timeout and durable fact. A synchronous success response should follow the promised commit point. If work continues in the background, return an operation ID and status rather than implying completion. Publish committed work through a transactional outbox or a comparably reliable mechanism; a database write followed by a best-effort publish has a failure gap.
-
-Do not place optional telemetry on the critical dependency chain. At the same time, “asynchronous” does not mean unbounded, durable or free: select queue capacity, retry deadlines, ordering scope and a poison-message policy. Consumers should record stable event identities or use conditional domain transitions so a redelivery has a safe effect. Broker-level transaction features do not automatically make an external payment, SMS or file write exactly once.
-
-## Deep dive: the decision that changes this system
+### Deep dive: the decision that changes this system
 
 At-least-once execution is realistic when a worker may perform an effect and crash before recording success. The downstream operation needs the run idempotency key. A fencing epoch must be checked by the resource being modified, not merely logged by the scheduler.
 
-The important partitioning question is not merely where bytes are stored but where conflicting operations meet. Different partitions may progress independently, while operations touching the same authority need ordering or conflict detection. A stale cache/read replica can improve latency, but its allowed staleness must match the operation. A user-facing ownership/payment decision often requires a stronger path than a browsing view.
-
-Do not use “eventual consistency” as a blanket explanation. Name the observable anomaly, the acceptable window and the remedy: stale reads, lost updates, duplicate effects, reordered events, or incomplete projections are different problems. Version/tombstone checks, conditional writes, durable deduplication and reconciliation solve different parts of that list. Include the client-visible response when a guarantee cannot be met.
-
-## Failure and race-condition walkthrough
+### Failure and race-condition walkthrough
 
 A paused worker outlives its lease, another worker completes the run, then the old worker resumes. Reject stale completion and stale resource writes. A lock TTL without resource-side epoch validation does not solve this.
 
-| Failure point | Question to answer | Recovery evidence |
-|---|---|---|
-| Before durable commit | Did anything become authoritative? | No committed operation means a safe fresh attempt |
-| Commit succeeds, response is lost | How does the client avoid duplication? | Stable request/operation identity and stored result |
-| Cache/projection is stale | Can it decide this operation? | Read policy, version, tombstone or authoritative fallback |
-| Worker lease expires | Can the old worker still mutate state? | Fencing epoch checked at the resource boundary |
-| Dependency is unavailable | Is work rejected, queued or degraded? | Bounded deadline, queue and explicit product outcome |
-| Recovery replays events | How is a repeated effect detected? | Event identity or idempotent domain transition |
+### Security, tenancy and lifecycle
 
-A timeout does not prove the remote side failed. Keep unknown outcomes distinct from rejected ones, especially around external side effects. Retry within a shared deadline, with jitter and one clear retry owner. If a gateway, SDK and worker each retry independently, a small outage becomes a load amplifier. Circuit breakers stop some repeated calls but do not create downstream capacity or reverse an already committed effect.
-
-## Security, tenancy and lifecycle
-
-Authorize the resource before reading private records or generating signed references. Derive tenant/principal from authenticated context rather than a freely supplied body field. Scope cache keys, events and deduplication identities by the relevant ownership boundary. Validate untrusted URLs and payloads at egress/parser boundaries. Avoid putting credentials, full personal payloads or signed access tokens in normal logs.
-
-Retention is part of architecture. Define when source records, indexes, object blobs, replicas, caches and backups stop exposing deleted data; deleting one primary row is not a complete lifecycle policy. Keep the minimum history necessary to diagnose/reconcile operations under the product's requirements. Admin repair paths need authorization and audit just as much as public APIs.
-
-## Trade-offs and a starting recommendation
+### Trade-offs and a starting recommendation
 
 Polling a small due-time range is simple; timing wheels reduce scheduling overhead but need durable recovery. Cron local times need policies for skipped/repeated daylight-saving instants and missed firings after outage.
 
-Present each alternative as a cost paid for a guarantee. SQL versus a KV store is about access paths, consistency and operating constraints, not a slogan that relational databases cannot scale. Caching buys latency at a freshness/invalidation cost. A queue decouples throughput at the cost of lag, replay and monitoring. Cross-region writes buy local write availability at the cost of coordination or application conflict resolution. A system does not become more correct merely by adding a named infrastructure product.
-
-For migrations, version schemas and event payloads; deploy readers that accept both compatible forms before writers emit the new form. Backfill in bounded batches, compare counts/checksums or domain invariants, move a small cohort, monitor, and retain rollback data until the cutover is proven. Rollback must account for writes made during the new version; restoring an old binary alone may not restore an old data model.
-
-## SLOs, failure drills and lab
+### SLOs, failure drills and lab
 
 Start lateness, successful completion, duplicate effects, oldest due job, lease churn and dead-letter age.
 
 **Test matrix:** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence.
 
-Build a load generator that models hot keys, retries and realistic arrival bursts rather than a uniform loop over random IDs. Separate p50, p95 and p99 latency, success/error/degraded outcomes, and cache-hit/miss paths. Test at steady state, after cold start, during one component failure and throughout recovery. A system that survives the outage but collapses while replaying backlog has not completed its failure test.
-
-Make a drill reproducible: state the starting dataset, failure time, expected invariant, maximum backlog and recovery criterion. Capture an operation trace that includes versions and identities, then verify the durable result after restart. Verify correctness and data-loss policy in addition to response latency; an API that returns quickly while double-selling or dropping acknowledged work has failed.
-
-## Follow-up questions with answers
+### Follow-up questions with answers
 
 **What cannot be eventually consistent here?** The operation establishing this guarantee: A schedule firing has a stable identity and stale workers cannot commit after lease ownership changes.
 
@@ -154,13 +131,23 @@ Make a drill reproducible: state the starting dataset, failure time, expected in
 
 **How would you demonstrate the design works?** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence. Keep the expected invariant and recovery outcome visible in the results.
 
-Conclude a walkthrough by narrating one successful critical request, one concurrent conflict and one uncertain failure. Name the durable authority, the partition key, the commit point and the observable recovery policy. Those four facts are more useful than a diagram whose boxes all say “highly available”.
-
-## Further reading
+### Further reading
 
 - [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+
+## Work through delivery semantics
+
+Most practical schedulers offer at-least-once attempts. Side effects need job-level idempotency or a destination that enforces fencing. A lease alone cannot stop a paused process from acting. Retries should preserve execution identity but create new attempt IDs.
+
+Cron schedules need a timezone and a policy for missed/duplicated local times and downtime: skip, run once or catch up every occurrence. A poison job needs bounded retries and an inspectable final state; infinite immediate retry can starve useful work.
+
+## Practise, then check your reasoning
+
+1. **Is “job started” equivalent to completed?** No. Record attempts, heartbeat/checkpoint and final result.
+2. **Can a scheduler promise one email merely by using a lock?** No. The email boundary must handle retries/uncertainty too.
+3. **Exercise:** pause a worker past its lease, allow reassignment and resume the old worker. Verify the external write rejects the stale token and only the valid attempt can complete the execution.
 
 === HLD 16 ===
 N|apps|Apps/Agents|0|130|130
@@ -193,7 +180,29 @@ Design a centralised logging and monitoring system (like ELK, Splunk or Datadog 
 
 **Scale:** 10k services emitting 5 TB/day ≈ 60 MB/s average, 5× bursts during incidents. Hot index ~35 TB for 7 days before replication.
 
-## Architecture
+## Learn through a concrete example
+
+A checkout fails across gateway, order and payment services. Logs are useful only if you can connect those events and find them before retention removes them. A log platform ingests append-oriented records, buffers bursts, builds searchable representations and enforces access/retention.
+
+A **trace ID** connects a request's work; a **structured log field** makes attributes searchable; a **partition** distributes ingestion; a **retention tier** balances speed and cost. Metrics summarize populations, while logs preserve selected events. They complement one another.
+
+## See ingestion and pressure handling
+
+![Buffering and indexing add delay that must be measured.](lessons/hld-16-flow.svg)
+
+*Buffering and indexing add delay that must be measured.*
+
+![Unbounded logging can take down the application it observes.](lessons/hld-16-failure.svg)
+
+*Unbounded logging can take down the application it observes.*
+
+### Calculate storage and safety
+
+At one million events/s and 500 bytes/event, raw input is 500 MB/s or 43.2 TB/day. Thirty days is roughly 1.3 PB before compression, indexes and replication. Retention and field-index policy matter more than choosing an arbitrary database brand.
+
+## Design details and alternatives
+
+### Architecture
 
 1. **Agents** on each host (Fluent Bit, Vector) tail files or stdout, batch, compress and ship. A local disk buffer covers network blips.
 2. **Kafka** is the ingestion buffer, partitioned by service. It absorbs bursts and decouples producers from indexers.
@@ -201,7 +210,7 @@ Design a centralised logging and monitoring system (like ELK, Splunk or Datadog 
 4. **Hot store:** Elasticsearch/OpenSearch (or a columnar store like ClickHouse or Loki-style label indexes), with time-based indexes per day for cheap deletion.
 5. **Cold store:** compressed Parquet on S3, queryable with Athena/Trino when needed.
 
-## Key design decisions & trade-offs
+### Key design decisions & trade-offs
 
 **1. Full-text index vs. label-only index.** Elasticsearch indexes every token, so search is powerful but storage and CPU cost 1.5–3× the raw size. Loki indexes only labels and scans compressed chunks, which is much cheaper but slower for needle-in-haystack searches. Pick per use case or tier.
 
@@ -215,17 +224,13 @@ Design a centralised logging and monitoring system (like ELK, Splunk or Datadog 
 
 **6. Correlation.** Inject trace IDs everywhere, so logs, metrics and traces link up during an incident.
 
-## Scope, guarantees and sizing assumptions
+### Scope, guarantees and sizing assumptions
 
 **Correctness requirement:** Accepted telemetry has a declared durability and loss policy; ingestion acknowledgement does not imply it is searchable yet.
 
 Assume 100,000 services x 10 log events/s x 500 bytes = 500 MB/s, about 43.2 TB/day raw. Compression and sampling change storage substantially and must be measured, not assumed to be free.
 
-These are illustrative planning assumptions, not published traffic statistics or benchmark results. Recalculate the model when retention, payload size, tenant mix or peak factor changes. Show units throughout: average QPS is operations divided by seconds, bandwidth is bytes per operation multiplied by operations per second, and stored bytes are arrivals multiplied by retention and record size. Keep decimal GB/TB distinct from binary GiB/TiB when comparing vendor capacity. Replication, indexes, compaction/write amplification, backups and spare capacity are separate multipliers, not free implementation details.
-
-Use the estimate to identify the first bottleneck, not to justify every distributed component. Ask which single key or customer can dominate the average. Measure a simple durable baseline before adding partitions. If a design serves a different workload than the stated assumption, explain the change rather than quietly inventing a larger number.
-
-## API contracts and data ownership
+### API contracts and data ownership
 
 ```text
 Batch ingest with bounded payload and tenant credentials; query by time/service/correlation ID; tail stream
@@ -239,76 +244,35 @@ Primary access/partitioning boundary:
 tenant + service + time bucket for storage; event_id or source sequence for deduplication when required
 ```
 
-Specify authentication, authorization, body limits and idempotency at the API boundary. The same idempotency key with the same payload returns the original result; the same key with a different payload is a conflict. Persist the payload fingerprint and outcome where retries can cross process restarts. Return stable resource/operation IDs so clients can query a pending or unknown outcome. Use cursor-based continuation for changing datasets and define the sort/snapshot semantics.
-
-An API sketch is incomplete without its authoritative records. Distinguish transactional state from projections and caches. A projection can be rebuilt; the committed ownership/history cannot. Define who may mutate each record and which fields must change atomically. A convenient cache key is not necessarily a safe database partition key, and a healthy load balancer does not choose primary-versus-replica reads on behalf of the database client.
-
-## Build the architecture in stages
-
-**Stage 1 — Correct baseline.** Keep one service boundary around the core transaction, durable records indexed for the dominant access path, explicit dependency adapters and basic operational metrics. Exercise the stated invariant with concurrent requests before introducing asynchronous replicas. Avoid coupling the primary user result to optional analytics, notifications or recommendation work.
-
-**Stage 2 — Measured scaling.** Add stateless request handlers and connection pools to absorb concurrent work. Cache only data whose freshness/authorization policy allows it. Introduce a durable queue when asynchronous work has an independent lifetime; define acceptance and completion separately. Autoscaling handlers cannot fix a single hot partition or an overwhelmed external provider.
+### Build the architecture in stages
 
 **Stage 3 — Partition and isolate.** Partition around tenant + service + time bucket for storage; event_id or source sequence for deduplication when required. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
 
-**Stage 4 — Regional resilience when required.** State the recovery point objective (acceptable lost acknowledged data) and recovery time objective (acceptable outage duration). A second region is useful only if it has usable data, credentials, capacity and a tested failover route. Prefer one write authority per conflicting resource until the product genuinely needs multi-writer conflict resolution.
-
-## Trace the critical request
+### Trace the critical request
 
 Agents batch and buffer within disk limits; collector authenticates and applies quotas; durable log absorbs bursts; processors redact/parse and index; hot storage serves recent search; immutable compressed objects retain colder data under policy.
 
-At each hop name the input, output, timeout and durable fact. A synchronous success response should follow the promised commit point. If work continues in the background, return an operation ID and status rather than implying completion. Publish committed work through a transactional outbox or a comparably reliable mechanism; a database write followed by a best-effort publish has a failure gap.
-
-Do not place optional telemetry on the critical dependency chain. At the same time, “asynchronous” does not mean unbounded, durable or free: select queue capacity, retry deadlines, ordering scope and a poison-message policy. Consumers should record stable event identities or use conditional domain transitions so a redelivery has a safe effect. Broker-level transaction features do not automatically make an external payment, SMS or file write exactly once.
-
-## Deep dive: the decision that changes this system
+### Deep dive: the decision that changes this system
 
 Event time and ingestion time differ when clients disconnect or clocks skew. A query must expose its time semantics. Index only selected fields; indexing arbitrary JSON creates a mapping explosion. Traces and logs share correlation IDs but have different retention and query patterns.
 
-The important partitioning question is not merely where bytes are stored but where conflicting operations meet. Different partitions may progress independently, while operations touching the same authority need ordering or conflict detection. A stale cache/read replica can improve latency, but its allowed staleness must match the operation. A user-facing ownership/payment decision often requires a stronger path than a browsing view.
-
-Do not use “eventual consistency” as a blanket explanation. Name the observable anomaly, the acceptable window and the remedy: stale reads, lost updates, duplicate effects, reordered events, or incomplete projections are different problems. Version/tombstone checks, conditional writes, durable deduplication and reconciliation solve different parts of that list. Include the client-visible response when a guarantee cannot be met.
-
-## Failure and race-condition walkthrough
+### Failure and race-condition walkthrough
 
 An outage generates more logs precisely when storage is strained. Backpressure, severity-aware shedding and bounded buffers prevent telemetry from taking down the application. State whether a dropped record was never accepted or lost after acknowledgement.
 
-| Failure point | Question to answer | Recovery evidence |
-|---|---|---|
-| Before durable commit | Did anything become authoritative? | No committed operation means a safe fresh attempt |
-| Commit succeeds, response is lost | How does the client avoid duplication? | Stable request/operation identity and stored result |
-| Cache/projection is stale | Can it decide this operation? | Read policy, version, tombstone or authoritative fallback |
-| Worker lease expires | Can the old worker still mutate state? | Fencing epoch checked at the resource boundary |
-| Dependency is unavailable | Is work rejected, queued or degraded? | Bounded deadline, queue and explicit product outcome |
-| Recovery replays events | How is a repeated effect detected? | Event identity or idempotent domain transition |
+### Security, tenancy and lifecycle
 
-A timeout does not prove the remote side failed. Keep unknown outcomes distinct from rejected ones, especially around external side effects. Retry within a shared deadline, with jitter and one clear retry owner. If a gateway, SDK and worker each retry independently, a small outage becomes a load amplifier. Circuit breakers stop some repeated calls but do not create downstream capacity or reverse an already committed effect.
-
-## Security, tenancy and lifecycle
-
-Authorize the resource before reading private records or generating signed references. Derive tenant/principal from authenticated context rather than a freely supplied body field. Scope cache keys, events and deduplication identities by the relevant ownership boundary. Validate untrusted URLs and payloads at egress/parser boundaries. Avoid putting credentials, full personal payloads or signed access tokens in normal logs.
-
-Retention is part of architecture. Define when source records, indexes, object blobs, replicas, caches and backups stop exposing deleted data; deleting one primary row is not a complete lifecycle policy. Keep the minimum history necessary to diagnose/reconcile operations under the product's requirements. Admin repair paths need authorization and audit just as much as public APIs.
-
-## Trade-offs and a starting recommendation
+### Trade-offs and a starting recommendation
 
 Full-text indexes offer flexible search at high cost; structured indexes plus object storage reduce cost but slow broad investigations. Sampling helps volume but must not quietly remove all rare errors.
 
-Present each alternative as a cost paid for a guarantee. SQL versus a KV store is about access paths, consistency and operating constraints, not a slogan that relational databases cannot scale. Caching buys latency at a freshness/invalidation cost. A queue decouples throughput at the cost of lag, replay and monitoring. Cross-region writes buy local write availability at the cost of coordination or application conflict resolution. A system does not become more correct merely by adding a named infrastructure product.
-
-For migrations, version schemas and event payloads; deploy readers that accept both compatible forms before writers emit the new form. Backfill in bounded batches, compare counts/checksums or domain invariants, move a small cohort, monitor, and retain rollback data until the cutover is proven. Rollback must account for writes made during the new version; restoring an old binary alone may not restore an old data model.
-
-## SLOs, failure drills and lab
+### SLOs, failure drills and lab
 
 Ingest acceptance, acknowledged loss, oldest unindexed event, searchable lag, dropped events by priority and cost per retained TB.
 
 **Test matrix:** Collector outage, local disk full, schema explosion, redaction failure, oversized batches, clock skew and query during index lag.
 
-Build a load generator that models hot keys, retries and realistic arrival bursts rather than a uniform loop over random IDs. Separate p50, p95 and p99 latency, success/error/degraded outcomes, and cache-hit/miss paths. Test at steady state, after cold start, during one component failure and throughout recovery. A system that survives the outage but collapses while replaying backlog has not completed its failure test.
-
-Make a drill reproducible: state the starting dataset, failure time, expected invariant, maximum backlog and recovery criterion. Capture an operation trace that includes versions and identities, then verify the durable result after restart. Verify correctness and data-loss policy in addition to response latency; an API that returns quickly while double-selling or dropping acknowledged work has failed.
-
-## Follow-up questions with answers
+### Follow-up questions with answers
 
 **What cannot be eventually consistent here?** The operation establishing this guarantee: Accepted telemetry has a declared durability and loss policy; ingestion acknowledgement does not imply it is searchable yet.
 
@@ -320,13 +284,23 @@ Make a drill reproducible: state the starting dataset, failure time, expected in
 
 **How would you demonstrate the design works?** Collector outage, local disk full, schema explosion, redaction failure, oversized batches, clock skew and query during index lag. Keep the expected invariant and recovery outcome visible in the results.
 
-Conclude a walkthrough by narrating one successful critical request, one concurrent conflict and one uncertain failure. Name the durable authority, the partition key, the commit point and the observable recovery policy. Those four facts are more useful than a diagram whose boxes all say “highly available”.
-
-## Further reading
+### Further reading
 
 - [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+
+## Work through queries and privacy
+
+Partitioning by time limits range scans, but tenant isolation and skew also affect placement. Indexing every high-cardinality field increases costs. Keep searchable trace IDs while controlling arbitrary labels and unbounded payloads. Authentication headers, secrets and personal documents should not appear in ordinary application logs.
+
+Measure ingest acknowledgement separately from search visibility: an accepted event can still wait in a buffer. Replay must preserve event identity where deduplication matters. A logging outage should not block normal work indefinitely unless the specific audit requirement deliberately requires it.
+
+## Practise, then check your reasoning
+
+1. **Can the platform promise no loss with bounded buffers and unlimited outages?** No. State the operating envelope and overflow policy.
+2. **Does deleting an index remove archived raw records?** Not automatically; enforce retention across tiers.
+3. **Exercise:** throttle indexing, fill the agent buffer and search by one trace ID. Record lost-event counters, newest searchable timestamp and the application's latency during the outage.
 
 === HLD 17 ===
 N|targets|Services/Hosts|0|130|150
@@ -357,7 +331,29 @@ Design a metrics / time-series monitoring system (like Prometheus at scale, Data
 
 **Scale:** 10M active series × 1 sample/10 s = **1M samples/s**. At ~1.5 bytes per sample after compression, that's ~130 GB/day.
 
-## Architecture
+## Learn through a concrete example
+
+You want p99 checkout latency and CPU usage for the last hour. Storing a row for every raw event is expensive; time-series systems organize measurements by metric identity, labels and timestamp. The surprising cost is often **cardinality**, the number of distinct series, rather than sample size alone.
+
+A **counter** increases over time, a **gauge** represents a current value, and a **histogram** summarizes a distribution. A **series** is one metric plus one specific label set. User IDs as labels can create millions of series.
+
+## See samples and cardinality explosion
+
+![Collection, aggregation and evaluation have separate timing semantics.](lessons/hld-17-flow.svg)
+
+*Collection, aggregation and evaluation have separate timing semantics.*
+
+![Bound label choices before accepting arbitrary per-request values.](lessons/hld-17-failure.svg)
+
+*Bound label choices before accepting arbitrary per-request values.*
+
+### Calculate series count
+
+For 200 services × 20 routes × 5 status classes × 3 regions, there are 60,000 combinations before instance labels and histogram buckets. Adding one million user IDs can multiply this beyond a usable design. At 60,000 series sampled every 15 seconds, samples arrive at 4,000/s; histogram bucket series increase this further.
+
+## Design details and alternatives
+
+### Architecture
 
 - **Collection:** pull (Prometheus scrapes `/metrics`) or push (agents, StatsD/OTel). A push gateway is used for short-lived jobs.
 - **Ingest:** a distributor hashes the series ID (name + sorted labels) to ingester shards (consistent hashing, replication factor 3). Ingesters keep recent data in memory with a **write-ahead log** and periodically flush immutable **blocks** (2 h) to object storage.
@@ -365,7 +361,7 @@ Design a metrics / time-series monitoring system (like Prometheus at scale, Data
 - **Compaction and downsampling:** background jobs merge blocks and create 5-minute and 1-hour rollups (min, max, sum, count, so averages stay correct).
 - **Query layer:** fans out to ingesters (recent) and the store (historical), merges, and caches results by time-aligned step.
 
-## Key design decisions & trade-offs
+### Key design decisions & trade-offs
 
 **1. Pull vs. push.** Pull gives easy health detection ("target down") and central control, but needs service discovery and struggles across firewalls and with short jobs. Push suits ephemeral and edge workloads, but you must protect against floods.
 
@@ -377,17 +373,13 @@ Design a metrics / time-series monitoring system (like Prometheus at scale, Data
 
 **5. Why not a general SQL DB?** Generic B-trees and row storage waste space and write throughput. A TSDB's append-only, time-partitioned, columnar, compressed design is 10–50× more efficient.
 
-## Scope, guarantees and sizing assumptions
+### Scope, guarantees and sizing assumptions
 
 **Correctness requirement:** Metric identity includes labels and type; aggregation respects counter resets and time semantics.
 
 Assume 100,000 targets x 200 series sampled every 15 seconds: 20 million active series and about 1.33 million samples/s. At an illustrative 16 raw bytes/sample: about 21.3 MB/s before compression and indexes.
 
-These are illustrative planning assumptions, not published traffic statistics or benchmark results. Recalculate the model when retention, payload size, tenant mix or peak factor changes. Show units throughout: average QPS is operations divided by seconds, bandwidth is bytes per operation multiplied by operations per second, and stored bytes are arrivals multiplied by retention and record size. Keep decimal GB/TB distinct from binary GiB/TiB when comparing vendor capacity. Replication, indexes, compaction/write amplification, backups and spare capacity are separate multipliers, not free implementation details.
-
-Use the estimate to identify the first bottleneck, not to justify every distributed component. Ask which single key or customer can dominate the average. Measure a simple durable baseline before adding partitions. If a design serves a different workload than the stated assumption, explain the change rather than quietly inventing a larger number.
-
-## API contracts and data ownership
+### API contracts and data ownership
 
 ```text
 Scrape/export endpoint or remote-write batch; range query with step; alert-rule definition
@@ -401,76 +393,35 @@ Primary access/partitioning boundary:
 metric_name + sorted label set + tenant; time for partition lifecycle
 ```
 
-Specify authentication, authorization, body limits and idempotency at the API boundary. The same idempotency key with the same payload returns the original result; the same key with a different payload is a conflict. Persist the payload fingerprint and outcome where retries can cross process restarts. Return stable resource/operation IDs so clients can query a pending or unknown outcome. Use cursor-based continuation for changing datasets and define the sort/snapshot semantics.
-
-An API sketch is incomplete without its authoritative records. Distinguish transactional state from projections and caches. A projection can be rebuilt; the committed ownership/history cannot. Define who may mutate each record and which fields must change atomically. A convenient cache key is not necessarily a safe database partition key, and a healthy load balancer does not choose primary-versus-replica reads on behalf of the database client.
-
-## Build the architecture in stages
-
-**Stage 1 — Correct baseline.** Keep one service boundary around the core transaction, durable records indexed for the dominant access path, explicit dependency adapters and basic operational metrics. Exercise the stated invariant with concurrent requests before introducing asynchronous replicas. Avoid coupling the primary user result to optional analytics, notifications or recommendation work.
-
-**Stage 2 — Measured scaling.** Add stateless request handlers and connection pools to absorb concurrent work. Cache only data whose freshness/authorization policy allows it. Introduce a durable queue when asynchronous work has an independent lifetime; define acceptance and completion separately. Autoscaling handlers cannot fix a single hot partition or an overwhelmed external provider.
+### Build the architecture in stages
 
 **Stage 3 — Partition and isolate.** Partition around metric_name + sorted label set + tenant; time for partition lifecycle. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
 
-**Stage 4 — Regional resilience when required.** State the recovery point objective (acceptable lost acknowledged data) and recovery time objective (acceptable outage duration). A second region is useful only if it has usable data, credentials, capacity and a tested failover route. Prefer one write authority per conflicting resource until the product genuinely needs multi-writer conflict resolution.
-
-## Trace the critical request
+### Trace the critical request
 
 Collect samples; validate timestamps and label cardinality; shard by series; append to time blocks; compact and downsample; query retrieves blocks and merges by label semantics; evaluate alert rules with explicit missing-data policy.
 
-At each hop name the input, output, timeout and durable fact. A synchronous success response should follow the promised commit point. If work continues in the background, return an operation ID and status rather than implying completion. Publish committed work through a transactional outbox or a comparably reliable mechanism; a database write followed by a best-effort publish has a failure gap.
-
-Do not place optional telemetry on the critical dependency chain. At the same time, “asynchronous” does not mean unbounded, durable or free: select queue capacity, retry deadlines, ordering scope and a poison-message policy. Consumers should record stable event identities or use conditional domain transitions so a redelivery has a safe effect. Broker-level transaction features do not automatically make an external payment, SMS or file write exactly once.
-
-## Deep dive: the decision that changes this system
+### Deep dive: the decision that changes this system
 
 A user_id label can turn one metric into millions of series. Counters are monotonic between resets; computing rates needs reset handling. Summing averages without weights is wrong. Histograms can aggregate bucket counts under compatible boundaries; precomputed quantiles generally cannot be averaged into a global p99.
 
-The important partitioning question is not merely where bytes are stored but where conflicting operations meet. Different partitions may progress independently, while operations touching the same authority need ordering or conflict detection. A stale cache/read replica can improve latency, but its allowed staleness must match the operation. A user-facing ownership/payment decision often requires a stronger path than a browsing view.
-
-Do not use “eventual consistency” as a blanket explanation. Name the observable anomaly, the acceptable window and the remedy: stale reads, lost updates, duplicate effects, reordered events, or incomplete projections are different problems. Version/tombstone checks, conditional writes, durable deduplication and reconciliation solve different parts of that list. Include the client-visible response when a guarantee cannot be met.
-
-## Failure and race-condition walkthrough
+### Failure and race-condition walkthrough
 
 A scrape gap is not necessarily zero. Duplicate or reordered samples need store-specific acceptance rules. Alert evaluation during missing data should distinguish unavailable telemetry from healthy zero error rate.
 
-| Failure point | Question to answer | Recovery evidence |
-|---|---|---|
-| Before durable commit | Did anything become authoritative? | No committed operation means a safe fresh attempt |
-| Commit succeeds, response is lost | How does the client avoid duplication? | Stable request/operation identity and stored result |
-| Cache/projection is stale | Can it decide this operation? | Read policy, version, tombstone or authoritative fallback |
-| Worker lease expires | Can the old worker still mutate state? | Fencing epoch checked at the resource boundary |
-| Dependency is unavailable | Is work rejected, queued or degraded? | Bounded deadline, queue and explicit product outcome |
-| Recovery replays events | How is a repeated effect detected? | Event identity or idempotent domain transition |
+### Security, tenancy and lifecycle
 
-A timeout does not prove the remote side failed. Keep unknown outcomes distinct from rejected ones, especially around external side effects. Retry within a shared deadline, with jitter and one clear retry owner. If a gateway, SDK and worker each retry independently, a small outage becomes a load amplifier. Circuit breakers stop some repeated calls but do not create downstream capacity or reverse an already committed effect.
-
-## Security, tenancy and lifecycle
-
-Authorize the resource before reading private records or generating signed references. Derive tenant/principal from authenticated context rather than a freely supplied body field. Scope cache keys, events and deduplication identities by the relevant ownership boundary. Validate untrusted URLs and payloads at egress/parser boundaries. Avoid putting credentials, full personal payloads or signed access tokens in normal logs.
-
-Retention is part of architecture. Define when source records, indexes, object blobs, replicas, caches and backups stop exposing deleted data; deleting one primary row is not a complete lifecycle policy. Keep the minimum history necessary to diagnose/reconcile operations under the product's requirements. Admin repair paths need authorization and audit just as much as public APIs.
-
-## Trade-offs and a starting recommendation
+### Trade-offs and a starting recommendation
 
 Pull simplifies service discovery and health visibility; push suits short-lived jobs and disconnected agents. Downsampling reduces cost but discards granularity; keep retention tiers aligned with debugging needs.
 
-Present each alternative as a cost paid for a guarantee. SQL versus a KV store is about access paths, consistency and operating constraints, not a slogan that relational databases cannot scale. Caching buys latency at a freshness/invalidation cost. A queue decouples throughput at the cost of lag, replay and monitoring. Cross-region writes buy local write availability at the cost of coordination or application conflict resolution. A system does not become more correct merely by adding a named infrastructure product.
-
-For migrations, version schemas and event payloads; deploy readers that accept both compatible forms before writers emit the new form. Backfill in bounded batches, compare counts/checksums or domain invariants, move a small cohort, monitor, and retain rollback data until the cutover is proven. Rollback must account for writes made during the new version; restoring an old binary alone may not restore an old data model.
-
-## SLOs, failure drills and lab
+### SLOs, failure drills and lab
 
 Series cardinality, ingest lag, query p99, dropped samples, alert evaluation delay and storage amplification.
 
 **Test matrix:** Counter reset, missing scrape, high-cardinality label attack, histogram aggregation, out-of-order sample, query spanning compaction and alert flapping.
 
-Build a load generator that models hot keys, retries and realistic arrival bursts rather than a uniform loop over random IDs. Separate p50, p95 and p99 latency, success/error/degraded outcomes, and cache-hit/miss paths. Test at steady state, after cold start, during one component failure and throughout recovery. A system that survives the outage but collapses while replaying backlog has not completed its failure test.
-
-Make a drill reproducible: state the starting dataset, failure time, expected invariant, maximum backlog and recovery criterion. Capture an operation trace that includes versions and identities, then verify the durable result after restart. Verify correctness and data-loss policy in addition to response latency; an API that returns quickly while double-selling or dropping acknowledged work has failed.
-
-## Follow-up questions with answers
+### Follow-up questions with answers
 
 **What cannot be eventually consistent here?** The operation establishing this guarantee: Metric identity includes labels and type; aggregation respects counter resets and time semantics.
 
@@ -482,13 +433,23 @@ Make a drill reproducible: state the starting dataset, failure time, expected in
 
 **How would you demonstrate the design works?** Counter reset, missing scrape, high-cardinality label attack, histogram aggregation, out-of-order sample, query spanning compaction and alert flapping. Keep the expected invariant and recovery outcome visible in the results.
 
-Conclude a walkthrough by narrating one successful critical request, one concurrent conflict and one uncertain failure. Name the durable authority, the partition key, the commit point and the observable recovery policy. Those four facts are more useful than a diagram whose boxes all say “highly available”.
-
-## Further reading
+### Further reading
 
 - [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+
+## Work through semantics
+
+Counters can reset when a process restarts, so rate calculations must account for resets. Averaging two p99 values does not yield the combined p99. Aggregate compatible histogram bucket counts, then estimate the percentile. Preserve units and bucket boundaries across deployments.
+
+Downsampling reduces long-term storage but loses detail. An hourly average cannot recover a ten-second outage. Alerts need a policy for missing samples; treating missing as zero can falsely report healthy traffic or trigger nonsense ratios. Keep alert evaluation lag and ingestion lag observable.
+
+## Practise, then check your reasoning
+
+1. **Is a user ID a good metric label?** Usually not for unbounded populations; use logs/traces or another bounded aggregation.
+2. **Can a gauge be safely summed across replicas?** Only when its meaning is additive; temperature is not equivalent to active-request count.
+3. **Exercise:** combine two latency populations with very different sizes and show why averaging their p99s is wrong. Then estimate storage with and without a high-cardinality label.
 
 === HLD 18 ===
 N|courier|Courier app|0|0|140
@@ -522,7 +483,29 @@ Design live ride or delivery tracking (Uber "your driver is 3 min away", Swiggy/
 
 **Scale:** 2M active couriers ÷ 4 s ≈ 500k pings/s, ~100 bytes each, so ~50 MB/s. Watchers: ~1–2 per active trip.
 
-## Architecture
+## Learn through a concrete example
+
+A delivery rider's dot should move smoothly on a customer's map. The rider sends noisy, delayed observations, not perfect physical truth. The tracking system must identify which update is newest, who may view it and how long stale locations remain useful.
+
+An **observation** contains coordinates, accuracy, device/session identity and sequence. A **subscription** links an authorized viewer to a trip. A **latest-location projection** serves the current map; the retained route history has different storage and privacy needs.
+
+## See update ordering and viewer delivery
+
+![Latest-state ordering precedes fan-out to authorized subscribers.](lessons/hld-18-flow.svg)
+
+*Latest-state ordering precedes fan-out to authorized subscribers.*
+
+![A lower sequence from the same session cannot overwrite newer state.](lessons/hld-18-failure.svg)
+
+*A lower sequence from the same session cannot overwrite newer state.*
+
+### Calculate cadence
+
+At 500,000 active trips updating every three seconds, ingestion is about 166,667 updates/s. Sending each update to two viewers adds roughly 333,333 deliveries/s before reconnect/replay. Adaptive cadence can reduce traffic when stationary; it must preserve the chosen freshness promise.
+
+## Design details and alternatives
+
+### Architecture
 
 1. **Ingest gateways** accept pings (HTTPS batch, WebSocket or MQTT). Validate, attach courier and trip IDs, and publish to **Kafka**, partitioned by `tripId` to keep per-trip order.
 2. A **latest-position store** (Redis hash or GEO) is updated by consumers: `courier → (lat, lng, ts, heading)`. A geo index per zone serves dashboards and "nearby" queries.
@@ -530,7 +513,7 @@ Design live ride or delivery tracking (Uber "your driver is 3 min away", Swiggy/
 4. An **ETA service** recomputes the ETA from position plus the road graph and traffic, periodically or when the position moves significantly.
 5. **History:** compacted route points go to a time-series or columnar store (and S3) for replay and analytics.
 
-## Key design decisions & trade-offs
+### Key design decisions & trade-offs
 
 **1. Don't write every ping to a database.** Only the latest position is hot. Keep it in memory or Redis. Kafka buffers and fans out; history is written in batches.
 
@@ -544,17 +527,13 @@ Design live ride or delivery tracking (Uber "your driver is 3 min away", Swiggy/
 
 **6. Privacy.** Customers only see the courier during the active trip. Subscriptions are authorised per trip and expire at completion.
 
-## Scope, guarantees and sizing assumptions
+### Scope, guarantees and sizing assumptions
 
 **Correctness requirement:** Latest location is determined by device sequence/session and freshness, not by whichever packet arrives last.
 
 Assume 2 million tracked devices updating every 3 seconds: about 666,667 updates/s. At 150 bytes/update that is 100 MB/s raw. Retaining every point for 24 hours is about 8.64 TB before compression/replicas.
 
-These are illustrative planning assumptions, not published traffic statistics or benchmark results. Recalculate the model when retention, payload size, tenant mix or peak factor changes. Show units throughout: average QPS is operations divided by seconds, bandwidth is bytes per operation multiplied by operations per second, and stored bytes are arrivals multiplied by retention and record size. Keep decimal GB/TB distinct from binary GiB/TiB when comparing vendor capacity. Replication, indexes, compaction/write amplification, backups and spare capacity are separate multipliers, not free implementation details.
-
-Use the estimate to identify the first bottleneck, not to justify every distributed component. Ask which single key or customer can dominate the average. Measure a simple durable baseline before adding partitions. If a design serves a different workload than the stated assumption, explain the change rather than quietly inventing a larger number.
-
-## API contracts and data ownership
+### API contracts and data ownership
 
 ```text
 Authenticated location batch with session,sequence,observedAt; GET /trips/{id}/latest; SSE/WebSocket subscription
@@ -568,76 +547,35 @@ Primary access/partitioning boundary:
 device_id for sequence ownership; trip_id for access and subscriptions; geospatial cell for nearby views
 ```
 
-Specify authentication, authorization, body limits and idempotency at the API boundary. The same idempotency key with the same payload returns the original result; the same key with a different payload is a conflict. Persist the payload fingerprint and outcome where retries can cross process restarts. Return stable resource/operation IDs so clients can query a pending or unknown outcome. Use cursor-based continuation for changing datasets and define the sort/snapshot semantics.
-
-An API sketch is incomplete without its authoritative records. Distinguish transactional state from projections and caches. A projection can be rebuilt; the committed ownership/history cannot. Define who may mutate each record and which fields must change atomically. A convenient cache key is not necessarily a safe database partition key, and a healthy load balancer does not choose primary-versus-replica reads on behalf of the database client.
-
-## Build the architecture in stages
-
-**Stage 1 — Correct baseline.** Keep one service boundary around the core transaction, durable records indexed for the dominant access path, explicit dependency adapters and basic operational metrics. Exercise the stated invariant with concurrent requests before introducing asynchronous replicas. Avoid coupling the primary user result to optional analytics, notifications or recommendation work.
-
-**Stage 2 — Measured scaling.** Add stateless request handlers and connection pools to absorb concurrent work. Cache only data whose freshness/authorization policy allows it. Introduce a durable queue when asynchronous work has an independent lifetime; define acceptance and completion separately. Autoscaling handlers cannot fix a single hot partition or an overwhelmed external provider.
+### Build the architecture in stages
 
 **Stage 3 — Partition and isolate.** Partition around device_id for sequence ownership; trip_id for access and subscriptions; geospatial cell for nearby views. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
 
-**Stage 4 — Regional resilience when required.** State the recovery point objective (acceptable lost acknowledged data) and recovery time objective (acceptable outage duration). A second region is useful only if it has usable data, credentials, capacity and a tested failover route. Prefer one write authority per conflicting resource until the product genuinely needs multi-writer conflict resolution.
-
-## Trace the critical request
+### Trace the critical request
 
 Authenticate device and trip; validate ranges and plausible timestamp; reject stale sequence within session; update latest projection; append history according to retention; route to authorized subscribers; coalesce intermediate points for slow clients.
 
-At each hop name the input, output, timeout and durable fact. A synchronous success response should follow the promised commit point. If work continues in the background, return an operation ID and status rather than implying completion. Publish committed work through a transactional outbox or a comparably reliable mechanism; a database write followed by a best-effort publish has a failure gap.
-
-Do not place optional telemetry on the critical dependency chain. At the same time, “asynchronous” does not mean unbounded, durable or free: select queue capacity, retry deadlines, ordering scope and a poison-message policy. Consumers should record stable event identities or use conditional domain transitions so a redelivery has a safe effect. Broker-level transaction features do not automatically make an external payment, SMS or file write exactly once.
-
-## Deep dive: the decision that changes this system
+### Deep dive: the decision that changes this system
 
 GPS precision is noisy, and receipt time differs from observation time. A device restart must create a new authenticated session epoch rather than resetting sequence silently. Geofencing should account for uncertainty and hysteresis to avoid repeated enter/exit events.
 
-The important partitioning question is not merely where bytes are stored but where conflicting operations meet. Different partitions may progress independently, while operations touching the same authority need ordering or conflict detection. A stale cache/read replica can improve latency, but its allowed staleness must match the operation. A user-facing ownership/payment decision often requires a stronger path than a browsing view.
-
-Do not use “eventual consistency” as a blanket explanation. Name the observable anomaly, the acceptable window and the remedy: stale reads, lost updates, duplicate effects, reordered events, or incomplete projections are different problems. Version/tombstone checks, conditional writes, durable deduplication and reconciliation solve different parts of that list. Include the client-visible response when a guarantee cannot be met.
-
-## Failure and race-condition walkthrough
+### Failure and race-condition walkthrough
 
 A mobile client reconnects after buffering thousands of points. Store history without regressing the latest point. A slow subscriber should receive a fresh snapshot and cursor instead of an unbounded queue of obsolete coordinates.
 
-| Failure point | Question to answer | Recovery evidence |
-|---|---|---|
-| Before durable commit | Did anything become authoritative? | No committed operation means a safe fresh attempt |
-| Commit succeeds, response is lost | How does the client avoid duplication? | Stable request/operation identity and stored result |
-| Cache/projection is stale | Can it decide this operation? | Read policy, version, tombstone or authoritative fallback |
-| Worker lease expires | Can the old worker still mutate state? | Fencing epoch checked at the resource boundary |
-| Dependency is unavailable | Is work rejected, queued or degraded? | Bounded deadline, queue and explicit product outcome |
-| Recovery replays events | How is a repeated effect detected? | Event identity or idempotent domain transition |
+### Security, tenancy and lifecycle
 
-A timeout does not prove the remote side failed. Keep unknown outcomes distinct from rejected ones, especially around external side effects. Retry within a shared deadline, with jitter and one clear retry owner. If a gateway, SDK and worker each retry independently, a small outage becomes a load amplifier. Circuit breakers stop some repeated calls but do not create downstream capacity or reverse an already committed effect.
-
-## Security, tenancy and lifecycle
-
-Authorize the resource before reading private records or generating signed references. Derive tenant/principal from authenticated context rather than a freely supplied body field. Scope cache keys, events and deduplication identities by the relevant ownership boundary. Validate untrusted URLs and payloads at egress/parser boundaries. Avoid putting credentials, full personal payloads or signed access tokens in normal logs.
-
-Retention is part of architecture. Define when source records, indexes, object blobs, replicas, caches and backups stop exposing deleted data; deleting one primary row is not a complete lifecycle policy. Keep the minimum history necessary to diagnose/reconcile operations under the product's requirements. Admin repair paths need authorization and audit just as much as public APIs.
-
-## Trade-offs and a starting recommendation
+### Trade-offs and a starting recommendation
 
 High-frequency sampling improves display smoothness but increases battery, network and storage cost. Separate short-lived live projections from history and apply access/retention policies to both.
 
-Present each alternative as a cost paid for a guarantee. SQL versus a KV store is about access paths, consistency and operating constraints, not a slogan that relational databases cannot scale. Caching buys latency at a freshness/invalidation cost. A queue decouples throughput at the cost of lag, replay and monitoring. Cross-region writes buy local write availability at the cost of coordination or application conflict resolution. A system does not become more correct merely by adding a named infrastructure product.
-
-For migrations, version schemas and event payloads; deploy readers that accept both compatible forms before writers emit the new form. Backfill in bounded batches, compare counts/checksums or domain invariants, move a small cohort, monitor, and retain rollback data until the cutover is proven. Rollback must account for writes made during the new version; restoring an old binary alone may not restore an old data model.
-
-## SLOs, failure drills and lab
+### SLOs, failure drills and lab
 
 Location freshness, end-to-end update delay, dropped/coalesced updates, stale sessions, subscriber backlog and geofence event quality.
 
 **Test matrix:** Out-of-order updates, reconnect batch, device restart, unauthorized trip subscription, implausible jump, stale location and slow WebSocket consumer.
 
-Build a load generator that models hot keys, retries and realistic arrival bursts rather than a uniform loop over random IDs. Separate p50, p95 and p99 latency, success/error/degraded outcomes, and cache-hit/miss paths. Test at steady state, after cold start, during one component failure and throughout recovery. A system that survives the outage but collapses while replaying backlog has not completed its failure test.
-
-Make a drill reproducible: state the starting dataset, failure time, expected invariant, maximum backlog and recovery criterion. Capture an operation trace that includes versions and identities, then verify the durable result after restart. Verify correctness and data-loss policy in addition to response latency; an API that returns quickly while double-selling or dropping acknowledged work has failed.
-
-## Follow-up questions with answers
+### Follow-up questions with answers
 
 **What cannot be eventually consistent here?** The operation establishing this guarantee: Latest location is determined by device sequence/session and freshness, not by whichever packet arrives last.
 
@@ -649,13 +587,23 @@ Make a drill reproducible: state the starting dataset, failure time, expected in
 
 **How would you demonstrate the design works?** Out-of-order updates, reconnect batch, device restart, unauthorized trip subscription, implausible jump, stale location and slow WebSocket consumer. Keep the expected invariant and recovery outcome visible in the results.
 
-Conclude a walkthrough by narrating one successful critical request, one concurrent conflict and one uncertain failure. Name the durable authority, the partition key, the commit point and the observable recovery policy. Those four facts are more useful than a diagram whose boxes all say “highly available”.
-
-## Further reading
+### Further reading
 
 - [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+
+## Work through reconnect and privacy
+
+Sequence numbers need a session/generation identity so a phone restart at sequence 1 does not make it permanently older than the previous session's 10,000. Coordinates also need sanity/accuracy checks; a sudden GPS jump is not proof of teleportation or fraud.
+
+On reconnect, send the latest authorized snapshot and resume live updates; replaying every obsolete point can make the map lag further behind. End the viewer's access when the trip relationship ends according to policy. Route retention and support access should be explicit rather than an unlimited archive of people's movements.
+
+## Practise, then check your reasoning
+
+1. **Does interpolation improve location truth?** It improves display smoothness, not measurement accuracy.
+2. **Should an offline rider appear at an unquestioned current position?** Show age/staleness and degrade the experience.
+3. **Exercise:** reorder packets, restart the phone session and reconnect a viewer after a minute. Verify latest-state ordering, bounded replay and revoked-trip access.
 
 === HLD 19 ===
 N|user|User|0|0|110
@@ -687,14 +635,36 @@ Design a generic ticket or seat reservation platform (concerts, airlines, events
 - Never oversell. Never charge without a ticket.
 - Survive 1M+ users arriving at sale open for 50k tickets, and stay fair (no bot advantage).
 
-## Architecture
+## Learn through a concrete example
+
+A concert sells reserved seats, while a workshop sells 500 general-admission places. These are different inventory models: one claims identities, the other decrements capacity. Treating both as one counter loses the seat map; treating both as individual seat records may add unnecessary complexity.
+
+A **reservation** owns inventory for a bounded interval. A **ticket** is the confirmed entitlement. A **check-in** consumes or records admission rights. Start by deciding whether identity, capacity or both are promised.
+
+## See inventory and ticket issuance
+
+![Ticket identity is issued from confirmed ownership and payment policy.](lessons/hld-19-flow.svg)
+
+*Ticket identity is issued from confirmed ownership and payment policy.*
+
+![A copied QR code must not create a second valid admission.](lessons/hld-19-failure.svg)
+
+*A copied QR code must not create a second valid admission.*
+
+### Calculate capacity
+
+For 500 general-admission places, 420 confirmed and 60 active holds leave 20 reservable places. A request for 25 must fail as a whole unless partial fulfilment is explicitly offered. Expired holds are not valid inventory promises even if cleanup has not yet run.
+
+## Design details and alternatives
+
+### Architecture
 
 - **Edge plus waiting room:** a CDN-hosted queue page issues signed, ordered queue tokens and admits users at a controlled rate to the shop.
 - **Reservation service:** stateless API over a strongly consistent **inventory store** (sharded SQL or a single-region strongly consistent DB), partitioned by event.
 - **Holds:** rows `(eventId, itemId, status, holdId, expiresAt)`. A hold is a conditional update. A sweeper (or lazy expiry on read) releases expired holds.
 - **Checkout:** confirm moves holds to `SOLD` in one transaction after successful payment authorisation. Payment uses idempotency keys and is captured after confirmation.
 
-## Key design decisions & trade-offs
+### Key design decisions & trade-offs
 
 **1. Conditional writes for consistency.**
 - Assigned seats: `UPDATE seats SET status='HELD', hold_id=? WHERE event=? AND seat IN (...) AND status='AVAILABLE'`. Success only if the affected row count equals the requested count, in one transaction (all-or-nothing).
@@ -708,17 +678,13 @@ Design a generic ticket or seat reservation platform (concerts, airlines, events
 
 **5. Payment and inventory consistency.** Authorise, then confirm the inventory, then capture. If confirm fails, void the authorisation. Reconcile stuck states (hold expired after authorisation) with automatic voids or refunds.
 
-## Scope, guarantees and sizing assumptions
+### Scope, guarantees and sizing assumptions
 
 **Correctness requirement:** Inventory ownership remains exclusive through expiry, payment uncertainty and worker failover.
 
 Assume 200,000 users competing for 20,000 tickets in 60 seconds: 3,333 purchase intents/s before browsing traffic. Inventory contention concentrates on a few event sections, so aggregate QPS is insufficient for capacity planning.
 
-These are illustrative planning assumptions, not published traffic statistics or benchmark results. Recalculate the model when retention, payload size, tenant mix or peak factor changes. Show units throughout: average QPS is operations divided by seconds, bandwidth is bytes per operation multiplied by operations per second, and stored bytes are arrivals multiplied by retention and record size. Keep decimal GB/TB distinct from binary GiB/TiB when comparing vendor capacity. Replication, indexes, compaction/write amplification, backups and spare capacity are separate multipliers, not free implementation details.
-
-Use the estimate to identify the first bottleneck, not to justify every distributed component. Ask which single key or customer can dominate the average. Measure a simple durable baseline before adding partitions. If a design serves a different workload than the stated assumption, explain the change rather than quietly inventing a larger number.
-
-## API contracts and data ownership
+### API contracts and data ownership
 
 ```text
 POST /holds; POST /bookings with hold token and request key; GET booking status; cancellation/refund endpoint
@@ -732,76 +698,35 @@ Primary access/partitioning boundary:
 event + section + seat or inventory_bucket; hold_id for exclusive ownership
 ```
 
-Specify authentication, authorization, body limits and idempotency at the API boundary. The same idempotency key with the same payload returns the original result; the same key with a different payload is a conflict. Persist the payload fingerprint and outcome where retries can cross process restarts. Return stable resource/operation IDs so clients can query a pending or unknown outcome. Use cursor-based continuation for changing datasets and define the sort/snapshot semantics.
-
-An API sketch is incomplete without its authoritative records. Distinguish transactional state from projections and caches. A projection can be rebuilt; the committed ownership/history cannot. Define who may mutate each record and which fields must change atomically. A convenient cache key is not necessarily a safe database partition key, and a healthy load balancer does not choose primary-versus-replica reads on behalf of the database client.
-
-## Build the architecture in stages
-
-**Stage 1 — Correct baseline.** Keep one service boundary around the core transaction, durable records indexed for the dominant access path, explicit dependency adapters and basic operational metrics. Exercise the stated invariant with concurrent requests before introducing asynchronous replicas. Avoid coupling the primary user result to optional analytics, notifications or recommendation work.
-
-**Stage 2 — Measured scaling.** Add stateless request handlers and connection pools to absorb concurrent work. Cache only data whose freshness/authorization policy allows it. Introduce a durable queue when asynchronous work has an independent lifetime; define acceptance and completion separately. Autoscaling handlers cannot fix a single hot partition or an overwhelmed external provider.
+### Build the architecture in stages
 
 **Stage 3 — Partition and isolate.** Partition around event + section + seat or inventory_bucket; hold_id for exclusive ownership. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
 
-**Stage 4 — Regional resilience when required.** State the recovery point objective (acceptable lost acknowledged data) and recovery time objective (acceptable outage duration). A second region is useful only if it has usable data, credentials, capacity and a tested failover route. Prefer one write authority per conflicting resource until the product genuinely needs multi-writer conflict resolution.
-
-## Trace the critical request
+### Trace the critical request
 
 Throttle admission; select authoritative inventory partition; conditionally reserve with hold ID and expiry; persist response identity; perform payment; confirm only if current hold still owns inventory; publish a ticket with unique redemption identity; handle cancellation by explicit policy.
 
-At each hop name the input, output, timeout and durable fact. A synchronous success response should follow the promised commit point. If work continues in the background, return an operation ID and status rather than implying completion. Publish committed work through a transactional outbox or a comparably reliable mechanism; a database write followed by a best-effort publish has a failure gap.
-
-Do not place optional telemetry on the critical dependency chain. At the same time, “asynchronous” does not mean unbounded, durable or free: select queue capacity, retry deadlines, ordering scope and a poison-message policy. Consumers should record stable event identities or use conditional domain transitions so a redelivery has a safe effect. Broker-level transaction features do not automatically make an external payment, SMS or file write exactly once.
-
-## Deep dive: the decision that changes this system
+### Deep dive: the decision that changes this system
 
 For general admission use an atomic remaining-capacity decrement plus hold ledger; for assigned seating use unique seat ownership. Both require expiry and late-payment rules. A ticket scanner also needs replay prevention and a policy for offline validation.
 
-The important partitioning question is not merely where bytes are stored but where conflicting operations meet. Different partitions may progress independently, while operations touching the same authority need ordering or conflict detection. A stale cache/read replica can improve latency, but its allowed staleness must match the operation. A user-facing ownership/payment decision often requires a stronger path than a browsing view.
-
-Do not use “eventual consistency” as a blanket explanation. Name the observable anomaly, the acceptable window and the remedy: stale reads, lost updates, duplicate effects, reordered events, or incomplete projections are different problems. Version/tombstone checks, conditional writes, durable deduplication and reconciliation solve different parts of that list. Include the client-visible response when a guarantee cannot be met.
-
-## Failure and race-condition walkthrough
+### Failure and race-condition walkthrough
 
 A leader changes during a sale. The new owner must recover committed holds and reject stale epochs, rather than reconstruct availability from an eventually consistent cache. Never clear holds purely from a client countdown.
 
-| Failure point | Question to answer | Recovery evidence |
-|---|---|---|
-| Before durable commit | Did anything become authoritative? | No committed operation means a safe fresh attempt |
-| Commit succeeds, response is lost | How does the client avoid duplication? | Stable request/operation identity and stored result |
-| Cache/projection is stale | Can it decide this operation? | Read policy, version, tombstone or authoritative fallback |
-| Worker lease expires | Can the old worker still mutate state? | Fencing epoch checked at the resource boundary |
-| Dependency is unavailable | Is work rejected, queued or degraded? | Bounded deadline, queue and explicit product outcome |
-| Recovery replays events | How is a repeated effect detected? | Event identity or idempotent domain transition |
+### Security, tenancy and lifecycle
 
-A timeout does not prove the remote side failed. Keep unknown outcomes distinct from rejected ones, especially around external side effects. Retry within a shared deadline, with jitter and one clear retry owner. If a gateway, SDK and worker each retry independently, a small outage becomes a load amplifier. Circuit breakers stop some repeated calls but do not create downstream capacity or reverse an already committed effect.
-
-## Security, tenancy and lifecycle
-
-Authorize the resource before reading private records or generating signed references. Derive tenant/principal from authenticated context rather than a freely supplied body field. Scope cache keys, events and deduplication identities by the relevant ownership boundary. Validate untrusted URLs and payloads at egress/parser boundaries. Avoid putting credentials, full personal payloads or signed access tokens in normal logs.
-
-Retention is part of architecture. Define when source records, indexes, object blobs, replicas, caches and backups stop exposing deleted data; deleting one primary row is not a complete lifecycle policy. Keep the minimum history necessary to diagnose/reconcile operations under the product's requirements. Admin repair paths need authorization and audit just as much as public APIs.
-
-## Trade-offs and a starting recommendation
+### Trade-offs and a starting recommendation
 
 Global strong consistency across regions increases coordination cost. Routing one event to a single write authority is often a better starting boundary; browsing and availability previews can be replicated.
 
-Present each alternative as a cost paid for a guarantee. SQL versus a KV store is about access paths, consistency and operating constraints, not a slogan that relational databases cannot scale. Caching buys latency at a freshness/invalidation cost. A queue decouples throughput at the cost of lag, replay and monitoring. Cross-region writes buy local write availability at the cost of coordination or application conflict resolution. A system does not become more correct merely by adding a named infrastructure product.
-
-For migrations, version schemas and event payloads; deploy readers that accept both compatible forms before writers emit the new form. Backfill in bounded batches, compare counts/checksums or domain invariants, move a small cohort, monitor, and retain rollback data until the cutover is proven. Rollback must account for writes made during the new version; restoring an old binary alone may not restore an old data model.
-
-## SLOs, failure drills and lab
+### SLOs, failure drills and lab
 
 Oversell count, confirmed-to-issued lag, hold leak age, conflict rate, admission delay and unresolved payment outcomes.
 
 **Test matrix:** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan.
 
-Build a load generator that models hot keys, retries and realistic arrival bursts rather than a uniform loop over random IDs. Separate p50, p95 and p99 latency, success/error/degraded outcomes, and cache-hit/miss paths. Test at steady state, after cold start, during one component failure and throughout recovery. A system that survives the outage but collapses while replaying backlog has not completed its failure test.
-
-Make a drill reproducible: state the starting dataset, failure time, expected invariant, maximum backlog and recovery criterion. Capture an operation trace that includes versions and identities, then verify the durable result after restart. Verify correctness and data-loss policy in addition to response latency; an API that returns quickly while double-selling or dropping acknowledged work has failed.
-
-## Follow-up questions with answers
+### Follow-up questions with answers
 
 **What cannot be eventually consistent here?** The operation establishing this guarantee: Inventory ownership remains exclusive through expiry, payment uncertainty and worker failover.
 
@@ -813,13 +738,23 @@ Make a drill reproducible: state the starting dataset, failure time, expected in
 
 **How would you demonstrate the design works?** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan. Keep the expected invariant and recovery outcome visible in the results.
 
-Conclude a walkthrough by narrating one successful critical request, one concurrent conflict and one uncertain failure. Name the durable authority, the partition key, the commit point and the observable recovery policy. Those four facts are more useful than a diagram whose boxes all say “highly available”.
-
-## Further reading
+### Further reading
 
 - [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+
+## Work through offline admission
+
+Offline scanners can verify signed ticket authenticity but cannot automatically know another disconnected scanner already admitted the same ticket. Choose a bounded offline policy, partition entrance rights or accept and reconcile duplicate-entry risk explicitly. Cryptographic signatures solve forgery, not shared mutable consumption state.
+
+Reissuing a ticket after loss should revoke the old entitlement version. Transfers change authorized holder under policy without producing two live tickets. Seat ownership, payment disposition and admission evidence remain distinct even when the UI presents one booking summary.
+
+## Practise, then check your reasoning
+
+1. **Does a QR code prevent screenshots?** No. It encodes data; admission-state rules prevent reuse online.
+2. **Does releasing a hold cancel a captured payment?** No. Resolve the financial outcome separately.
+3. **Exercise:** sell the final 20 places under 100 concurrent requests, then race two scanners on one ticket. Repeat with disconnected scanners and document exactly which guarantee is lost.
 
 === HLD 20 ===
 N|client|Clients|0|130|120
@@ -853,14 +788,36 @@ Design a large-scale API gateway (like Kong, AWS API Gateway, Zuul or Envoy-base
 
 **Scale:** 2M req/s peak. At ~20k req/s per node, that's ~100+ nodes across regions.
 
-## Architecture
+## Learn through a concrete example
+
+An API gateway receives requests for orders, search and payments. It can authenticate, route and apply shared limits, but it should not become the owner of every service's business rules. A fast gateway can still overwhelm a slow downstream service unless it bounds concurrency and retries.
+
+The **control plane** distributes routing/policy configuration. The **data plane** handles requests using a validated snapshot. A **bulkhead** limits a dependency's resource consumption; a **circuit breaker** temporarily avoids calls to a failing dependency.
+
+## See request budgets and configuration safety
+
+![Routing and resilience preserve downstream capacity and caller identity.](lessons/hld-20-flow.svg)
+
+*Routing and resilience preserve downstream capacity and caller identity.*
+
+![Validate and publish atomically while preserving the last good snapshot.](lessons/hld-20-failure.svg)
+
+*Validate and publish atomically while preserving the last good snapshot.*
+
+### Calculate retry amplification
+
+If gateway, service and SDK each attempt a request three times, one user action may create `3×3×3 = 27` provider calls. Assign one retry owner and share a deadline. At 2,000 requests/s with 200 ms average residence, about 400 requests are in flight; a slowdown to two seconds raises this to about 4,000 unless admission changes.
+
+## Design details and alternatives
+
+### Architecture
 
 - **Edge:** DNS or anycast to regional load balancers (L4), then a fleet of **stateless gateway nodes** (L7, Envoy/NGINX/Netty-based).
 - **Data plane (per node):** TLS termination, then a filter chain (auth, rate limit, transform, route), then the upstream connection pool with load balancing (least-requests / P2C), retries, timeouts and circuit breakers.
 - **Control plane:** config store (routes, plugins, keys) pushed to nodes via xDS or watch streams. Versioned, validated and staged for rollout.
 - **Dependencies:** service discovery (Consul, Kubernetes endpoints), the auth/JWKS cache, a distributed rate-limit store (Redis), and telemetry exporters (OTel).
 
-## Key design decisions & trade-offs
+### Key design decisions & trade-offs
 
 **1. Keep the hot path local.** JWT verification with cached JWKS keys (no network call). Rate limits use local token buckets synchronised with Redis asynchronously, or Redis with tight timeouts and fail-open. Every remote call on the request path adds latency and a failure mode.
 
@@ -874,17 +831,13 @@ Design a large-scale API gateway (like Kong, AWS API Gateway, Zuul or Envoy-base
 
 **6. Observability.** Inject or propagate trace context and emit RED metrics (rate, errors, duration) per route. Sample access logs at high volume.
 
-## Scope, guarantees and sizing assumptions
+### Scope, guarantees and sizing assumptions
 
 **Correctness requirement:** Authentication, routing and policy selection derive from trusted configuration and identity, not from forwarded client claims.
 
 Assume 100,000 requests/s and 100 microseconds of gateway CPU/request: 10 CPU-seconds/s, roughly 10 fully occupied cores before TLS, filters and headroom. A 10 ms synchronous policy lookup would require about 1,000 concurrent outstanding lookups.
 
-These are illustrative planning assumptions, not published traffic statistics or benchmark results. Recalculate the model when retention, payload size, tenant mix or peak factor changes. Show units throughout: average QPS is operations divided by seconds, bandwidth is bytes per operation multiplied by operations per second, and stored bytes are arrivals multiplied by retention and record size. Keep decimal GB/TB distinct from binary GiB/TiB when comparing vendor capacity. Replication, indexes, compaction/write amplification, backups and spare capacity are separate multipliers, not free implementation details.
-
-Use the estimate to identify the first bottleneck, not to justify every distributed component. Ask which single key or customer can dominate the average. Measure a simple durable baseline before adding partitions. If a design serves a different workload than the stated assumption, explain the change rather than quietly inventing a larger number.
-
-## API contracts and data ownership
+### API contracts and data ownership
 
 ```text
 External proxy routes; management-plane versioned route/policy update; health/readiness; configuration rollback
@@ -898,76 +851,35 @@ Primary access/partitioning boundary:
 route_id + config_version; tenant/principal for rate budgets; upstream cluster for pools/circuit state
 ```
 
-Specify authentication, authorization, body limits and idempotency at the API boundary. The same idempotency key with the same payload returns the original result; the same key with a different payload is a conflict. Persist the payload fingerprint and outcome where retries can cross process restarts. Return stable resource/operation IDs so clients can query a pending or unknown outcome. Use cursor-based continuation for changing datasets and define the sort/snapshot semantics.
-
-An API sketch is incomplete without its authoritative records. Distinguish transactional state from projections and caches. A projection can be rebuilt; the committed ownership/history cannot. Define who may mutate each record and which fields must change atomically. A convenient cache key is not necessarily a safe database partition key, and a healthy load balancer does not choose primary-versus-replica reads on behalf of the database client.
-
-## Build the architecture in stages
-
-**Stage 1 — Correct baseline.** Keep one service boundary around the core transaction, durable records indexed for the dominant access path, explicit dependency adapters and basic operational metrics. Exercise the stated invariant with concurrent requests before introducing asynchronous replicas. Avoid coupling the primary user result to optional analytics, notifications or recommendation work.
-
-**Stage 2 — Measured scaling.** Add stateless request handlers and connection pools to absorb concurrent work. Cache only data whose freshness/authorization policy allows it. Introduce a durable queue when asynchronous work has an independent lifetime; define acceptance and completion separately. Autoscaling handlers cannot fix a single hot partition or an overwhelmed external provider.
+### Build the architecture in stages
 
 **Stage 3 — Partition and isolate.** Partition around route_id + config_version; tenant/principal for rate budgets; upstream cluster for pools/circuit state. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
 
-**Stage 4 — Regional resilience when required.** State the recovery point objective (acceptable lost acknowledged data) and recovery time objective (acceptable outage duration). A second region is useful only if it has usable data, credentials, capacity and a tested failover route. Prefer one write authority per conflicting resource until the product genuinely needs multi-writer conflict resolution.
-
-## Trace the critical request
+### Trace the critical request
 
 Terminate TLS; normalize and bound input; remove spoofed forwarding headers; authenticate; authorize route; apply quota and deadline; select healthy upstream; proxy with bounded buffers; propagate trace context; record outcome without logging credentials.
 
-At each hop name the input, output, timeout and durable fact. A synchronous success response should follow the promised commit point. If work continues in the background, return an operation ID and status rather than implying completion. Publish committed work through a transactional outbox or a comparably reliable mechanism; a database write followed by a best-effort publish has a failure gap.
-
-Do not place optional telemetry on the critical dependency chain. At the same time, “asynchronous” does not mean unbounded, durable or free: select queue capacity, retry deadlines, ordering scope and a poison-message policy. Consumers should record stable event identities or use conditional domain transitions so a redelivery has a safe effect. Broker-level transaction features do not automatically make an external payment, SMS or file write exactly once.
-
-## Deep dive: the decision that changes this system
+### Deep dive: the decision that changes this system
 
 A gateway retry of POST can repeat a business effect. Retry only under method/idempotency-aware rules and an end-to-end deadline. Timeout budgets must include queue time and every attempt; cascading retries across gateway and service can amplify load multiplicatively.
 
-The important partitioning question is not merely where bytes are stored but where conflicting operations meet. Different partitions may progress independently, while operations touching the same authority need ordering or conflict detection. A stale cache/read replica can improve latency, but its allowed staleness must match the operation. A user-facing ownership/payment decision often requires a stronger path than a browsing view.
-
-Do not use “eventual consistency” as a blanket explanation. Name the observable anomaly, the acceptable window and the remedy: stale reads, lost updates, duplicate effects, reordered events, or incomplete projections are different problems. Version/tombstone checks, conditional writes, durable deduplication and reconciliation solve different parts of that list. Include the client-visible response when a guarantee cannot be met.
-
-## Failure and race-condition walkthrough
+### Failure and race-condition walkthrough
 
 The configuration plane is unavailable. Continue with a validated last-known-good snapshot within policy rather than fetching configuration on every request. Reject malformed updates atomically; avoid publishing half an auth/routing change.
 
-| Failure point | Question to answer | Recovery evidence |
-|---|---|---|
-| Before durable commit | Did anything become authoritative? | No committed operation means a safe fresh attempt |
-| Commit succeeds, response is lost | How does the client avoid duplication? | Stable request/operation identity and stored result |
-| Cache/projection is stale | Can it decide this operation? | Read policy, version, tombstone or authoritative fallback |
-| Worker lease expires | Can the old worker still mutate state? | Fencing epoch checked at the resource boundary |
-| Dependency is unavailable | Is work rejected, queued or degraded? | Bounded deadline, queue and explicit product outcome |
-| Recovery replays events | How is a repeated effect detected? | Event identity or idempotent domain transition |
+### Security, tenancy and lifecycle
 
-A timeout does not prove the remote side failed. Keep unknown outcomes distinct from rejected ones, especially around external side effects. Retry within a shared deadline, with jitter and one clear retry owner. If a gateway, SDK and worker each retry independently, a small outage becomes a load amplifier. Circuit breakers stop some repeated calls but do not create downstream capacity or reverse an already committed effect.
-
-## Security, tenancy and lifecycle
-
-Authorize the resource before reading private records or generating signed references. Derive tenant/principal from authenticated context rather than a freely supplied body field. Scope cache keys, events and deduplication identities by the relevant ownership boundary. Validate untrusted URLs and payloads at egress/parser boundaries. Avoid putting credentials, full personal payloads or signed access tokens in normal logs.
-
-Retention is part of architecture. Define when source records, indexes, object blobs, replicas, caches and backups stop exposing deleted data; deleting one primary row is not a complete lifecycle policy. Keep the minimum history necessary to diagnose/reconcile operations under the product's requirements. Admin repair paths need authorization and audit just as much as public APIs.
-
-## Trade-offs and a starting recommendation
+### Trade-offs and a starting recommendation
 
 Central gateways simplify shared policy but can become noisy-neighbor bottlenecks. Separate control and data planes, limit plugin work, and isolate large uploads/streaming so buffers do not exhaust all workers.
 
-Present each alternative as a cost paid for a guarantee. SQL versus a KV store is about access paths, consistency and operating constraints, not a slogan that relational databases cannot scale. Caching buys latency at a freshness/invalidation cost. A queue decouples throughput at the cost of lag, replay and monitoring. Cross-region writes buy local write availability at the cost of coordination or application conflict resolution. A system does not become more correct merely by adding a named infrastructure product.
-
-For migrations, version schemas and event payloads; deploy readers that accept both compatible forms before writers emit the new form. Backfill in bounded batches, compare counts/checksums or domain invariants, move a small cohort, monitor, and retain rollback data until the cutover is proven. Rollback must account for writes made during the new version; restoring an old binary alone may not restore an old data model.
-
-## SLOs, failure drills and lab
+### SLOs, failure drills and lab
 
 Gateway overhead p99, auth errors, upstream saturation, retry amplification, active connections, config convergence and memory per stream.
 
 **Test matrix:** Spoofed identity headers, expired key rotation cache, malformed route update, upstream slow response, retry storm, large body and streaming cancellation.
 
-Build a load generator that models hot keys, retries and realistic arrival bursts rather than a uniform loop over random IDs. Separate p50, p95 and p99 latency, success/error/degraded outcomes, and cache-hit/miss paths. Test at steady state, after cold start, during one component failure and throughout recovery. A system that survives the outage but collapses while replaying backlog has not completed its failure test.
-
-Make a drill reproducible: state the starting dataset, failure time, expected invariant, maximum backlog and recovery criterion. Capture an operation trace that includes versions and identities, then verify the durable result after restart. Verify correctness and data-loss policy in addition to response latency; an API that returns quickly while double-selling or dropping acknowledged work has failed.
-
-## Follow-up questions with answers
+### Follow-up questions with answers
 
 **What cannot be eventually consistent here?** The operation establishing this guarantee: Authentication, routing and policy selection derive from trusted configuration and identity, not from forwarded client claims.
 
@@ -979,10 +891,20 @@ Make a drill reproducible: state the starting dataset, failure time, expected in
 
 **How would you demonstrate the design works?** Spoofed identity headers, expired key rotation cache, malformed route update, upstream slow response, retry storm, large body and streaming cancellation. Keep the expected invariant and recovery outcome visible in the results.
 
-Conclude a walkthrough by narrating one successful critical request, one concurrent conflict and one uncertain failure. Name the durable authority, the partition key, the commit point and the observable recovery policy. Those four facts are more useful than a diagram whose boxes all say “highly available”.
-
-## Further reading
+### Further reading
 
 - [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+
+## Work through trust boundaries
+
+Strip untrusted identity headers before injecting verified ones. Downstream services still authorize resource-specific actions; a signed-in user is not entitled to every order ID. Bound body size, decompression, headers and connection lifetimes independently.
+
+Retries are safe for operations whose semantics support them, not simply because the gateway sees a timeout. Streaming responses may already have exposed partial output. Canary configuration by route/instance and monitor error changes before broad activation; retain a rollback snapshot.
+
+## Practise, then check your reasoning
+
+1. **Does the gateway replace service authorization?** No. It supplies verified identity and common policy; services own domain permissions.
+2. **Does a circuit breaker add capacity?** No. It limits damage while a dependency is unhealthy.
+3. **Exercise:** slow one upstream tenfold, push an invalid route and replay a timed-out payment. Verify bounded in-flight work, retained good configuration and no unsafe automatic duplicate write.

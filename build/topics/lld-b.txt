@@ -29,7 +29,38 @@ Design the core of a cab-booking app like Uber or Ola: a rider requests a ride, 
 - A driver is offered one trip at a time, and two riders can never be assigned the same driver.
 - Matching rules and pricing (surge) must be swappable.
 
-## Key abstractions
+## Learn through a concrete example
+
+A rider requests a trip. Two nearby drivers receive offers, but only one may become the assigned driver. Meanwhile a driver can receive offers for several riders. A location search answers “who is nearby?”; assignment answers “who owns this trip?” These decisions require different models.
+
+A *trip* is the lifecycle of one ride. An *offer* is an expiring invitation. A *driver lease* is temporary exclusive assignment while a ride starts. Begin with one dispatcher process and explicit timeouts before considering geographic partitioning.
+
+## See matching and cancellation
+
+![An offer is not yet an exclusive driver assignment.](lessons/lld-7-flow.svg)
+
+*An offer is not yet an exclusive driver assignment.*
+
+![One transition authority decides whether the trip was assigned or cancelled.](lessons/lld-7-failure.svg)
+
+*One transition authority decides whether the trip was assigned or cancelled.*
+
+### Build the transition model
+
+Use trip states `REQUESTED`, `ASSIGNED`, `ARRIVED`, `IN_PROGRESS`, `COMPLETED` and `CANCELLED`. Cancellation rules differ before and after pickup. Keep pricing estimates separate from the final fare, which may depend on observed duration, distance and policy.
+
+```text
+acceptOffer(offerId, driverId, expectedTripVersion)
+Preconditions: offer live; trip REQUESTED; driver available
+Atomic result: trip assigned AND driver unavailable
+Conflict: no assignment; return current trip/offer state
+```
+
+For an illustrative score, driver A is 1 km away but needs 8 minutes because of road direction; B is 2 km away and needs 4 minutes. Straight-line nearest is not best pickup ETA. A replaceable dispatch policy can improve this without changing trip-state rules.
+
+## Design details and alternatives
+
+### Key abstractions
 
 | Type | Responsibility |
 |---|---|
@@ -41,7 +72,7 @@ Design the core of a cab-booking app like Uber or Ola: a rider requests a ride, 
 | `Trip` | State machine plus history |
 | `TripObserver` | `RiderNotifier`, `DriverNotifier`, `ReceiptMailer` |
 
-## Design decisions & trade-offs
+### Design decisions & trade-offs
 
 **1. Atomic driver reservation.** Matching reads candidates without locks, but *claiming* a driver must be atomic:
 ```java
@@ -59,7 +90,7 @@ If the CAS fails, another trip took the driver, so try the next candidate. If th
 
 **5. Trip State pattern.** Cancellation fees depend on state: free before assignment, a fee after the driver arrives. That logic lives in each state's `cancel()`.
 
-## Ownership, boundaries and invariants
+### Ownership, boundaries and invariants
 
 **Central design question:** Driver assignment and trip progression need one authoritative owner even if location search is approximate.
 
@@ -67,93 +98,56 @@ Rider and Driver hold identities; Vehicle has capacity and category. RideRequest
 
 **Correctness rule:** A driver cannot be assigned to two active trips, and a trip has at most one accepted driver. A cached location result never establishes availability.
 
-Begin with a single-process, testable domain model. Treat database durability, multiple JVMs, and hardware/provider calls as explicit extensions; do not claim that a Java lock gives system-wide correctness. An aggregate is the object boundary within which a command preserves its invariants. It is not necessarily an entire application or database table. Identify which values may be observed stale and which decision must be serialized before drawing a class hierarchy.
-
-The storage outline below is a design vocabulary rather than complete executable DDL. Choose actual column types, foreign keys, indexes and retention after naming the access paths. Keep domain identities stable across retries and keep historical commercial facts immutable.
-
 ```text
 trip(id,rider_id,driver_id,state,offer_token,version); driver_availability(driver_id,state,active_trip_id)
 ```
 
-## State machine and command contracts
+### State machine and command contracts
 
 ```text
 REQUESTED -> OFFERED -> ACCEPTED -> ARRIVED -> IN_PROGRESS -> COMPLETED; CANCELLED before permitted boundaries
 ```
 
-For every arrow write five things: the actor allowed to request it, the input, its precondition, the state it changes, and the durable result returned. A controller should translate input and errors, while the aggregate owns legal transitions. A policy calculates a decision without secretly writing another aggregate. External adapters translate a provider or device response into a typed outcome, including unknown outcomes.
-
-Use a command envelope containing an operation ID, target identity, expected version where relevant, and validated arguments. Return an immutable result containing the committed version and domain outcome. Reject invalid input before a state change, but repeat mutable-state checks inside the serialization boundary. A preflight check outside a lock can improve user feedback; it cannot establish the invariant.
-
-Do not represent every failure with `false`. Distinguish invalid input, conflict, unavailable resource, dependency failure and unknown external outcome. That distinction controls whether a client should correct input, refresh state, retry with the same identity or wait for reconciliation. A retry with a new operation identity is a new command, even when the user thinks it is the old request.
-
-## End-to-end execution trace
+### End-to-end execution trace
 
 Create request; fetch nearby candidates; reserve one with an expiring offer; notify; atomically accept only if the offer is current and the driver is free; start after pickup confirmation; end with measured facts; calculate and settle fare using a durable operation ID.
 
-Trace one successful call through API, application service, aggregate, repository and adapter. Record the first durable fact and the exact point at which success can be acknowledged. Then replay the call with the same identity. The second response should describe the original result rather than create another effect. If the operation has no external side effect and is naturally idempotent, explain that simpler property instead of adding an unnecessary request table.
-
-Snapshot immutable output for clients. Returning a mutable internal collection allows UI code to violate invariants without calling a command. Copy lists/sets or expose read-only views with documented lifetime; remember that an unmodifiable collection can still contain mutable elements. Keep repository concerns behind interfaces so a deterministic in-memory implementation can demonstrate the domain without pretending it models multi-process transactions.
-
-## Concurrency and recovery walkthrough
+### Concurrency and recovery walkthrough
 
 Two dispatches offer different trips to one driver. A conditional claim on driver availability plus trip ownership prevents both acceptances. Expiry and acceptance must compare the same offer token.
 
-Write an interleaving table before selecting a synchronization primitive:
 
-| Step | Request A | Request B | Required observation |
-|---|---|---|---|
-| 1 | Reads version v | Reads version v | Both observations may be individually valid |
-| 2 | Validates and attempts commit | Waits or attempts commit | One authority decides conflicts |
-| 3 | Commits version v+1 | Rechecks or loses compare-and-set | B cannot rely on its old precondition |
-| 4 | Returns committed result | Returns conflict or retries within policy | Retries preserve operation identity |
 
-For one JVM, synchronize the whole check-and-update operation on the owning aggregate, or use a single-owner event loop. Thread-safe containers protect their own methods; they do not make a sequence across several objects atomic. For database-backed replicas, use conditional updates, uniqueness/exclusion constraints or row locks in a transaction. Pick a consistent lock ordering when a command owns several resources. Release locks before a slow network call, and model the pending state needed to resume later.
-
-Recovery starts from recorded state, not from a guess about which line of Java probably ran. Persist the operation intent and classify external results. If a process fails after a provider or device acts, query/reconcile by its original reference. Do not claim rollback can reverse cash movement, a sent SMS or an already captured payment. Compensation is a new operation that can itself fail and needs its own identity and state.
-
-## Policy choices and extension seams
+### Policy choices and extension seams
 
 Sequential offers avoid many cancellations but increase wait time; a small parallel offer batch reduces latency while requiring atomic winner selection. Do not put map-provider calls into Trip state transitions.
 
-Add an interface where there are two meaningful behaviors or an unreliable boundary, not for every noun. Prefer composition when a rule changes independently of entity identity. Keep state-dependent validation close to the state owner. Patterns are useful vocabulary for a chosen responsibility: Strategy for a replaceable policy, State for legal transitions, Adapter for an external system. A diagram full of pattern names is weaker than a small model with clear mutation rules.
-
-Time, money and randomness deserve explicit types. Use `Instant` for an absolute event time and a `ZoneId` when local calendar meaning matters. Use a monotonic elapsed-time source for duration-based quotas; wall clocks can move. Represent money in a defined currency using integral minor units or an explicit decimal/rounding policy. Guard addition/multiplication overflow and do not convert through binary floating-point. Inject a clock or dice source so tests can reproduce a boundary without sleeps or luck.
-
-## Edge cases that change the design
+### Edge cases that change the design
 
 A rider cancels while a driver accepts. Serialize the transition and return the resulting state. Stale GPS does not prove pickup. Surge quote validity and cancellation fees require explicit policy versions.
 
-Input validation is not the only boundary. Also bound collection sizes, pending work, callback retries and retained history. Authenticate the actor before loading private state and authorize the specific resource before applying a command. Log operation IDs, versions and state transitions; avoid logging secrets or entire payment/identity payloads. Monitoring should make a stuck pending state visible rather than converting it silently into success.
-
-## Verification and a practical lab
+### Verification and a practical lab
 
 **Topic-specific cases:** Only one trip claims a driver; expired offer rejection; duplicate completion; cancellation boundary; stale location exclusion; fare snapshot stability.
 
 **Lab:** Interleave rider cancellation, driver acceptance and offer expiry. State the one committed trip outcome and which notifications can safely be sent afterward.
 
-Test the invariant after each transition, not only the final happy-path response. Include two independent aggregate instances to catch accidental static/global state. Run a race test with a barrier so both contenders begin from the same observation. Use a fake clock to cross expiry boundaries exactly. Test an adapter that throws before acting and one that acts then times out; these are different failure cases. A property-based sequence test can generate valid and invalid commands and check conservation/ownership after every step.
-
-The Java examples in `examples/reference-invariants/ReferenceInvariants.java` demonstrate selected executable mechanisms: half-open intervals, exact equal splits, expiring ownership and a token bucket. They are deliberately small examples of invariants, not complete implementations of every system. The original topic code above remains a design sketch unless explicitly marked runnable. Explain which repository/adapter must provide a production guarantee before copying a sketch into a service.
-
-## Follow-up answers and review checklist
-
-**Where is the first correctness boundary?** The aggregate or durable conditional update that establishes this rule: A driver cannot be assigned to two active trips, and a trip has at most one accepted driver. A cached location result never establishes availability.
-
-**What changes when a second process is added?** In-process locks no longer cover all writers. Move the decisive check to a shared authoritative transaction or partition owner, while retaining local encapsulation for readability.
-
-**What happens when a response is lost?** Query the operation identity or repeat the same idempotent command. Return the known committed outcome; if an external effect is uncertain, preserve and reconcile that uncertainty.
-
-**What should be extracted into a pattern?** Start from the actual extension seam: Sequential offers avoid many cancellations but increase wait time; a small parallel offer batch reduces latency while requiring atomic winner selection. Do not put map-provider calls into Trip state transitions.
-
-**What is the best next exercise?** Interleave rider cancellation, driver acceptance and offer expiry. State the one committed trip outcome and which notifications can safely be sent afterward.
-
-Before calling this design complete, narrate one command, one contention race and one restart. Point to the exact fields that prevent duplicate ownership or invalid transitions. State which parts are single-JVM demonstrations and which require transactional persistence. A reviewer should be able to derive tests from your invariants without reading your implementation.
-
-## Further reading
+### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+
+## Work through failure and extensions
+
+A driver's phone may miss the assignment response. Repeating O9 should return the same assigned trip, not assign a second rider. Offer expiry must compare the offer identity so an old timer cannot release a later assignment. Location freshness also matters: a point from 15 minutes ago should not compete equally with a current location.
+
+At larger scale, driver and trip records may live in separate services. A distributed workflow needs a recoverable pending assignment and compensation; claiming that two independent database writes are atomic would be misleading. Start with one transactional ownership boundary when possible.
+
+## Practise, then check your reasoning
+
+1. **Can two riders see the same nearby driver?** Yes. Search is a hint; only assignment establishes exclusivity.
+2. **May the rider cancel an already completed trip?** No. A refund/dispute is a separate operation with its own rules.
+3. **Exercise:** race two drivers accepting one trip, then two trips claiming one driver. Assert one owner in each direction and no driver left busy by a failed assignment.
 
 === LLD 8 ===
 N|cust|Customer|0|0|130
@@ -185,7 +179,38 @@ Design a food delivery system like Swiggy or Zomato: browse restaurants, place a
 - Only valid state transitions are allowed.
 - An agent carries at most N orders. Assignment rules differ by city.
 
-## Key abstractions
+## Learn through a concrete example
+
+A customer orders a pizza and a drink. The restaurant can reject the pizza after payment authorization, or the delivery partner can become unavailable after preparation. One status called `PROCESSING` cannot explain who is responsible or what recovery is needed.
+
+Separate the **order** (the commercial agreement), **restaurant fulfilment** (acceptance and preparation), **payment** and **delivery assignment**. They are related lifecycles, not interchangeable enums. Start with a modular application and explicit transitions between these responsibilities.
+
+## See fulfilment and a late failure
+
+![A visible order status summarizes several independently recorded facts.](lessons/lld-8-flow.svg)
+
+*A visible order status summarizes several independently recorded facts.*
+
+![Recover the financial operation without inventing a food delivery.](lessons/lld-8-failure.svg)
+
+*Recover the financial operation without inventing a food delivery.*
+
+### Build the first version
+
+An order line needs item ID, chosen options, quantity and a snapshot of unit price. A menu entry can change tomorrow; yesterday's order must remain explainable. For two ₹300 pizzas and a ₹60 drink, subtotal is ₹660. A ₹50 delivery fee and ₹40 discount give ₹670 before the chosen tax policy. Apply discount allocation and rounding explicitly.
+
+```text
+OrderLine(menuItemId, nameSnapshot, optionsSnapshot, quantity, unitPrice)
+Order(orderId, customerId, addressSnapshot, lines, total, version)
+RestaurantDecision(orderId, acceptedItems, reason, decisionId)
+Delivery(deliveryId, orderId, partnerId, state)
+```
+
+A restaurant cannot silently replace an item with a higher-priced alternative. Record substitution consent or reject/partially fulfil under a documented policy.
+
+## Design details and alternatives
+
+### Key abstractions
 
 | Type | Responsibility |
 |---|---|
@@ -207,7 +232,7 @@ enum OrderStatus {
 }
 ```
 
-## Design decisions & trade-offs
+### Design decisions & trade-offs
 
 **1. Transition table vs. full State classes.** A transition map on an enum is compact and easy to audit. Full State classes pay off when each state has *behaviour* (cancellation refunds, allowed edits). A common answer is the enum for legality plus a `RefundPolicy` keyed by state.
 
@@ -219,7 +244,7 @@ enum OrderStatus {
 
 **5. Concurrency.** The restaurant's accept and the customer's cancel can race. Guard transitions with a conditional update (`compareAndSet` on status, or `UPDATE … WHERE status = :expected`), so only one wins.
 
-## Ownership, boundaries and invariants
+### Ownership, boundaries and invariants
 
 **Central design question:** An order coordinates restaurant, courier and payment states without pretending they are one atomic action.
 
@@ -227,93 +252,58 @@ Restaurant owns menu versions; Cart holds selections; Order snapshots item names
 
 **Correctness rule:** An accepted order retains the agreed price and items even when the live menu changes. A delivered order must not return to preparing because a late event arrives.
 
-Begin with a single-process, testable domain model. Treat database durability, multiple JVMs, and hardware/provider calls as explicit extensions; do not claim that a Java lock gives system-wide correctness. An aggregate is the object boundary within which a command preserves its invariants. It is not necessarily an entire application or database table. Identify which values may be observed stale and which decision must be serialized before drawing a class hierarchy.
-
-The storage outline below is a design vocabulary rather than complete executable DDL. Choose actual column types, foreign keys, indexes and retention after naming the access paths. Keep domain identities stable across retries and keep historical commercial facts immutable.
-
 ```text
 orders(id,menu_version,total_minor,state,version); order_line(snapshot); delivery(order_id,courier_id,status); payment_attempt(id,status)
 ```
 
-## State machine and command contracts
+### State machine and command contracts
 
 ```text
 Order CREATED -> ACCEPTED -> FULFILLED | CANCELLED; Delivery UNASSIGNED -> ASSIGNED -> PICKED_UP -> DELIVERED
 ```
 
-For every arrow write five things: the actor allowed to request it, the input, its precondition, the state it changes, and the durable result returned. A controller should translate input and errors, while the aggregate owns legal transitions. A policy calculates a decision without secretly writing another aggregate. External adapters translate a provider or device response into a typed outcome, including unknown outcomes.
-
-Use a command envelope containing an operation ID, target identity, expected version where relevant, and validated arguments. Return an immutable result containing the committed version and domain outcome. Reject invalid input before a state change, but repeat mutable-state checks inside the serialization boundary. A preflight check outside a lock can improve user feedback; it cannot establish the invariant.
-
-Do not represent every failure with `false`. Distinguish invalid input, conflict, unavailable resource, dependency failure and unknown external outcome. That distinction controls whether a client should correct input, refresh state, retry with the same identity or wait for reconciliation. A retry with a new operation identity is a new command, even when the user thinks it is the old request.
-
-## End-to-end execution trace
+### End-to-end execution trace
 
 Validate menu and service area; create price snapshot; authorize payment; ask restaurant to accept; capture according to policy; assign a courier; record pickup and delivery; handle cancellation/refund through explicit compensating operations.
 
-Trace one successful call through API, application service, aggregate, repository and adapter. Record the first durable fact and the exact point at which success can be acknowledged. Then replay the call with the same identity. The second response should describe the original result rather than create another effect. If the operation has no external side effect and is naturally idempotent, explain that simpler property instead of adding an unnecessary request table.
-
-Snapshot immutable output for clients. Returning a mutable internal collection allows UI code to violate invariants without calling a command. Copy lists/sets or expose read-only views with documented lifetime; remember that an unmodifiable collection can still contain mutable elements. Keep repository concerns behind interfaces so a deterministic in-memory implementation can demonstrate the domain without pretending it models multi-process transactions.
-
-## Concurrency and recovery walkthrough
+### Concurrency and recovery walkthrough
 
 A restaurant accepts while the customer cancels. Compare the order version and use cancellation rules for the resulting state. Deduplicate provider and courier events by event identity, not by matching message text.
 
-Write an interleaving table before selecting a synchronization primitive:
 
-| Step | Request A | Request B | Required observation |
-|---|---|---|---|
-| 1 | Reads version v | Reads version v | Both observations may be individually valid |
-| 2 | Validates and attempts commit | Waits or attempts commit | One authority decides conflicts |
-| 3 | Commits version v+1 | Rechecks or loses compare-and-set | B cannot rely on its old precondition |
-| 4 | Returns committed result | Returns conflict or retries within policy | Retries preserve operation identity |
 
-For one JVM, synchronize the whole check-and-update operation on the owning aggregate, or use a single-owner event loop. Thread-safe containers protect their own methods; they do not make a sequence across several objects atomic. For database-backed replicas, use conditional updates, uniqueness/exclusion constraints or row locks in a transaction. Pick a consistent lock ordering when a command owns several resources. Release locks before a slow network call, and model the pending state needed to resume later.
-
-Recovery starts from recorded state, not from a guess about which line of Java probably ran. Persist the operation intent and classify external results. If a process fails after a provider or device acts, query/reconcile by its original reference. Do not claim rollback can reverse cash movement, a sent SMS or an already captured payment. Compensation is a new operation that can itself fail and needs its own identity and state.
-
-## Policy choices and extension seams
+### Policy choices and extension seams
 
 Separate payment, preparation and delivery state axes avoid one enormous enum with impossible combinations. A coordinator keeps legal combinations explicit. Observer-style notifications may update views but must not commit payment state.
 
-Add an interface where there are two meaningful behaviors or an unreliable boundary, not for every noun. Prefer composition when a rule changes independently of entity identity. Keep state-dependent validation close to the state owner. Patterns are useful vocabulary for a chosen responsibility: Strategy for a replaceable policy, State for legal transitions, Adapter for an external system. A diagram full of pattern names is weaker than a small model with clear mutation rules.
-
-Time, money and randomness deserve explicit types. Use `Instant` for an absolute event time and a `ZoneId` when local calendar meaning matters. Use a monotonic elapsed-time source for duration-based quotas; wall clocks can move. Represent money in a defined currency using integral minor units or an explicit decimal/rounding policy. Guard addition/multiplication overflow and do not convert through binary floating-point. Inject a clock or dice source so tests can reproduce a boundary without sleeps or luck.
-
-## Edge cases that change the design
+### Edge cases that change the design
 
 One unavailable menu item may require partial acceptance with customer approval. An address change after courier assignment affects fees and serviceability. No courier available is a recoverable dispatch problem, not evidence that food was never prepared.
 
-Input validation is not the only boundary. Also bound collection sizes, pending work, callback retries and retained history. Authenticate the actor before loading private state and authorize the specific resource before applying a command. Log operation IDs, versions and state transitions; avoid logging secrets or entire payment/identity payloads. Monitoring should make a stuck pending state visible rather than converting it silently into success.
-
-## Verification and a practical lab
+### Verification and a practical lab
 
 **Topic-specific cases:** Menu price changes do not alter an order; duplicate pickup ignored; cancel/accept race; partial item rejection; payment uncertainty; invalid address change.
 
 **Lab:** Cancel after food preparation but before courier pickup. Define allowed refund components and a compensation record rather than deleting the order.
 
-Test the invariant after each transition, not only the final happy-path response. Include two independent aggregate instances to catch accidental static/global state. Run a race test with a barrier so both contenders begin from the same observation. Use a fake clock to cross expiry boundaries exactly. Test an adapter that throws before acting and one that acts then times out; these are different failure cases. A property-based sequence test can generate valid and invalid commands and check conservation/ownership after every step.
-
-The Java examples in `examples/reference-invariants/ReferenceInvariants.java` demonstrate selected executable mechanisms: half-open intervals, exact equal splits, expiring ownership and a token bucket. They are deliberately small examples of invariants, not complete implementations of every system. The original topic code above remains a design sketch unless explicitly marked runnable. Explain which repository/adapter must provide a production guarantee before copying a sketch into a service.
-
-## Follow-up answers and review checklist
-
-**Where is the first correctness boundary?** The aggregate or durable conditional update that establishes this rule: An accepted order retains the agreed price and items even when the live menu changes. A delivered order must not return to preparing because a late event arrives.
-
-**What changes when a second process is added?** In-process locks no longer cover all writers. Move the decisive check to a shared authoritative transaction or partition owner, while retaining local encapsulation for readability.
-
-**What happens when a response is lost?** Query the operation identity or repeat the same idempotent command. Return the known committed outcome; if an external effect is uncertain, preserve and reconcile that uncertainty.
-
-**What should be extracted into a pattern?** Start from the actual extension seam: Separate payment, preparation and delivery state axes avoid one enormous enum with impossible combinations. A coordinator keeps legal combinations explicit. Observer-style notifications may update views but must not commit payment state.
-
-**What is the best next exercise?** Cancel after food preparation but before courier pickup. Define allowed refund components and a compensation record rather than deleting the order.
-
-Before calling this design complete, narrate one command, one contention race and one restart. Point to the exact fields that prevent duplicate ownership or invalid transitions. State which parts are single-JVM demonstrations and which require transactional persistence. A reviewer should be able to derive tests from your invariants without reading your implementation.
-
-## Further reading
+### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+
+## Work through retries and cancellation
+
+The same restaurant acceptance event may arrive twice. Apply it once by decision identity and legal source state. An acceptance arriving after cancellation must not resurrect the order. Similarly, reassigning a courier should not create a second restaurant preparation request.
+
+Cancellation before preparation may be free; cancellation after food is prepared may have a charge. Put this rule in a cancellation policy using recorded milestones. Do not inspect a stale UI label and guess whether the kitchen has started.
+
+Keep network calls outside database locks. Record intent, call the provider, then record the result. If the process stops between those steps, resume using the original operation reference. A void and a refund are different actions depending on whether money was only authorized or already captured.
+
+## Practise, then check your reasoning
+
+1. **Why snapshot the address?** Editing a profile after dispatch must not redirect an already accepted delivery without an explicit change operation.
+2. **Does a payment success mean restaurant acceptance?** No. Financial and fulfilment outcomes are separate.
+3. **Exercise:** simulate restaurant rejection, repeated acceptance, courier replacement and cancellation-after-preparation. Explain the order, payment and delivery states after each—not just one final label.
 
 === LLD 9 ===
 N|lib|Library|300|0|130
@@ -348,7 +338,38 @@ Design a library management system: catalogue books, let members search, borrow,
 - Rules vary by member type (borrow limit, loan period, fine rate) without code changes.
 - Auditable: every borrow, return, renewal and fine is recorded.
 
-## Key abstractions
+## Learn through a concrete example
+
+A library has three physical copies of the same title. Nila borrows copy C2; Arjun reserves the title because the other copies are unavailable. A `Book` with one `borrowed` flag loses both copy identity and the reservation queue.
+
+A **bibliographic record** describes a title/edition. A **copy** is a physical item with a barcode. A **loan** connects one copy and one member for a period. A **hold** is a claim to the next eligible copy, usually of a title or edition rather than a particular barcode.
+
+## See borrowing and return allocation
+
+![Title metadata stays independent of physical circulation.](lessons/lld-9-flow.svg)
+
+*Title metadata stays independent of physical circulation.*
+
+![The copy and active-loan constraint decide checkout ownership.](lessons/lld-9-failure.svg)
+
+*The copy and active-loan constraint decide checkout ownership.*
+
+### Build and calculate
+
+Use `BookEdition`, `BookCopy`, `Member`, `Loan` and `HoldQueue`. Catalogue search returns editions, while checkout needs a barcode. A unique active-loan constraint for each copy protects circulation independently of search indexes.
+
+```text
+checkout(copyId, memberId, now)
+Check: member active; loan limit not exceeded; copy available;
+       any pickup hold belongs to this member
+Commit: create loan with due date; copy becomes ON_LOAN
+```
+
+Suppose a 14-day loan is due on 15 November under a local-date policy. Returning on the 18th gives three overdue days. At ₹5 per overdue day the fee is ₹15, subject to grace days and caps. A timestamp-based policy can differ; choose deliberately and store the applicable policy version.
+
+## Design details and alternatives
+
+### Key abstractions
 
 | Type | Responsibility |
 |---|---|
@@ -361,7 +382,7 @@ Design a library management system: catalogue books, let members search, borrow,
 | `FineStrategy` | `PerDayFine`, `CappedFine`, `GracePeriodFine` |
 | `NotificationService` | Email or SMS when a reservation is ready |
 
-## Design decisions & trade-offs
+### Design decisions & trade-offs
 
 **1. Book vs. BookItem.** This is the main insight. A library holds 3 copies of "Clean Code". Loans attach to *items*, and reservations attach to *books* (any copy will do). Mixing them up breaks reservations and inventory.
 
@@ -373,7 +394,7 @@ Design a library management system: catalogue books, let members search, borrow,
 
 **5. Search indexing.** In memory, use maps keyed by lower-cased tokens. At scale, use a search engine. Keep `Catalog` behind an interface so swapping is painless.
 
-## Ownership, boundaries and invariants
+### Ownership, boundaries and invariants
 
 **Central design question:** A bibliographic title and a physical lendable copy are different objects.
 
@@ -381,93 +402,56 @@ BookTitle holds ISBN and catalogue metadata; BookCopy has barcode, branch and co
 
 **Correctness rule:** A copy has at most one open loan. Renewing a loan cannot bypass a waiting member under the chosen fairness policy. Lost copies cannot appear available because their last loan closed.
 
-Begin with a single-process, testable domain model. Treat database durability, multiple JVMs, and hardware/provider calls as explicit extensions; do not claim that a Java lock gives system-wide correctness. An aggregate is the object boundary within which a command preserves its invariants. It is not necessarily an entire application or database table. Identify which values may be observed stale and which decision must be serialized before drawing a class hierarchy.
-
-The storage outline below is a design vocabulary rather than complete executable DDL. Choose actual column types, foreign keys, indexes and retention after naming the access paths. Keep domain identities stable across retries and keep historical commercial facts immutable.
-
 ```text
 book_title(isbn,title); copy(barcode,isbn,branch,state,version); loan(id,copy_id,member_id,due_at,returned_at)
 ```
 
-## State machine and command contracts
+### State machine and command contracts
 
 ```text
 Copy AVAILABLE -> ON_LOAN -> INSPECTION -> AVAILABLE; HOLD_ASSIGNED and LOST are explicit states
 ```
 
-For every arrow write five things: the actor allowed to request it, the input, its precondition, the state it changes, and the durable result returned. A controller should translate input and errors, while the aggregate owns legal transitions. A policy calculates a decision without secretly writing another aggregate. External adapters translate a provider or device response into a typed outcome, including unknown outcomes.
-
-Use a command envelope containing an operation ID, target identity, expected version where relevant, and validated arguments. Return an immutable result containing the committed version and domain outcome. Reject invalid input before a state change, but repeat mutable-state checks inside the serialization boundary. A preflight check outside a lock can improve user feedback; it cannot establish the invariant.
-
-Do not represent every failure with `false`. Distinguish invalid input, conflict, unavailable resource, dependency failure and unknown external outcome. That distinction controls whether a client should correct input, refresh state, retry with the same identity or wait for reconciliation. A retry with a new operation identity is a new command, even when the user thinks it is the old request.
-
-## End-to-end execution trace
+### End-to-end execution trace
 
 Authenticate the member; check eligibility and loan count; atomically claim an available copy; persist loan and due date; at return close exactly one loan; compute late fees; inspect condition; allocate to the next eligible hold before publishing general availability.
 
-Trace one successful call through API, application service, aggregate, repository and adapter. Record the first durable fact and the exact point at which success can be acknowledged. Then replay the call with the same identity. The second response should describe the original result rather than create another effect. If the operation has no external side effect and is naturally idempotent, explain that simpler property instead of adding an unnecessary request table.
-
-Snapshot immutable output for clients. Returning a mutable internal collection allows UI code to violate invariants without calling a command. Copy lists/sets or expose read-only views with documented lifetime; remember that an unmodifiable collection can still contain mutable elements. Keep repository concerns behind interfaces so a deterministic in-memory implementation can demonstrate the domain without pretending it models multi-process transactions.
-
-## Concurrency and recovery walkthrough
+### Concurrency and recovery walkthrough
 
 Two librarians scan the same copy at different desks. A unique active-loan constraint or copy version allows one checkout. Renew versus hold placement needs a defined transaction boundary.
 
-Write an interleaving table before selecting a synchronization primitive:
 
-| Step | Request A | Request B | Required observation |
-|---|---|---|---|
-| 1 | Reads version v | Reads version v | Both observations may be individually valid |
-| 2 | Validates and attempts commit | Waits or attempts commit | One authority decides conflicts |
-| 3 | Commits version v+1 | Rechecks or loses compare-and-set | B cannot rely on its old precondition |
-| 4 | Returns committed result | Returns conflict or retries within policy | Retries preserve operation identity |
 
-For one JVM, synchronize the whole check-and-update operation on the owning aggregate, or use a single-owner event loop. Thread-safe containers protect their own methods; they do not make a sequence across several objects atomic. For database-backed replicas, use conditional updates, uniqueness/exclusion constraints or row locks in a transaction. Pick a consistent lock ordering when a command owns several resources. Release locks before a slow network call, and model the pending state needed to resume later.
-
-Recovery starts from recorded state, not from a guess about which line of Java probably ran. Persist the operation intent and classify external results. If a process fails after a provider or device acts, query/reconcile by its original reference. Do not claim rollback can reverse cash movement, a sent SMS or an already captured payment. Compensation is a new operation that can itself fail and needs its own identity and state.
-
-## Policy choices and extension seams
+### Policy choices and extension seams
 
 Store availability as a projection for search, while copy/loan records remain authoritative. Strategy is appropriate for faculty-versus-student loan duration; subclassing Book for every policy is not.
 
-Add an interface where there are two meaningful behaviors or an unreliable boundary, not for every noun. Prefer composition when a rule changes independently of entity identity. Keep state-dependent validation close to the state owner. Patterns are useful vocabulary for a chosen responsibility: Strategy for a replaceable policy, State for legal transitions, Adapter for an external system. A diagram full of pattern names is weaker than a small model with clear mutation rules.
-
-Time, money and randomness deserve explicit types. Use `Instant` for an absolute event time and a `ZoneId` when local calendar meaning matters. Use a monotonic elapsed-time source for duration-based quotas; wall clocks can move. Represent money in a defined currency using integral minor units or an explicit decimal/rounding policy. Guard addition/multiplication overflow and do not convert through binary floating-point. Inject a clock or dice source so tests can reproduce a boundary without sleeps or luck.
-
-## Edge cases that change the design
+### Edge cases that change the design
 
 ISBN is not a copy identifier. A returned damaged book goes to inspection. Time-zone-aware branch closing rules affect due dates. Deleting a member must not destroy accounting history.
 
-Input validation is not the only boundary. Also bound collection sizes, pending work, callback retries and retained history. Authenticate the actor before loading private state and authorize the specific resource before applying a command. Log operation IDs, versions and state transitions; avoid logging secrets or entire payment/identity payloads. Monitoring should make a stuck pending state visible rather than converting it silently into success.
-
-## Verification and a practical lab
+### Verification and a practical lab
 
 **Topic-specific cases:** One open loan per copy; member limit; renewal with queued hold; return replay; damage inspection; hold expiration fairness.
 
 **Lab:** Place two holds on a title with one copy, return the copy and let the first hold expire. Show queue advancement without issuing two pickup offers.
 
-Test the invariant after each transition, not only the final happy-path response. Include two independent aggregate instances to catch accidental static/global state. Run a race test with a barrier so both contenders begin from the same observation. Use a fake clock to cross expiry boundaries exactly. Test an adapter that throws before acting and one that acts then times out; these are different failure cases. A property-based sequence test can generate valid and invalid commands and check conservation/ownership after every step.
-
-The Java examples in `examples/reference-invariants/ReferenceInvariants.java` demonstrate selected executable mechanisms: half-open intervals, exact equal splits, expiring ownership and a token bucket. They are deliberately small examples of invariants, not complete implementations of every system. The original topic code above remains a design sketch unless explicitly marked runnable. Explain which repository/adapter must provide a production guarantee before copying a sketch into a service.
-
-## Follow-up answers and review checklist
-
-**Where is the first correctness boundary?** The aggregate or durable conditional update that establishes this rule: A copy has at most one open loan. Renewing a loan cannot bypass a waiting member under the chosen fairness policy. Lost copies cannot appear available because their last loan closed.
-
-**What changes when a second process is added?** In-process locks no longer cover all writers. Move the decisive check to a shared authoritative transaction or partition owner, while retaining local encapsulation for readability.
-
-**What happens when a response is lost?** Query the operation identity or repeat the same idempotent command. Return the known committed outcome; if an external effect is uncertain, preserve and reconcile that uncertainty.
-
-**What should be extracted into a pattern?** Start from the actual extension seam: Store availability as a projection for search, while copy/loan records remain authoritative. Strategy is appropriate for faculty-versus-student loan duration; subclassing Book for every policy is not.
-
-**What is the best next exercise?** Place two holds on a title with one copy, return the copy and let the first hold expire. Show queue advancement without issuing two pickup offers.
-
-Before calling this design complete, narrate one command, one contention race and one restart. Point to the exact fields that prevent duplicate ownership or invalid transitions. State which parts are single-JVM demonstrations and which require transactional persistence. A reviewer should be able to derive tests from your invariants without reading your implementation.
-
-## Further reading
+### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+
+## Work through holds and renewal
+
+Renewal is not just `dueDate += 14`: reject it if another member has a waiting hold, the member is blocked, or the renewal count is exhausted. Two simultaneous renewals should not extend the date twice because one client retried after a lost response.
+
+A returned damaged copy is not automatically available. Move it into inspection/repair state, and allocate the next healthy copy to the waiting queue. When a pickup hold expires, compare its hold identity before releasing the copy; a later reassignment must survive a delayed timer.
+
+## Practise, then check your reasoning
+
+1. **Where does ISBN belong?** On the edition/catalogue record, not as the sole identity of every physical copy.
+2. **May returning one copy clear every loan for that title?** No. Close the active loan for the scanned copy only.
+3. **Exercise:** create two copies, three members and two queued holds. Return one copy, expire the first pickup window, and verify fair reassignment without losing the second member's place.
 
 === LLD 10 ===
 N|group|Group|300|0|130
@@ -496,7 +480,40 @@ Design Splitwise: users add shared expenses in groups, split them equally, by ex
 **Non-functional**
 - Money must be exact (no floating point) and balances must always sum to zero.
 
-## Key abstractions
+## Learn through a concrete example
+
+Three friends share a ₹1,000 meal paid by Asha. Asha owes her own share and is owed the others' shares. The system records obligations; it does not move bank money merely because a balance changes on screen.
+
+An **expense** is an immutable statement of who paid and who owes how much. A **settlement** reduces obligations after a separate payment or recorded agreement. A **balance** is derived from these events. Begin with one currency and integral minor units: ₹1,000 is 100,000 paise.
+
+## See splitting and conserving money
+
+![The sum of all participant shares must equal the original expense.](lessons/lld-10-flow.svg)
+
+*The sum of all participant shares must equal the original expense.*
+
+![Corrections are explicit events rather than silent rewrites.](lessons/lld-10-failure.svg)
+
+*Corrections are explicit events rather than silent rewrites.*
+
+### Build and calculate
+
+For an equal split, compute `base = total / count` and `remainder = total % count`. Give one extra paise to the first `remainder` participants in a stable order. For percentages, validate that percentages sum to the declared scale, then allocate rounding remainders explicitly.
+
+```java
+// Nonnegative paise; participants are already distinct and stably ordered.
+long share(long total, int count, int index) {
+    if (total < 0 || count <= 0 || index < 0 || index >= count)
+        throw new IllegalArgumentException();
+    return total / count + (index < total % count ? 1 : 0);
+}
+```
+
+If Asha pays everything, her own share does not become a debt to herself. With shares 33,334, 33,333 and 33,333, she is owed 66,666 paise in total. Group balances sum to zero when every credit has its corresponding debit.
+
+## Design details and alternatives
+
+### Key abstractions
 
 | Type | Responsibility |
 |---|---|
@@ -519,7 +536,7 @@ class EqualSplitStrategy implements SplitStrategy {
 }
 ```
 
-## Design decisions & trade-offs
+### Design decisions & trade-offs
 
 **1. Money in minor units.** Use `long` paise or `BigDecimal` with fixed scale. ₹100 split 3 ways is 33.34 + 33.33 + 33.33, and someone has to absorb the remainder deterministically.
 
@@ -531,7 +548,7 @@ class EqualSplitStrategy implements SplitStrategy {
 
 **5. Edits and deletes.** Editing an expense means reversing its old effect and applying the new one. With balances derived from expenses, that's just a recompute.
 
-## Ownership, boundaries and invariants
+### Ownership, boundaries and invariants
 
 **Central design question:** Money allocation must conserve the expense exactly, including rounding remainders.
 
@@ -539,93 +556,56 @@ Group contains memberships; Expense records payer, currency, total and immutable
 
 **Correctness rule:** The sum of allocated minor units equals the expense amount, and the signed group balance sums to zero. Currency is part of the value; amounts in different currencies must not be added silently.
 
-Begin with a single-process, testable domain model. Treat database durability, multiple JVMs, and hardware/provider calls as explicit extensions; do not claim that a Java lock gives system-wide correctness. An aggregate is the object boundary within which a command preserves its invariants. It is not necessarily an entire application or database table. Identify which values may be observed stale and which decision must be serialized before drawing a class hierarchy.
-
-The storage outline below is a design vocabulary rather than complete executable DDL. Choose actual column types, foreign keys, indexes and retention after naming the access paths. Keep domain identities stable across retries and keep historical commercial facts immutable.
-
 ```text
 expense(id,group_id,payer,currency,amount_minor); share(expense_id,member_id,minor_units); ledger(operation_id,member_id,delta)
 ```
 
-## State machine and command contracts
+### State machine and command contracts
 
 ```text
 Expense POSTED -> REVERSED; settlement REQUESTED -> CONFIRMED | FAILED | UNKNOWN
 ```
 
-For every arrow write five things: the actor allowed to request it, the input, its precondition, the state it changes, and the durable result returned. A controller should translate input and errors, while the aggregate owns legal transitions. A policy calculates a decision without secretly writing another aggregate. External adapters translate a provider or device response into a typed outcome, including unknown outcomes.
-
-Use a command envelope containing an operation ID, target identity, expected version where relevant, and validated arguments. Return an immutable result containing the committed version and domain outcome. Reject invalid input before a state change, but repeat mutable-state checks inside the serialization boundary. A preflight check outside a lock can improve user feedback; it cannot establish the invariant.
-
-Do not represent every failure with `false`. Distinguish invalid input, conflict, unavailable resource, dependency failure and unknown external outcome. That distinction controls whether a client should correct input, refresh state, retry with the same identity or wait for reconciliation. A retry with a new operation identity is a new command, even when the user thinks it is the old request.
-
-## End-to-end execution trace
+### End-to-end execution trace
 
 Validate members and currency; compute shares; allocate rounding remainder deterministically; persist expense plus ledger entries atomically; update the balance view; settle with an idempotent transfer reference; reverse corrections instead of rewriting history.
 
-Trace one successful call through API, application service, aggregate, repository and adapter. Record the first durable fact and the exact point at which success can be acknowledged. Then replay the call with the same identity. The second response should describe the original result rather than create another effect. If the operation has no external side effect and is naturally idempotent, explain that simpler property instead of adding an unnecessary request table.
-
-Snapshot immutable output for clients. Returning a mutable internal collection allows UI code to violate invariants without calling a command. Copy lists/sets or expose read-only views with documented lifetime; remember that an unmodifiable collection can still contain mutable elements. Keep repository concerns behind interfaces so a deterministic in-memory implementation can demonstrate the domain without pretending it models multi-process transactions.
-
-## Concurrency and recovery walkthrough
+### Concurrency and recovery walkthrough
 
 Two settlements read the same outstanding debt. Lock or version the relevant obligation and apply only the remaining amount. Retry an operation by its identity to avoid double reduction.
 
-Write an interleaving table before selecting a synchronization primitive:
 
-| Step | Request A | Request B | Required observation |
-|---|---|---|---|
-| 1 | Reads version v | Reads version v | Both observations may be individually valid |
-| 2 | Validates and attempts commit | Waits or attempts commit | One authority decides conflicts |
-| 3 | Commits version v+1 | Rechecks or loses compare-and-set | B cannot rely on its old precondition |
-| 4 | Returns committed result | Returns conflict or retries within policy | Retries preserve operation identity |
 
-For one JVM, synchronize the whole check-and-update operation on the owning aggregate, or use a single-owner event loop. Thread-safe containers protect their own methods; they do not make a sequence across several objects atomic. For database-backed replicas, use conditional updates, uniqueness/exclusion constraints or row locks in a transaction. Pick a consistent lock ordering when a command owns several resources. Release locks before a slow network call, and model the pending state needed to resume later.
-
-Recovery starts from recorded state, not from a guess about which line of Java probably ran. Persist the operation intent and classify external results. If a process fails after a provider or device acts, query/reconcile by its original reference. Do not claim rollback can reverse cash movement, a sent SMS or an already captured payment. Compensation is a new operation that can itself fail and needs its own identity and state.
-
-## Policy choices and extension seams
+### Policy choices and extension seams
 
 Pairwise balances are easy to explain; minimizing transfers is a derived optimization and must preserve net balances. Greedy settlement is a useful heuristic but does not guarantee a minimum number of payments for all cases.
 
-Add an interface where there are two meaningful behaviors or an unreliable boundary, not for every noun. Prefer composition when a rule changes independently of entity identity. Keep state-dependent validation close to the state owner. Patterns are useful vocabulary for a chosen responsibility: Strategy for a replaceable policy, State for legal transitions, Adapter for an external system. A diagram full of pattern names is weaker than a small model with clear mutation rules.
-
-Time, money and randomness deserve explicit types. Use `Instant` for an absolute event time and a `ZoneId` when local calendar meaning matters. Use a monotonic elapsed-time source for duration-based quotas; wall clocks can move. Represent money in a defined currency using integral minor units or an explicit decimal/rounding policy. Guard addition/multiplication overflow and do not convert through binary floating-point. Inject a clock or dice source so tests can reproduce a boundary without sleeps or luck.
-
-## Edge cases that change the design
+### Edge cases that change the design
 
 Splitting 100 minor units among three people gives 34,33,33 under a stable remainder rule. Negative expenses need an explicit refund model. Membership removal does not erase debt.
 
-Input validation is not the only boundary. Also bound collection sizes, pending work, callback retries and retained history. Authenticate the actor before loading private state and authorize the specific resource before applying a command. Log operation IDs, versions and state transitions; avoid logging secrets or entire payment/identity payloads. Monitoring should make a stuck pending state visible rather than converting it silently into success.
-
-## Verification and a practical lab
+### Verification and a practical lab
 
 **Topic-specific cases:** Rounding conservation; percentages total exactly 100; invalid members; mixed currency rejection; repeated settlement; reversal reproduces previous balances.
 
 **Lab:** Split 100 cents among three members, settle one share twice with the same key, and reverse the expense. Verify conservation after every step.
 
-Test the invariant after each transition, not only the final happy-path response. Include two independent aggregate instances to catch accidental static/global state. Run a race test with a barrier so both contenders begin from the same observation. Use a fake clock to cross expiry boundaries exactly. Test an adapter that throws before acting and one that acts then times out; these are different failure cases. A property-based sequence test can generate valid and invalid commands and check conservation/ownership after every step.
-
-The Java examples in `examples/reference-invariants/ReferenceInvariants.java` demonstrate selected executable mechanisms: half-open intervals, exact equal splits, expiring ownership and a token bucket. They are deliberately small examples of invariants, not complete implementations of every system. The original topic code above remains a design sketch unless explicitly marked runnable. Explain which repository/adapter must provide a production guarantee before copying a sketch into a service.
-
-## Follow-up answers and review checklist
-
-**Where is the first correctness boundary?** The aggregate or durable conditional update that establishes this rule: The sum of allocated minor units equals the expense amount, and the signed group balance sums to zero. Currency is part of the value; amounts in different currencies must not be added silently.
-
-**What changes when a second process is added?** In-process locks no longer cover all writers. Move the decisive check to a shared authoritative transaction or partition owner, while retaining local encapsulation for readability.
-
-**What happens when a response is lost?** Query the operation identity or repeat the same idempotent command. Return the known committed outcome; if an external effect is uncertain, preserve and reconcile that uncertainty.
-
-**What should be extracted into a pattern?** Start from the actual extension seam: Pairwise balances are easy to explain; minimizing transfers is a derived optimization and must preserve net balances. Greedy settlement is a useful heuristic but does not guarantee a minimum number of payments for all cases.
-
-**What is the best next exercise?** Split 100 cents among three members, settle one share twice with the same key, and reverse the expense. Verify conservation after every step.
-
-Before calling this design complete, narrate one command, one contention race and one restart. Point to the exact fields that prevent duplicate ownership or invalid transitions. State which parts are single-JVM demonstrations and which require transactional persistence. A reviewer should be able to derive tests from your invariants without reading your implementation.
-
-## Further reading
+### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+
+## Work through settlement and simplification
+
+If Ben owes Asha ₹400 and Asha owes Cara ₹400, a suggestion may let Ben pay Cara directly. That reduces transfers while preserving each person's net balance. It changes the payment route, not the underlying expense history. Pairwise relationship constraints may forbid such simplification, so it is an optional policy.
+
+Store settlement identities and amounts once. Two retries of the same recorded payment must not erase twice the obligation. Keep INR and USD in separate ledgers unless an explicit exchange-rate transaction defines the conversion; adding unlike currencies produces a meaningless balance.
+
+## Practise, then check your reasoning
+
+1. **Does rounding every share independently work?** No. Three rounded thirds can fail to add up to the expense. Allocate the remainder deterministically.
+2. **Is a “mark paid” click a bank transfer?** No. It records a settlement claim unless a real payment integration supplies authoritative evidence.
+3. **Exercise:** split every amount from 0 to 10,000 paise among 1–10 people. Assert nonnegative shares, sum conservation and at most one paise difference for equal splits. Then replay one settlement and assert unchanged balances.
 
 === LLD 11 ===
 N|vm|VendingMachine|300|0|160
@@ -660,7 +640,35 @@ Design a coffee vending machine that serves espresso, cappuccino, latte and so o
 - New drinks, recipes and payment methods plug in without touching the core flow.
 - Recovers to a safe state after a power cut mid-transaction.
 
-## Key abstractions
+## Learn through a concrete example
+
+You select a ₹30 coffee and insert ₹50. The machine needs water, beans, a cup and enough change. Taking payment is not the same as successfully dispensing a drink. Start with one machine and a small menu; make physical outcomes explicit before adding payment apps or remote monitoring.
+
+The **recipe** describes ingredient quantities, **inventory** records available ingredients, and a **vend session** owns one customer's interaction. A state machine answers which actions are allowed at each stage: inserting money during maintenance must not accidentally start brewing.
+
+## See preparation and a partial outcome
+
+![Reserve ingredients and change before committing the physical action.](lessons/lld-11-flow.svg)
+
+*Reserve ingredients and change before committing the physical action.*
+
+![Physical evidence determines whether retry or refund is appropriate.](lessons/lld-11-failure.svg)
+
+*Physical evidence determines whether retry or refund is appropriate.*
+
+### Build and calculate
+
+A recipe requiring 10 g beans and 150 ml water allows `min(beans/10, water/150, cups)` servings. With 95 g beans, 1,000 ml water and 20 cups, water limits capacity to six drinks. Inventory checks must reserve the whole recipe together; separately decrementing beans and then discovering no cup leaves inconsistent stock.
+
+```text
+VendSession: IDLE -> SELECTED -> FUNDED -> DISPENSING -> COMPLETE
+Failures: SELECTED/FUNDED -> CANCELLED
+          DISPENSING -> DELIVERY_UNCERTAIN -> RECONCILIATION
+```
+
+## Design details and alternatives
+
+### Key abstractions
 
 | Type | Responsibility |
 |---|---|
@@ -683,7 +691,7 @@ class Inventory {
 }
 ```
 
-## Design decisions & trade-offs
+### Design decisions & trade-offs
 
 **1. Recipes as data.** Don't make `Cappuccino extends Coffee` with hard-coded quantities. A recipe registry (loaded from config) plus a Factory means a new drink is a config entry. Use a Decorator only for user add-ons (extra shot, extra sugar).
 
@@ -695,7 +703,7 @@ class Inventory {
 
 **5. Menu availability is derived.** Recompute which drinks are selectable from inventory after every deduct or refill, and push that to the display (Observer).
 
-## Ownership, boundaries and invariants
+### Ownership, boundaries and invariants
 
 **Central design question:** Inventory reservation, money acceptance and physical dispensing are separate observable steps.
 
@@ -703,90 +711,53 @@ Machine owns SlotInventory and a VendSession. Product describes a SKU; Recipe or
 
 **Correctness rule:** Never decrement sellable stock twice for one vend request. Do not claim successful delivery before the hardware confirms it. Accepted money must end in purchase, change, refund or an explicit recoverable balance.
 
-Begin with a single-process, testable domain model. Treat database durability, multiple JVMs, and hardware/provider calls as explicit extensions; do not claim that a Java lock gives system-wide correctness. An aggregate is the object boundary within which a command preserves its invariants. It is not necessarily an entire application or database table. Identify which values may be observed stale and which decision must be serialized before drawing a class hierarchy.
-
-The storage outline below is a design vocabulary rather than complete executable DDL. Choose actual column types, foreign keys, indexes and retention after naming the access paths. Keep domain identities stable across retries and keep historical commercial facts immutable.
-
 ```text
 slot(id,sku,available,reserved); vend(id,sku,price_minor,tender_minor,state); cash(denomination,count)
 ```
 
-## State machine and command contracts
+### State machine and command contracts
 
 ```text
 IDLE -> SELECTED -> FUNDED -> DISPENSING -> COMPLETE; JAMMED -> REFUND_PENDING -> REVIEW
 ```
 
-For every arrow write five things: the actor allowed to request it, the input, its precondition, the state it changes, and the durable result returned. A controller should translate input and errors, while the aggregate owns legal transitions. A policy calculates a decision without secretly writing another aggregate. External adapters translate a provider or device response into a typed outcome, including unknown outcomes.
-
-Use a command envelope containing an operation ID, target identity, expected version where relevant, and validated arguments. Return an immutable result containing the committed version and domain outcome. Reject invalid input before a state change, but repeat mutable-state checks inside the serialization boundary. A preflight check outside a lock can improve user feedback; it cannot establish the invariant.
-
-Do not represent every failure with `false`. Distinguish invalid input, conflict, unavailable resource, dependency failure and unknown external outcome. That distinction controls whether a client should correct input, refresh state, retry with the same identity or wait for reconciliation. A retry with a new operation identity is a new command, even when the user thinks it is the old request.
-
-## End-to-end execution trace
+### End-to-end execution trace
 
 Select a product; validate stock and price; reserve stock; accept sufficient tender; verify change availability; journal the vend; dispense; on confirmation consume stock and return change; on jam reverse the reservation and initiate refund.
 
-Trace one successful call through API, application service, aggregate, repository and adapter. Record the first durable fact and the exact point at which success can be acknowledged. Then replay the call with the same identity. The second response should describe the original result rather than create another effect. If the operation has no external side effect and is naturally idempotent, explain that simpler property instead of adding an unnecessary request table.
-
-Snapshot immutable output for clients. Returning a mutable internal collection allows UI code to violate invariants without calling a command. Copy lists/sets or expose read-only views with documented lifetime; remember that an unmodifiable collection can still contain mutable elements. Keep repository concerns behind interfaces so a deterministic in-memory implementation can demonstrate the domain without pretending it models multi-process transactions.
-
-## Concurrency and recovery walkthrough
+### Concurrency and recovery walkthrough
 
 Two sessions select the last unit while an operator restocks. One inventory owner serializes reserve/commit/release; restocking must not overwrite reserved counts. Network payment callbacks use the vend operation ID.
 
-Write an interleaving table before selecting a synchronization primitive:
 
-| Step | Request A | Request B | Required observation |
-|---|---|---|---|
-| 1 | Reads version v | Reads version v | Both observations may be individually valid |
-| 2 | Validates and attempts commit | Waits or attempts commit | One authority decides conflicts |
-| 3 | Commits version v+1 | Rechecks or loses compare-and-set | B cannot rely on its old precondition |
-| 4 | Returns committed result | Returns conflict or retries within policy | Retries preserve operation identity |
 
-For one JVM, synchronize the whole check-and-update operation on the owning aggregate, or use a single-owner event loop. Thread-safe containers protect their own methods; they do not make a sequence across several objects atomic. For database-backed replicas, use conditional updates, uniqueness/exclusion constraints or row locks in a transaction. Pick a consistent lock ordering when a command owns several resources. Release locks before a slow network call, and model the pending state needed to resume later.
-
-Recovery starts from recorded state, not from a guess about which line of Java probably ran. Persist the operation intent and classify external results. If a process fails after a provider or device acts, query/reconcile by its original reference. Do not claim rollback can reverse cash movement, a sent SMS or an already captured payment. Compensation is a new operation that can itself fail and needs its own identity and state.
-
-## Policy choices and extension seams
+### Policy choices and extension seams
 
 State is helpful for selection/payment/dispense transitions. Different products can use Strategy for preparation. Do not let product factories control cash or mutate global inventory.
 
-Add an interface where there are two meaningful behaviors or an unreliable boundary, not for every noun. Prefer composition when a rule changes independently of entity identity. Keep state-dependent validation close to the state owner. Patterns are useful vocabulary for a chosen responsibility: Strategy for a replaceable policy, State for legal transitions, Adapter for an external system. A diagram full of pattern names is weaker than a small model with clear mutation rules.
-
-Time, money and randomness deserve explicit types. Use `Instant` for an absolute event time and a `ZoneId` when local calendar meaning matters. Use a monotonic elapsed-time source for duration-based quotas; wall clocks can move. Represent money in a defined currency using integral minor units or an explicit decimal/rounding policy. Guard addition/multiplication overflow and do not convert through binary floating-point. Inject a clock or dice source so tests can reproduce a boundary without sleeps or luck.
-
-## Edge cases that change the design
+### Edge cases that change the design
 
 Enough total money does not imply the machine can make change. Power loss after dispensing needs journal reconciliation. A refund actuator can fail too, so expose an operator-review state instead of looping forever.
 
-Input validation is not the only boundary. Also bound collection sizes, pending work, callback retries and retained history. Authenticate the actor before loading private state and authorize the specific resource before applying a command. Log operation IDs, versions and state transitions; avoid logging secrets or entire payment/identity payloads. Monitoring should make a stuck pending state visible rather than converting it silently into success.
-
-## Verification and a practical lab
+### Verification and a practical lab
 
 **Topic-specific cases:** Last-item race; exact change; impossible change; jam; duplicate confirmation; refund failure; restart during dispense.
 
 **Lab:** Inject a jam after payment is accepted but before stock consumption. Recover the stock reservation and record the customer liability.
 
-Test the invariant after each transition, not only the final happy-path response. Include two independent aggregate instances to catch accidental static/global state. Run a race test with a barrier so both contenders begin from the same observation. Use a fake clock to cross expiry boundaries exactly. Test an adapter that throws before acting and one that acts then times out; these are different failure cases. A property-based sequence test can generate valid and invalid commands and check conservation/ownership after every step.
-
-The Java examples in `examples/reference-invariants/ReferenceInvariants.java` demonstrate selected executable mechanisms: half-open intervals, exact equal splits, expiring ownership and a token bucket. They are deliberately small examples of invariants, not complete implementations of every system. The original topic code above remains a design sketch unless explicitly marked runnable. Explain which repository/adapter must provide a production guarantee before copying a sketch into a service.
-
-## Follow-up answers and review checklist
-
-**Where is the first correctness boundary?** The aggregate or durable conditional update that establishes this rule: Never decrement sellable stock twice for one vend request. Do not claim successful delivery before the hardware confirms it. Accepted money must end in purchase, change, refund or an explicit recoverable balance.
-
-**What changes when a second process is added?** In-process locks no longer cover all writers. Move the decisive check to a shared authoritative transaction or partition owner, while retaining local encapsulation for readability.
-
-**What happens when a response is lost?** Query the operation identity or repeat the same idempotent command. Return the known committed outcome; if an external effect is uncertain, preserve and reconcile that uncertainty.
-
-**What should be extracted into a pattern?** Start from the actual extension seam: State is helpful for selection/payment/dispense transitions. Different products can use Strategy for preparation. Do not let product factories control cash or mutate global inventory.
-
-**What is the best next exercise?** Inject a jam after payment is accepted but before stock consumption. Recover the stock reservation and record the customer liability.
-
-Before calling this design complete, narrate one command, one contention race and one restart. Point to the exact fields that prevent duplicate ownership or invalid transitions. State which parts are single-JVM demonstrations and which require transactional persistence. A reviewer should be able to derive tests from your invariants without reading your implementation.
-
-## Further reading
+### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+
+## Work through the important decisions
+
+Coin selection is a bounded change problem: available denominations and counts matter. A ₹20 difference does not prove a ₹20 coin is present. Reserve a feasible change plan before consuming money, or show an exact-change policy before purchase.
+
+Once hot water has entered a cup, cancelling cannot restore the original ingredients. Record consumed quantities and waste; do not “roll back” physical brewing by incrementing every ingredient counter. Maintenance mode should block new sessions and reconcile cash/stock under an operator identity.
+
+## Practise, then check your reasoning
+
+1. **Does a new drink require another machine state?** Usually no. A new recipe changes data; new physical behaviour may need a new dispenser strategy.
+2. **Can a failed sensor mean zero delivery?** Not necessarily. Distinguish known none from unknown.
+3. **Exercise:** start with enough beans for two drinks but one cup. Race two purchases; only one may reserve a complete recipe. Then fail after brewing and verify consumed stock stays consumed.

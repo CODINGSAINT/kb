@@ -42,7 +42,20 @@ for(let day=1;day<=20;day++){
     const sections=t.markdown.split(/^(?=## )/m).filter(Boolean);
     const reference=sections.filter(s=>!/^## (problem|requirements)/i.test(s)).join('\n');
     const words=reference.split(/\s+/).filter(Boolean).length;
-    assert(words>=1500,`${key}: reference depth ${words} words`);
+    // A padded manuscript passed the previous 1,500-word gate. Verify the authored
+    // teaching contract and duplication instead; this still needs editorial review.
+    assert(words>=600,`${key}: unexpectedly abbreviated reference (${words} words)`);
+    assert(headings.includes('Learn through a concrete example'),`${key}: missing learner introduction`);
+    assert(headings.includes('Design details and alternatives'),`${key}: missing technical second pass`);
+    assert(headings.includes('Practise, then check your reasoning'),`${key}: missing explained practice`);
+    const pictures=[...reference.matchAll(/!\[([^\]]+)\]\((lessons\/[^)]+\.svg)\)/g)];
+    assert(pictures.length>=2,`${key}: needs operation and failure pictures`);
+    for(const [,alt,url] of pictures){
+      assert(alt.length>=30,`${key}: inadequate diagram text alternative`);
+      const svg=read(`public/${url}`);
+      assert(svg.includes('<title') && svg.includes('<desc'),`${key}: inaccessible SVG ${url}`);
+      assert(!/<script|foreignObject|onload=|https?:\/\//i.test(svg.replace('http://www.w3.org/2000/svg','')),`${key}: active or remote SVG content`);
+    }
     assert(/```/.test(reference),`${key}: missing concrete code/data/flow example`);
     assert(/(failure|race|recovery)/i.test(reference),`${key}: no failure treatment`);
     assert(/(lab|exercise|practice prompt|verification)/i.test(reference),`${key}: no practice`);
@@ -55,6 +68,16 @@ for(let day=1;day<=20;day++){
     metrics[t.category].push(words);
   }
 }
+const paragraphs=new Map();
+for(const [key,t] of topics) {
+  for(const p of t.markdown.split(/\n\s*\n/).map(p=>p.trim())) {
+    if(p.split(/\s+/).length<35 || /^(?:#|```|\||- )/.test(p)) continue;
+    if(!paragraphs.has(p)) paragraphs.set(p,new Set());
+    paragraphs.get(p).add(key);
+  }
+}
+for(const [p,owners] of paragraphs)
+  assert(owners.size<10,`Repeated teaching prose in ${owners.size} lessons: ${p.slice(0,100)}`);
 const fund=JSON.parse(read('content/fundamentals.json'));
 noPersonal(fund,'fundamentals');
 const items=fund.groups.flatMap(g=>g.items), byId=new Map(items.map(i=>[i.id,i]));
@@ -76,4 +99,4 @@ const dsa=JSON.parse(read('content/dsa.json'));
 assert.equal(dsa.topics.reduce((s,t)=>s+t.problems.length,0),304);
 for(const [track,words] of Object.entries(metrics))
   console.log(`${track}: ${words.length} references, ${Math.min(...words)}-${Math.max(...words)} reference words`);
-console.log('PASS: 60 source/generated references, valid diagrams, 45 chapters, reciprocal prerequisites, 304 DSA problems, no personal fields');
+console.log('PASS: 60 source/generated guided lessons, accessible lesson figures, no widely repeated long prose, valid topic diagrams, 45 chapters, reciprocal prerequisites, 304 DSA problems, no personal fields');

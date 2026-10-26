@@ -1,3 +1,27 @@
+# Student-focused reference rewrite (2026-10-26)
+
+This revision follows the owner's rejection of the previous expanded references. It replaces widely repeated prose with independently authored teaching introductions, concrete operations, worked calculations, topic-specific failures and exercises with answers across all 60 references. Existing useful technical details remain as a second pass; Chess was rewritten to use one coherent immutable-piece/copying model.
+
+The intended reading progression is the same across LLD, HLD and AI: understand a familiar situation, define the important terms, follow the successful operation, see its failure, study the implementation/alternatives, then solve a small exercise. Experienced readers can use the contents list to jump to design details and failure reasoning. The 45 prerequisite chapters remain linked for readers who need more foundation.
+
+## Illustrations and rebuild
+
+There are 120 topic-specific operation/failure SVGs plus three domain drawings: an actual pinned-rook chessboard, a URL-shortener architecture and a fractional-token bucket. These supplement the 60 existing overview diagrams. Captions and SVG descriptions provide text alternatives; assets are local and work in the public/offline build. Narrow causal figures use a 440px viewBox for phone readability; the wider URL architecture links to its full-size image.
+
+Authored manuscript sources: `build/topics/*.txt`. Figure source: `build/lesson-figures.json`, `build/make-lesson-figures.js`, `build/make-special-figures.js`. Rebuild manuscripts with `node build/assemble.js` and figures with `npm run build:figures`; then run `npm run check:content` and `npm run build:site`. Temporary migration scripts/drafts are not part of the product.
+
+## Honest scope and quality checks
+
+Removing repeated prose made many references shorter. That is intentional, but a shorter reference is not automatically deeper or complete. This is an editorial rewrite for review, not evidence that all subjects now match a professional textbook's coverage. Current reference bodies are roughly 700–4,200 words, with the supplied URL-shortener case study at the upper end. Do not describe their word counts as a quality score.
+
+The previous minimum 1,500-word check encouraged a false sense of completeness. It is replaced by checks for the common learning structure, operation/failure images, accessible safe SVGs, explained practice, no long prose repeated across ten or more topics, source/generated parity, diagram edges, prerequisite reciprocity and personal-data boundaries. A small minimum catches accidentally empty/truncated chapters; it is not the editorial acceptance criterion.
+
+Reviewers should ask whether a new developer can follow the example without guessing vocabulary, whether the calculations and answers can be reproduced, and whether an experienced developer can identify the actual correctness boundary and defend the alternatives. The Java/Spring snippets remain teaching fragments unless explicitly executable. Selected Spring 1.1.8 API shapes are checked by the Maven example; it makes no provider calls and is not a claim to the latest framework release.
+
+The earlier source/provenance record follows for context. Its recurring-prose policy is superseded by the teaching contract above.
+
+---
+
 # Reference-design revamp
 
 All 60 design references (20 LLD, 20 HLD and 20 AI/Spring AI) now have extended authored source. Day 1 previously existed only in generated JSON; its three blocks now live in `build/topics/day-01-references.txt`, so a content rebuild retains the expanded material.
@@ -11,7 +35,7 @@ The answer-first reveal boundary remains unchanged: `Problem` and `Requirements`
 - AI: mechanisms, budget calculations, Java/Spring boundaries, structured contracts, retrieval/memory/tool policies, failure handling and evaluations. Spring snippets use an explicit 1.1 API family; the included API contract compiles against 1.1.8. This is a teaching baseline, not a claim that it is the latest release.
 - Eight new AI prerequisites take the AI fundamentals group from 2 to 10 chapters. All 20 AI topics link to relevant chapters, with reciprocal “read before” links. Total fundamentals: 45. DSA remains 304 problems.
 
-Shared reliability explanations recur so each reference can stand alone. Each topic also has its own ownership rule, model/access path, concurrency/failure scenario and practical exercise; word count alone is not an editorial quality guarantee. Review domain correctness and usefulness alongside the automated structural checks.
+Historical note: the first revision repeated reliability explanations; this student-focused revision removes those repeated long paragraphs. Each topic also has its own ownership rule, model/access path, concurrency/failure scenario and practical exercise; word count alone is not an editorial quality guarantee. Review domain correctness and usefulness alongside the automated structural checks.
 
 ## Supplied sources and original writing
 
