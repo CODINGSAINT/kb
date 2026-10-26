@@ -1,5 +1,11 @@
 # Chess, Parking Lot and Elevator: worked LLD answers
 
+## Parking Lot clarity review
+
+The follow-up changes **Parking Lot only**. It follows one vehicle/ticket through entry, payment and exit; explains terms after their everyday meaning; keeps the complete answer and useful physical/flow diagrams; and removes competitor links and the duplicate code-like class picture from the lesson. The Java excerpts are selectable text with readable spacing, copied from the complete source. Research provenance stays in this repository note.
+
+Chess, Elevator and the other 57 references are unchanged by this follow-up. The single-article correction is for owner review before applying the style elsewhere or publishing it. Earlier technical checks below do not establish learner approval.
+
 This revision replaces only **LLD-1, LLD-2 and LLD-3**. Each reference presents a chosen solution, ownership/contracts, complete worked execution, failure/recovery decisions, trade-offs and answered follow-ups. Other LLD, HLD, AI and prerequisite material is outside this revision.
 
 ## Editorial and implementation decisions
