@@ -1,17 +1,17 @@
 === LLD 12 ===
-N|cart|ShoppingCart|300|0|150
-N|item|CartItem|0|0|130
-N|product|Product|0|150|130
-N|engine|PricingEngine|300|150|160
-N|rules|PromotionRule ×N|600|150|160|ellipse
-N|checkout|Checkout|300|280|140
-N|inv|Inventory|600|280|130|cylinder
-E|cart|item|has N
-E|item|product|refers
-E|cart|engine|price()
-E|engine|rules|apply in order
-E|cart|checkout|place order
-E|checkout|inv|reserve
+N|n0|Cart|0|0|200|rect
+N|n1|CartLine|250|0|200|rect
+N|n2|PricingService|500|0|200|rect
+N|n3|Quote|0|110|200|rect
+N|n4|CheckoutService|250|110|200|rect
+N|n5|InventoryPort|500|110|200|rect
+N|n6|Order|0|220|200|rect
+E|n0|n1|owns
+E|n0|n2|priced by
+E|n2|n3|creates
+E|n4|n3|accepts
+E|n4|n5|reserves through
+E|n4|n6|creates once
 ---
 ## Problem
 
@@ -31,13 +31,27 @@ Design the shopping cart and pricing engine of an e-commerce site: add or remove
 - Correct when the same cart is edited from two devices at once.
 - Checkout re-validation is fast (well under 200 ms), as it sits on the purchase path.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-Ravi adds a ₹900 shirt to his cart. Tomorrow the catalogue price becomes ₹950. Does the cart promise ₹900? Usually it is a selection, while a checkout quote is a time-bounded commercial offer. Make that distinction visible rather than letting an old UI price decide what the customer pays.
+I support variant quantities, coupons, price quotation and conversion to an order. `Cart` owns selection; `PricingService` calculates a bounded quote; Checkout coordinates stock and order creation. Product ID alone is insufficient when size/colour variants have distinct inventory.
+
+## 2. Checkout contract and algorithm
+
+```text
+setQuantity(cartId,expectedVersion,variantId,quantity) -> CartVersion
+quote(cartId,cartVersion,address) -> Quote(id,total,lines,expiry)
+checkout(checkoutId,quoteId,customer) -> ExistingOrder | NewOrder | Requote
+```
+
+An edit validates positive bounded quantities and advances the version. Quote snapshots item, discount, shipping, currency and tax-policy inputs. Checkout locks the quote/cart boundary, rejects expired or mismatched versions, and records one accepted intent. Inventory reservation follows its authoritative conditional contract; a failed reservation resolves payment/order state explicitly. Two ₹950 shirts with 10% discount give ₹1,710; ₹50 shipping gives ₹1,760 before stated taxes. A retry returns the same order; another payload under the same checkout identity conflicts. Catalogue repricing does not silently change the accepted quote.
+
+## 3. Final design diagram
+
+[![Design Shopping Cart: Cart owns CartLine; Cart priced by PricingService; PricingService creates Quote; CheckoutService accepts Quote; CheckoutService reserves through InventoryPort; CheckoutService creates once Order](designs/lld-12.svg)](designs/lld-12.svg)
 
 A **cart line** represents a product variant and quantity. A **price quote** includes prices, discounts, tax assumptions and expiry. An **order** freezes accepted commercial facts. Inventory is a separate authority: adding something to a cart does not necessarily reserve it.
 
-## See checkout and repricing
+## 4. Critical operation: worked execution
 
 ![The customer accepts an explicit quote before order creation.](lessons/lld-12-flow.svg)
 
@@ -47,7 +61,7 @@ A **cart line** represents a product variant and quantity. A **price quote** inc
 
 *An expired quote triggers a new visible offer, not a silent charge.*
 
-### Build and calculate
+### Worked calculation and implementation
 
 For two ₹950 shirts, a 10% item discount gives ₹1,710. Adding ₹50 shipping gives ₹1,760 before the selected tax policy. A shipping discount and an item discount are not interchangeable if tax treatment differs. Specify discount order and rounding in the quote.
 
@@ -57,7 +71,7 @@ Quote(quoteId, cartVersion, lines, discounts, shipping, tax, total, expiresAt)
 Order(orderId, acceptedQuoteSnapshot, checkoutId)
 ```
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -105,12 +119,6 @@ Cart owns CartLines keyed by product and selected options. ProductCatalogue and 
 cart(id,user_id,version,state); cart_line(cart_id,sku,options,quantity); quote(id,cart_version,total_minor,expires_at)
 ```
 
-### State machine and command contracts
-
-```text
-Cart OPEN -> CHECKOUT_PENDING -> CHECKED_OUT; quote VALID -> EXPIRED
-```
-
 ### End-to-end execution trace
 
 Add or merge a line; validate option compatibility; calculate an explanatory quote; at checkout refresh price and inventory; reserve stock; obtain payment authorization; create an immutable order with line snapshots; mark the cart checked out or expose a recoverable pending state.
@@ -118,8 +126,6 @@ Add or merge a line; validate option compatibility; calculate an explanatory quo
 ### Concurrency and recovery walkthrough
 
 Two browser tabs edit the same cart version, or both submit checkout. Optimistic cart versioning prevents lost updates; a durable checkout idempotency key prevents duplicate orders.
-
-
 
 ### Policy choices and extension seams
 
@@ -129,18 +135,14 @@ A pricing chain is useful when rule ordering is explicit: item promotions, order
 
 Coupons may have per-user limits requiring atomic redemption. Product deletion leaves an unavailable line rather than silently dropping intent. Refunds use order snapshots, not current catalogue prices.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Concurrent tab update; empty checkout; coupon cap; price change; inventory shortage; duplicate order prevention; currency validation.
-
-**Lab:** Apply a percentage discount and a fixed coupon in both orders, explain the difference, and choose one documented policy. Repeat checkout after a timeout.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through concurrent changes
+### Work through concurrent changes
 
 Two browser tabs edit cart version 7: one changes quantity, another removes the line. Require an expected cart version or use clearly defined merge operations. A stale “set quantity to 3” must not silently resurrect an intentionally removed item.
 
@@ -148,26 +150,30 @@ Two checkout retries with identity X9 should return the same order. A different 
 
 Do not use product ID alone when size/colour variants have separate stock. Bound quantity, distinct lines and coupon applications so pricing complexity cannot grow without limit.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does removing a cart line cancel a submitted order?** No. They are separate lifecycles.
-2. **Where does the accepted address belong?** In the order snapshot; subsequent profile edits should not mutate it.
-3. **Exercise:** reprice a cart between display and checkout, edit it in two tabs, then retry submission after losing the response. Explain the visible quote, final cart version and number of created orders.
+**Does removing a cart line cancel a submitted order?** No. They are separate lifecycles.
+
+**Where does the accepted address belong?** In the order snapshot; subsequent profile edits should not mutate it.
+
+## 7. Closing answer
+
+I treat the cart as mutable intent and the accepted quote as the commercial contract. Versioned edits prevent stale tabs from silently overwriting selections, while idempotent checkout creates one order with frozen prices and address. Adding to a cart does not claim stock.
 
 === LLD 13 ===
-N|api|NotificationService|280|0|190
-N|tmpl|TemplateEngine|0|0|150
-N|pref|User Preferences|0|150|160|cylinder
-N|factory|ChannelFactory|280|150|160
-N|email|Email|600|0|120
-N|sms|SMS|600|120|120
-N|push|Push|600|240|120
-E|api|tmpl|render
-E|api|pref|channels?
-E|api|factory|get sender
-E|factory|email|creates
-E|factory|sms|creates
-E|factory|push|creates
+N|n0|NotificationService|0|0|200|rect
+N|n1|NotificationIntent|250|0|200|rect
+N|n2|TemplateRenderer|500|0|200|rect
+N|n3|ChannelPolicy|0|110|200|rect
+N|n4|DeliveryChannel|250|110|200|rect
+N|n5|Attempt|500|110|200|rect
+N|n6|Receipt|0|220|200|rect
+E|n0|n1|records
+E|n1|n2|rendered by
+E|n1|n3|routes through
+E|n3|n4|selects
+E|n4|n5|creates
+E|n5|n6|records
 ---
 ## Problem
 
@@ -187,13 +193,27 @@ Design a notification system (as an in-process library or service) that sends me
 - Adding a channel (e.g. WhatsApp) needs no change to existing senders.
 - Observable: delivery status can be tracked per message and channel.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-A password-reset message is sent by email; a delivery update can use SMS or push. “Send notification” hides different validation, formatting, consent and provider outcomes. Build a channel-neutral request while keeping channel-specific delivery behind adapters.
+I deliver email, SMS and push for typed business events. NotificationIntent freezes template version, recipient scope, urgency and expiry. `DeliveryChannel` is an interface implemented per provider/channel; rendering and route policy remain separate so adding a channel does not modify domain events.
+
+## 2. Dispatch and retry algorithm
+
+```text
+notify(eventId,recipient,templateVersion,parameters) -> notificationId
+deliver(notificationId) -> Accepted | RetryScheduled | PermanentFailure | Unknown
+Attempt: attemptId, notificationId, providerRef, outcome, nextAttemptAt
+```
+
+I deduplicate the intent, validate consent/expiry, render bounded channel content and record the attempt before the provider call. Definitive invalid addresses terminate; throttling schedules bounded backoff; timeout-after-acceptance remains uncertain and uses provider query/idempotency where available. Expired OTPs are not replayed later. At 200 SMS/minute against a 100/minute provider quota, backlog grows 100/minute, so channel admission must honor quota rather than adding unlimited threads. Receipts advance only supported states and duplicate callbacks cannot create another intent.
+
+## 3. Final design diagram
+
+[![Design Notification System: NotificationService records NotificationIntent; NotificationIntent rendered by TemplateRenderer; NotificationIntent routes through ChannelPolicy; ChannelPolicy selects DeliveryChannel; DeliveryChannel creates Attempt; Attempt records Receipt](designs/lld-13.svg)](designs/lld-13.svg)
 
 A **notification** is the intent to inform someone. A **delivery attempt** is one provider call. A **template version** determines rendered content. Provider acceptance means the provider received the message; it does not prove the recipient read it.
 
-## See delivery and retry
+## 4. Critical operation: worked execution
 
 ![Intent is stable while attempts and provider receipts accumulate.](lessons/lld-13-flow.svg)
 
@@ -203,7 +223,7 @@ A **notification** is the intent to inform someone. A **delivery attempt** is on
 
 *A timeout is not proof that the message was never sent.*
 
-### Build and calculate
+### Worked calculation and implementation
 
 ```java
 // Adapter contract sketch; no provider credentials in the domain object.
@@ -214,7 +234,7 @@ interface DeliveryChannel {
 
 Keep `EmailChannel`, `SmsChannel` and `PushChannel` responsible for their provider contracts. A policy chooses a channel; a renderer applies its length and formatting rules. An SMS long enough to become multiple billed segments needs channel-specific calculation rather than one universal “character count.”
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -260,12 +280,6 @@ NotificationRequest contains recipient, template version, channel preference and
 notification(id,request_key,recipient,template_version,status); attempt(id,notification_id,provider_ref,outcome,next_at)
 ```
 
-### State machine and command contracts
-
-```text
-QUEUED -> SENDING -> ACCEPTED -> DELIVERED | FAILED; RETRY_WAIT and UNKNOWN are explicit
-```
-
 ### End-to-end execution trace
 
 Authorize the request; validate recipient and preference; snapshot the template inputs; persist the notification and durable dispatch intent; render; send with provider idempotency when supported; classify result; retry transient failures within budget; record callbacks independently.
@@ -273,8 +287,6 @@ Authorize the request; validate recipient and preference; snapshot the template 
 ### Concurrency and recovery walkthrough
 
 A timeout occurs after the provider accepts a message. Query using provider reference or retry with its idempotency key; when unsupported, document possible duplicate delivery. Local deduplication alone cannot undo an already sent SMS.
-
-
 
 ### Policy choices and extension seams
 
@@ -284,43 +296,41 @@ Factory selects an adapter; Strategy expresses channel fallback. Decorators can 
 
 Unsubscribe takes precedence over queued marketing work under a documented cut-off policy. Missing template variables are permanent validation failures. Quiet hours depend on the recipient zone, not server local time.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Duplicate intent; missing variables; opt-out; retry budget; permanent provider error; out-of-order delivery callback; timezone quiet hours.
-
-**Lab:** Make the provider accept a message and then time out. Explain the delivery state, reconciliation query and duplicate-risk policy.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through policy choices
+### Work through policy choices
 
 At 1,000 intents/minute with 20% SMS, nominal SMS traffic is 200/minute before retries. If the provider permits 100/minute, queueing will grow by 100/minute unless admission, alternate channels or the product's delay promise changes. More worker threads cannot remove the provider quota.
 
 Preserve the original event identity across retries. Distinguish permanent invalid-address failures from temporary throttling. Expire stale password-reset intents instead of sending an obsolete security code hours later. A notification system must not let an arbitrary template parameter override the recipient's authorization or consent.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Should email formatting live in the order aggregate?** No. The order emits a business fact; notification rendering adapts it to a channel.
-2. **Is at-least-once processing enough to prevent duplicate SMS?** No. Worker deduplication and provider idempotency capabilities are separate considerations.
-3. **Exercise:** use a fake provider that rejects, throttles, accepts and times out after accepting. Check attempt history, retry classification and expiry in each case. Do not reduce all outcomes to `sent=false`.
+**Should email formatting live in the order aggregate?** No. The order emits a business fact; notification rendering adapts it to a channel.
+
+**Is at-least-once processing enough to prevent duplicate SMS?** No. Worker deduplication and provider idempotency capabilities are separate considerations.
+
+## 7. Closing answer
+
+I separate notification intent from channel-specific attempts and delivery evidence. Strategy chooses the channel, adapters integrate providers, and stable identities make retries inspectable. Accepted, delivered and read are separate outcomes; consent and expiry are checked before sending.
 
 === LLD 14 ===
-N|client|Client Request|0|0|150
-N|limiter|RateLimiter|290|0|150
-N|registry|Per-key Buckets|590|0|170|cylinder
-N|algo|Algorithm (Strategy)|290|150|190|ellipse
-N|tb|Token Bucket|0|280|150
-N|sw|Sliding Window|290|280|160
-N|fw|Fixed Window|600|280|150
-E|client|limiter|tryAcquire(key)
-E|limiter|registry|lookup
-E|limiter|algo|delegates
-E|algo|tb|impl
-E|algo|sw|impl
-E|algo|fw|impl
+N|n0|RateLimiter|0|0|200|rect
+N|n1|KeyPolicy|250|0|200|rect
+N|n2|BucketRegistry|500|0|200|rect
+N|n3|TokenBucket|0|110|200|rect
+N|n4|MonotonicClock|250|110|200|rect
+N|n5|AdmissionResult|500|110|200|rect
+E|n0|n1|resolves key
+E|n0|n2|looks up
+E|n2|n3|owns per key
+E|n3|n4|measures elapsed
+E|n3|n5|returns
 ---
 ## Problem
 
@@ -336,13 +346,30 @@ Design a rate limiter class in Java (the LLD version, inside one JVM): `boolean 
 **Non-functional**
 - O(1) per call where possible, safe under many concurrent threads, and bounded memory (evict idle keys).
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-An API allows five requests immediately and then replenishes two requests per second. A counter reset every second cannot express that burst policy cleanly. A **token bucket** stores permits: requests consume permits and elapsed time replenishes them up to a capacity.
+I enforce capacity 5 and refill 2 permits/second per authenticated caller in one JVM. `RateLimiter` resolves keys, `TokenBucket` owns state, and an injected monotonic clock makes arithmetic testable. Costs are positive and no larger than capacity.
 
-Start with one JVM and one caller. Then add multiple callers and finally multiple servers. The algorithm's arithmetic and its deployment authority are separate lessons; a correct local bucket does not automatically become a global quota.
+## 2. Atomic decision
 
-## See admission and a concurrent race
+```text
+synchronized tryAcquire(cost,nowNanos):
+  elapsed = max(0,nowNanos-lastNanos)
+  tokens = min(capacity,tokens + elapsed/1e9*rate)
+  lastNanos = max(lastNanos,nowNanos)
+  if tokens >= cost: tokens -= cost; return ALLOW
+  return DENY with retryAfterNanos = ceil((cost-tokens)/rate * 1e9)
+```
+
+After depletion, 1.25 seconds refills 2.5 permits: two unit requests pass, then the next waits 0.25 seconds before HTTP-header rounding. I use fine-grained retry durations internally; a whole-second header rounds upward. Registry lookup is thread-safe but bucket synchronization covers the multi-field calculation. Idle eviction occurs only after a period long enough to restore a full bucket under the policy; premature deletion would grant another burst. Twenty-four simultaneous calls with frozen time admit exactly five. Multiple servers do not share this lock, so I do not claim global enforcement from this implementation.
+
+## 3. Final design diagram
+
+[![Design Rate Limiter: RateLimiter resolves key KeyPolicy; RateLimiter looks up BucketRegistry; BucketRegistry owns per key TokenBucket; TokenBucket measures elapsed MonotonicClock; TokenBucket returns AdmissionResult](designs/lld-14.svg)](designs/lld-14.svg)
+
+I start with one JVM and one caller. Then add multiple callers and finally multiple servers. The algorithm's arithmetic and its deployment authority are separate lessons; a correct local bucket does not automatically become a global quota.
+
+## 4. Critical operation: worked execution
 
 ![Refill and consumption form one atomic operation.](lessons/lld-14-flow.svg)
 
@@ -356,7 +383,7 @@ Start with one JVM and one caller. Then add multiple callers and finally multipl
 
 *Fractional permits explain why two requests can pass now while the next must wait.*
 
-### Build and calculate
+### Worked calculation and implementation
 
 With capacity 5, rate 2/s and an empty bucket at t=0, t=1.25 has 2.5 tokens. Two unit-cost requests succeed, leaving 0.5. The next needs another 0.5 token, so its earliest retry is 0.25 seconds later. Do not round retry delay downward.
 
@@ -369,7 +396,7 @@ else: DENY, retryAfter = (requestCost - tokens) / rate
 
 Handle nonpositive capacity/rate and cost greater than capacity explicitly. Floating-point arithmetic can be acceptable for an educational bucket with bounded values; fixed-point arithmetic is an alternative when exact quotas and reproducibility require it.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -382,19 +409,6 @@ Handle nonpositive capacity/rate and cost greater than capacity explicitly. Floa
 | `LimiterRegistry` | `ConcurrentHashMap<String, RateLimitAlgorithm>` plus idle eviction |
 | `Clock` | Injected time source, so tests are deterministic |
 
-```java
-final class TokenBucket implements RateLimitAlgorithm {
-    private final long capacity; private final double refillPerNano;
-    private double tokens; private long last;
-    public synchronized boolean allow() {
-        long now = clock.nanoTime();
-        tokens = Math.min(capacity, tokens + (now - last) * refillPerNano);
-        last = now;
-        if (tokens >= 1) { tokens -= 1; return true; }
-        return false;
-    }
-}
-```
 
 ### Design decisions & trade-offs
 
@@ -428,12 +442,6 @@ RateLimitKey identifies principal, route and policy version. RatePolicy contains
 key(principal,route,policy_version); bucket(tokens,last_refill_nanos); policy(capacity,rate_per_second)
 ```
 
-### State machine and command contracts
-
-```text
-Tokens evolve by refill and debit; policy changes are versioned rather than silently reusing incompatible state
-```
-
 ### End-to-end execution trace
 
 Resolve policy; locate the bucket; acquire its synchronization boundary; calculate elapsed monotonic time; refill with a cap; consume if enough; return a retry delay based on the deficit; release the lock before request processing.
@@ -441,8 +449,6 @@ Resolve policy; locate the bucket; acquire its synchronization boundary; calcula
 ### Concurrency and recovery walkthrough
 
 One hundred threads request the final token simultaneously. Refill and consume must be one critical section; a thread-safe map does not make a read-modify-write bucket sequence atomic.
-
-
 
 ### Policy choices and extension seams
 
@@ -452,43 +458,43 @@ Token bucket permits bounded bursts; leaky bucket smooths output; fixed windows 
 
 Idle-key eviction can reset quota if implemented carelessly. Fractional refill needs numeric care and overflow-safe elapsed handling. Costs must be positive; reject configuration with zero refill when retry calculation divides by rate.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Initial burst cap; concurrent last-token race; fractional refill; clock behavior; bounded key eviction; exact retry-after calculation.
-
-**Lab:** Use a fake monotonic clock to exhaust a bucket, advance half a refill interval, then race two requests. Show expected decisions without sleeping.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through deployment boundaries
+### Work through deployment boundaries
 
 Three servers each allowing five immediate requests can collectively allow fifteen. For a global five-request burst, use a shared atomic decision store, route each key to one owner, or explicitly allocate sub-budgets. The latter can underuse quota and needs reassignment rules.
 
 Use monotonic elapsed time for a local bucket; wall-clock corrections must not mint tokens. Evicting idle callers is safe only when the recreated state matches the policy. Deleting an exhausted bucket and recreating it full immediately grants another burst.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does a thread-safe map make the whole bucket algorithm atomic?** No. Coordinate state calculation and consumption for each key.
-2. **Does a denied request consume a token?** Define it; a common admission policy consumes only allowed work.
-3. **Exercise:** release 24 threads against a full bucket of capacity 5 with a frozen clock. Exactly five unit-cost requests should succeed. Advance the fake clock by 500 ms and expect one more permit at 2/s.
+**Does a thread-safe map make the whole bucket algorithm atomic?** No. Coordinate state calculation and consumption for each key.
+
+**Does a denied request consume a token?** Define it; a common admission policy consumes only allowed work.
+
+## 7. Closing answer
+
+I choose a per-key token bucket with atomic refill-and-consume, monotonic time and explicit retry delay. The local implementation serializes one bucket without blocking unrelated keys. A global quota needs one shared decision authority or consciously allocated local sub-budgets.
 
 === LLD 15 ===
-N|user|User|0|0|110
-N|wallet|WalletService|250|0|160
-N|idem|Idempotency Store|560|0|180|cylinder
-N|acct|Wallet Account|250|150|160
-N|ledger|Ledger Entries|560|150|160|cylinder
-N|gw|PaymentGateway|0|150|160|ellipse
-N|txn|Txn State|250|280|150|ellipse
-E|user|wallet|transfer(key)
-E|wallet|idem|check key
-E|wallet|acct|lock & update
-E|acct|ledger|append debit/credit
-E|wallet|gw|top-up
-E|wallet|txn|transitions
+N|n0|TransferService|0|0|200|rect
+N|n1|Wallet|250|0|200|rect
+N|n2|Transfer|500|0|200|rect
+N|n3|LedgerEntry|0|110|200|rect
+N|n4|BalanceProjection|250|110|200|rect
+N|n5|PaymentPort|500|110|200|rect
+N|n6|Reconciler|0|220|200|rect
+E|n0|n1|locks in order
+E|n0|n2|records once
+E|n2|n3|posts balanced
+E|n3|n4|projects
+E|n0|n5|external boundary
+E|n6|n2|resolves pending
 ---
 ## Problem
 
@@ -504,13 +510,30 @@ Design a digital wallet like Paytm or PhonePe: users top up from a bank or card,
 - Never lose or create money. Balances must match the ledger exactly.
 - Client retries must not double-charge. Concurrent transfers must not overdraw.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-Anita transfers ₹200 from wallet A to B. The money must leave A exactly once and arrive at B exactly once. A pair of mutable balance fields does not explain what happened after a crash, duplicate request or dispute. A **ledger** records immutable movements; a balance is a projection of those entries.
+I transfer INR minor units between internal wallets with no overdraft. Wallet identity and transfer identity are separate; the ledger explains balances. External top-up/cash-out uses a separate provider workflow, not the internal atomic transfer transaction.
 
-Begin with one currency and one database transaction. A wallet identifies an account; a transfer identifies the business operation; balanced ledger entries explain its effect. External card or bank payments add a separate uncertain network boundary.
+## 2. Internal transfer transaction
 
-## See a balanced transfer
+```text
+transfer(id,from,to,amount,currency):
+  validate positive amount, same currency, distinct wallets and actor permission
+  return existing result for matching id/payload, reject conflicting reuse
+  lock wallets in stable ID order
+  verify spendable balance; insert transfer and debit/credit entries
+  update protected balance projection and commit
+```
+
+For ₹500 in A and a ₹200 transfer, entries are A −20,000 paise and B +20,000. The sum is zero and A becomes ₹300. Two ₹400 debits against ₹500 cannot both pass the locked funds check. Fee collection adds balanced entries to an explicit fee account. Reversal is another uniquely identified transfer linked to the original. A provider timeout remains pending under its original reference; reconciliation confirms whether collection happened before another attempt or refund is authorized.
+
+## 3. Final design diagram
+
+[![Design Wallet / Payment System: TransferService locks in order Wallet; TransferService records once Transfer; Transfer posts balanced LedgerEntry; LedgerEntry projects BalanceProjection; TransferService external boundary PaymentPort; Reconciler resolves pending Transfer](designs/lld-15.svg)](designs/lld-15.svg)
+
+I begin with one currency and one database transaction. A wallet identifies an account; a transfer identifies the business operation; balanced ledger entries explain its effect. External card or bank payments add a separate uncertain network boundary.
+
+## 4. Critical operation: worked execution
 
 ![Both sides commit together under one transfer identity.](lessons/lld-15-flow.svg)
 
@@ -520,7 +543,7 @@ Begin with one currency and one database transaction. A wallet identifies an acc
 
 *Retry returns the original transfer instead of debiting again.*
 
-### Build and calculate
+### Worked calculation and implementation
 
 If A has 50,000 paise and transfers 20,000 to B, A ends with 30,000 and B increases by 20,000. The signed entry sum for the internal transfer is zero. Fees require explicit entries to a fee account; otherwise conservation appears to break.
 
@@ -531,7 +554,7 @@ T4/A: -20000 INR paise
 T4/B: +20000 INR paise
 ```
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -539,8 +562,8 @@ T4/B: +20000 INR paise
 |---|---|
 | `Wallet` | id, user, `balance` (derived or cached), status, version |
 | `LedgerEntry` | Immutable: txnId, walletId, `DEBIT/CREDIT`, amount, balanceAfter |
-| `Transaction` | id, type, amount, from, to, `TxnState`, idempotencyKey |
-| `TxnState` | `INITIATED → PROCESSING → SUCCESS / FAILED → REVERSED` |
+| `Transfer` | id, type, amount, from, to, `TransferState`, idempotencyKey |
+| `TransferState` | `POSTED → REVERSED`; external funding intents separately track pending/unknown results |
 | `PaymentInstrument` (Strategy) | `Card`, `UPI`, `NetBanking` for top-ups |
 | `IdempotencyStore` | key → result (first result wins) |
 | `LimitPolicy` | Chain of checks: KYC tier, daily cap, velocity |
@@ -579,12 +602,6 @@ Wallet holds owner and currency. Transfer identifies source, destination, amount
 wallet(id,currency,balance_minor,version); transfer(id,request_key,payload_hash,status); entry(transfer_id,wallet_id,delta_minor)
 ```
 
-### State machine and command contracts
-
-```text
-CREATED -> POSTED | REJECTED; external transfer PENDING -> SETTLED | RECONCILIATION_REQUIRED
-```
-
 ### End-to-end execution trace
 
 Authenticate and authorize; validate positive amount and currency; lock wallet rows in stable ID order; check balance; insert transfer and balanced entries atomically; update cached balances; commit; publish events using an outbox. External funding follows a separate pending/settled protocol.
@@ -592,8 +609,6 @@ Authenticate and authorize; validate positive amount and currency; lock wallet r
 ### Concurrency and recovery walkthrough
 
 Concurrent debits both observe enough funds. A database conditional debit or row lock serializes the balance check with the debit. An in-memory synchronized method cannot protect other service instances.
-
-
 
 ### Policy choices and extension seams
 
@@ -603,42 +618,41 @@ Storing just a mutable balance is quick but loses auditability. Ledger entries e
 
 Timeout after bank acceptance means UNKNOWN. Reversal is a new balanced transaction, never deletion of the original. Currency conversion needs an explicit rate snapshot and balancing entries in each currency domain.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Concurrent overdraft prevention; payload mismatch; self-transfer policy; arithmetic overflow; balanced reversal; provider timeout; ledger-to-balance reconciliation.
-
-**Lab:** Race two 80-unit debits against a 100-unit wallet, then replay the winning operation and issue its reversal. Verify nonnegative balance and ledger conservation.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through contention and corrections
+### Work through contention and corrections
 
 Two transfers of ₹400 each compete against ₹500. Checking the balance before entering the transaction permits both. Serialize the spendable-funds decision or use a conditional debit; one must lose. Locking A then B in one transfer and B then A in another can deadlock, so establish a consistent order and a retry policy for transaction conflicts.
 
 A correction is a reversing transaction linked to the original, never deletion of posted ledger history. For an external provider timeout, record `PENDING` or `UNKNOWN` and reconcile by provider reference. A database rollback cannot reverse a successful card charge.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Can different currencies share one arithmetic balance?** No. Model conversion with explicit amounts, currency pair, rate and rounding.
-2. **Can the same transfer ID carry another amount?** Reject it as conflicting intent, even if the original operation succeeded.
-3. **Exercise:** race two ₹400 debits against ₹500, retry the winner, then reverse it. Check immutable entries, nonnegative spendable funds under the chosen policy, and conservation after every committed transition.
+**Can different currencies share one arithmetic balance?** No. Model conversion with explicit amounts, currency pair, rate and rounding.
+
+**Can the same transfer ID carry another amount?** Reject it as conflicting intent, even if the original operation succeeded.
+
+## 7. Closing answer
+
+I use immutable balanced ledger entries, stable transfer identities and one transactional spendable-funds decision. Corrections reverse rather than erase entries. External provider uncertainty has a pending reconciliation state because a database rollback cannot undo a captured payment.
 
 === LLD 16 ===
-N|game|Game|300|0|130
-N|board|Board N×N|300|150|140
-N|player|Player ×2|0|0|130
-N|strat|MoveStrategy|0|150|150|ellipse
-N|win|WinChecker|600|150|140
-N|state|GameState|600|0|140|ellipse
-E|game|player|turns
-E|player|strat|uses
-E|game|board|place(r,c)
-E|game|win|after move
-E|win|board|O(1) counters
-E|game|state|status
+N|n0|Game|0|0|200|rect
+N|n1|Board|250|0|200|rect
+N|n2|Move|500|0|200|rect
+N|n3|WinPolicy|0|110|200|rect
+N|n4|Player|250|110|200|rect
+N|n5|GameResult|500|110|200|rect
+E|n0|n1|owns
+E|n0|n2|accepts
+E|n0|n3|evaluates
+E|n0|n4|alternates
+E|n0|n5|records
 ---
 ## Problem
 
@@ -657,13 +671,31 @@ Design tic-tac-toe for two players on an N×N board, with win detection in **O(1
 - Game logic is independent of the UI, so it runs in a console, on the web or in tests.
 - New player strategies (AI difficulty levels) plug in without changing the game.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-In Tic-Tac-Toe, X chooses the centre square. O cannot choose it afterward, X cannot play twice, and no move is legal after a win. These small rules make a useful first aggregate: one object owns the board, turn and result so callers cannot change them independently.
+I implement a two-player 3×3 game with X first, no undo and three-in-a-row victory. `Board` stores EMPTY/X/O; `Game` is the mutation boundary; WinPolicy evaluates the last move. I return immutable snapshots rather than exposing the backing array.
 
-A **game state** is the complete position. A **move** is a request to change it. A **win policy** answers whether a board satisfies the chosen winning rule. Start with 3×3, two players and three in a row; generalization comes after the basic transitions work.
+## 2. Move algorithm
 
-## See a move and terminal state
+```text
+play(playerId,row,col,expectedVersion):
+  under game lock: verify ACTIVE, version, correct player and valid empty cell
+  place mark; increment occupied cells and version
+  if row/column/relevant diagonal is winning: record winner
+  else if occupied == 9: record DRAW
+  else: switch turn
+  return snapshot
+```
+
+I inspect only lines through the new mark; for N×N requiring N in a line this is O(N), while memory is O(N²). A final square completing X's row is a win even if the board is now full, hence win precedes draw. A terminal game rejects delayed moves. A larger N×N/K-in-a-row version replaces WinPolicy with bidirectional counts around the last mark instead of requiring an entire row. Two requests against one version serialize and only the valid expected turn commits.
+
+## 3. Final design diagram
+
+[![Design Tic-Tac-Toe: Game owns Board; Game accepts Move; Game evaluates WinPolicy; Game alternates Player; Game records GameResult](designs/lld-16.svg)](designs/lld-16.svg)
+
+A **game state** is the complete position. A **move** is a request to change it. A **win policy** answers whether a board satisfies the chosen winning rule. I start with 3×3, two players and three in a row; generalization comes after the basic transitions work.
+
+## 4. Critical operation: worked execution
 
 ![Validation occurs before board mutation and outcome detection.](lessons/lld-16-flow.svg)
 
@@ -673,7 +705,7 @@ A **game state** is the complete position. A **move** is a request to change it.
 
 *The result is part of the authority, not a UI decoration.*
 
-### Build and reason
+### Selected algorithm
 
 Store an enum value `EMPTY`, `X` or `O` per cell. After a move, inspect its row, column and relevant diagonals. On an N×N board requiring N in a row this takes O(N); scanning all rows after every move takes O(N²). For 3×3, readability is usually worth more than saving a few comparisons.
 
@@ -686,7 +718,7 @@ After:  X X X    Result: WIN_X, not nextTurn=O
         . . .
 ```
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -737,12 +769,6 @@ Game owns Board, current Player and Result. Move is row and column plus player. 
 game(id,size,win_length,side_to_move,version); cell(row,column,symbol); move(sequence,player,row,column)
 ```
 
-### State machine and command contracts
-
-```text
-IN_PROGRESS -> WON | DRAW; no moves after terminal state
-```
-
 ### End-to-end execution trace
 
 Validate game state, player and bounds; check empty cell; commit the placement; evaluate a win before a draw; otherwise advance the player. Return an immutable view so rendering cannot mutate the board.
@@ -751,35 +777,33 @@ Validate game state, player and bounds; check empty cell; commit the placement; 
 
 Two requests target different cells for the same turn. Serialize on the game aggregate or use a position version so only one request commits before turn advancement.
 
-
-
 ### Policy choices and extension seams
 
-For a small board scanning rows/columns is simple. Per-player row/column counters reduce checks for full-line wins but are less flexible for arbitrary connect-k rules. Start with the specified rule, not a universal game framework.
+For a small board scanning rows/columns is simple. Per-player row/column counters reduce checks for full-line wins but are less flexible for arbitrary connect-k rules. I start with the specified rule, not a universal game framework.
 
 ### Edge cases that change the design
 
 A final move can both fill the board and win; win takes precedence over draw. Validate n and k before allocating memory. A fresh game needs fresh state rather than a reused singleton board.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Row/column/diagonal wins; occupied cell; wrong player; final-cell win; out-of-range move; simultaneous requests; independent game instances.
-
-**Lab:** Use a board with one empty square that completes a diagonal, and verify WIN rather than DRAW. Replay the final move and ensure rejection.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through generalization
+### Work through generalization
 
 An N×N board with K consecutive marks needs a different win rule: count matching marks in both directions from the last move for horizontal, vertical and two diagonals. Do not assume the whole row must be filled. Keep player strategy outside `Game`; a human, random bot and search bot can all submit the same move contract.
 
 For a network version, require the expected game version to reject double-clicks or two stale browser tabs. Return an immutable board snapshot; exposing the backing array lets callers bypass every rule.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Is a full board always a draw?** Check for a win first; the last empty square may complete a winning line.
-2. **Should an invalid move switch turn?** No. An uncommitted request changes nothing.
-3. **Exercise:** play X row 0 while O builds row 1. Verify X wins first and O's late move is rejected. Add a test proving that modifying a returned snapshot cannot mutate the live board.
+**Is a full board always a draw?** Check for a win first; the last empty square may complete a winning line.
+
+**Should an invalid move switch turn?** No. An uncommitted request changes nothing.
+
+## 7. Closing answer
+
+One Game owns board, turn and result. Each accepted move changes them together, invalid requests change nothing, and the chosen win policy is evaluated before declaring a full-board draw. The same command contract supports human players or replaceable move strategies.

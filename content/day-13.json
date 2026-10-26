@@ -12,103 +12,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "api",
+            "id": "n0",
             "label": "NotificationService",
-            "x": 280,
-            "y": 0,
-            "w": 190,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "tmpl",
-            "label": "TemplateEngine",
             "x": 0,
             "y": 0,
-            "w": 150,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "pref",
-            "label": "User Preferences",
-            "x": 0,
-            "y": 150,
-            "w": 160,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "factory",
-            "label": "ChannelFactory",
-            "x": 280,
-            "y": 150,
-            "w": 160,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "email",
-            "label": "Email",
-            "x": 600,
+            "id": "n1",
+            "label": "NotificationIntent",
+            "x": 250,
             "y": 0,
-            "w": 120,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "sms",
-            "label": "SMS",
-            "x": 600,
-            "y": 120,
-            "w": 120,
+            "id": "n2",
+            "label": "TemplateRenderer",
+            "x": 500,
+            "y": 0,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "push",
-            "label": "Push",
-            "x": 600,
-            "y": 240,
-            "w": 120,
+            "id": "n3",
+            "label": "ChannelPolicy",
+            "x": 0,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n4",
+            "label": "DeliveryChannel",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Attempt",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Receipt",
+            "x": 0,
+            "y": 220,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "api",
-            "to": "tmpl",
-            "label": "render"
+            "from": "n0",
+            "to": "n1",
+            "label": "records"
           },
           {
-            "from": "api",
-            "to": "pref",
-            "label": "channels?"
+            "from": "n1",
+            "to": "n2",
+            "label": "rendered by"
           },
           {
-            "from": "api",
-            "to": "factory",
-            "label": "get sender"
+            "from": "n1",
+            "to": "n3",
+            "label": "routes through"
           },
           {
-            "from": "factory",
-            "to": "email",
+            "from": "n3",
+            "to": "n4",
+            "label": "selects"
+          },
+          {
+            "from": "n4",
+            "to": "n5",
             "label": "creates"
           },
           {
-            "from": "factory",
-            "to": "sms",
-            "label": "creates"
-          },
-          {
-            "from": "factory",
-            "to": "push",
-            "label": "creates"
+            "from": "n5",
+            "to": "n6",
+            "label": "records"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a notification system (as an in-process library or service) that sends messages over email, SMS, push and in-app channels, respects user preferences, renders templates, retries failures and is easy to extend with new channels. It's an extensibility problem: **Strategy** per channel, **Factory** to create senders, and **Observer** to decouple producers from delivery.\n\n## Requirements\n\n**Functional**\n- `send(userId, eventType, payload)`. The system picks channels from user preferences and event priority.\n- Template per event and channel, with variables and localisation.\n- Retry with backoff. Fallback (push fails, so use SMS for critical events).\n- Rate-limit per user. Respect quiet hours. Deduplicate.\n\n**Non-functional**\n- High throughput (millions per day) and asynchronous: `send()` never blocks the caller.\n- At-least-once delivery with idempotency keys, so retries don't produce duplicate messages.\n- Adding a channel (e.g. WhatsApp) needs no change to existing senders.\n- Observable: delivery status can be tracked per message and channel.\n\n## Learn through a concrete example\n\nA password-reset message is sent by email; a delivery update can use SMS or push. “Send notification” hides different validation, formatting, consent and provider outcomes. Build a channel-neutral request while keeping channel-specific delivery behind adapters.\n\nA **notification** is the intent to inform someone. A **delivery attempt** is one provider call. A **template version** determines rendered content. Provider acceptance means the provider received the message; it does not prove the recipient read it.\n\n## See delivery and retry\n\n![Intent is stable while attempts and provider receipts accumulate.](lessons/lld-13-flow.svg)\n\n*Intent is stable while attempts and provider receipts accumulate.*\n\n![A timeout is not proof that the message was never sent.](lessons/lld-13-failure.svg)\n\n*A timeout is not proof that the message was never sent.*\n\n### Build and calculate\n\n```java\n// Adapter contract sketch; no provider credentials in the domain object.\ninterface DeliveryChannel {\n    DeliveryReceipt send(RenderedMessage message, String attemptKey);\n}\n```\n\nKeep `EmailChannel`, `SmsChannel` and `PushChannel` responsible for their provider contracts. A policy chooses a channel; a renderer applies its length and formatting rules. An SMS long enough to become multiple billed segments needs channel-specific calculation rather than one universal “character count.”\n\n## Design details and alternatives\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `NotificationService` | Facade: resolve channels, render, dispatch |\n| `NotificationChannel` (Strategy) | `EmailChannel`, `SmsChannel`, `PushChannel`, `InAppChannel`; `send(Message)` |\n| `ChannelFactory` | `get(ChannelType)` (registry map, so new channels self-register) |\n| `TemplateEngine` | `render(templateId, locale, vars)` |\n| `PreferenceService` | Per-user, per-event channel opt-ins and quiet hours |\n| `Notification` | id, user, event, channel, status (PENDING, SENT, FAILED, RETRYING) |\n| `RetryPolicy` | Exponential backoff with jitter, max attempts |\n| Filters (Chain of Responsibility) | `DedupFilter → RateLimitFilter → QuietHoursFilter` |\n\n```java\npublic interface NotificationChannel {\n    ChannelType type();\n    DeliveryResult send(RenderedMessage msg);\n}\n```\n\n### Design decisions & trade-offs\n\n**1. Open/closed via registry.** Adding WhatsApp is one class implementing `NotificationChannel`, registered with the factory. No `switch` to edit. Vendor adapters (SES vs. SendGrid) sit behind each channel as a second Strategy level.\n\n**2. Pre-send filters as a chain.** Dedup, rate limit, quiet hours and preference checks are independent rules. A chain lets you reorder them and add new ones, and each filter can short-circuit (drop or delay).\n\n**3. Async dispatch.** Producers call `send`, which enqueues work (`BlockingQueue`, or Kafka in HLD). A worker pool delivers. Producers never block on a slow SMS gateway.\n\n**4. Retries and idempotency.** Keep a notification ID through retries so vendors or your dedup can drop duplicates. Classify failures: transient (timeout, 5xx) gets retried; permanent (invalid number) fails fast.\n\n**5. Priority.** OTPs and security alerts skip quiet hours and use a separate high-priority queue, so a marketing blast can't delay them.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Creating a notification and delivering it through an unreliable provider are different responsibilities.\n\nNotificationRequest contains recipient, template version, channel preference and deduplication key. Renderer produces channel-specific payloads; ChannelAdapter calls email/SMS/push providers. DeliveryAttempt records outcome and retry schedule; PreferencePolicy decides consent and quiet hours.\n\n**Correctness rule:** A request identity maps to one logical notification. Retries may create several provider attempts but must not be misreported as several user intents. A successful enqueue is not confirmed delivery.\n\n```text\nnotification(id,request_key,recipient,template_version,status); attempt(id,notification_id,provider_ref,outcome,next_at)\n```\n\n### State machine and command contracts\n\n```text\nQUEUED -> SENDING -> ACCEPTED -> DELIVERED | FAILED; RETRY_WAIT and UNKNOWN are explicit\n```\n\n### End-to-end execution trace\n\nAuthorize the request; validate recipient and preference; snapshot the template inputs; persist the notification and durable dispatch intent; render; send with provider idempotency when supported; classify result; retry transient failures within budget; record callbacks independently.\n\n### Concurrency and recovery walkthrough\n\nA timeout occurs after the provider accepts a message. Query using provider reference or retry with its idempotency key; when unsupported, document possible duplicate delivery. Local deduplication alone cannot undo an already sent SMS.\n\n\n\n### Policy choices and extension seams\n\nFactory selects an adapter; Strategy expresses channel fallback. Decorators can add metrics and retries only if retry policy understands idempotency. Avoid a generic retry decorator around every side effect.\n\n### Edge cases that change the design\n\nUnsubscribe takes precedence over queued marketing work under a documented cut-off policy. Missing template variables are permanent validation failures. Quiet hours depend on the recipient zone, not server local time.\n\n### Verification and a practical lab\n\n**Topic-specific cases:** Duplicate intent; missing variables; opt-out; retry budget; permanent provider error; out-of-order delivery callback; timezone quiet hours.\n\n**Lab:** Make the provider accept a message and then time out. Explain the delivery state, reconciliation query and duplicate-risk policy.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n## Work through policy choices\n\nAt 1,000 intents/minute with 20% SMS, nominal SMS traffic is 200/minute before retries. If the provider permits 100/minute, queueing will grow by 100/minute unless admission, alternate channels or the product's delay promise changes. More worker threads cannot remove the provider quota.\n\nPreserve the original event identity across retries. Distinguish permanent invalid-address failures from temporary throttling. Expire stale password-reset intents instead of sending an obsolete security code hours later. A notification system must not let an arbitrary template parameter override the recipient's authorization or consent.\n\n## Practise, then check your reasoning\n\n1. **Should email formatting live in the order aggregate?** No. The order emits a business fact; notification rendering adapts it to a channel.\n2. **Is at-least-once processing enough to prevent duplicate SMS?** No. Worker deduplication and provider idempotency capabilities are separate considerations.\n3. **Exercise:** use a fake provider that rejects, throttles, accepts and times out after accepting. Check attempt history, retry classification and expiry in each case. Do not reduce all outcomes to `sent=false`.\n"
+      "markdown": "## Problem\n\nDesign a notification system (as an in-process library or service) that sends messages over email, SMS, push and in-app channels, respects user preferences, renders templates, retries failures and is easy to extend with new channels. It's an extensibility problem: **Strategy** per channel, **Factory** to create senders, and **Observer** to decouple producers from delivery.\n\n## Requirements\n\n**Functional**\n- `send(userId, eventType, payload)`. The system picks channels from user preferences and event priority.\n- Template per event and channel, with variables and localisation.\n- Retry with backoff. Fallback (push fails, so use SMS for critical events).\n- Rate-limit per user. Respect quiet hours. Deduplicate.\n\n**Non-functional**\n- High throughput (millions per day) and asynchronous: `send()` never blocks the caller.\n- At-least-once delivery with idempotency keys, so retries don't produce duplicate messages.\n- Adding a channel (e.g. WhatsApp) needs no change to existing senders.\n- Observable: delivery status can be tracked per message and channel.\n\n## 1. Scope and chosen solution\n\nI deliver email, SMS and push for typed business events. NotificationIntent freezes template version, recipient scope, urgency and expiry. `DeliveryChannel` is an interface implemented per provider/channel; rendering and route policy remain separate so adding a channel does not modify domain events.\n\n## 2. Dispatch and retry algorithm\n\n```text\nnotify(eventId,recipient,templateVersion,parameters) -> notificationId\ndeliver(notificationId) -> Accepted | RetryScheduled | PermanentFailure | Unknown\nAttempt: attemptId, notificationId, providerRef, outcome, nextAttemptAt\n```\n\nI deduplicate the intent, validate consent/expiry, render bounded channel content and record the attempt before the provider call. Definitive invalid addresses terminate; throttling schedules bounded backoff; timeout-after-acceptance remains uncertain and uses provider query/idempotency where available. Expired OTPs are not replayed later. At 200 SMS/minute against a 100/minute provider quota, backlog grows 100/minute, so channel admission must honor quota rather than adding unlimited threads. Receipts advance only supported states and duplicate callbacks cannot create another intent.\n\n## 3. Final design diagram\n\n[![Design Notification System: NotificationService records NotificationIntent; NotificationIntent rendered by TemplateRenderer; NotificationIntent routes through ChannelPolicy; ChannelPolicy selects DeliveryChannel; DeliveryChannel creates Attempt; Attempt records Receipt](designs/lld-13.svg)](designs/lld-13.svg)\n\nA **notification** is the intent to inform someone. A **delivery attempt** is one provider call. A **template version** determines rendered content. Provider acceptance means the provider received the message; it does not prove the recipient read it.\n\n## 4. Critical operation: worked execution\n\n![Intent is stable while attempts and provider receipts accumulate.](lessons/lld-13-flow.svg)\n\n*Intent is stable while attempts and provider receipts accumulate.*\n\n![A timeout is not proof that the message was never sent.](lessons/lld-13-failure.svg)\n\n*A timeout is not proof that the message was never sent.*\n\n### Worked calculation and implementation\n\n```java\n// Adapter contract sketch; no provider credentials in the domain object.\ninterface DeliveryChannel {\n    DeliveryReceipt send(RenderedMessage message, String attemptKey);\n}\n```\n\nKeep `EmailChannel`, `SmsChannel` and `PushChannel` responsible for their provider contracts. A policy chooses a channel; a renderer applies its length and formatting rules. An SMS long enough to become multiple billed segments needs channel-specific calculation rather than one universal “character count.”\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `NotificationService` | Facade: resolve channels, render, dispatch |\n| `NotificationChannel` (Strategy) | `EmailChannel`, `SmsChannel`, `PushChannel`, `InAppChannel`; `send(Message)` |\n| `ChannelFactory` | `get(ChannelType)` (registry map, so new channels self-register) |\n| `TemplateEngine` | `render(templateId, locale, vars)` |\n| `PreferenceService` | Per-user, per-event channel opt-ins and quiet hours |\n| `Notification` | id, user, event, channel, status (PENDING, SENT, FAILED, RETRYING) |\n| `RetryPolicy` | Exponential backoff with jitter, max attempts |\n| Filters (Chain of Responsibility) | `DedupFilter → RateLimitFilter → QuietHoursFilter` |\n\n```java\npublic interface NotificationChannel {\n    ChannelType type();\n    DeliveryResult send(RenderedMessage msg);\n}\n```\n\n### Design decisions & trade-offs\n\n**1. Open/closed via registry.** Adding WhatsApp is one class implementing `NotificationChannel`, registered with the factory. No `switch` to edit. Vendor adapters (SES vs. SendGrid) sit behind each channel as a second Strategy level.\n\n**2. Pre-send filters as a chain.** Dedup, rate limit, quiet hours and preference checks are independent rules. A chain lets you reorder them and add new ones, and each filter can short-circuit (drop or delay).\n\n**3. Async dispatch.** Producers call `send`, which enqueues work (`BlockingQueue`, or Kafka in HLD). A worker pool delivers. Producers never block on a slow SMS gateway.\n\n**4. Retries and idempotency.** Keep a notification ID through retries so vendors or your dedup can drop duplicates. Classify failures: transient (timeout, 5xx) gets retried; permanent (invalid number) fails fast.\n\n**5. Priority.** OTPs and security alerts skip quiet hours and use a separate high-priority queue, so a marketing blast can't delay them.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Creating a notification and delivering it through an unreliable provider are different responsibilities.\n\nNotificationRequest contains recipient, template version, channel preference and deduplication key. Renderer produces channel-specific payloads; ChannelAdapter calls email/SMS/push providers. DeliveryAttempt records outcome and retry schedule; PreferencePolicy decides consent and quiet hours.\n\n**Correctness rule:** A request identity maps to one logical notification. Retries may create several provider attempts but must not be misreported as several user intents. A successful enqueue is not confirmed delivery.\n\n```text\nnotification(id,request_key,recipient,template_version,status); attempt(id,notification_id,provider_ref,outcome,next_at)\n```\n\n### End-to-end execution trace\n\nAuthorize the request; validate recipient and preference; snapshot the template inputs; persist the notification and durable dispatch intent; render; send with provider idempotency when supported; classify result; retry transient failures within budget; record callbacks independently.\n\n### Concurrency and recovery walkthrough\n\nA timeout occurs after the provider accepts a message. Query using provider reference or retry with its idempotency key; when unsupported, document possible duplicate delivery. Local deduplication alone cannot undo an already sent SMS.\n\n### Policy choices and extension seams\n\nFactory selects an adapter; Strategy expresses channel fallback. Decorators can add metrics and retries only if retry policy understands idempotency. Avoid a generic retry decorator around every side effect.\n\n### Edge cases that change the design\n\nUnsubscribe takes precedence over queued marketing work under a documented cut-off policy. Missing template variables are permanent validation failures. Quiet hours depend on the recipient zone, not server local time.\n\n**Topic-specific cases:** Duplicate intent; missing variables; opt-out; retry budget; permanent provider error; out-of-order delivery callback; timezone quiet hours.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through policy choices\n\nAt 1,000 intents/minute with 20% SMS, nominal SMS traffic is 200/minute before retries. If the provider permits 100/minute, queueing will grow by 100/minute unless admission, alternate channels or the product's delay promise changes. More worker threads cannot remove the provider quota.\n\nPreserve the original event identity across retries. Distinguish permanent invalid-address failures from temporary throttling. Expire stale password-reset intents instead of sending an obsolete security code hours later. A notification system must not let an arbitrary template parameter override the recipient's authorization or consent.\n\n## 6. Interviewer follow-ups\n\n**Should email formatting live in the order aggregate?** No. The order emits a business fact; notification rendering adapts it to a channel.\n\n**Is at-least-once processing enough to prevent duplicate SMS?** No. Worker deduplication and provider idempotency capabilities are separate considerations.\n\n## 7. Closing answer\n\nI separate notification intent from channel-specific attempts and delivery evidence. Strategy chooses the channel, adapters integrate providers, and stable identities make retries inspectable. Accepted, delivered and read are separate outcomes; consent and expiry are checked before sending.\n"
     },
     {
       "category": "HLD",
@@ -118,103 +118,108 @@
       "diagram": {
         "nodes": [
           {
-            "id": "user",
-            "label": "User",
+            "id": "n0",
+            "label": "Sale waiting room",
             "x": 0,
             "y": 0,
-            "w": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "show",
-            "label": "Show/Seat-map Svc",
-            "x": 200,
+            "id": "n1",
+            "label": "Booking API",
+            "x": 250,
             "y": 0,
-            "w": 190,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "cache",
-            "label": "Seat-map Cache",
+            "id": "n2",
+            "label": "Show-seat authority",
             "x": 500,
             "y": 0,
-            "w": 170,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "lock",
-            "label": "Seat Hold (Redis NX + TTL)",
-            "x": 200,
-            "y": 150,
-            "w": 220,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "book",
-            "label": "Booking Svc",
-            "x": 500,
-            "y": 150,
-            "w": 150,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "db",
-            "label": "Bookings DB (unique seat)",
-            "x": 500,
-            "y": 280,
-            "w": 220,
-            "h": 62,
-            "shape": "cylinder"
+            "id": "n3",
+            "label": "Hold store",
+            "x": 0,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           },
           {
-            "id": "pay",
-            "label": "Payment GW",
-            "x": 200,
-            "y": 280,
-            "w": 150,
+            "id": "n4",
+            "label": "Payment workflow",
+            "x": 250,
+            "y": 110,
+            "w": 200,
             "h": 50,
-            "shape": "ellipse"
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Ticket store",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Expiry and reconciliation",
+            "x": 0,
+            "y": 220,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "user",
-            "to": "show",
-            "label": "view seats"
+            "from": "n0",
+            "to": "n1",
+            "label": "bounded admission"
           },
           {
-            "from": "show",
-            "to": "cache",
-            "label": "read"
+            "from": "n1",
+            "to": "n2",
+            "label": "atomic claims"
           },
           {
-            "from": "user",
-            "to": "lock",
-            "label": "hold seats"
+            "from": "n2",
+            "to": "n3",
+            "label": "token ownership"
           },
           {
-            "from": "lock",
-            "to": "book",
-            "label": "on pay"
+            "from": "n1",
+            "to": "n4",
+            "label": "payment intent"
           },
           {
-            "from": "book",
-            "to": "pay",
-            "label": "charge"
+            "from": "n4",
+            "to": "n5",
+            "label": "confirm owned seats"
           },
           {
-            "from": "book",
-            "to": "db",
-            "label": "confirm"
+            "from": "n6",
+            "to": "n3",
+            "label": "expires"
+          },
+          {
+            "from": "n6",
+            "to": "n4",
+            "label": "reconciles"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign BookMyShow at the HLD level: millions of users browse shows across cities, and on popular releases tens of thousands compete for the same seats within seconds. The LLD covered seat locking in one process. Here: **distributed locking**, **inventory consistency**, **transactions with payment** and **concurrency under spikes**.\n\n## Requirements\n\n**Functional**\n- Browse movies, cinemas and shows by city. View a live seat map.\n- Hold seats for ~8 minutes, pay, confirm and issue a ticket. Release holds on timeout or failure.\n\n**Non-functional**\n- Zero double bookings. The seat map is near-real-time. Survive opening-day spikes (e.g. 1M users for one show).\n\n**Scale:** 10k cinemas × ~20 shows/day × 200 seats ≈ 40M seat-inventory rows per day. Browse traffic ~50k req/s. Booking writes ~5k/s at peak, concentrated on a few hot shows.\n\n## Learn through a concrete example\n\nTickets for a popular film go on sale at noon. Most users browse the seating map; a smaller number try to claim the same seats. A waiting room controls arrival rate, but the reservation database still decides who owns each seat.\n\nA **show-seat** is seat A7 for a specific screening. A **hold** grants temporary ownership. A **booking** confirms the purchase. The venue's static seat layout is reusable across shows; its availability is not.\n\n## See traffic control and reservation authority\n\n![Admission controls load; transaction conditions control correctness.](lessons/hld-13-flow.svg)\n\n*Admission controls load; transaction conditions control correctness.*\n\n![Payment success does not override a new seat owner.](lessons/hld-13-failure.svg)\n\n*Payment success does not override a new seat owner.*\n\n### Calculate contention\n\nIf 100,000 users refresh a 200-seat show every two seconds, reads are 50,000/s while only 200 seats can be sold. Cache maps and coalesce refreshes, but treat their availability display as approximate. The write path should not scale its promises beyond the physical 200 seats.\n\n## Design details and alternatives\n\n### Architecture\n\n- **Catalogue/search** (movies, cinemas, shows): read-heavy, cached, CDN for posters.\n- **Seat map service:** reads seat states from cache, with the DB as the source of truth.\n- **Hold:** `SET seat:{showId}:{seatId} userId NX PX 480000` for each requested seat in **Redis** (a Lua script makes multi-seat holds all-or-nothing).\n- **Booking service:** on payment success, verifies the holds are still owned by the user, then writes the booking in the **SQL DB** in one transaction with a **unique constraint on (showId, seatId)**. The DB is the final guard.\n- **Payment** via gateway with an idempotency key; the webhook confirms the booking.\n\n### Key design decisions & trade-offs\n\n**1. Two-layer protection.** Redis holds give fast, expiring, user-friendly locks. The DB unique constraint guarantees correctness even if Redis loses a key (failover). Never rely on the Redis lock alone for money.\n\n**2. Optimistic vs. pessimistic.** Pessimistic (`SELECT … FOR UPDATE` on seat rows) serialises contention in the DB and causes lock storms on hot shows. Optimistic (conditional update `WHERE status='AVAILABLE'`, or insert plus unique constraint) fails fast and lets the user pick another seat. Prefer optimistic plus Redis holds.\n\n**3. Hot shows and the waiting room.** For mega releases, put users in a **virtual queue** and admit them at a rate the booking path can handle. It's fairer and protects every downstream system.\n\n**4. Seat map freshness.** Push hold and release events via WebSocket or SSE to viewers of that show, or poll every few seconds. A stale map only causes a failed hold, never a double booking.\n\n**5. Payment edge cases.** The hold expired during a slow payment but the money was captured. Try to re-acquire the seats; if they're taken, auto-refund. Reconcile pending payments periodically.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** For each show-seat, one authoritative state transition determines who owns the hold or confirmed booking.\n\nAssume 50,000 seats released and 500,000 users arriving in a minute: 8,333 admission attempts/s before seat-map refreshes. If each polls every 5 seconds, 100,000 seat-map reads/s arise independently of purchases.\n\n### API contracts and data ownership\n\n```text\nGET /shows/{id}/seats; POST /holds with seats; POST /holds/{id}/confirm; DELETE /holds/{id}\n```\n\n```text\nLogical records (outline, not complete DDL):\nshow_seat(show_id,seat_id,state,hold_id,expires_at,version); booking(id,hold_id,payment_id,status)\n\nPrimary access/partitioning boundary:\nshow_id and seat_id for inventory; hold_id and booking_id for idempotency\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around show_id and seat_id for inventory; hold_id and booking_id for idempotency. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAdmit a bounded number of customers; serve cached seat maps as advisory; atomically acquire requested seats in stable order; return a server-expiry hold token; process payment outside inventory locks; confirm only the current unexpired hold; publish final state.\n\n### Deep dive: the decision that changes this system\n\nWaiting rooms and rate limits protect the transactional seat authority; they do not guarantee a seat. One popular show is a hot partition, so choose ownership by show or section while preserving atomic multi-seat operations. A lease expiry worker is cleanup, not the sole expiry check.\n\n### Failure and race-condition walkthrough\n\nThe first buyer pays after a hold expires and seats are sold again. Preserve the later owner and compensate/refund the earlier payment. A distributed lock without fencing can let a paused old worker overwrite a new owner.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nA single show leader simplifies serialization; sharding by section improves throughput but makes cross-section seat requests harder. Strong writes and stale maps are compatible if the product clearly treats maps as estimates.\n\n### SLOs, failure drills and lab\n\nOversell must remain zero within the model; track hold latency, conflict rate, expired-hold age, admission queue time and payment reconciliation.\n\n**Test matrix:** Last-seat races, all-or-none group selection, hold expiry with payment callback, stale map, paused worker resumption and admission overload.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: For each show-seat, one authoritative state transition determines who owns the hold or confirmed booking.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 50,000 seats released and 500,000 users arriving in a minute: 8,333 admission attempts/s before seat-map refreshes. If each polls every 5 seconds, 100,000 seat-map reads/s arise independently of purchases.\n\n**Which failure would invalidate the naive design?** The first buyer pays after a hold expires and seats are sold again. Preserve the later owner and compensate/refund the earlier payment. A distributed lock without fencing can let a paused old worker overwrite a new owner.\n\n**Why not introduce every distributed component immediately?** A single show leader simplifies serialization; sharding by section improves throughput but makes cross-section seat requests harder. Strong writes and stale maps are compatible if the product clearly treats maps as estimates.\n\n**How would you demonstrate the design works?** Last-seat races, all-or-none group selection, hold expiry with payment callback, stale map, paused worker resumption and admission overload. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n## Work through expiry and recovery\n\nThe database condition checks ownership token and time. A background expiry job improves cleanup speed but is not the source of the validity rule. A stale expiry worker must not release a newer hold. Multi-seat selections need all-or-nothing ownership with stable lock order.\n\nPartition by show for local contention boundaries when appropriate; an exceptionally popular show is still a hot partition. Admission, request deduplication and bounded transactions reduce pressure without weakening seat ownership. Track payment-without-booking and booking-without-settlement as operational reconciliation queues.\n\n## Practise, then check your reasoning\n\n1. **Does a waiting-room token guarantee a ticket?** No. It grants a chance to attempt allocation under capacity limits.\n2. **Should map-cache failure make seats double-bookable?** No. The cache is not the ownership authority.\n3. **Exercise:** race expiry, confirmation and a new hold for A7. Verify exactly one current owner and an explicit disposition for every payment callback, including duplicates.\n"
+      "markdown": "## Problem\n\nDesign BookMyShow at the HLD level: millions of users browse shows across cities, and on popular releases tens of thousands compete for the same seats within seconds. The LLD covered seat locking in one process. Here: **distributed locking**, **inventory consistency**, **transactions with payment** and **concurrency under spikes**.\n\n## Requirements\n\n**Functional**\n- Browse movies, cinemas and shows by city. View a live seat map.\n- Hold seats for ~8 minutes, pay, confirm and issue a ticket. Release holds on timeout or failure.\n\n**Non-functional**\n- Zero double bookings. The seat map is near-real-time. Survive opening-day spikes (e.g. 1M users for one show).\n\n**Scale:** 10k cinemas × ~20 shows/day × 200 seats ≈ 40M seat-inventory rows per day. Browse traffic ~50k req/s. Booking writes ~5k/s at peak, concentrated on a few hot shows.\n\n## 1. Scope and selected architecture\n\nI sell reserved seats for high-demand shows. I choose per-show allocation partitions, cached maps and a bounded waiting room. The authoritative show-seat transaction owns all-seat holds; payment and ticket issuance use a recoverable workflow. Cached maps never grant ownership.\n\n## 2. Booking protocol\n\n```text\nPOST /shows/{id}/holds {requestId,seats} -> holdId,expiresAt,quotedTotal\nPOST /holds/{id}/payment -> paymentIntent\nGET /bookings/{id} -> pending | confirmed | compensationRequired\nShowSeat PK(showId,seatId): state,holdId,expiry,bookingId\nBooking UNIQUE(holdId); Payment UNIQUE(providerReference)\n```\n\nHold creation locks sorted seat rows, verifies every claim and commits one hold or nothing. Payment confirmation locks the same ownership, checks strict unexpired validity and creates the booking once. Cleanup only releases matching expired tokens. A payment after lost ownership creates a recorded refund/exception, never steals the seat. At 100,000 visitors polling every two seconds, reads reach 50,000/s for only 200 seats; cache refresh coalescing and admission protect the write authority. I monitor allocation conflicts, oldest pending payment, hold leakage and paid-without-booking cases rather than only successful HTTP responses.\n\n## 3. Final design diagram\n\n[![BookMyShow: Sale waiting room bounded admission Booking API; Booking API atomic claims Show-seat authority; Show-seat authority token ownership Hold store; Booking API payment intent Payment workflow; Payment workflow confirm owned seats Ticket store; Expiry and reconciliation expires Hold store; Expiry and reconciliation reconciles Payment workflow](designs/hld-13.svg)](designs/hld-13.svg)\n\nA **show-seat** is seat A7 for a specific screening. A **hold** grants temporary ownership. A **booking** confirms the purchase. The venue's static seat layout is reusable across shows; its availability is not.\n\n## 4. Critical operation: worked execution\n\n![Admission controls load; transaction conditions control correctness.](lessons/hld-13-flow.svg)\n\n*Admission controls load; transaction conditions control correctness.*\n\n![Payment success does not override a new seat owner.](lessons/hld-13-failure.svg)\n\n*Payment success does not override a new seat owner.*\n\n### Calculate contention\n\nIf 100,000 users refresh a 200-seat show every two seconds, reads are 50,000/s while only 200 seats can be sold. Cache maps and coalesce refreshes, but treat their availability display as approximate. The write path should not scale its promises beyond the physical 200 seats.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n- **Catalogue/search** (movies, cinemas, shows): read-heavy, cached, CDN for posters.\n- **Seat map service:** reads seat states from cache, with the DB as the source of truth.\n- **Hold:** `SET seat:{showId}:{seatId} userId NX PX 480000` for each requested seat in **Redis** (a Lua script makes multi-seat holds all-or-nothing).\n- **Booking service:** on payment success, verifies the holds are still owned by the user, then writes the booking in the **SQL DB** in one transaction with a **unique constraint on (showId, seatId)**. The DB is the final guard.\n- **Payment** via gateway with an idempotency key; the webhook confirms the booking.\n\n### Key design decisions & trade-offs\n\n**1. Two-layer protection.** Redis holds give fast, expiring, user-friendly locks. The DB unique constraint guarantees correctness even if Redis loses a key (failover). Never rely on the Redis lock alone for money.\n\n**2. Optimistic vs. pessimistic.** Pessimistic (`SELECT … FOR UPDATE` on seat rows) serialises contention in the DB and causes lock storms on hot shows. Optimistic (conditional update `WHERE status='AVAILABLE'`, or insert plus unique constraint) fails fast and lets the user pick another seat. Prefer optimistic plus Redis holds.\n\n**3. Hot shows and the waiting room.** For mega releases, put users in a **virtual queue** and admit them at a rate the booking path can handle. It's fairer and protects every downstream system.\n\n**4. Seat map freshness.** Push hold and release events via WebSocket or SSE to viewers of that show, or poll every few seconds. A stale map only causes a failed hold, never a double booking.\n\n**5. Payment edge cases.** The hold expired during a slow payment but the money was captured. Try to re-acquire the seats; if they're taken, auto-refund. Reconcile pending payments periodically.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** For each show-seat, one authoritative state transition determines who owns the hold or confirmed booking.\n\nAssume 50,000 seats released and 500,000 users arriving in a minute: 8,333 admission attempts/s before seat-map refreshes. If each polls every 5 seconds, 100,000 seat-map reads/s arise independently of purchases.\n\n### API contracts and data ownership\n\n```text\nGET /shows/{id}/seats; POST /holds with seats; POST /holds/{id}/confirm; DELETE /holds/{id}\n```\n\n```text\nLogical records (outline, not complete DDL):\nshow_seat(show_id,seat_id,state,hold_id,expires_at,version); booking(id,hold_id,payment_id,status)\n\nPrimary access/partitioning boundary:\nshow_id and seat_id for inventory; hold_id and booking_id for idempotency\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around show_id and seat_id for inventory; hold_id and booking_id for idempotency. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAdmit a bounded number of customers; serve cached seat maps as advisory; atomically acquire requested seats in stable order; return a server-expiry hold token; process payment outside inventory locks; confirm only the current unexpired hold; publish final state.\n\n### Deep dive: the decision that changes this system\n\nWaiting rooms and rate limits protect the transactional seat authority; they do not guarantee a seat. One popular show is a hot partition, so choose ownership by show or section while preserving atomic multi-seat operations. A lease expiry worker is cleanup, not the sole expiry check.\n\n### Failure and race-condition walkthrough\n\nThe first buyer pays after a hold expires and seats are sold again. Preserve the later owner and compensate/refund the earlier payment. A distributed lock without fencing can let a paused old worker overwrite a new owner.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nA single show leader simplifies serialization; sharding by section improves throughput but makes cross-section seat requests harder. Strong writes and stale maps are compatible if the product clearly treats maps as estimates.\n\nOversell must remain zero within the model; track hold latency, conflict rate, expired-hold age, admission queue time and payment reconciliation.\n\n**Test matrix:** Last-seat races, all-or-none group selection, hold expiry with payment callback, stale map, paused worker resumption and admission overload.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: For each show-seat, one authoritative state transition determines who owns the hold or confirmed booking.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 50,000 seats released and 500,000 users arriving in a minute: 8,333 admission attempts/s before seat-map refreshes. If each polls every 5 seconds, 100,000 seat-map reads/s arise independently of purchases.\n\n**Which failure would invalidate the naive design?** The first buyer pays after a hold expires and seats are sold again. Preserve the later owner and compensate/refund the earlier payment. A distributed lock without fencing can let a paused old worker overwrite a new owner.\n\n**Why not introduce every distributed component immediately?** A single show leader simplifies serialization; sharding by section improves throughput but makes cross-section seat requests harder. Strong writes and stale maps are compatible if the product clearly treats maps as estimates.\n\n**How would you demonstrate the design works?** Last-seat races, all-or-none group selection, hold expiry with payment callback, stale map, paused worker resumption and admission overload. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through expiry and recovery\n\nThe database condition checks ownership token and time. A background expiry job improves cleanup speed but is not the source of the validity rule. A stale expiry worker must not release a newer hold. Multi-seat selections need all-or-nothing ownership with stable lock order.\n\nPartition by show for local contention boundaries when appropriate; an exceptionally popular show is still a hot partition. Admission, request deduplication and bounded transactions reduce pressure without weakening seat ownership. Track payment-without-booking and booking-without-settlement as operational reconciliation queues.\n\n## 6. Interviewer follow-ups\n\n**Does a waiting-room token guarantee a ticket?** No. It grants a chance to attempt allocation under capacity limits.\n\n**Should map-cache failure make seats double-bookable?** No. The cache is not the ownership authority.\n\n## 7. Closing answer\n\nI handle sale overload before the booking transaction and seat correctness inside it. Token-owned expiring holds, ordered row locking and idempotent payment confirmation provide the complete sale boundary. A waiting-room grant is admission to attempt booking, not a promise of inventory.\n"
     },
     {
       "category": "AI",
@@ -224,94 +229,108 @@
       "diagram": {
         "nodes": [
           {
-            "id": "user",
-            "label": "User",
+            "id": "n0",
+            "label": "User request",
             "x": 0,
             "y": 0,
-            "w": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "app",
-            "label": "ChatClient + tools",
-            "x": 200,
+            "id": "n1",
+            "label": "Model proposal",
+            "x": 250,
             "y": 0,
-            "w": 180,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "llm",
-            "label": "LLM",
+            "id": "n2",
+            "label": "Tool policy",
             "x": 500,
             "y": 0,
-            "w": 110,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "tool",
-            "label": "@Tool methods",
-            "x": 200,
-            "y": 150,
-            "w": 160,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "svc",
-            "label": "Bank / internal APIs",
-            "x": 200,
-            "y": 280,
-            "w": 180,
-            "h": 62,
-            "shape": "cylinder"
+            "id": "n3",
+            "label": "Authorized order service",
+            "x": 0,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           },
           {
-            "id": "ctx",
-            "label": "ToolContext (userId, auth)",
+            "id": "n4",
+            "label": "Order database",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Typed tool result",
             "x": 500,
-            "y": 150,
-            "w": 210,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Final response",
+            "x": 0,
+            "y": 220,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "user",
-            "to": "app",
-            "label": "question"
+            "from": "n0",
+            "to": "n1",
+            "label": "intent"
           },
           {
-            "from": "app",
-            "to": "llm",
-            "label": "prompt + tool schemas"
+            "from": "n1",
+            "to": "n2",
+            "label": "name arguments"
           },
           {
-            "from": "llm",
-            "to": "app",
-            "label": "tool_call(args)"
+            "from": "n2",
+            "to": "n3",
+            "label": "allowed call"
           },
           {
-            "from": "app",
-            "to": "tool",
-            "label": "invoke"
+            "from": "n3",
+            "to": "n4",
+            "label": "current facts"
           },
           {
-            "from": "tool",
-            "to": "svc",
-            "label": "real call"
+            "from": "n3",
+            "to": "n5",
+            "label": "minimal fields"
           },
           {
-            "from": "ctx",
-            "to": "tool",
-            "label": "injected"
+            "from": "n5",
+            "to": "n1",
+            "label": "observation"
+          },
+          {
+            "from": "n1",
+            "to": "n6",
+            "label": "grounded explanation"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain tool (function) calling: how an LLM requests the execution of your code with structured arguments, how the application runs the tool and feeds the result back, how Spring AI exposes Java methods as tools (`@Tool`, `ToolCallback`, `ToolContext`), and how to make tool use safe in an enterprise (authorisation, validation, side effects).\n\n## Requirements\n\n- The tool-calling loop: the model returns `tool_calls`, the app executes, a tool result message goes back, the model writes the final answer.\n- Defining tools in Spring AI: `@Tool` methods, `@ToolParam` descriptions, `.tools(...)` / `defaultTools`.\n- Passing hidden context (user identity) with `ToolContext`.\n- Read vs. write tools, confirmations, idempotency, errors and timeouts.\n- Security: least privilege, never trusting model-supplied arguments blindly.\n\n## Learn through a concrete example\n\nA customer asks “Where is order O123?” The model can interpret the question, but the order service knows the current status. A **tool** is an application function described to the model. The model proposes its name and arguments; application code decides whether and how to execute it.\n\nStart with a read-only lookup. Do not expose a general SQL executor or arbitrary HTTP client when one narrow domain operation meets the need. A tool description improves selection; it is not an authorization rule.\n\n## See proposal and enforcement\n\n![Authenticated application identity governs access to model-proposed arguments.](lessons/ai-13-flow.svg)\n\n*Authenticated application identity governs access to model-proposed arguments.*\n\n![Resource authorization runs even when arguments look syntactically valid.](lessons/ai-13-failure.svg)\n\n*Resource authorization runs even when arguments look syntactically valid.*\n\n### Define the narrow boundary\n\n```java\nimport org.springframework.ai.tool.annotation.Tool;\n\n// Integration excerpt: authorizedOrders enforces identity outside model arguments.\nfinal class OrderTools {\n    private final AuthorizedOrderLookup authorizedOrders;\n    OrderTools(AuthorizedOrderLookup lookup) { this.authorizedOrders = lookup; }\n    @Tool(description = \"Read the current user's authorized order status\")\n    OrderStatus lookupOrder(String orderId) {\n        return authorizedOrders.lookupForCurrentPrincipal(orderId);\n    }\n}\n```\n\nThe model does not get to supply `isAdmin=true` or choose another principal. In asynchronous work, propagate or explicitly bind the verified principal through an application-owned context; do not rely on a thread-local surviving arbitrary executor changes.\n\n## Design details and alternatives\n\n### Key concepts and learning objective\n\n**Question to answer:** How can an assistant look up a live order without being allowed to act on arbitrary accounts?\n\nThe model proposes a tool name and arguments. The application validates schema, derives authenticated identity, authorizes the resource and executes the tool. Tool result text returns as untrusted data for a later model step; the model never becomes the security principal.\n\n### Architecture and contracts\n\n```text\nModel proposes call -> allow-list -> parse/validate -> authorize with server identity -> operation ledger -> execute -> bounded result -> model continuation\n\nApplication contracts (design outline):\nOrderLookup(orderId); ToolContext(tenant,user,requestId); ToolResult(status,data,errorCode)\n```\n\nSpring AI @Tool can expose a narrow method and .tools(instance) can register it for a request. Wrap it in application authorization and bound the result; never expose a generic SQL or shell execution tool to this assistant.\n\n### Worked reasoning and capacity example\n\nA loop with at most four model steps and two tools per step can still request eight side effects. Bound tool count, elapsed time, output bytes and spend independently, not just recursion depth.\n\n### Java and Spring AI implementation outline\n\n```java\nfinal class OrderTools {\n  private final AuthorizedOrders orders;\n  OrderTools(AuthorizedOrders orders) { this.orders = orders; }\n  @org.springframework.ai.tool.annotation.Tool(description=\"Read one authorized order status\")\n  String status(String orderId) { return orders.statusForCurrentPrincipal(orderId); }\n}\n// AuthorizedOrders is an application port, not a model-provided identity.\n```\n\n### Design decisions and alternatives\n\nBegin with read-only lookup tools. Side effects need operation IDs and a review/confirmation policy appropriate to the action. Descriptions should explain inputs and output semantics but cannot grant permissions.\n\n### Failure scenario and safe recovery\n\nA malicious user asks for another account’s order and provides a plausible userId argument. The tool ignores model-supplied identity and checks order ownership using the authenticated context.\n\n### Security, privacy and provenance\n\nA read-only label is descriptive metadata. Enforce read-only behavior in the implementation and database credentials.\n\n### Hands-on lab and evaluation\n\n**Build:** Implement a read-only stock/order tool; test nonexistent IDs, foreign-tenant IDs, oversized arguments, duplicate calls and a provider timeout following a completed tool.\n\n**Measure:** Task success, correct tool selection, unauthorized attempts blocked, argument validity, duplicate effects and tool latency/error classification.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n## Work through write tools\n\nA refund tool needs stronger handling than a status lookup: validate amount, eligibility, current state, operation identity and required user review. Persist intent and reconcile provider uncertainty. A model retry after a lost response must not create another refund.\n\nLimit tool count, payload size and duration. Validate tool results before sending them back; external results can contain instructions and should remain data. For the pinned 1.1 API family, use its documented execution behaviour rather than copying a newer-version advisor loop without verification.\n\n## Practise, then check your reasoning\n\n1. **Does `@Tool` make a method safe?** No. It exposes a callable contract; domain authorization and validation remain necessary.\n2. **Should tools return raw database rows?** Return minimal typed data needed for the task, excluding secrets and unrelated personal fields.\n3. **Exercise:** test owned order, forbidden order, malformed ID, service timeout and repeated refund intent. Assert no unauthorized reads and at most one committed financial effect.\n"
+      "markdown": "## Problem\n\nExplain tool (function) calling: how an LLM requests the execution of your code with structured arguments, how the application runs the tool and feeds the result back, how Spring AI exposes Java methods as tools (`@Tool`, `ToolCallback`, `ToolContext`), and how to make tool use safe in an enterprise (authorisation, validation, side effects).\n\n## Requirements\n\n- The tool-calling loop: the model returns `tool_calls`, the app executes, a tool result message goes back, the model writes the final answer.\n- Defining tools in Spring AI: `@Tool` methods, `@ToolParam` descriptions, `.tools(...)` / `defaultTools`.\n- Passing hidden context (user identity) with `ToolContext`.\n- Read vs. write tools, confirmations, idempotency, errors and timeouts.\n- Security: least privilege, never trusting model-supplied arguments blindly.\n\n## 1. Selected tool and authority boundary\n\nI implement a read-only order-status assistant. The model sees a schema for `lookupOrder(orderId)` and can propose it; the application checks the current principal's access before the order service reads data. Identity is application-owned and is not an argument the model can override.\n\n## 2. Spring boundary and flow\n\n```java\nimport org.springframework.ai.tool.annotation.Tool;\nfinal class OrderTools {\n    private final AuthorizedOrderLookup orders;\n    OrderTools(AuthorizedOrderLookup orders) { this.orders = orders; }\n    @Tool(description=\"Read status of an order authorized for the current user\")\n    public OrderStatus lookupOrder(String orderId) {\n        return orders.lookupForCurrentPrincipal(orderId);\n    }\n}\n// Registered on the selected ChatClient request using .tools(orderTools).\n```\n\nThe service validates ID format, ownership, deadline and result bounds. O123 for its owner returns current status evidence; O999 belonging to someone else returns denial without private fields. A timeout is a typed unavailable result, not permission for the model to invent delivery status. Verified identity is explicitly propagated/bound in asynchronous execution rather than assuming thread-local security survives every boundary.\n\nA refund extension would use a separate tool with current eligibility, amount/currency checks, stable refund identity and the product's approval rule. Repeated invocation returns the recorded operation; provider uncertainty is reconciled before another effect. Tool results remain untrusted external data for instruction purposes and cannot expand the caller's authority.\n\n## 3. Final design diagram\n\n[![Tool Calling / Function Calling: User request intent Model proposal; Model proposal name arguments Tool policy; Tool policy allowed call Authorized order service; Authorized order service current facts Order database; Authorized order service minimal fields Typed tool result; Typed tool result observation Model proposal; Model proposal grounded explanation Final response](designs/ai-13.svg)](designs/ai-13.svg)\n\nI start with a read-only lookup. Do not expose a general SQL executor or arbitrary HTTP client when one narrow domain operation meets the need. A tool description improves selection; it is not an authorization rule.\n\n## 4. Critical operation: worked execution\n\n![Authenticated application identity governs access to model-proposed arguments.](lessons/ai-13-flow.svg)\n\n*Authenticated application identity governs access to model-proposed arguments.*\n\n![Resource authorization runs even when arguments look syntactically valid.](lessons/ai-13-failure.svg)\n\n*Resource authorization runs even when arguments look syntactically valid.*\n\n### Define the narrow boundary\n\n```java\nimport org.springframework.ai.tool.annotation.Tool;\n\n// Integration excerpt: authorizedOrders enforces identity outside model arguments.\nfinal class OrderTools {\n    private final AuthorizedOrderLookup authorizedOrders;\n    OrderTools(AuthorizedOrderLookup lookup) { this.authorizedOrders = lookup; }\n    @Tool(description = \"Read the current user's authorized order status\")\n    OrderStatus lookupOrder(String orderId) {\n        return authorizedOrders.lookupForCurrentPrincipal(orderId);\n    }\n}\n```\n\nThe model does not get to supply `isAdmin=true` or choose another principal. In asynchronous work, propagate or explicitly bind the verified principal through an application-owned context; do not rely on a thread-local surviving arbitrary executor changes.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** How can an assistant look up a live order without being allowed to act on arbitrary accounts?\n\nThe model proposes a tool name and arguments. The application validates schema, derives authenticated identity, authorizes the resource and executes the tool. Tool result text returns as untrusted data for a later model step; the model never becomes the security principal.\n\n### Architecture and contracts\n\n```text\nModel proposes call -> allow-list -> parse/validate -> authorize with server identity -> operation ledger -> execute -> bounded result -> model continuation\n\nApplication contracts (design outline):\nOrderLookup(orderId); ToolContext(tenant,user,requestId); ToolResult(status,data,errorCode)\n```\n\nSpring AI @Tool can expose a narrow method and .tools(instance) can register it for a request. Wrap it in application authorization and bound the result; never expose a generic SQL or shell execution tool to this assistant.\n\n### Worked reasoning and capacity example\n\nA loop with at most four model steps and two tools per step can still request eight side effects. Bound tool count, elapsed time, output bytes and spend independently, not just recursion depth.\n\n### Java and Spring AI implementation outline\n\n```java\nfinal class OrderTools {\n  private final AuthorizedOrders orders;\n  OrderTools(AuthorizedOrders orders) { this.orders = orders; }\n  @org.springframework.ai.tool.annotation.Tool(description=\"Read one authorized order status\")\n  String status(String orderId) { return orders.statusForCurrentPrincipal(orderId); }\n}\n// AuthorizedOrders is an application port, not a model-provided identity.\n```\n\n### Design decisions and alternatives\n\nI begin with read-only lookup tools. Side effects need operation IDs and a review/confirmation policy appropriate to the action. Descriptions should explain inputs and output semantics but cannot grant permissions.\n\n### Failure scenario and safe recovery\n\nA malicious user asks for another account’s order and provides a plausible userId argument. The tool ignores model-supplied identity and checks order ownership using the authenticated context.\n\n### Security, privacy and provenance\n\nA read-only label is descriptive metadata. Enforce read-only behavior in the implementation and database credentials.\n\n\n**Verification criteria:** Task success, correct tool selection, unauthorized attempts blocked, argument validity, duplicate effects and tool latency/error classification.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through write tools\n\nA refund tool needs stronger handling than a status lookup: validate amount, eligibility, current state, operation identity and required user review. Persist intent and reconcile provider uncertainty. A model retry after a lost response must not create another refund.\n\nLimit tool count, payload size and duration. Validate tool results before sending them back; external results can contain instructions and should remain data. For the pinned 1.1 API family, use its documented execution behaviour rather than copying a newer-version advisor loop without verification.\n\n## 6. Interviewer follow-ups\n\n**Does `@Tool` make a method safe?** No. It exposes a callable contract; domain authorization and validation remain necessary.\n\n**Should tools return raw database rows?** Return minimal typed data needed for the task, excluding secrets and unrelated personal fields.\n\n## 7. Closing answer\n\nTool calling separates language intent from deterministic execution. I expose a narrow authorized order lookup, validate every proposed call and return minimal typed evidence. Write tools add explicit eligibility, operation identity and review policy; model arguments never become permission.\n"
     }
   ]
 }

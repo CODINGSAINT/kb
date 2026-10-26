@@ -1,17 +1,17 @@
 === HLD 15 ===
-N|api|Job API|0|0|120
-N|store|Job Store (next_run idx)|200|0|210|cylinder
-N|sched|Scheduler (leader)|200|150|180
-N|zk|Leader Election (etcd)|0|150|170|ellipse
-N|queue|Ready Queue|500|150|150|cylinder
-N|workers|Worker Pool|500|0|150
-N|dlq|Retry / DLQ|500|280|150|cylinder
-E|api|store|register
-E|sched|store|poll due jobs
-E|zk|sched|lease
-E|sched|queue|enqueue
-E|queue|workers|pull
-E|workers|dlq|on failure
+N|n0|Schedule API|0|0|200|rect
+N|n1|Schedule store|250|0|200|rect
+N|n2|Due-time dispatcher|500|0|200|rect
+N|n3|Execution queue|0|110|200|rect
+N|n4|Workers|250|110|200|rect
+N|n5|Execution journal|500|110|200|rect
+N|n6|Fenced destination|0|220|200|rect
+E|n0|n1|defines
+E|n2|n1|finds due
+E|n2|n3|unique occurrence
+E|n3|n4|leased attempts
+E|n4|n5|checkpoints
+E|n4|n6|token writes
 ---
 ## Problem
 
@@ -27,13 +27,29 @@ Design a distributed job scheduler (like a cloud cron, Airflow's scheduler core,
 - Millions of jobs; tens of thousands firing per minute at peaks (on-the-hour spikes).
 - No missed runs when nodes die. Avoid duplicate runs (or make them harmless).
 
-## Learn through a concrete example
+## 1. Scope and selected execution model
 
-A report should run at 09:00, but two scheduler replicas wake together. Both may enqueue it unless one authority claims that occurrence. A **schedule** defines future intent; an **execution** is one occurrence; an **attempt** is one worker's try. Keeping these separate makes retries and audit history understandable.
+I support delayed/recurring jobs, retries, cancellation and worker recovery. I choose a durable schedule store, partitioned due-time dispatch and leased worker execution. Timezone, misfire and retry policies are persisted with the schedule.
 
-Start with a durable jobs table and leases. A **lease** expires after a bounded time so another worker can recover abandoned work. A **fencing token** increases with each ownership grant so an old worker can be rejected after losing its lease.
+## 2. Claim and execute algorithm
 
-## See scheduling and stale ownership
+```text
+Schedule: id,rule,zone,nextFire,misfirePolicy
+Execution UNIQUE(scheduleId,intendedFireTime): state,leaseOwner,leaseExpiry,fence
+Attempt: id,executionId,startedAt,result
+claim: conditional READY/expired -> RUNNING, increment fence
+complete: conditional matching owner/fence and live lease -> COMPLETED
+```
+
+Dispatch inserts each intended occurrence once and enqueues its ID. A worker claims, checkpoints and executes using the occurrence identity and fencing token. A destination rejecting old tokens prevents a resumed expired worker from overwriting newer work; an email-like effect instead needs idempotency/reconciliation support. Three hundred jobs/s lasting two seconds need roughly 600 active slots under those assumptions. Retries retain execution identity but create new attempts and honor the original task deadline. Cancellation stops future claims and requests cooperative running cancellation; it does not erase a side effect already performed.
+
+## 3. Final design diagram
+
+[![Distributed Job Scheduler: Schedule API defines Schedule store; Due-time dispatcher finds due Schedule store; Due-time dispatcher unique occurrence Execution queue; Execution queue leased attempts Workers; Workers checkpoints Execution journal; Workers token writes Fenced destination](designs/hld-15.svg)](designs/hld-15.svg)
+
+I start with a durable jobs table and leases. A **lease** expires after a bounded time so another worker can recover abandoned work. A **fencing token** increases with each ownership grant so an old worker can be rejected after losing its lease.
+
+## 4. Critical operation: worked execution
 
 ![Schedule identity plus intended fire time deduplicates dispatch.](lessons/hld-15-flow.svg)
 
@@ -47,7 +63,7 @@ Start with a durable jobs table and leases. A **lease** expires after a bounded 
 
 At 100 jobs/s and a 5-second average runtime, nominal concurrency is about 500. If workers sustain only 80 completions/s, backlog grows 20/s. A larger polling batch does not fix insufficient execution capacity. Keep queue depth, oldest-ready age and running lease age separate.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -113,8 +129,6 @@ A paused worker outlives its lease, another worker completes the run, then the o
 
 Polling a small due-time range is simple; timing wheels reduce scheduling overhead but need durable recovery. Cron local times need policies for skipped/repeated daylight-saving instants and missed firings after outage.
 
-### SLOs, failure drills and lab
-
 Start lateness, successful completion, duplicate effects, oldest due job, lease churn and dead-letter age.
 
 **Test matrix:** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence.
@@ -137,31 +151,36 @@ Start lateness, successful completion, duplicate effects, oldest due job, lease 
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through delivery semantics
+### Work through delivery semantics
 
 Most practical schedulers offer at-least-once attempts. Side effects need job-level idempotency or a destination that enforces fencing. A lease alone cannot stop a paused process from acting. Retries should preserve execution identity but create new attempt IDs.
 
 Cron schedules need a timezone and a policy for missed/duplicated local times and downtime: skip, run once or catch up every occurrence. A poison job needs bounded retries and an inspectable final state; infinite immediate retry can starve useful work.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Is “job started” equivalent to completed?** No. Record attempts, heartbeat/checkpoint and final result.
-2. **Can a scheduler promise one email merely by using a lock?** No. The email boundary must handle retries/uncertainty too.
-3. **Exercise:** pause a worker past its lease, allow reassignment and resume the old worker. Verify the external write rejects the stale token and only the valid attempt can complete the execution.
+**Is “job started” equivalent to completed?** No. Record attempts, heartbeat/checkpoint and final result.
+
+**Can a scheduler promise one email merely by using a lock?** No. The email boundary must handle retries/uncertainty too.
+
+## 7. Closing answer
+
+I separate schedules, occurrences and attempts. Unique occurrence identities avoid duplicate dispatch, leases recover abandoned execution and fencing/idempotency protects effects from stale workers. At-least-once attempts are explicit; exactly-once external effects require cooperation from the destination.
 
 === HLD 16 ===
-N|apps|Apps/Agents|0|130|130
-N|kafka|Kafka (buffer)|200|130|150|cylinder
-N|proc|Stream Processors|430|130|170
-N|hot|Hot store (OpenSearch)|650|0|110|cylinder
-N|cold|Cold store (S3/Parquet)|650|260|110|cylinder
-N|query|Query + Alerting|430|0|170|ellipse
-E|apps|kafka|ship logs
-E|kafka|proc|consume
-E|proc|hot|index 7d
-E|proc|cold|archive
-E|query|hot|search
-E|query|cold|on demand
+N|n0|Application agents|0|0|200|rect
+N|n1|Ingest gateway|250|0|200|rect
+N|n2|Durable buffer|500|0|200|rect
+N|n3|Index workers|0|110|200|rect
+N|n4|Searchable segments|250|110|200|rect
+N|n5|Query service|500|110|200|rect
+N|n6|Archive tier|0|220|200|rect
+E|n0|n1|batches
+E|n1|n2|acknowledged events
+E|n2|n3|consume
+E|n3|n4|publish
+E|n5|n4|time tenant query
+E|n4|n6|retention lifecycle
 ---
 ## Problem
 
@@ -180,13 +199,28 @@ Design a centralised logging and monitoring system (like ELK, Splunk or Datadog 
 
 **Scale:** 10k services emitting 5 TB/day ≈ 60 MB/s average, 5× bursts during incidents. Hot index ~35 TB for 7 days before replication.
 
-## Learn through a concrete example
+## 1. Scope and selected pipeline
 
-A checkout fails across gateway, order and payment services. Logs are useful only if you can connect those events and find them before retention removes them. A log platform ingests append-oriented records, buffers bursts, builds searchable representations and enforces access/retention.
+I collect structured service logs, search by tenant/time/trace and retain older data cheaply. I choose local bounded agents, a durable ingest buffer and immutable indexed segments. Audit events requiring stronger guarantees use a separately specified durable path.
+
+## 2. Contracts and indexing
+
+```text
+POST /log-batches {tenant,batchId,events[]} -> accepted receipt
+GET /logs?timeRange&traceId&cursor -> authorized events,nextCursor
+Event: eventId,tenant,service,eventTime,ingestTime,traceId,severity,fields
+Segment manifest: tenant/time partition,objectPaths,indexVersion,min/max times
+```
+
+Ingest authenticates tenant, bounds decompressed bytes/fields and accepts only after its promised durability boundary. Consumers build searchable segments and publish manifests atomically. Queries prune tenant/time partitions, read indexes and merge results with stable cursors. One million 500-byte events/s is 43.2 TB/day raw; compression, index policy and retention therefore drive the architecture. If agents fill their buffers, low-priority sampling/drop counts are visible; they do not block ordinary application work forever. Search lag, dropped events, oldest buffered event and query cost reveal different health dimensions. Secrets are filtered before ordinary logging, not simply hidden in the UI.
+
+## 3. Final design diagram
+
+[![Logging / Monitoring System: Application agents batches Ingest gateway; Ingest gateway acknowledged events Durable buffer; Durable buffer consume Index workers; Index workers publish Searchable segments; Query service time tenant query Searchable segments; Searchable segments retention lifecycle Archive tier](designs/hld-16.svg)](designs/hld-16.svg)
 
 A **trace ID** connects a request's work; a **structured log field** makes attributes searchable; a **partition** distributes ingestion; a **retention tier** balances speed and cost. Metrics summarize populations, while logs preserve selected events. They complement one another.
 
-## See ingestion and pressure handling
+## 4. Critical operation: worked execution
 
 ![Buffering and indexing add delay that must be measured.](lessons/hld-16-flow.svg)
 
@@ -200,7 +234,7 @@ A **trace ID** connects a request's work; a **structured log field** makes attri
 
 At one million events/s and 500 bytes/event, raw input is 500 MB/s or 43.2 TB/day. Thirty days is roughly 1.3 PB before compression, indexes and replication. Retention and field-index policy matter more than choosing an arbitrary database brand.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -266,8 +300,6 @@ An outage generates more logs precisely when storage is strained. Backpressure, 
 
 Full-text indexes offer flexible search at high cost; structured indexes plus object storage reduce cost but slow broad investigations. Sampling helps volume but must not quietly remove all rare errors.
 
-### SLOs, failure drills and lab
-
 Ingest acceptance, acknowledged loss, oldest unindexed event, searchable lag, dropped events by priority and cost per retained TB.
 
 **Test matrix:** Collector outage, local disk full, schema explosion, redaction failure, oversized batches, clock skew and query during index lag.
@@ -290,30 +322,36 @@ Ingest acceptance, acknowledged loss, oldest unindexed event, searchable lag, dr
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through queries and privacy
+### Work through queries and privacy
 
 Partitioning by time limits range scans, but tenant isolation and skew also affect placement. Indexing every high-cardinality field increases costs. Keep searchable trace IDs while controlling arbitrary labels and unbounded payloads. Authentication headers, secrets and personal documents should not appear in ordinary application logs.
 
 Measure ingest acknowledgement separately from search visibility: an accepted event can still wait in a buffer. Replay must preserve event identity where deduplication matters. A logging outage should not block normal work indefinitely unless the specific audit requirement deliberately requires it.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Can the platform promise no loss with bounded buffers and unlimited outages?** No. State the operating envelope and overflow policy.
-2. **Does deleting an index remove archived raw records?** Not automatically; enforce retention across tiers.
-3. **Exercise:** throttle indexing, fill the agent buffer and search by one trace ID. Record lost-event counters, newest searchable timestamp and the application's latency during the outage.
+**Can the platform promise no loss with bounded buffers and unlimited outages?** No. State the operating envelope and overflow policy.
+
+**Does deleting an index remove archived raw records?** Not automatically; enforce retention across tiers.
+
+## 7. Closing answer
+
+I decouple ingestion durability from search visibility and put bounds on every buffer. Tenant/time partitioning and selective indexing control cost. Retention spans hot and archived data, and a logging outage follows an explicit loss/backpressure policy instead of silently exhausting the observed application.
 
 === HLD 17 ===
-N|targets|Services/Hosts|0|130|150
-N|collect|Collectors (push/scrape)|200|130|200
-N|ingest|Ingest + WAL|470|0|150|cylinder
-N|tsdb|TSDB (Gorilla compressed)|470|130|210|cylinder
-N|down|Downsampler 1m→1h|470|270|190
-N|query|Query (PromQL) + Dashboards|200|270|230|ellipse
-E|targets|collect|metrics
-E|collect|ingest|batches
-E|ingest|tsdb|blocks
-E|tsdb|down|rollup
-E|query|tsdb|range query
+N|n0|Instrumented services|0|0|200|rect
+N|n1|Collectors|250|0|200|rect
+N|n2|Ingest and limits|500|0|200|rect
+N|n3|Time-series blocks|0|110|200|rect
+N|n4|Query engine|250|110|200|rect
+N|n5|Alert evaluator|500|110|200|rect
+N|n6|Long-term rollups|0|220|200|rect
+E|n0|n1|samples
+E|n1|n2|tenant validation
+E|n2|n3|append series
+E|n4|n3|range reads
+E|n5|n4|evaluates windows
+E|n3|n6|downsamples
 ---
 ## Problem
 
@@ -331,13 +369,28 @@ Design a metrics / time-series monitoring system (like Prometheus at scale, Data
 
 **Scale:** 10M active series × 1 sample/10 s = **1M samples/s**. At ~1.5 bytes per sample after compression, that's ~130 GB/day.
 
-## Learn through a concrete example
+## 1. Scope and selected semantics
 
-You want p99 checkout latency and CPU usage for the last hour. Storing a row for every raw event is expensive; time-series systems organize measurements by metric identity, labels and timestamp. The surprising cost is often **cardinality**, the number of distinct series, rather than sample size alone.
+I ingest counters, gauges and histograms, query recent/history windows and evaluate alerts. I choose tenant-scoped label validation, append-oriented time blocks and rollups. Unbounded request/user identifiers are excluded from metric labels; logs/traces serve that lookup need.
+
+## 2. Data and query contract
+
+```text
+Series identity = tenant + metricName + canonical label set
+Sample = seriesId,timestamp,value; histogram = compatible bucket counts
+Query: rate(request_total[5m]), histogram quantile over summed bucket rates
+Alert: expression,window,holdDuration,missingDataPolicy
+```
+
+Ingest validates units, timestamp range, duplicates and cardinality limits before append. Blocks are compacted and queried by time/series indexes. Counters are converted to rates with reset handling. Histograms merge counts only with compatible definitions; averaging p99 values is invalid. For 200 services×20 routes×5 statuses×3 regions, 60,000 series at 15-second sampling produce 4,000 samples/s before instances/buckets. Adding arbitrary user IDs destroys that bound. Alerts separately represent false, true and missing/unknown data; absent samples are not automatically healthy zeros.
+
+## 3. Final design diagram
+
+[![Metrics / Time-Series System: Instrumented services samples Collectors; Collectors tenant validation Ingest and limits; Ingest and limits append series Time-series blocks; Query engine range reads Time-series blocks; Alert evaluator evaluates windows Query engine; Time-series blocks downsamples Long-term rollups](designs/hld-17.svg)](designs/hld-17.svg)
 
 A **counter** increases over time, a **gauge** represents a current value, and a **histogram** summarizes a distribution. A **series** is one metric plus one specific label set. User IDs as labels can create millions of series.
 
-## See samples and cardinality explosion
+## 4. Critical operation: worked execution
 
 ![Collection, aggregation and evaluation have separate timing semantics.](lessons/hld-17-flow.svg)
 
@@ -351,7 +404,7 @@ A **counter** increases over time, a **gauge** represents a current value, and a
 
 For 200 services × 20 routes × 5 status classes × 3 regions, there are 60,000 combinations before instance labels and histogram buckets. Adding one million user IDs can multiply this beyond a usable design. At 60,000 series sampled every 15 seconds, samples arrive at 4,000/s; histogram bucket series increase this further.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -415,8 +468,6 @@ A scrape gap is not necessarily zero. Duplicate or reordered samples need store-
 
 Pull simplifies service discovery and health visibility; push suits short-lived jobs and disconnected agents. Downsampling reduces cost but discards granularity; keep retention tiers aligned with debugging needs.
 
-### SLOs, failure drills and lab
-
 Series cardinality, ingest lag, query p99, dropped samples, alert evaluation delay and storage amplification.
 
 **Test matrix:** Counter reset, missing scrape, high-cardinality label attack, histogram aggregation, out-of-order sample, query spanning compaction and alert flapping.
@@ -439,32 +490,36 @@ Series cardinality, ingest lag, query p99, dropped samples, alert evaluation del
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through semantics
+### Work through semantics
 
 Counters can reset when a process restarts, so rate calculations must account for resets. Averaging two p99 values does not yield the combined p99. Aggregate compatible histogram bucket counts, then estimate the percentile. Preserve units and bucket boundaries across deployments.
 
 Downsampling reduces long-term storage but loses detail. An hourly average cannot recover a ten-second outage. Alerts need a policy for missing samples; treating missing as zero can falsely report healthy traffic or trigger nonsense ratios. Keep alert evaluation lag and ingestion lag observable.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Is a user ID a good metric label?** Usually not for unbounded populations; use logs/traces or another bounded aggregation.
-2. **Can a gauge be safely summed across replicas?** Only when its meaning is additive; temperature is not equivalent to active-request count.
-3. **Exercise:** combine two latency populations with very different sizes and show why averaging their p99s is wrong. Then estimate storage with and without a high-cardinality label.
+**Is a user ID a good metric label?** Usually not for unbounded populations; use logs/traces or another bounded aggregation.
+
+**Can a gauge be safely summed across replicas?** Only when its meaning is additive; temperature is not equivalent to active-request count.
+
+## 7. Closing answer
+
+Metric meaning and bounded cardinality are the core contract. I store labeled timestamped series, aggregate compatible histogram buckets before estimating percentiles, and handle counter resets/missing data explicitly. Retention and downsampling trade detail for cost rather than promising recovery of discarded detail.
 
 === HLD 18 ===
-N|courier|Courier app|0|0|140
-N|ingest|GPS Ingest (UDP/WS)|200|0|190
-N|kafka|Kafka (by tripId)|480|0|160|cylinder
-N|latest|Latest-position (Redis)|480|140|200|cylinder
-N|fanout|Tracking Fan-out|200|140|180
-N|customer|Customer app|0|140|140
-N|history|Route History (TSDB)|480|270|200|cylinder
-E|courier|ingest|ping 3-5s
-E|ingest|kafka|publish
-E|kafka|latest|update
-E|kafka|history|append
-E|kafka|fanout|subscribers
-E|fanout|customer|WS push
+N|n0|Driver devices|0|0|200|rect
+N|n1|Location ingest|250|0|200|rect
+N|n2|Latest-state store|500|0|200|rect
+N|n3|Trip subscription service|0|110|200|rect
+N|n4|Fanout|250|110|200|rect
+N|n5|Customer devices|500|110|200|rect
+N|n6|Route history|0|220|200|rect
+E|n0|n1|session sequence
+E|n1|n2|conditional latest
+E|n3|n4|authorizes viewers
+E|n2|n4|current point
+E|n4|n5|live updates
+E|n1|n6|retained samples
 ---
 ## Problem
 
@@ -483,13 +538,28 @@ Design live ride or delivery tracking (Uber "your driver is 3 min away", Swiggy/
 
 **Scale:** 2M active couriers ÷ 4 s ≈ 500k pings/s, ~100 bytes each, so ~50 MB/s. Watchers: ~1–2 per active trip.
 
-## Learn through a concrete example
+## 1. Scope and chosen consistency
 
-A delivery rider's dot should move smoothly on a customer's map. The rider sends noisy, delayed observations, not perfect physical truth. The tracking system must identify which update is newest, who may view it and how long stale locations remain useful.
+I track active ride/delivery trips with live viewer updates and limited route history. Latest location is a projection; it is not exact physical truth. I choose per-driver/session conditional writes, subscription authorization and bounded fan-out.
+
+## 2. Location protocol
+
+```text
+PUT /trips/{id}/location {deviceSession,seq,point,accuracy,observedAt}
+SUBSCRIBE(tripId,lastSeenVersion) -> current authorized snapshot then updates
+Latest: tripId,driverId,deviceSession,seq,point,lastSeen
+Viewer grant: principal,tripId,expiry,relationshipVersion
+```
+
+Ingest verifies trip ownership, coordinate bounds and freshness, then accepts only newer session/sequence observations. Device restart establishes a new authorized session generation. Update fan-out uses current trip relationships; reconnect first revalidates and sends the latest snapshot. At 500,000 trips updating every three seconds, about 166,667 updates/s enter the pipeline; two viewers double delivery work. Adaptive cadence reduces stationary traffic under an explicit freshness bound. The UI interpolates for smoothness but displays stale observation age. Completed-trip access expires according to policy and history is retained only for its stated use.
+
+## 3. Final design diagram
+
+[![Ride/Delivery Tracking: Driver devices session sequence Location ingest; Location ingest conditional latest Latest-state store; Trip subscription service authorizes viewers Fanout; Latest-state store current point Fanout; Fanout live updates Customer devices; Location ingest retained samples Route history](designs/hld-18.svg)](designs/hld-18.svg)
 
 An **observation** contains coordinates, accuracy, device/session identity and sequence. A **subscription** links an authorized viewer to a trip. A **latest-location projection** serves the current map; the retained route history has different storage and privacy needs.
 
-## See update ordering and viewer delivery
+## 4. Critical operation: worked execution
 
 ![Latest-state ordering precedes fan-out to authorized subscribers.](lessons/hld-18-flow.svg)
 
@@ -503,7 +573,7 @@ An **observation** contains coordinates, accuracy, device/session identity and s
 
 At 500,000 active trips updating every three seconds, ingestion is about 166,667 updates/s. Sending each update to two viewers adds roughly 333,333 deliveries/s before reconnect/replay. Adaptive cadence can reduce traffic when stationary; it must preserve the chosen freshness promise.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -569,8 +639,6 @@ A mobile client reconnects after buffering thousands of points. Store history wi
 
 High-frequency sampling improves display smoothness but increases battery, network and storage cost. Separate short-lived live projections from history and apply access/retention policies to both.
 
-### SLOs, failure drills and lab
-
 Location freshness, end-to-end update delay, dropped/coalesced updates, stale sessions, subscriber backlog and geofence event quality.
 
 **Test matrix:** Out-of-order updates, reconnect batch, device restart, unauthorized trip subscription, implausible jump, stale location and slow WebSocket consumer.
@@ -593,32 +661,36 @@ Location freshness, end-to-end update delay, dropped/coalesced updates, stale se
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through reconnect and privacy
+### Work through reconnect and privacy
 
 Sequence numbers need a session/generation identity so a phone restart at sequence 1 does not make it permanently older than the previous session's 10,000. Coordinates also need sanity/accuracy checks; a sudden GPS jump is not proof of teleportation or fraud.
 
 On reconnect, send the latest authorized snapshot and resume live updates; replaying every obsolete point can make the map lag further behind. End the viewer's access when the trip relationship ends according to policy. Route retention and support access should be explicit rather than an unlimited archive of people's movements.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does interpolation improve location truth?** It improves display smoothness, not measurement accuracy.
-2. **Should an offline rider appear at an unquestioned current position?** Show age/staleness and degrade the experience.
-3. **Exercise:** reorder packets, restart the phone session and reconnect a viewer after a minute. Verify latest-state ordering, bounded replay and revoked-trip access.
+**Does interpolation improve location truth?** It improves display smoothness, not measurement accuracy.
+
+**Should an offline rider appear at an unquestioned current position?** Show age/staleness and degrade the experience.
+
+## 7. Closing answer
+
+I preserve newest-location ordering by device session and sequence, fan out only to authorized trip viewers, and show observation age rather than false precision. Reconnect sends a current snapshot instead of a backlog of obsolete points. History retention is separate from the live map's short-lived state.
 
 === HLD 19 ===
-N|user|User|0|0|110
-N|queue|Waiting Room|200|0|150|ellipse
-N|res|Reservation Svc|420|0|170
-N|db|Inventory DB (row lock/version)|420|150|260|cylinder
-N|hold|Hold TTL expiry|150|150|160
-N|pay|Payment|420|280|130
-N|confirm|Confirm + Ticket|150|280|160
-E|user|queue|enter
-E|queue|res|admit N/s
-E|res|db|reserve (conditional)
-E|hold|db|expire holds
-E|res|pay|charge
-E|pay|confirm|on success
+N|n0|Admission gateway|0|0|200|rect
+N|n1|Reservation service|250|0|200|rect
+N|n2|Inventory authority|500|0|200|rect
+N|n3|Payment workflow|0|110|200|rect
+N|n4|Ticket issuer|250|110|200|rect
+N|n5|Check-in authority|500|110|200|rect
+N|n6|Reconciliation|0|220|200|rect
+E|n0|n1|bounded sale
+E|n1|n2|claims capacity
+E|n1|n3|records intent
+E|n3|n4|confirmed entitlement
+E|n4|n5|redeemed once
+E|n6|n3|resolves uncertainty
 ---
 ## Problem
 
@@ -635,13 +707,28 @@ Design a generic ticket or seat reservation platform (concerts, airlines, events
 - Never oversell. Never charge without a ticket.
 - Survive 1M+ users arriving at sale open for 50k tickets, and stay fair (no bot advantage).
 
-## Learn through a concrete example
+## 1. Scope and selected inventory model
 
-A concert sells reserved seats, while a workshop sells 500 general-admission places. These are different inventory models: one claims identities, the other decrements capacity. Treating both as one counter loses the seat map; treating both as individual seat records may add unnecessary complexity.
+I support reserved-seat and general-admission events, payment, ticket reissue and check-in. I choose explicit inventory types behind one reservation contract and one ticket-state authority. QR signatures prove authenticity, not whether another disconnected scanner already consumed admission.
+
+## 2. APIs and invariants
+
+```text
+POST /events/{id}/reservations {requestId,seats|quantity} -> hold
+POST /tickets/{id}/check-in {scannerId,scanId} -> admitted | alreadyUsed | invalid
+Inventory: capacity,sold,validHeld or per-seat owner
+Ticket: id,reservationId,entitlementVersion,state,checkInEvidence
+```
+
+Reservation atomically claims all selected seats or conditionally increments held quantity. For capacity 500, sold 420 and valid holds 60, only 20 remain. Confirmation converts that same reservation to sold and issues unique ticket entitlements. Check-in conditionally changes VALID to USED and stores scan evidence; concurrent scanners cannot both consume first entry. Reissue revokes the old version. Offline operation can validate signatures but must partition rights or accept/reconcile duplicate-use risk; I do not describe signature validation as globally exclusive consumption. Late payments and expired inventory follow a recorded compensation policy.
+
+## 3. Final design diagram
+
+[![Ticket / Seat Reservation System: Admission gateway bounded sale Reservation service; Reservation service claims capacity Inventory authority; Reservation service records intent Payment workflow; Payment workflow confirmed entitlement Ticket issuer; Ticket issuer redeemed once Check-in authority; Reconciliation resolves uncertainty Payment workflow](designs/hld-19.svg)](designs/hld-19.svg)
 
 A **reservation** owns inventory for a bounded interval. A **ticket** is the confirmed entitlement. A **check-in** consumes or records admission rights. Start by deciding whether identity, capacity or both are promised.
 
-## See inventory and ticket issuance
+## 4. Critical operation: worked execution
 
 ![Ticket identity is issued from confirmed ownership and payment policy.](lessons/hld-19-flow.svg)
 
@@ -655,7 +742,7 @@ A **reservation** owns inventory for a bounded interval. A **ticket** is the con
 
 For 500 general-admission places, 420 confirmed and 60 active holds leave 20 reservable places. A request for 25 must fail as a whole unless partial fulfilment is explicitly offered. Expired holds are not valid inventory promises even if cleanup has not yet run.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -720,8 +807,6 @@ A leader changes during a sale. The new owner must recover committed holds and r
 
 Global strong consistency across regions increases coordination cost. Routing one event to a single write authority is often a better starting boundary; browsing and availability previews can be replicated.
 
-### SLOs, failure drills and lab
-
 Oversell count, confirmed-to-issued lag, hold leak age, conflict rate, admission delay and unresolved payment outcomes.
 
 **Test matrix:** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan.
@@ -744,32 +829,36 @@ Oversell count, confirmed-to-issued lag, hold leak age, conflict rate, admission
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through offline admission
+### Work through offline admission
 
 Offline scanners can verify signed ticket authenticity but cannot automatically know another disconnected scanner already admitted the same ticket. Choose a bounded offline policy, partition entrance rights or accept and reconcile duplicate-entry risk explicitly. Cryptographic signatures solve forgery, not shared mutable consumption state.
 
 Reissuing a ticket after loss should revoke the old entitlement version. Transfers change authorized holder under policy without producing two live tickets. Seat ownership, payment disposition and admission evidence remain distinct even when the UI presents one booking summary.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does a QR code prevent screenshots?** No. It encodes data; admission-state rules prevent reuse online.
-2. **Does releasing a hold cancel a captured payment?** No. Resolve the financial outcome separately.
-3. **Exercise:** sell the final 20 places under 100 concurrent requests, then race two scanners on one ticket. Repeat with disconnected scanners and document exactly which guarantee is lost.
+**Does a QR code prevent screenshots?** No. It encodes data; admission-state rules prevent reuse online.
+
+**Does releasing a hold cancel a captured payment?** No. Resolve the financial outcome separately.
+
+## 7. Closing answer
+
+I separate inventory reservation, paid entitlement and admission consumption. Reserved seats claim identities; general admission claims quantity. Online conditional check-in prevents copied QR codes being used twice, while offline scanning has a deliberately weaker, documented duplicate-use guarantee.
 
 === HLD 20 ===
-N|client|Clients|0|130|120
-N|lb|Global LB / Anycast|180|130|180
-N|gw|Gateway nodes|430|130|150
-N|filters|Filter chain: authN, rate, transform|380|0|280|ellipse
-N|disc|Service Discovery|430|270|170|cylinder
-N|svcs|Backend Services|650|130|110
-N|obs|Logs/Metrics/Traces|650|270|110|cylinder
-E|client|lb|HTTPS
-E|lb|gw|route
-E|gw|filters|per request
-E|gw|disc|resolve
-E|gw|svcs|proxy
-E|gw|obs|emit
+N|n0|Client|0|0|200|rect
+N|n1|Gateway data plane|250|0|200|rect
+N|n2|Policy snapshot|500|0|200|rect
+N|n3|Upstream services|0|110|200|rect
+N|n4|Control plane|250|110|200|rect
+N|n5|Telemetry|500|110|200|rect
+N|n6|Dependency bulkheads|0|220|200|rect
+E|n0|n1|bounded HTTP
+E|n1|n2|route auth quota
+E|n1|n3|forwards
+E|n4|n2|validated publish
+E|n1|n5|records
+E|n1|n6|limits concurrency
 ---
 ## Problem
 
@@ -788,13 +877,28 @@ Design a large-scale API gateway (like Kong, AWS API Gateway, Zuul or Envoy-base
 
 **Scale:** 2M req/s peak. At ~20k req/s per node, that's ~100+ nodes across regions.
 
-## Learn through a concrete example
+## 1. Scope and selected responsibilities
 
-An API gateway receives requests for orders, search and payments. It can authenticate, route and apply shared limits, but it should not become the owner of every service's business rules. A fast gateway can still overwhelm a slow downstream service unless it bounds concurrency and retries.
+I design authentication, routing, quotas, observability and dependency protection for many APIs. The gateway does not own order/payment business state. I choose stateless data-plane instances using immutable versioned configuration and isolated upstream concurrency pools.
+
+## 2. Request and configuration algorithms
+
+```text
+Config: version,routes,upstreams,authRules,quotas,deadlines,retryPolicies
+Publish: validate -> canary -> health gate -> atomic snapshot activation
+Request: bound input -> authenticate -> resolve policy -> admit
+         -> forward within remaining deadline -> classify result
+```
+
+I strip untrusted identity headers, inject verified context and require services to check resource ownership. The request budget is shared across retries; streaming/side-effect operations are retried only under safe semantics. Three retry layers with three attempts each can cause 27 calls, so I assign one owner. At 2,000 requests/s and 200 ms residence, about 400 requests are in flight; a two-second slowdown implies 4,000 without admission changes. Bulkheads prevent one failing service from exhausting all gateway resources. Invalid config is rejected before activation, and canary regression restores the previous snapshot.
+
+## 3. Final design diagram
+
+[![Large-scale API Gateway: Client bounded HTTP Gateway data plane; Gateway data plane route auth quota Policy snapshot; Gateway data plane forwards Upstream services; Control plane validated publish Policy snapshot; Gateway data plane records Telemetry; Gateway data plane limits concurrency Dependency bulkheads](designs/hld-20.svg)](designs/hld-20.svg)
 
 The **control plane** distributes routing/policy configuration. The **data plane** handles requests using a validated snapshot. A **bulkhead** limits a dependency's resource consumption; a **circuit breaker** temporarily avoids calls to a failing dependency.
 
-## See request budgets and configuration safety
+## 4. Critical operation: worked execution
 
 ![Routing and resilience preserve downstream capacity and caller identity.](lessons/hld-20-flow.svg)
 
@@ -808,7 +912,7 @@ The **control plane** distributes routing/policy configuration. The **data plane
 
 If gateway, service and SDK each attempt a request three times, one user action may create `3×3×3 = 27` provider calls. Assign one retry owner and share a deadline. At 2,000 requests/s with 200 ms average residence, about 400 requests are in flight; a slowdown to two seconds raises this to about 4,000 unless admission changes.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -873,8 +977,6 @@ The configuration plane is unavailable. Continue with a validated last-known-goo
 
 Central gateways simplify shared policy but can become noisy-neighbor bottlenecks. Separate control and data planes, limit plugin work, and isolate large uploads/streaming so buffers do not exhaust all workers.
 
-### SLOs, failure drills and lab
-
 Gateway overhead p99, auth errors, upstream saturation, retry amplification, active connections, config convergence and memory per stream.
 
 **Test matrix:** Spoofed identity headers, expired key rotation cache, malformed route update, upstream slow response, retry storm, large body and streaming cancellation.
@@ -897,14 +999,18 @@ Gateway overhead p99, auth errors, upstream saturation, retry amplification, act
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through trust boundaries
+### Work through trust boundaries
 
 Strip untrusted identity headers before injecting verified ones. Downstream services still authorize resource-specific actions; a signed-in user is not entitled to every order ID. Bound body size, decompression, headers and connection lifetimes independently.
 
 Retries are safe for operations whose semantics support them, not simply because the gateway sees a timeout. Streaming responses may already have exposed partial output. Canary configuration by route/instance and monitor error changes before broad activation; retain a rollback snapshot.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does the gateway replace service authorization?** No. It supplies verified identity and common policy; services own domain permissions.
-2. **Does a circuit breaker add capacity?** No. It limits damage while a dependency is unhealthy.
-3. **Exercise:** slow one upstream tenfold, push an invalid route and replay a timed-out payment. Verify bounded in-flight work, retained good configuration and no unsafe automatic duplicate write.
+**Does the gateway replace service authorization?** No. It supplies verified identity and common policy; services own domain permissions.
+
+**Does a circuit breaker add capacity?** No. It limits damage while a dependency is unhealthy.
+
+## 7. Closing answer
+
+I keep routing policy in a validated control-plane snapshot and enforce request budgets in the data plane. Verified identity, bounded concurrency and one retry owner protect upstream services. Resource authorization stays in the owning domain service, and a bad configuration cannot displace the last working snapshot.

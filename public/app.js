@@ -787,11 +787,12 @@ cd kb && npm install && npm start</code></pre>
     root.insertAdjacentHTML("beforeend", '<div id="refZone"></div><div id="dayExtra"></div>');
     const renderRef = (asking) => {
       const zone = $("#refZone");
+      const hasInlineDesign = t.markdown?.includes("](designs/");
       if (!ref.length && !t.diagram?.nodes?.length) { zone.innerHTML = ""; return; }
       if (revealed.has(key)) {
         zone.innerHTML = `<section class="card"><h2>Reference design <span class="spacer"></span><button class="btn small" id="refHide">Hide again</button></h2>
-            ${t.diagram?.nodes?.length ? `<div class="diagram" id="diagram" data-diagram="${dkey}"></div>` : ""}<nav class="toc" id="refToc" aria-label="Reference design contents" hidden><div class="toc-title">In this reference</div><ol id="refTocList"></ol></nav><div id="writeup"></div></section>`;
-        if (t.diagram?.nodes?.length) { const dg = $("#diagram"); dg._spec = t.diagram; KBDiagram.render(dg, t.diagram, dkey); }
+            ${t.diagram?.nodes?.length && !hasInlineDesign ? `<div class="diagram" id="diagram" data-diagram="${dkey}"></div>` : ""}<nav class="toc" id="refToc" aria-label="Reference design contents" hidden><div class="toc-title">In this reference</div><ol id="refTocList"></ol></nav><div id="writeup"></div></section>`;
+        if (t.diagram?.nodes?.length && !hasInlineDesign) { const dg = $("#diagram"); dg._spec = t.diagram; KBDiagram.render(dg, t.diagram, dkey); }
         viewer($("#writeup"), ref.map((x) => x.md).join("\n\n"));
         const referenceHeads = [...$("#writeup").querySelectorAll("h2")];
         if (referenceHeads.length > 2) {
@@ -819,7 +820,7 @@ cd kb && npm install && npm start</code></pre>
           : "You haven't saved an answer yet. Seeing the reference first turns the exercise into reading. Try writing your own design first, even a rough one.";
       zone.innerHTML = `<section class="card gate">
         <h2>Reference design <span class="spacer"></span><span class="muted small">hidden</span></h2>
-        <p class="muted" style="margin-top:0">Contains the diagram, detailed walkthrough, implementation notes, trade-offs and exercises. Attempt your own design first, then compare it with the reference.</p>
+        <p class="muted" style="margin-top:0">Contains the complete reference answer: chosen design, APIs or classes, worked execution, failure handling, trade-offs and interviewer follow-ups. Attempt your own answer first, then compare.</p>
         ${asking
           ? `<div class="confirm"><p><b>Are you sure you want to see it?</b> ${esc(warn)}</p>
                <div class="row"><button class="btn ${answered ? "primary" : ""}" id="refYes">${answered ? "Yes, show the reference" : "Show it anyway"}</button>

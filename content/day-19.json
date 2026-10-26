@@ -12,103 +12,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "cust",
-            "label": "Customer",
-            "x": 0,
-            "y": 0,
-            "w": 130,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "order",
+            "id": "n0",
             "label": "Order",
-            "x": 300,
-            "y": 0,
-            "w": 120,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "sm",
-            "label": "Order State Machine",
-            "x": 580,
-            "y": 0,
-            "w": 180,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "inv",
-            "label": "Inventory",
             "x": 0,
-            "y": 150,
-            "w": 130,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "pay",
-            "label": "Payment",
-            "x": 300,
-            "y": 150,
-            "w": 130,
+            "y": 0,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "ship",
+            "id": "n1",
+            "label": "OrderLine",
+            "x": 250,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n2",
+            "label": "InventoryReservation",
+            "x": 500,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n3",
             "label": "Shipment",
-            "x": 580,
-            "y": 150,
-            "w": 140,
+            "x": 0,
+            "y": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "obs",
-            "label": "Observers: email/SMS/analytics",
-            "x": 240,
-            "y": 280,
-            "w": 260,
+            "id": "n4",
+            "label": "PaymentIntent",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Return",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Outbox",
+            "x": 0,
+            "y": 220,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "cust",
-            "to": "order",
-            "label": "place"
+            "from": "n0",
+            "to": "n1",
+            "label": "owns"
           },
           {
-            "from": "order",
-            "to": "sm",
-            "label": "transition"
+            "from": "n1",
+            "to": "n2",
+            "label": "reserves"
           },
           {
-            "from": "order",
-            "to": "inv",
-            "label": "reserve"
+            "from": "n1",
+            "to": "n3",
+            "label": "fulfilled by"
           },
           {
-            "from": "order",
-            "to": "pay",
-            "label": "charge"
+            "from": "n0",
+            "to": "n4",
+            "label": "collects through"
           },
           {
-            "from": "order",
-            "to": "ship",
-            "label": "create"
+            "from": "n3",
+            "to": "n5",
+            "label": "can produce"
           },
           {
-            "from": "sm",
-            "to": "obs",
-            "label": "publish event"
+            "from": "n0",
+            "to": "n6",
+            "label": "publishes events"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign Amazon's order management: from a cart, create an order that may hold items from several sellers and warehouses; reserve inventory, take payment, split into shipments, track each shipment, and support cancellation and returns. It brings together a **State machine**, **Observer** and **Strategy** (fulfilment and payment), plus consistency across inventory and payment.\n\n## Requirements\n\n**Functional**\n- Place an order: validate the cart, reserve inventory, charge, confirm.\n- Split into shipments by warehouse and seller, each with its own lifecycle.\n- Cancel (fully or one item) before shipping. Return and refund after delivery.\n- Notify the customer on every change.\n\n**Non-functional**\n- No overselling and no double charging: inventory reservation and payment stay consistent, and order placement is idempotent.\n- State changes follow the order lifecycle only, with a full audit history.\n- Handles sale-day peaks: high write throughput, with notifications sent asynchronously.\n- New payment methods and fulfilment types plug in without rewriting order flow.\n\n## Learn through a concrete example\n\nAn online order contains a book from warehouse A and a charger from warehouse B. The book ships first. A single order-level `SHIPPED` flag cannot say whether both items shipped, whether the charger was cancelled, or which amount can be refunded.\n\nSeparate the **order** from its **lines**, **inventory reservations**, **shipments** and **payment operations**. An order summarizes the commercial agreement; fulfilment facts belong at the line/quantity level. Start with one transactional order store and explicit integrations.\n\n## See split fulfilment\n\n![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)\n\n*Ordered quantities are partitioned across fulfilment outcomes.*\n\n![A line cannot be both newly cancelled and dispatched for the same units.](lessons/lld-19-failure.svg)\n\n*A line cannot be both newly cancelled and dispatched for the same units.*\n\n### Build and calculate\n\nFor an order line with quantity 3, track ordered, cancelled, shipped and returned quantities explicitly. If one unit is cancelled and two ship, fulfilment is complete even though shipped quantity is less than the original three. Returns refer to shipped units and do not rewrite the original order quantity.\n\n```text\nOrderLine: ordered=3, cancelled=1, shipped=2, returned=0\nConstraints: cancelled + shipped <= ordered\n             returned <= shipped\nRemaining to fulfil = ordered - cancelled - shipped = 0\n```\n\n## Design details and alternatives\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Order` | id, customer, `List<OrderLine>`, payment, status, address snapshot |\n| `OrderLine` | product, seller, qty, price snapshot, line status |\n| `OrderState` | `CREATED → PAYMENT_PENDING → CONFIRMED → PARTIALLY_SHIPPED → SHIPPED → DELIVERED`; `CANCELLED`, `RETURN_REQUESTED → RETURNED` |\n| `Shipment` | lines, warehouse, carrier, tracking; `PACKED → SHIPPED → OUT_FOR_DELIVERY → DELIVERED` |\n| `FulfilmentStrategy` | Nearest warehouse, fewest shipments, cheapest |\n| `InventoryService` | `reserve(lines, ttl)`, `commit`, `release` |\n| `OrderEventPublisher` | Observer hub: `OrderConfirmed`, `ShipmentDelivered`, … |\n\n### Design decisions & trade-offs\n\n**1. Order status is derived from shipments and lines.** With partial shipping, an order is \"shipped\" only when all shipments are. Derive aggregate status from children rather than setting it independently. That prevents contradictions like \"order DELIVERED, shipment still in transit\".\n\n**2. Transactional flow as a saga.** Reserve inventory (with a TTL), then charge payment, then commit inventory and confirm. On payment failure, release the inventory. Each step has a compensating action, so you can explain it without a distributed transaction.\n\n**3. Observer for side effects.** The state machine publishes events. Email, SMS, loyalty points and analytics subscribe. Adding \"notify the seller\" doesn't touch `Order`.\n\n**4. Snapshots.** Copy price, title and address into the order. Later catalogue or address edits must not rewrite history.\n\n**5. Guarded transitions.** `cancel()` is legal only before `SHIPPED` (per line). A transition table plus `canTransition(from, to)` stops illegal moves, and an optimistic version field handles concurrent updates such as a warehouse \"packed\" racing a customer \"cancel\".\n\n### Ownership, boundaries and invariants\n\n**Central design question:** An order is a durable commercial record whose fulfillment and payment can progress independently.\n\nOrder snapshots buyer, lines, address, currency and totals. OrderLine references a purchased SKU snapshot. InventoryReservation, PaymentAttempt and Shipment carry separate lifecycle state. OrderCoordinator applies business policy; TaxPolicy and ShippingPolicy return deterministic quotes.\n\n**Correctness rule:** The total equals the sum of immutable line amounts, tax, discounts and delivery under a defined rounding policy. A shipment cannot exceed purchased quantities, and retries cannot create a second paid order.\n\n```text\norders(id,request_key,total_minor,status,version); line(id,qty,shipped_qty,cancelled_qty); shipment; payment_attempt; refund\n```\n\n### State machine and command contracts\n\n```text\nOrder PENDING -> CONFIRMED -> PARTIALLY_FULFILLED -> FULFILLED; separate payment and refund statuses\n```\n\n### End-to-end execution trace\n\nValidate quote; reserve inventory; create a pending order; authorize payment; confirm or compensate stock; capture according to fulfillment policy; split into shipments; record delivery; process partial refunds as separate auditable records.\n\n### Concurrency and recovery walkthrough\n\nCancellation crosses shipment handoff. Compare order-line fulfillment quantities and cancel only unshipped units; compensation may become return/refund after the boundary. Late payment callbacks are deduplicated and reconciled.\n\n\n\n### Policy choices and extension seams\n\nOne giant enum for every shipment/payment combination becomes unmaintainable. Separate state axes plus invariants give clearer composition. Saga coordination belongs in application logic, not in every OrderLine getter.\n\n### Edge cases that change the design\n\nTwo warehouses can partially fulfill one order. Refund arithmetic must account for prorated discounts and taxes. A retry with a reused idempotency key and changed cart payload is a conflict.\n\n### Verification and a practical lab\n\n**Topic-specific cases:** Duplicate checkout; inventory compensation; partial shipment; cancellation boundary; duplicate webhook; partial refund conservation; immutable price snapshots.\n\n**Lab:** Fulfill one of two lines, cancel the remainder and receive a duplicate payment webhook. Show final quantities, stock release and refund records.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n## Work through integration failures\n\nA duplicate warehouse event must not increment `shipped` twice. Use event identity and the line's legal remaining quantity. A reservation timeout that later succeeds needs reconciliation by reservation reference, especially if another warehouse was already asked to fulfil the same item.\n\nPayments follow capture policy: authorize at order placement, perhaps capture per shipment. Refunds must reference captured amounts; a cancelled, never-captured line may need authorization release rather than a refund. Store the financial evidence instead of inferring it from shipping status.\n\n## Practise, then check your reasoning\n\n1. **Can an order be completed with a cancelled line?** Yes, if every unit has a final documented fulfilment disposition.\n2. **Should a return delete a shipment?** No. The shipment happened; the return is a later event.\n3. **Exercise:** order three units, cancel one, ship two in separate events, replay the first event and return one. Verify quantity bounds and the exact captured/refundable amounts after each step.\n"
+      "markdown": "## Problem\n\nDesign Amazon's order management: from a cart, create an order that may hold items from several sellers and warehouses; reserve inventory, take payment, split into shipments, track each shipment, and support cancellation and returns. It brings together a **State machine**, **Observer** and **Strategy** (fulfilment and payment), plus consistency across inventory and payment.\n\n## Requirements\n\n**Functional**\n- Place an order: validate the cart, reserve inventory, charge, confirm.\n- Split into shipments by warehouse and seller, each with its own lifecycle.\n- Cancel (fully or one item) before shipping. Return and refund after delivery.\n- Notify the customer on every change.\n\n**Non-functional**\n- No overselling and no double charging: inventory reservation and payment stay consistent, and order placement is idempotent.\n- State changes follow the order lifecycle only, with a full audit history.\n- Handles sale-day peaks: high write throughput, with notifications sent asynchronously.\n- New payment methods and fulfilment types plug in without rewriting order flow.\n\n## 1. Scope and chosen solution\n\nI support multi-line orders with split shipments, cancellation before dispatch and returns after delivery. An Order owns accepted terms; each line tracks quantities; warehouse and payment integrations have stable operation references. I choose quantity accounting rather than a single SHIPPED flag.\n\n## 2. Commands and conservation\n\n```text\nsubmit(checkoutId,acceptedQuote) -> Order\nreserve(lineId,reservationId,quantity)\nship(eventId,lineId,shipmentId,quantity)\ncancel(commandId,lineId,quantity)\nreturnItem(returnId,lineId,quantity,evidence)\nInvariant: cancelled + shipped <= ordered; returned <= shipped\n```\n\nEvery line transition locks its current version, checks remaining eligible quantity, deduplicates the operation/event and commits quantity plus outbox fact. For ordered 3, cancelled 1 and shipped 2, remaining-to-fulfil is zero. A repeated shipment event cannot increment shipped again. Cancellation racing dispatch competes for the same remaining units; the loser becomes a rejection or a return workflow. Capture-per-shipment and refunds reference actual captured amounts; a never-captured authorization is released instead of refunded. Returns append evidence without deleting original shipment history.\n\n## 3. Final design diagram\n\n[![Design Amazon Order Management: Order owns OrderLine; OrderLine reserves InventoryReservation; OrderLine fulfilled by Shipment; Order collects through PaymentIntent; Shipment can produce Return; Order publishes events Outbox](designs/lld-19.svg)](designs/lld-19.svg)\n\nSeparate the **order** from its **lines**, **inventory reservations**, **shipments** and **payment operations**. An order summarizes the commercial agreement; fulfilment facts belong at the line/quantity level. I start with one transactional order store and explicit integrations.\n\n## 4. Critical operation: worked execution\n\n![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)\n\n*Ordered quantities are partitioned across fulfilment outcomes.*\n\n![A line cannot be both newly cancelled and dispatched for the same units.](lessons/lld-19-failure.svg)\n\n*A line cannot be both newly cancelled and dispatched for the same units.*\n\n### Worked calculation and implementation\n\nFor an order line with quantity 3, track ordered, cancelled, shipped and returned quantities explicitly. If one unit is cancelled and two ship, fulfilment is complete even though shipped quantity is less than the original three. Returns refer to shipped units and do not rewrite the original order quantity.\n\n```text\nOrderLine: ordered=3, cancelled=1, shipped=2, returned=0\nConstraints: cancelled + shipped <= ordered\n             returned <= shipped\nRemaining to fulfil = ordered - cancelled - shipped = 0\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Order` | id, customer, `List<OrderLine>`, payment, status, address snapshot |\n| `OrderLine` | product, seller, qty, price snapshot, line status |\n| `OrderState` | `CREATED → PAYMENT_PENDING → CONFIRMED → PARTIALLY_SHIPPED → SHIPPED → DELIVERED`; `CANCELLED`, `RETURN_REQUESTED → RETURNED` |\n| `Shipment` | lines, warehouse, carrier, tracking; `PACKED → SHIPPED → OUT_FOR_DELIVERY → DELIVERED` |\n| `FulfilmentStrategy` | Nearest warehouse, fewest shipments, cheapest |\n| `InventoryService` | `reserve(lines, ttl)`, `commit`, `release` |\n| `OrderEventPublisher` | Observer hub: `OrderConfirmed`, `ShipmentDelivered`, … |\n\n### Design decisions & trade-offs\n\n**1. Order status is derived from shipments and lines.** With partial shipping, an order is \"shipped\" only when all shipments are. Derive aggregate status from children rather than setting it independently. That prevents contradictions like \"order DELIVERED, shipment still in transit\".\n\n**2. Transactional flow as a saga.** Reserve inventory (with a TTL), then charge payment, then commit inventory and confirm. On payment failure, release the inventory. Each step has a compensating action, so you can explain it without a distributed transaction.\n\n**3. Observer for side effects.** The state machine publishes events. Email, SMS, loyalty points and analytics subscribe. Adding \"notify the seller\" doesn't touch `Order`.\n\n**4. Snapshots.** Copy price, title and address into the order. Later catalogue or address edits must not rewrite history.\n\n**5. Guarded transitions.** `cancel()` is legal only before `SHIPPED` (per line). A transition table plus `canTransition(from, to)` stops illegal moves, and an optimistic version field handles concurrent updates such as a warehouse \"packed\" racing a customer \"cancel\".\n\n### Ownership, boundaries and invariants\n\n**Central design question:** An order is a durable commercial record whose fulfillment and payment can progress independently.\n\nOrder snapshots buyer, lines, address, currency and totals. OrderLine references a purchased SKU snapshot. InventoryReservation, PaymentAttempt and Shipment carry separate lifecycle state. OrderCoordinator applies business policy; TaxPolicy and ShippingPolicy return deterministic quotes.\n\n**Correctness rule:** The total equals the sum of immutable line amounts, tax, discounts and delivery under a defined rounding policy. A shipment cannot exceed purchased quantities, and retries cannot create a second paid order.\n\n```text\norders(id,request_key,total_minor,status,version); line(id,qty,shipped_qty,cancelled_qty); shipment; payment_attempt; refund\n```\n\n### End-to-end execution trace\n\nValidate quote; reserve inventory; create a pending order; authorize payment; confirm or compensate stock; capture according to fulfillment policy; split into shipments; record delivery; process partial refunds as separate auditable records.\n\n### Concurrency and recovery walkthrough\n\nCancellation crosses shipment handoff. Compare order-line fulfillment quantities and cancel only unshipped units; compensation may become return/refund after the boundary. Late payment callbacks are deduplicated and reconciled.\n\n### Policy choices and extension seams\n\nOne giant enum for every shipment/payment combination becomes unmaintainable. Separate state axes plus invariants give clearer composition. Saga coordination belongs in application logic, not in every OrderLine getter.\n\n### Edge cases that change the design\n\nTwo warehouses can partially fulfill one order. Refund arithmetic must account for prorated discounts and taxes. A retry with a reused idempotency key and changed cart payload is a conflict.\n\n**Topic-specific cases:** Duplicate checkout; inventory compensation; partial shipment; cancellation boundary; duplicate webhook; partial refund conservation; immutable price snapshots.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through integration failures\n\nA duplicate warehouse event must not increment `shipped` twice. Use event identity and the line's legal remaining quantity. A reservation timeout that later succeeds needs reconciliation by reservation reference, especially if another warehouse was already asked to fulfil the same item.\n\nPayments follow capture policy: authorize at order placement, perhaps capture per shipment. Refunds must reference captured amounts; a cancelled, never-captured line may need authorization release rather than a refund. Store the financial evidence instead of inferring it from shipping status.\n\n## 6. Interviewer follow-ups\n\n**Can an order be completed with a cancelled line?** Yes, if every unit has a final documented fulfilment disposition.\n\n**Should a return delete a shipment?** No. The shipment happened; the return is a later event.\n\n## 7. Closing answer\n\nI make fulfilment quantitative at order-line level and derive the order summary. Immutable commercial snapshots, versioned quantity transitions and idempotent warehouse events preserve partial shipments, cancellations and returns. Financial capture/refund follows actual recorded fulfilment policy rather than one overloaded status.\n"
     },
     {
       "category": "HLD",
@@ -118,103 +118,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "user",
-            "label": "User",
+            "id": "n0",
+            "label": "Admission gateway",
             "x": 0,
             "y": 0,
-            "w": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "queue",
-            "label": "Waiting Room",
-            "x": 200,
+            "id": "n1",
+            "label": "Reservation service",
+            "x": 250,
             "y": 0,
-            "w": 150,
+            "w": 200,
             "h": 50,
-            "shape": "ellipse"
+            "shape": "rect"
           },
           {
-            "id": "res",
-            "label": "Reservation Svc",
-            "x": 420,
+            "id": "n2",
+            "label": "Inventory authority",
+            "x": 500,
             "y": 0,
-            "w": 170,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "db",
-            "label": "Inventory DB (row lock/version)",
-            "x": 420,
-            "y": 150,
-            "w": 260,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "hold",
-            "label": "Hold TTL expiry",
-            "x": 150,
-            "y": 150,
-            "w": 160,
+            "id": "n3",
+            "label": "Payment workflow",
+            "x": 0,
+            "y": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "pay",
-            "label": "Payment",
-            "x": 420,
-            "y": 280,
-            "w": 130,
+            "id": "n4",
+            "label": "Ticket issuer",
+            "x": 250,
+            "y": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "confirm",
-            "label": "Confirm + Ticket",
-            "x": 150,
-            "y": 280,
-            "w": 160,
+            "id": "n5",
+            "label": "Check-in authority",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Reconciliation",
+            "x": 0,
+            "y": 220,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "user",
-            "to": "queue",
-            "label": "enter"
+            "from": "n0",
+            "to": "n1",
+            "label": "bounded sale"
           },
           {
-            "from": "queue",
-            "to": "res",
-            "label": "admit N/s"
+            "from": "n1",
+            "to": "n2",
+            "label": "claims capacity"
           },
           {
-            "from": "res",
-            "to": "db",
-            "label": "reserve (conditional)"
+            "from": "n1",
+            "to": "n3",
+            "label": "records intent"
           },
           {
-            "from": "hold",
-            "to": "db",
-            "label": "expire holds"
+            "from": "n3",
+            "to": "n4",
+            "label": "confirmed entitlement"
           },
           {
-            "from": "res",
-            "to": "pay",
-            "label": "charge"
+            "from": "n4",
+            "to": "n5",
+            "label": "redeemed once"
           },
           {
-            "from": "pay",
-            "to": "confirm",
-            "label": "on success"
+            "from": "n6",
+            "to": "n3",
+            "label": "resolves uncertainty"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a generic ticket or seat reservation platform (concerts, airlines, events, IRCTC-like) where inventory is scarce, demand spikes violently at sale open, and correctness is non-negotiable. Unlike HLD #13 (cinema seat maps), think of it as a reusable **inventory reservation engine** with **strong consistency**, **holds with expiry**, **transactions** and **fair admission under extreme load**.\n\n## Requirements\n\n**Functional**\n- Inventory types: assigned seats, or general admission (N identical tickets).\n- `hold(items, ttl)`, then `confirm(holdId, payment)` or `release`. Holds auto-expire.\n- Purchase limits per user, presale codes, waitlists.\n\n**Non-functional**\n- Never oversell. Never charge without a ticket.\n- Survive 1M+ users arriving at sale open for 50k tickets, and stay fair (no bot advantage).\n\n## Learn through a concrete example\n\nA concert sells reserved seats, while a workshop sells 500 general-admission places. These are different inventory models: one claims identities, the other decrements capacity. Treating both as one counter loses the seat map; treating both as individual seat records may add unnecessary complexity.\n\nA **reservation** owns inventory for a bounded interval. A **ticket** is the confirmed entitlement. A **check-in** consumes or records admission rights. Start by deciding whether identity, capacity or both are promised.\n\n## See inventory and ticket issuance\n\n![Ticket identity is issued from confirmed ownership and payment policy.](lessons/hld-19-flow.svg)\n\n*Ticket identity is issued from confirmed ownership and payment policy.*\n\n![A copied QR code must not create a second valid admission.](lessons/hld-19-failure.svg)\n\n*A copied QR code must not create a second valid admission.*\n\n### Calculate capacity\n\nFor 500 general-admission places, 420 confirmed and 60 active holds leave 20 reservable places. A request for 25 must fail as a whole unless partial fulfilment is explicitly offered. Expired holds are not valid inventory promises even if cleanup has not yet run.\n\n## Design details and alternatives\n\n### Architecture\n\n- **Edge plus waiting room:** a CDN-hosted queue page issues signed, ordered queue tokens and admits users at a controlled rate to the shop.\n- **Reservation service:** stateless API over a strongly consistent **inventory store** (sharded SQL or a single-region strongly consistent DB), partitioned by event.\n- **Holds:** rows `(eventId, itemId, status, holdId, expiresAt)`. A hold is a conditional update. A sweeper (or lazy expiry on read) releases expired holds.\n- **Checkout:** confirm moves holds to `SOLD` in one transaction after successful payment authorisation. Payment uses idempotency keys and is captured after confirmation.\n\n### Key design decisions & trade-offs\n\n**1. Conditional writes for consistency.**\n- Assigned seats: `UPDATE seats SET status='HELD', hold_id=? WHERE event=? AND seat IN (...) AND status='AVAILABLE'`. Success only if the affected row count equals the requested count, in one transaction (all-or-nothing).\n- General admission: a counter row `remaining`, with `UPDATE … SET remaining = remaining - n WHERE remaining >= n`. Hot row contention is a problem, so **split the counter into K sub-buckets** (e.g. 50 rows of 1,000) and pick randomly.\n\n**2. Hold TTL trade-off.** Long holds (15 min) are kind to users but lock inventory from others. Short holds (5 min) mean more expired checkouts. Extend the hold once the user is actively in payment.\n\n**3. Fairness and bots.** The waiting room (randomised or FIFO from sale open), per-account limits, CAPTCHA or device attestation, and verified-fan presales. Admission rate equals the measured checkout capacity.\n\n**4. Single-writer per hot event.** For extreme events, route all writes for one event to one partition or actor that processes reservations sequentially in memory with a durable log. That gives no lock contention and deterministic ordering.\n\n**5. Payment and inventory consistency.** Authorise, then confirm the inventory, then capture. If confirm fails, void the authorisation. Reconcile stuck states (hold expired after authorisation) with automatic voids or refunds.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** Inventory ownership remains exclusive through expiry, payment uncertainty and worker failover.\n\nAssume 200,000 users competing for 20,000 tickets in 60 seconds: 3,333 purchase intents/s before browsing traffic. Inventory contention concentrates on a few event sections, so aggregate QPS is insufficient for capacity planning.\n\n### API contracts and data ownership\n\n```text\nPOST /holds; POST /bookings with hold token and request key; GET booking status; cancellation/refund endpoint\n```\n\n```text\nLogical records (outline, not complete DDL):\ninventory(event,seat,state,owner_hold,version); hold(id,expires_at,state); booking(id,hold_id,payment_ref,state); outbox\n\nPrimary access/partitioning boundary:\nevent + section + seat or inventory_bucket; hold_id for exclusive ownership\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around event + section + seat or inventory_bucket; hold_id for exclusive ownership. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nThrottle admission; select authoritative inventory partition; conditionally reserve with hold ID and expiry; persist response identity; perform payment; confirm only if current hold still owns inventory; publish a ticket with unique redemption identity; handle cancellation by explicit policy.\n\n### Deep dive: the decision that changes this system\n\nFor general admission use an atomic remaining-capacity decrement plus hold ledger; for assigned seating use unique seat ownership. Both require expiry and late-payment rules. A ticket scanner also needs replay prevention and a policy for offline validation.\n\n### Failure and race-condition walkthrough\n\nA leader changes during a sale. The new owner must recover committed holds and reject stale epochs, rather than reconstruct availability from an eventually consistent cache. Never clear holds purely from a client countdown.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nGlobal strong consistency across regions increases coordination cost. Routing one event to a single write authority is often a better starting boundary; browsing and availability previews can be replicated.\n\n### SLOs, failure drills and lab\n\nOversell count, confirmed-to-issued lag, hold leak age, conflict rate, admission delay and unresolved payment outcomes.\n\n**Test matrix:** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: Inventory ownership remains exclusive through expiry, payment uncertainty and worker failover.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 200,000 users competing for 20,000 tickets in 60 seconds: 3,333 purchase intents/s before browsing traffic. Inventory contention concentrates on a few event sections, so aggregate QPS is insufficient for capacity planning.\n\n**Which failure would invalidate the naive design?** A leader changes during a sale. The new owner must recover committed holds and reject stale epochs, rather than reconstruct availability from an eventually consistent cache. Never clear holds purely from a client countdown.\n\n**Why not introduce every distributed component immediately?** Global strong consistency across regions increases coordination cost. Routing one event to a single write authority is often a better starting boundary; browsing and availability previews can be replicated.\n\n**How would you demonstrate the design works?** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n## Work through offline admission\n\nOffline scanners can verify signed ticket authenticity but cannot automatically know another disconnected scanner already admitted the same ticket. Choose a bounded offline policy, partition entrance rights or accept and reconcile duplicate-entry risk explicitly. Cryptographic signatures solve forgery, not shared mutable consumption state.\n\nReissuing a ticket after loss should revoke the old entitlement version. Transfers change authorized holder under policy without producing two live tickets. Seat ownership, payment disposition and admission evidence remain distinct even when the UI presents one booking summary.\n\n## Practise, then check your reasoning\n\n1. **Does a QR code prevent screenshots?** No. It encodes data; admission-state rules prevent reuse online.\n2. **Does releasing a hold cancel a captured payment?** No. Resolve the financial outcome separately.\n3. **Exercise:** sell the final 20 places under 100 concurrent requests, then race two scanners on one ticket. Repeat with disconnected scanners and document exactly which guarantee is lost.\n"
+      "markdown": "## Problem\n\nDesign a generic ticket or seat reservation platform (concerts, airlines, events, IRCTC-like) where inventory is scarce, demand spikes violently at sale open, and correctness is non-negotiable. Unlike HLD #13 (cinema seat maps), think of it as a reusable **inventory reservation engine** with **strong consistency**, **holds with expiry**, **transactions** and **fair admission under extreme load**.\n\n## Requirements\n\n**Functional**\n- Inventory types: assigned seats, or general admission (N identical tickets).\n- `hold(items, ttl)`, then `confirm(holdId, payment)` or `release`. Holds auto-expire.\n- Purchase limits per user, presale codes, waitlists.\n\n**Non-functional**\n- Never oversell. Never charge without a ticket.\n- Survive 1M+ users arriving at sale open for 50k tickets, and stay fair (no bot advantage).\n\n## 1. Scope and selected inventory model\n\nI support reserved-seat and general-admission events, payment, ticket reissue and check-in. I choose explicit inventory types behind one reservation contract and one ticket-state authority. QR signatures prove authenticity, not whether another disconnected scanner already consumed admission.\n\n## 2. APIs and invariants\n\n```text\nPOST /events/{id}/reservations {requestId,seats|quantity} -> hold\nPOST /tickets/{id}/check-in {scannerId,scanId} -> admitted | alreadyUsed | invalid\nInventory: capacity,sold,validHeld or per-seat owner\nTicket: id,reservationId,entitlementVersion,state,checkInEvidence\n```\n\nReservation atomically claims all selected seats or conditionally increments held quantity. For capacity 500, sold 420 and valid holds 60, only 20 remain. Confirmation converts that same reservation to sold and issues unique ticket entitlements. Check-in conditionally changes VALID to USED and stores scan evidence; concurrent scanners cannot both consume first entry. Reissue revokes the old version. Offline operation can validate signatures but must partition rights or accept/reconcile duplicate-use risk; I do not describe signature validation as globally exclusive consumption. Late payments and expired inventory follow a recorded compensation policy.\n\n## 3. Final design diagram\n\n[![Ticket / Seat Reservation System: Admission gateway bounded sale Reservation service; Reservation service claims capacity Inventory authority; Reservation service records intent Payment workflow; Payment workflow confirmed entitlement Ticket issuer; Ticket issuer redeemed once Check-in authority; Reconciliation resolves uncertainty Payment workflow](designs/hld-19.svg)](designs/hld-19.svg)\n\nA **reservation** owns inventory for a bounded interval. A **ticket** is the confirmed entitlement. A **check-in** consumes or records admission rights. Start by deciding whether identity, capacity or both are promised.\n\n## 4. Critical operation: worked execution\n\n![Ticket identity is issued from confirmed ownership and payment policy.](lessons/hld-19-flow.svg)\n\n*Ticket identity is issued from confirmed ownership and payment policy.*\n\n![A copied QR code must not create a second valid admission.](lessons/hld-19-failure.svg)\n\n*A copied QR code must not create a second valid admission.*\n\n### Calculate capacity\n\nFor 500 general-admission places, 420 confirmed and 60 active holds leave 20 reservable places. A request for 25 must fail as a whole unless partial fulfilment is explicitly offered. Expired holds are not valid inventory promises even if cleanup has not yet run.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n- **Edge plus waiting room:** a CDN-hosted queue page issues signed, ordered queue tokens and admits users at a controlled rate to the shop.\n- **Reservation service:** stateless API over a strongly consistent **inventory store** (sharded SQL or a single-region strongly consistent DB), partitioned by event.\n- **Holds:** rows `(eventId, itemId, status, holdId, expiresAt)`. A hold is a conditional update. A sweeper (or lazy expiry on read) releases expired holds.\n- **Checkout:** confirm moves holds to `SOLD` in one transaction after successful payment authorisation. Payment uses idempotency keys and is captured after confirmation.\n\n### Key design decisions & trade-offs\n\n**1. Conditional writes for consistency.**\n- Assigned seats: `UPDATE seats SET status='HELD', hold_id=? WHERE event=? AND seat IN (...) AND status='AVAILABLE'`. Success only if the affected row count equals the requested count, in one transaction (all-or-nothing).\n- General admission: a counter row `remaining`, with `UPDATE … SET remaining = remaining - n WHERE remaining >= n`. Hot row contention is a problem, so **split the counter into K sub-buckets** (e.g. 50 rows of 1,000) and pick randomly.\n\n**2. Hold TTL trade-off.** Long holds (15 min) are kind to users but lock inventory from others. Short holds (5 min) mean more expired checkouts. Extend the hold once the user is actively in payment.\n\n**3. Fairness and bots.** The waiting room (randomised or FIFO from sale open), per-account limits, CAPTCHA or device attestation, and verified-fan presales. Admission rate equals the measured checkout capacity.\n\n**4. Single-writer per hot event.** For extreme events, route all writes for one event to one partition or actor that processes reservations sequentially in memory with a durable log. That gives no lock contention and deterministic ordering.\n\n**5. Payment and inventory consistency.** Authorise, then confirm the inventory, then capture. If confirm fails, void the authorisation. Reconcile stuck states (hold expired after authorisation) with automatic voids or refunds.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** Inventory ownership remains exclusive through expiry, payment uncertainty and worker failover.\n\nAssume 200,000 users competing for 20,000 tickets in 60 seconds: 3,333 purchase intents/s before browsing traffic. Inventory contention concentrates on a few event sections, so aggregate QPS is insufficient for capacity planning.\n\n### API contracts and data ownership\n\n```text\nPOST /holds; POST /bookings with hold token and request key; GET booking status; cancellation/refund endpoint\n```\n\n```text\nLogical records (outline, not complete DDL):\ninventory(event,seat,state,owner_hold,version); hold(id,expires_at,state); booking(id,hold_id,payment_ref,state); outbox\n\nPrimary access/partitioning boundary:\nevent + section + seat or inventory_bucket; hold_id for exclusive ownership\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around event + section + seat or inventory_bucket; hold_id for exclusive ownership. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nThrottle admission; select authoritative inventory partition; conditionally reserve with hold ID and expiry; persist response identity; perform payment; confirm only if current hold still owns inventory; publish a ticket with unique redemption identity; handle cancellation by explicit policy.\n\n### Deep dive: the decision that changes this system\n\nFor general admission use an atomic remaining-capacity decrement plus hold ledger; for assigned seating use unique seat ownership. Both require expiry and late-payment rules. A ticket scanner also needs replay prevention and a policy for offline validation.\n\n### Failure and race-condition walkthrough\n\nA leader changes during a sale. The new owner must recover committed holds and reject stale epochs, rather than reconstruct availability from an eventually consistent cache. Never clear holds purely from a client countdown.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nGlobal strong consistency across regions increases coordination cost. Routing one event to a single write authority is often a better starting boundary; browsing and availability previews can be replicated.\n\nOversell count, confirmed-to-issued lag, hold leak age, conflict rate, admission delay and unresolved payment outcomes.\n\n**Test matrix:** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: Inventory ownership remains exclusive through expiry, payment uncertainty and worker failover.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 200,000 users competing for 20,000 tickets in 60 seconds: 3,333 purchase intents/s before browsing traffic. Inventory contention concentrates on a few event sections, so aggregate QPS is insufficient for capacity planning.\n\n**Which failure would invalidate the naive design?** A leader changes during a sale. The new owner must recover committed holds and reject stale epochs, rather than reconstruct availability from an eventually consistent cache. Never clear holds purely from a client countdown.\n\n**Why not introduce every distributed component immediately?** Global strong consistency across regions increases coordination cost. Routing one event to a single write authority is often a better starting boundary; browsing and availability previews can be replicated.\n\n**How would you demonstrate the design works?** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through offline admission\n\nOffline scanners can verify signed ticket authenticity but cannot automatically know another disconnected scanner already admitted the same ticket. Choose a bounded offline policy, partition entrance rights or accept and reconcile duplicate-entry risk explicitly. Cryptographic signatures solve forgery, not shared mutable consumption state.\n\nReissuing a ticket after loss should revoke the old entitlement version. Transfers change authorized holder under policy without producing two live tickets. Seat ownership, payment disposition and admission evidence remain distinct even when the UI presents one booking summary.\n\n## 6. Interviewer follow-ups\n\n**Does a QR code prevent screenshots?** No. It encodes data; admission-state rules prevent reuse online.\n\n**Does releasing a hold cancel a captured payment?** No. Resolve the financial outcome separately.\n\n## 7. Closing answer\n\nI separate inventory reservation, paid entitlement and admission consumption. Reserved seats claim identities; general admission claims quantity. Online conditional check-in prevents copied QR codes being used twice, while offline scanning has a deliberately weaker, documented duplicate-use guarantee.\n"
     },
     {
       "category": "AI",
@@ -224,102 +224,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "req",
-            "label": "Request",
+            "id": "n0",
+            "label": "Gateway admission",
             "x": 0,
-            "y": 130,
-            "w": 110,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "router",
-            "label": "Model Router",
-            "x": 180,
-            "y": 130,
-            "w": 160,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "cache",
-            "label": "Semantic Cache",
-            "x": 180,
             "y": 0,
-            "w": 160,
-            "h": 62,
-            "shape": "cylinder"
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           },
           {
-            "id": "small",
-            "label": "Small fast model",
-            "x": 460,
+            "id": "n1",
+            "label": "Run orchestrator",
+            "x": 250,
             "y": 0,
-            "w": 170,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "large",
-            "label": "Large model",
-            "x": 460,
-            "y": 130,
-            "w": 150,
+            "id": "n2",
+            "label": "Retrieval and tools",
+            "x": 500,
+            "y": 0,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "fallback",
-            "label": "Fallback provider",
-            "x": 460,
-            "y": 260,
-            "w": 170,
+            "id": "n3",
+            "label": "Provider router",
+            "x": 0,
+            "y": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "cb",
-            "label": "Rate limit + Circuit breaker",
-            "x": 170,
-            "y": 270,
-            "w": 240,
+            "id": "n4",
+            "label": "Model providers",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Output validator",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Usage and operations",
+            "x": 0,
+            "y": 220,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "req",
-            "to": "router"
+            "from": "n0",
+            "to": "n1",
+            "label": "bounded request"
           },
           {
-            "from": "router",
-            "to": "cache",
-            "label": "hit?"
+            "from": "n1",
+            "to": "n2",
+            "label": "authorized work"
           },
           {
-            "from": "router",
-            "to": "small",
-            "label": "easy"
+            "from": "n1",
+            "to": "n3",
+            "label": "remaining budget"
           },
           {
-            "from": "router",
-            "to": "large",
-            "label": "hard"
+            "from": "n3",
+            "to": "n4",
+            "label": "capability route"
           },
           {
-            "from": "large",
-            "to": "fallback",
-            "label": "on failure"
+            "from": "n4",
+            "to": "n5",
+            "label": "typed outcome"
           },
           {
-            "from": "cb",
-            "to": "router",
-            "label": "guards"
+            "from": "n1",
+            "to": "n6",
+            "label": "actual usage"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign the architecture of production AI systems in an enterprise: routing between models by task and cost, fallbacks across providers, caching (exact and semantic), handling provider rate limits, controlling cost and latency, and building resilience, so an AI feature behaves like any other critical service (SLOs, graceful degradation, budgets).\n\n## Requirements\n\n- Model routing: by task type, complexity, user tier, data sensitivity.\n- Resilience: timeouts, retries with backoff, circuit breakers, multi-provider fallback, degraded modes.\n- Caching: response caching, semantic caching, provider prompt caching, embedding caches.\n- Rate limits and quotas: provider TPM/RPM limits, per-tenant budgets, queueing.\n- Cost management and capacity planning. An AI gateway as a central control point.\n\n## Learn through a concrete example\n\nA useful AI endpoint becomes unusable when the provider slows down. Requests pile up, users retry, and each retry can trigger more paid work. Production architecture needs admission, deadlines and explicit partial outcomes as much as model selection.\n\nA **bulkhead** bounds a dependency's concurrency. A **circuit breaker** avoids repeated calls during known failure. A **run budget** limits tokens, tools, time and spend. A **fallback** is acceptable only if it meets the task's permissions, capability and quality requirements.\n\n## See admission and retry ownership\n\n![Every component spends from one end-to-end budget.](lessons/ai-19-flow.svg)\n\n*Every component spends from one end-to-end budget.*\n\n![One original request can multiply into many provider attempts.](lessons/ai-19-failure.svg)\n\n*One original request can multiply into many provider attempts.*\n\n### Calculate capacity and budget\n\nAt 50 requests/s and eight-second average residence, about 400 requests are active. If the provider can sustain only 200 at the required latency, an unbounded queue cannot solve the mismatch. Reject, defer, reduce work or provision capacity under a stated policy.\n\nFor a 20-second user deadline, reserve time for retrieval, generation and validation rather than giving each a fresh 20 seconds. A fallback must fit remaining time. If a tool already changed business state, retrying the whole run may be unsafe even when the model provider is replaceable.\n\n## Design details and alternatives\n\n### Key concepts and learning objective\n\n**Question to answer:** How do you keep an AI service usable under provider throttling, slow streams and unpredictable task cost?\n\nSeparate admission, orchestration, model providers, tool services, memory and evidence storage. Apply bulkheads and budgets at each expensive boundary. A model request may fail after consuming tokens or completing a tool, so retry safety depends on workflow state.\n\n### Architecture and contracts\n\n```text\nGateway quota -> request/run budget -> bounded orchestration -> authorized retrieval/tools -> provider route -> validation -> streaming/final delivery -> usage ledger\n\nApplication contracts (design outline):\nRunBudget(deadline,inputTokens,outputTokens,maxToolCalls,maxSpend); ProviderRoute(capabilities,region,policy); Outcome(status,usage)\n```\n\nUse explicit deadlines, bounded executors/reactive backpressure and circuit breakers around provider/tool calls. Persist expensive side-effect state before returning a retryable transport error.\n\n### Worked reasoning and capacity example\n\nAt 50 requests/s and 8-second average residence time, about 400 calls are concurrently in flight. If provider quota supports only 200, queueing without admission limits increases latency indefinitely. Budget tool latency and retries within the same end-to-end deadline.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord RunBudget(java.time.Instant deadline, int maxCalls, long maxOutputTokens) {}\n// Share remaining deadline/retry budget across orchestration and transports.\n// Persist side-effect identity before reporting a retryable request outcome.\n```\n\n### Design decisions and alternatives\n\nChoose fallbacks that satisfy data residency, tool/schema capabilities and quality gates. A cheaper/faster model is not automatically a behaviorally equivalent replacement. Scope caches by tenant and evidence/prompt/model versions.\n\n### Failure scenario and safe recovery\n\nA provider outage triggers retries at gateway, orchestrator and SDK. Three attempts at each layer can produce 27 downstream attempts per user request. Assign one retry owner and a shared remaining deadline.\n\n### Security, privacy and provenance\n\nServing a cached answer is safe only when authorization, freshness and task semantics still match. Semantic similarity alone does not establish that.\n\n### Hands-on lab and evaluation\n\n**Build:** Load-test with a stub provider that emits slow tokens, 429, timeout-after-tool and malformed output. Verify bounded queue, cancellation, degradation and no duplicate effects.\n\n**Measure:** Successful-task latency/cost, rejected admission, provider saturation, retry amplification, stream cancellation and oldest unresolved workflow.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n## Work through degradation\n\nSeparate “no supporting evidence,” “provider unavailable,” “budget exhausted” and “partial stream interrupted” in the UI/API. Returning invented text as a successful fallback hides failure. Cached answers need permission, evidence freshness and task equivalence checks; semantic similarity alone is insufficient.\n\nVersion deployments and canary on the same evaluation slices used before release. A fallback route may send data to another region/provider, so routing must respect the actual privacy/residency policy. Use stubs for overload and failure drills before relying on live-provider experiments.\n\n## Practise, then check your reasoning\n\n1. **Does a faster model guarantee an equivalent answer?** No. Evaluate task capability and policy compliance.\n2. **Should a cancelled browser request always keep running?** Define the product's durable/background semantics; otherwise propagate cancellation where supported.\n3. **Exercise:** simulate 429s, slow tokens, dropped connections and timeout after a tool action. Verify bounded queues, a single retry owner and no duplicate side effects.\n"
+      "markdown": "## Problem\n\nDesign the architecture of production AI systems in an enterprise: routing between models by task and cost, fallbacks across providers, caching (exact and semantic), handling provider rate limits, controlling cost and latency, and building resilience, so an AI feature behaves like any other critical service (SLOs, graceful degradation, budgets).\n\n## Requirements\n\n- Model routing: by task type, complexity, user tier, data sensitivity.\n- Resilience: timeouts, retries with backoff, circuit breakers, multi-provider fallback, degraded modes.\n- Caching: response caching, semantic caching, provider prompt caching, embedding caches.\n- Rate limits and quotas: provider TPM/RPM limits, per-tenant budgets, queueing.\n- Cost management and capacity planning. An AI gateway as a central control point.\n\n## 1. Selected production architecture\n\nI separate stateless request handling from a bounded run orchestrator, scoped evidence/tools, provider adapters and durable side-effect state. Provider routing uses a capability/policy registry, not merely a matching API shape. Queues and bulkheads have finite capacity.\n\n## 2. Budget and recovery contracts\n\n```text\nRunBudget: absoluteDeadline,input/outputTokens,maxSteps,maxAttempts,maxSpend\nOutcome: COMPLETE | NO_EVIDENCE | UNAVAILABLE | CANCELLED | BUDGET_EXHAUSTED\nRetry owner: orchestrator; downstream adapter attempts count in the same budget\nSideEffect: operationId,payloadHash,state,providerReference,reconciliationState\n```\n\nAt 50 requests/s and eight seconds average residence, about 400 requests are active. If the allowed provider concurrency is 200, admission/degradation must address the mismatch; an unbounded queue does not add capacity. Three retry layers with three attempts each may create 27 calls, so one shared remaining deadline/attempt counter controls them.\n\nFallback respects required tools/schema, quality, region and data policy. Cached answers require current permission/evidence equivalence. Cancellation stops unnecessary work where supported; intentionally durable background tasks have a separate explicit contract. A tool effect completed before model timeout is reconciled by its original identity before any whole-run replay. Canary release compares task quality, spend and critical failures, and rollback restores the previous evaluated configuration.\n\n## 3. Final design diagram\n\n[![Production AI Architecture: Gateway admission bounded request Run orchestrator; Run orchestrator authorized work Retrieval and tools; Run orchestrator remaining budget Provider router; Provider router capability route Model providers; Model providers typed outcome Output validator; Run orchestrator actual usage Usage and operations](designs/ai-19.svg)](designs/ai-19.svg)\n\nA **bulkhead** bounds a dependency's concurrency. A **circuit breaker** avoids repeated calls during known failure. A **run budget** limits tokens, tools, time and spend. A **fallback** is acceptable only if it meets the task's permissions, capability and quality requirements.\n\n## 4. Critical operation: worked execution\n\n![Every component spends from one end-to-end budget.](lessons/ai-19-flow.svg)\n\n*Every component spends from one end-to-end budget.*\n\n![One original request can multiply into many provider attempts.](lessons/ai-19-failure.svg)\n\n*One original request can multiply into many provider attempts.*\n\n### Calculate capacity and budget\n\nAt 50 requests/s and eight-second average residence, about 400 requests are active. If the provider can sustain only 200 at the required latency, an unbounded queue cannot solve the mismatch. Reject, defer, reduce work or provision capacity under a stated policy.\n\nFor a 20-second user deadline, reserve time for retrieval, generation and validation rather than giving each a fresh 20 seconds. A fallback must fit remaining time. If a tool already changed business state, retrying the whole run may be unsafe even when the model provider is replaceable.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** How do you keep an AI service usable under provider throttling, slow streams and unpredictable task cost?\n\nSeparate admission, orchestration, model providers, tool services, memory and evidence storage. Apply bulkheads and budgets at each expensive boundary. A model request may fail after consuming tokens or completing a tool, so retry safety depends on workflow state.\n\n### Architecture and contracts\n\n```text\nGateway quota -> request/run budget -> bounded orchestration -> authorized retrieval/tools -> provider route -> validation -> streaming/final delivery -> usage ledger\n\nApplication contracts (design outline):\nRunBudget(deadline,inputTokens,outputTokens,maxToolCalls,maxSpend); ProviderRoute(capabilities,region,policy); Outcome(status,usage)\n```\n\nUse explicit deadlines, bounded executors/reactive backpressure and circuit breakers around provider/tool calls. Persist expensive side-effect state before returning a retryable transport error.\n\n### Worked reasoning and capacity example\n\nAt 50 requests/s and 8-second average residence time, about 400 calls are concurrently in flight. If provider quota supports only 200, queueing without admission limits increases latency indefinitely. Budget tool latency and retries within the same end-to-end deadline.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord RunBudget(java.time.Instant deadline, int maxCalls, long maxOutputTokens) {}\n// Share remaining deadline/retry budget across orchestration and transports.\n// Persist side-effect identity before reporting a retryable request outcome.\n```\n\n### Design decisions and alternatives\n\nChoose fallbacks that satisfy data residency, tool/schema capabilities and quality gates. A cheaper/faster model is not automatically a behaviorally equivalent replacement. Scope caches by tenant and evidence/prompt/model versions.\n\n### Failure scenario and safe recovery\n\nA provider outage triggers retries at gateway, orchestrator and SDK. Three attempts at each layer can produce 27 downstream attempts per user request. Assign one retry owner and a shared remaining deadline.\n\n### Security, privacy and provenance\n\nServing a cached answer is safe only when authorization, freshness and task semantics still match. Semantic similarity alone does not establish that.\n\n\n**Verification criteria:** Successful-task latency/cost, rejected admission, provider saturation, retry amplification, stream cancellation and oldest unresolved workflow.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through degradation\n\nSeparate “no supporting evidence,” “provider unavailable,” “budget exhausted” and “partial stream interrupted” in the UI/API. Returning invented text as a successful fallback hides failure. Cached answers need permission, evidence freshness and task equivalence checks; semantic similarity alone is insufficient.\n\nVersion deployments and canary on the same evaluation slices used before release. A fallback route may send data to another region/provider, so routing must respect the actual privacy/residency policy. Use stubs for overload and failure drills before relying on live-provider experiments.\n\n## 6. Interviewer follow-ups\n\n**Does a faster model guarantee an equivalent answer?** No. Evaluate task capability and policy compliance.\n\n**Should a cancelled browser request always keep running?** Define the product's durable/background semantics; otherwise propagate cancellation where supported.\n\n## 7. Closing answer\n\nI bound admission, concurrency and every run's total time/tokens/attempts. One retry owner prevents amplification, and fallbacks satisfy capability and data policy before serving traffic. Explicit incomplete/unavailable outcomes preserve truth when a provider fails instead of substituting unsupported success.\n"
     }
   ]
 }

@@ -1,15 +1,17 @@
 === LLD 17 ===
-N|game|Game|300|0|130
-N|board|Board|300|150|130
-N|dice|Dice Strategy|0|0|150|ellipse
-N|player|Player queue|0|150|150
-N|jump|Snake / Ladder (Jump)|560|150|200
-N|rules|RuleSet|600|0|130|ellipse
-E|game|dice|roll
-E|game|player|next turn
-E|game|board|move(pos+roll)
-E|board|jump|lookup jump
-E|game|rules|exact end? 6 again?
+N|n0|Game|0|0|200|rect
+N|n1|Board|250|0|200|rect
+N|n2|Player|500|0|200|rect
+N|n3|Dice|0|110|200|rect
+N|n4|TurnPolicy|250|110|200|rect
+N|n5|JumpResolver|500|110|200|rect
+N|n6|MoveHistory|0|220|200|rect
+E|n0|n1|uses
+E|n0|n2|rotates
+E|n0|n3|rolls through
+E|n0|n4|advances with
+E|n1|n5|resolves jumps
+E|n0|n6|records
 ---
 ## Problem
 
@@ -28,13 +30,31 @@ Design Snake & Ladder: N players take turns rolling dice and move along a board 
 - Rule variants are configurable without changing the game loop.
 - The board is validated once at setup, not during play.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-A player on square 97 rolls 5 on a 100-square board. Do they stay at 97, bounce back, or finish? Different rules produce different valid games. The design must state the rule before hiding it in an `if` statement.
+I choose a 100-square board, six-sided dice, exact landing to win, one jump per landing and first winner ends the game. No bonus turn for six in this ruleset. The board validates jump endpoints and direction; snakes descend and ladders ascend.
+
+## 2. Turn execution
+
+```text
+playTurn(playerId):
+  verify active game and expected player
+  roll injected dice, require 1..6
+  candidate = position + roll
+  if candidate > 100: final = old position
+  else: final = jumpMap.getOrDefault(candidate,candidate)
+  commit roll, old/final position and winner or next player
+```
+
+At 14 with roll 3 and ladder 17→38, final position is 38. At 97 with roll 5, it stays 97. One-jump resolution cannot loop even if arbitrary map data contains a cycle; I still reject invalid self-jumps and endpoints at construction. A chained-jump extension uses a visited set and rejects cycles. Concurrent turn calls serialize at Game, preventing two dice rolls for the same accepted turn/version. Expected dice value 3.5 does not equal net progress because jumps and overshoots alter movement.
+
+## 3. Final design diagram
+
+[![Design Snake & Ladder: Game uses Board; Game rotates Player; Game rolls through Dice; Game advances with TurnPolicy; Board resolves jumps JumpResolver; Game records MoveHistory](designs/lld-17.svg)](designs/lld-17.svg)
 
 The **board** stores snakes and ladders, the **dice source** produces a roll, and the **game** owns turn order and player positions. Randomness is an input boundary, so tests should supply predetermined rolls rather than hope the right number appears.
 
-## See a turn and chained jumps
+## 4. Critical operation: worked execution
 
 ![The game applies movement policy before resolving a jump.](lessons/lld-17-flow.svg)
 
@@ -44,7 +64,7 @@ The **board** stores snakes and ladders, the **dice source** produces a roll, an
 
 *Validate jump chains or restrict the board to one jump per landing.*
 
-### Build and reason
+### Selected algorithm
 
 ```java
 // Rule sketch: exact landing; an overshoot leaves the position unchanged.
@@ -57,7 +77,7 @@ int advance(int current, int roll, int lastSquare) {
 
 For a board with six-sided dice, the expected single roll is `(1+2+3+4+5+6)/6 = 3.5`. That is not the expected net movement once snakes, ladders and overshoot rules apply. Avoid replacing the actual board process with this average when explaining game duration.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -103,12 +123,6 @@ Board maps starting squares to Jump targets; Game owns Players and current turn.
 game(id,board_size,current_player,version); player(id,position); jump(from_square,to_square); turn(id,roll,result)
 ```
 
-### State machine and command contracts
-
-```text
-READY -> RUNNING -> WON; each turn carries a sequence and one accepted roll
-```
-
 ### End-to-end execution trace
 
 Verify current player; obtain a dice value from the configured dice; compute tentative square; apply overshoot policy; resolve the allowed snake/ladder behavior with a visited set if chaining is supported; commit the final position; declare victory or advance turn.
@@ -116,8 +130,6 @@ Verify current player; obtain a dice value from the configured dice; compute ten
 ### Concurrency and recovery walkthrough
 
 Two roll commands for the same turn use different random values. A turn request ID and aggregate version prevent both from advancing the game; persist the chosen roll before returning success.
-
-
 
 ### Policy choices and extension seams
 
@@ -127,43 +139,43 @@ A map from square to destination is sufficient for snakes and ladders. Subclasse
 
 Reject jumps from or to invalid squares, duplicate jump origins and forbidden start/end cells. Decide whether landing on a ladder leads to another jump. Do not quietly hard-code a popular house rule as the only valid ruleset.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Deterministic dice; overshoot; exact finish; cycle detection; extra-turn rule; duplicate roll command; board configuration validation.
-
-**Lab:** Use scripted rolls to land on a snake, a ladder and an overshoot in consecutive turns. Then enable chained jumps and inject a cycle to verify validation.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through extension seams
+### Work through extension seams
 
 Represent jumps as data `start -> end`; validate endpoints inside the board and forbid a zero-length jump. If the chosen rules allow at most one jump per turn, document that instead of accidentally chaining jumps because the implementation uses recursion.
 
 Rules such as “roll six again” and “three sixes lose the turn” belong in a turn policy with an explicit roll history. They do not belong in the physical dice implementation. A replay log should store actual rolls and committed moves so results remain reproducible even if a random generator changes.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **How do you test a ladder landing?** Inject a roll that reaches its starting square and assert the final destination.
-2. **Should a winner keep receiving turns?** No. Define whether the game ends at first victory or ranks all players, then enforce that terminal policy.
-3. **Exercise:** replay `[3,6,2]` from known positions, test the 97+5 boundary and reject a cyclic jump map. No test should depend on luck or sleeping.
+**How do you test a ladder landing?** Inject a roll that reaches its starting square and assert the final destination.
+
+**Should a winner keep receiving turns?** No. Define whether the game ends at first victory or ranks all players, then enforce that terminal policy.
+
+## 7. Closing answer
+
+I make board jumps data and inject dice results, while Game owns deterministic turn transitions. Exact-landing and one-jump-per-landing are explicit policies. A move log records actual rolls, so tests and replay do not depend on randomness.
 
 === LLD 18 ===
-N|user|Passenger|0|0|130
-N|search|SearchService|280|0|160
-N|train|Train/Schedule|580|0|160
-N|book|BookingService|280|150|160
-N|inv|Seat Inventory (segments)|540|150|220|cylinder
-N|wl|Waitlist/RAC|280|280|150|ellipse
-N|pnr|PNR Booking|0|150|140
-E|user|search|from/to/date
-E|search|train|runs?
-E|user|book|book
-E|book|inv|allocate segment
-E|book|wl|if full
-E|book|pnr|issue
+N|n0|ReservationService|0|0|200|rect
+N|n1|TrainRun|250|0|200|rect
+N|n2|SeatAllocation|500|0|200|rect
+N|n3|JourneyInterval|0|110|200|rect
+N|n4|Booking|250|110|200|rect
+N|n5|Waitlist|500|110|200|rect
+N|n6|FarePolicy|0|220|200|rect
+E|n0|n1|selects
+E|n1|n2|owns
+E|n2|n3|claims segments
+E|n0|n4|creates
+E|n0|n5|promotes
+E|n4|n6|freezes price
 ---
 ## Problem
 
@@ -180,13 +192,30 @@ Design a train reservation system like IRCTC: search trains between stations on 
 **Non-functional**
 - No overlapping allocation of a seat on any segment. Fair under huge spikes.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-A train visits A, B, C and D. One passenger books seat 12 from A to C; another can use the same seat from C to D. Marking seat 12 as globally booked wastes valid capacity. Occupancy belongs to journey segments on one dated train run.
+I support one dated train run, reserved seats, cancellations and a FIFO eligible waitlist. A route version supplies ordered stop indices. Booking holds the accepted fare and journey; SeatAllocation owns occupied segments for each run-seat pair.
+
+## 2. Allocation algorithm
+
+```text
+book(id,runId,fromStop,toStop,passengers):
+  translate stops to validated interval [fromIndex,toIndex)
+  lock candidate run-seat rows in stable seat order
+  choose seats whose occupied bits do not intersect the interval mask
+  require enough seats; atomically OR masks and create one booking
+cancel(bookingId): remove only that booking's segments; reevaluate waitlist
+```
+
+A→C occupies `[0,2)` and C→D `[2,3)`, so the same seat serves both. B→D `[1,3)` conflicts with the first booking. With S stops, each seat needs S−1 segment bits in this fixed-route model. Passenger groups are all-or-nothing under the chosen contract. Two allocation workers cannot independently read and rewrite the same free mask: the locked/versioned update is decisive. Cancellation cannot clear another passenger's later segment, and timetable changes do not reinterpret tickets issued against an earlier route version.
+
+## 3. Final design diagram
+
+[![Design Train Reservation System: ReservationService selects TrainRun; TrainRun owns SeatAllocation; SeatAllocation claims segments JourneyInterval; ReservationService creates Booking; ReservationService promotes Waitlist; Booking freezes price FarePolicy](designs/lld-18.svg)](designs/lld-18.svg)
 
 A **route** defines ordered stops, a **run** is a train on a date, and a **reservation** owns seat capacity between two stop indices. For run R, A–C occupies `[0,2)` and C–D occupies `[2,3)`, which do not overlap.
 
-## See segment ownership
+## 4. Critical operation: worked execution
 
 ![A seat must be free for every occupied segment in the requested interval.](lessons/lld-18-flow.svg)
 
@@ -196,7 +225,7 @@ A **route** defines ordered stops, a **run** is a train on a date, and a **reser
 
 *Reserve the full requested journey or nothing.*
 
-### Build and calculate
+### Worked calculation and implementation
 
 For a route with S stops, each seat has S−1 travel segments. A bitset can represent segment occupancy for a fixed run; interval records can be clearer when route lengths vary. Both require an atomic check-and-reserve operation.
 
@@ -206,7 +235,7 @@ New request C-D = [2,3): allowed
 New request B-D = [1,3): overlaps, reject for this seat
 ```
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -244,12 +273,6 @@ TrainRun identifies a dated journey; Route has ordered Stations. Coach and Seat 
 run(id,service_date,route_version); seat(run_id,seat_id,occupied_mask,version); reservation(id,from_index,to_index,hold_id,status)
 ```
 
-### State machine and command contracts
-
-```text
-AVAILABLE segments -> HELD -> CONFIRMED -> CANCELLED; waitlist WAITING -> OFFERED -> CONFIRMED
-```
-
 ### End-to-end execution trace
 
 Validate station order and dated run; find seats with every requested segment free; atomically claim the segment set; create an expiring hold; confirm after payment; release only those segments on cancellation and promote waitlisted passengers according to policy.
@@ -257,8 +280,6 @@ Validate station order and dated run; find seats with every requested segment fr
 ### Concurrency and recovery walkthrough
 
 Requests A-to-C and B-to-D both see the same seat. Their bit masks overlap on B-to-C; atomic mask update or locked segment rows permits one. A-to-B and B-to-C can safely share the seat.
-
-
 
 ### Policy choices and extension seams
 
@@ -268,18 +289,14 @@ A bitset is compact for a short fixed route; relational segment rows make constr
 
 Route changes and coach substitutions need migration policies for existing reservations. Store service date and station zones explicitly. Cancellation after partial journey must not resell already traversed segments as future inventory.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Overlapping and adjacent segments; multi-seat atomicity; waitlist order; partial cancellation; late payment; route-version mismatch.
-
-**Lab:** For A-B-C-D, reserve A-C and test B-D rejection plus C-D acceptance. Cancel A-C and verify only A-B and B-C are released.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through waitlists and cancellation
+### Work through waitlists and cancellation
 
 Waitlist priority must be defined for the whole requested interval. Freeing A–B does not satisfy a passenger waiting for A–D. A cancellation releases only the original booking's segments, then reevaluates eligible waiting requests under the fairness policy.
 
@@ -287,26 +304,30 @@ Two allocation workers must not both observe a free bitset and write independent
 
 Keep route indices with a route version; changing a timetable's stop order must not reinterpret issued tickets. Price and cancellation fee snapshots preserve the contract even when tariffs later change.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Can the same seat have two tickets on a run?** Yes, for non-overlapping intervals.
-2. **Does cancelling A–C also free C–D?** No. That may belong to another passenger.
-3. **Exercise:** book A–C and C–D, reject B–D, cancel A–C, then accept A–B without affecting C–D. Race two requests for the last available segment and assert a single owner.
+**Can the same seat have two tickets on a run?** Yes, for non-overlapping intervals.
+
+**Does cancelling A–C also free C–D?** No. That may belong to another passenger.
+
+## 7. Closing answer
+
+I allocate dated-run seat segments, not globally booked seats. Half-open intervals permit back-to-back journeys, and one atomic allocation covers the entire requested route. Cancellation releases only the original owned segments and promotes only waitlist requests whose full journey can now fit.
 
 === LLD 19 ===
-N|cust|Customer|0|0|130
-N|order|Order|300|0|120
-N|sm|Order State Machine|580|0|180|ellipse
-N|inv|Inventory|0|150|130|cylinder
-N|pay|Payment|300|150|130
-N|ship|Shipment|580|150|140
-N|obs|Observers: email/SMS/analytics|240|280|260
-E|cust|order|place
-E|order|sm|transition
-E|order|inv|reserve
-E|order|pay|charge
-E|order|ship|create
-E|sm|obs|publish event
+N|n0|Order|0|0|200|rect
+N|n1|OrderLine|250|0|200|rect
+N|n2|InventoryReservation|500|0|200|rect
+N|n3|Shipment|0|110|200|rect
+N|n4|PaymentIntent|250|110|200|rect
+N|n5|Return|500|110|200|rect
+N|n6|Outbox|0|220|200|rect
+E|n0|n1|owns
+E|n1|n2|reserves
+E|n1|n3|fulfilled by
+E|n0|n4|collects through
+E|n3|n5|can produce
+E|n0|n6|publishes events
 ---
 ## Problem
 
@@ -326,13 +347,30 @@ Design Amazon's order management: from a cart, create an order that may hold ite
 - Handles sale-day peaks: high write throughput, with notifications sent asynchronously.
 - New payment methods and fulfilment types plug in without rewriting order flow.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-An online order contains a book from warehouse A and a charger from warehouse B. The book ships first. A single order-level `SHIPPED` flag cannot say whether both items shipped, whether the charger was cancelled, or which amount can be refunded.
+I support multi-line orders with split shipments, cancellation before dispatch and returns after delivery. An Order owns accepted terms; each line tracks quantities; warehouse and payment integrations have stable operation references. I choose quantity accounting rather than a single SHIPPED flag.
 
-Separate the **order** from its **lines**, **inventory reservations**, **shipments** and **payment operations**. An order summarizes the commercial agreement; fulfilment facts belong at the line/quantity level. Start with one transactional order store and explicit integrations.
+## 2. Commands and conservation
 
-## See split fulfilment
+```text
+submit(checkoutId,acceptedQuote) -> Order
+reserve(lineId,reservationId,quantity)
+ship(eventId,lineId,shipmentId,quantity)
+cancel(commandId,lineId,quantity)
+returnItem(returnId,lineId,quantity,evidence)
+Invariant: cancelled + shipped <= ordered; returned <= shipped
+```
+
+Every line transition locks its current version, checks remaining eligible quantity, deduplicates the operation/event and commits quantity plus outbox fact. For ordered 3, cancelled 1 and shipped 2, remaining-to-fulfil is zero. A repeated shipment event cannot increment shipped again. Cancellation racing dispatch competes for the same remaining units; the loser becomes a rejection or a return workflow. Capture-per-shipment and refunds reference actual captured amounts; a never-captured authorization is released instead of refunded. Returns append evidence without deleting original shipment history.
+
+## 3. Final design diagram
+
+[![Design Amazon Order Management: Order owns OrderLine; OrderLine reserves InventoryReservation; OrderLine fulfilled by Shipment; Order collects through PaymentIntent; Shipment can produce Return; Order publishes events Outbox](designs/lld-19.svg)](designs/lld-19.svg)
+
+Separate the **order** from its **lines**, **inventory reservations**, **shipments** and **payment operations**. An order summarizes the commercial agreement; fulfilment facts belong at the line/quantity level. I start with one transactional order store and explicit integrations.
+
+## 4. Critical operation: worked execution
 
 ![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)
 
@@ -342,7 +380,7 @@ Separate the **order** from its **lines**, **inventory reservations**, **shipmen
 
 *A line cannot be both newly cancelled and dispatched for the same units.*
 
-### Build and calculate
+### Worked calculation and implementation
 
 For an order line with quantity 3, track ordered, cancelled, shipped and returned quantities explicitly. If one unit is cancelled and two ship, fulfilment is complete even though shipped quantity is less than the original three. Returns refer to shipped units and do not rewrite the original order quantity.
 
@@ -353,7 +391,7 @@ Constraints: cancelled + shipped <= ordered
 Remaining to fulfil = ordered - cancelled - shipped = 0
 ```
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -391,12 +429,6 @@ Order snapshots buyer, lines, address, currency and totals. OrderLine references
 orders(id,request_key,total_minor,status,version); line(id,qty,shipped_qty,cancelled_qty); shipment; payment_attempt; refund
 ```
 
-### State machine and command contracts
-
-```text
-Order PENDING -> CONFIRMED -> PARTIALLY_FULFILLED -> FULFILLED; separate payment and refund statuses
-```
-
 ### End-to-end execution trace
 
 Validate quote; reserve inventory; create a pending order; authorize payment; confirm or compensate stock; capture according to fulfillment policy; split into shipments; record delivery; process partial refunds as separate auditable records.
@@ -404,8 +436,6 @@ Validate quote; reserve inventory; create a pending order; authorize payment; co
 ### Concurrency and recovery walkthrough
 
 Cancellation crosses shipment handoff. Compare order-line fulfillment quantities and cancel only unshipped units; compensation may become return/refund after the boundary. Late payment callbacks are deduplicated and reconciled.
-
-
 
 ### Policy choices and extension seams
 
@@ -415,43 +445,43 @@ One giant enum for every shipment/payment combination becomes unmaintainable. Se
 
 Two warehouses can partially fulfill one order. Refund arithmetic must account for prorated discounts and taxes. A retry with a reused idempotency key and changed cart payload is a conflict.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Duplicate checkout; inventory compensation; partial shipment; cancellation boundary; duplicate webhook; partial refund conservation; immutable price snapshots.
-
-**Lab:** Fulfill one of two lines, cancel the remainder and receive a duplicate payment webhook. Show final quantities, stock release and refund records.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through integration failures
+### Work through integration failures
 
 A duplicate warehouse event must not increment `shipped` twice. Use event identity and the line's legal remaining quantity. A reservation timeout that later succeeds needs reconciliation by reservation reference, especially if another warehouse was already asked to fulfil the same item.
 
 Payments follow capture policy: authorize at order placement, perhaps capture per shipment. Refunds must reference captured amounts; a cancelled, never-captured line may need authorization release rather than a refund. Store the financial evidence instead of inferring it from shipping status.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Can an order be completed with a cancelled line?** Yes, if every unit has a final documented fulfilment disposition.
-2. **Should a return delete a shipment?** No. The shipment happened; the return is a later event.
-3. **Exercise:** order three units, cancel one, ship two in separate events, replay the first event and return one. Verify quantity bounds and the exact captured/refundable amounts after each step.
+**Can an order be completed with a cancelled line?** Yes, if every unit has a final documented fulfilment disposition.
+
+**Should a return delete a shipment?** No. The shipment happened; the return is a later event.
+
+## 7. Closing answer
+
+I make fulfilment quantitative at order-line level and derive the order summary. Immutable commercial snapshots, versioned quantity transitions and idempotent warehouse events preserve partial shipments, cancellations and returns. Financial capture/refund follows actual recorded fulfilment policy rather than one overloaded status.
 
 === LLD 20 ===
-N|user|User|0|0|110
-N|cal|CalendarService|260|0|170
-N|conflict|ConflictChecker|580|0|170
-N|tree|Interval Index (TreeMap)|560|150|210|cylinder
-N|meet|Meeting|260|150|130
-N|rooms|Room Allocator|0|150|160|ellipse
-N|notify|Invite Notifier|260|280|160
-E|user|cal|schedule
-E|cal|conflict|check attendees
-E|conflict|tree|overlaps?
-E|cal|meet|create
-E|cal|rooms|find room
-E|meet|notify|invites/RSVP
+N|n0|CalendarService|0|0|200|rect
+N|n1|Event|250|0|200|rect
+N|n2|Occurrence|500|0|200|rect
+N|n3|RoomReservation|0|110|200|rect
+N|n4|RecurrenceRule|250|110|200|rect
+N|n5|Invitation|500|110|200|rect
+N|n6|ConflictPolicy|0|220|200|rect
+E|n0|n1|owns edits
+E|n1|n2|expands into
+E|n2|n3|claims
+E|n1|n4|defined by
+E|n1|n5|versions
+E|n3|n6|checks intervals
 ---
 ## Problem
 
@@ -467,13 +497,28 @@ Design a calendar and meeting scheduler like Google Calendar: create events, inv
 **Non-functional**
 - A room can never be double-booked. Searching across many attendees must be fast.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-Leena books meeting room R from 10:00 to 11:00. Another meeting starts at 11:00. These can coexist under half-open intervals, but a 10:30–11:30 request conflicts. A calendar is not merely a list of timestamps: recurrence, timezones and ownership change what “the same time” means.
+I schedule meetings with rooms, attendees and recurring local-time rules. Concrete occurrences store instants; recurring definitions store local time, ZoneId and an explicit gap/overlap policy. I materialize a bounded future horizon and extend it, avoiding an impossible infinite expansion.
+
+## 2. Reservation and edit transaction
+
+```text
+create(eventId,organizer,start,end,room,attendees) -> EventVersion
+reschedule(eventId,expectedVersion,newInterval,newRoom) -> Version | Conflict
+respond(invitationId,eventVersion,attendee,answer) -> AttendanceState
+conflict(a,b) = a.start < b.end && b.start < a.end
+```
+
+The room transaction serializes interval allocation and the event version change. A failed reschedule keeps the original reservation intact. 10:00–11:00 and 11:00–12:00 coexist; 10:30–11:30 conflicts. Editing one recurrence creates an exception; “this and future” splits the series under explicit identity/version rules. Responses to an old invitation version do not overwrite the new version's attendance. A 09:00 Europe/London weekly rule is re-expanded using timezone rules, not by adding a fixed UTC offset forever. Late notifications refer to event versions and cannot resurrect cancelled occurrences.
+
+## 3. Final design diagram
+
+[![Design Calendar / Meeting Scheduler: CalendarService owns edits Event; Event expands into Occurrence; Occurrence claims RoomReservation; Event defined by RecurrenceRule; Event versions Invitation; RoomReservation checks intervals ConflictPolicy](designs/lld-20.svg)](designs/lld-20.svg)
 
 An **event** is a user's scheduling intent; an **occurrence** is one dated instance of a recurring event; a **resource reservation** claims a room over an interval. Separate personal invitations from the room's exclusive allocation.
 
-## See reservation and a daylight-saving complication
+## 4. Critical operation: worked execution
 
 ![Room ownership is decided independently of email invitations.](lessons/lld-20-flow.svg)
 
@@ -483,7 +528,7 @@ An **event** is a user's scheduling intent; an **occurrence** is one dated insta
 
 *Expand recurring occurrences using a timezone identifier and policy.*
 
-### Build and reason
+### Selected algorithm
 
 ```text
 Overlap(a,b) = a.start < b.end AND b.start < a.end
@@ -493,7 +538,7 @@ Overlap(a,b) = a.start < b.end AND b.start < a.end
 
 Store instants for concrete occurrences and a `ZoneId` plus local rule for recurrence. Some local times are missing or duplicated during clock changes; choose a policy and show it to the organizer rather than silently shifting an important meeting.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -532,12 +577,6 @@ Calendar owns Events and access rules. Event contains organizer, attendees, star
 event(id,start_instant,end_instant,zone,recurrence_rule,version); occurrence_override(event_id,original_start,status); invitation(event_id,attendee,response)
 ```
 
-### State machine and command contracts
-
-```text
-Event CONFIRMED -> CANCELLED; invitation NEEDS_ACTION -> ACCEPTED | DECLINED | TENTATIVE
-```
-
 ### End-to-end execution trace
 
 Validate organizer permissions and interval; expand only the requested recurrence horizon; check resource conflicts; save event and invitation intent atomically; notify after commit; track accept/decline responses with versions; apply single-occurrence overrides separately.
@@ -545,8 +584,6 @@ Validate organizer permissions and interval; expand only the requested recurrenc
 ### Concurrency and recovery walkthrough
 
 Two organizers reserve one room for overlapping intervals. An authoritative room-schedule lock or range exclusion constraint decides the winner. Availability lookup alone is advisory.
-
-
 
 ### Policy choices and extension seams
 
@@ -556,25 +593,25 @@ Persisting local recurrence rule plus zone preserves a recurring 09:00 meeting a
 
 A daylight-saving gap may make a local time nonexistent, while an overlap makes it ambiguous. Choose and display a resolution policy. Half-open intervals allow back-to-back meetings. All-day events should use dates rather than pretending every day is exactly 24 hours.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Adjacent slots; room conflict; personal overlap policy; daylight-saving gap/overlap; single-occurrence edit; duplicate invitation; unauthorized calendar access.
-
-**Lab:** Create a weekly meeting across a daylight-saving transition, move one occurrence and reserve an adjacent room slot. Explain identity and overlap behavior.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through edits and concurrency
+### Work through edits and concurrency
 
 Two organizers can race for an empty room. A preflight availability search is useful but cannot establish the reservation. The room's transaction/interval constraint decides. Changing room or time should release the old reservation only if acquiring the new one succeeds atomically under the chosen storage design.
 
 Editing one occurrence creates an exception; editing “this and future” may split the recurring series. Expanding an infinite series into database rows is impossible, so use a bounded scheduling horizon and extend it with conflict handling. Version invitations so late responses to an old time do not overwrite responses to the replacement event.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does a declined attendee response free the room?** No. The organizer's event owns it until cancellation or modification.
-2. **Does storing UTC solve recurrence?** It solves concrete instants, not recurring local-time intent.
-3. **Exercise:** reserve adjacent meetings, reject an overlap, then move one meeting into a conflicting slot and verify its original reservation survives the rejected edit. Add one timezone transition test without depending on the machine's default timezone.
+**Does a declined attendee response free the room?** No. The organizer's event owns it until cancellation or modification.
+
+**Does storing UTC solve recurrence?** It solves concrete instants, not recurring local-time intent.
+
+## 7. Closing answer
+
+I separate event intent, dated occurrences and exclusive room allocation. Half-open intervals define conflicts, timezone-aware recurrence preserves local intent, and versioned edits acquire replacement reservations before releasing old ones. Invitation responses cannot silently alter room ownership.

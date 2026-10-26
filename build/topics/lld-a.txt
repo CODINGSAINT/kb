@@ -1,17 +1,17 @@
 === LLD 2 ===
-N|lot|ParkingLot|300|0|150
-N|floor|ParkingFloor|300|135|150
-N|spot|ParkingSpot|300|270|150
-N|gate|Entry/Exit Gate|0|135|150
-N|ticket|Ticket|0|270|130
-N|fee|FeeStrategy|600|135|150|ellipse
-N|alloc|SpotAllocator|600|0|150|ellipse
-E|lot|floor|has N
-E|floor|spot|has N
-E|lot|gate|has
-E|gate|ticket|issues
-E|lot|alloc|uses
-E|lot|fee|uses
+N|n0|ParkingLot|0|0|200|rect
+N|n1|SpotAllocator|250|0|200|rect
+N|n2|ParkingSpot|500|0|200|rect
+N|n3|ParkingSession|0|110|200|rect
+N|n4|PricingPolicy|250|110|200|rect
+N|n5|PaymentPort|500|110|200|rect
+N|n6|GatePort|0|220|200|rect
+E|n0|n1|selects through
+E|n1|n2|claims
+E|n0|n3|owns visits
+E|n3|n4|quotes with
+E|n3|n5|collects through
+E|n0|n6|opens after grant
 ---
 ## Problem
 
@@ -29,13 +29,34 @@ Design a parking lot system in Java with multiple floors, several vehicle and sp
 - Several gates operate at the same time, so spot assignment must be thread-safe.
 - Adding a vehicle type, spot type or pricing rule shouldn't mean rewriting existing classes.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-A car enters a parking building. The display says there is one free car-sized space. Two gates read that display at the same time. If both issue tickets for that space, the object model has failed even if every class has a sensible name.
+I support a multi-floor lot with several gates, vehicle-to-spot compatibility, ticket issuance, time-based fees and payment-assisted exit. I start in one process. `ParkingLot` coordinates allocation, while `PricingPolicy`, `PaymentPort` and `GatePort` isolate changeable pricing and physical/external actions. The invariant is one active session per occupied spot, and one settled financial intent per exit.
+
+## 2. Contracts, records and ownership
+
+```text
+enter(entryRequestId, vehicle, now) -> Ticket(sessionId, spotId, enteredAt)
+quoteExit(sessionId, now) -> Quote(quoteId, amountPaise, tariffVersion, expiresAt)
+payExit(sessionId, quoteId, paymentRequestId) -> PaymentPending | ExitGranted
+confirmExit(sessionId, gateEventId) -> Closed
+
+ParkingSession: id, vehicleId, spotId, enteredAt, status, finalQuote, version
+Occupancy: spotId PRIMARY KEY, activeSessionId UNIQUE
+PaymentIntent: requestId UNIQUE, sessionId, quoteId, payloadHash, result
+```
+
+`enter` locks the allocation boundary, finds a compatible free spot, records occupancy and session together, then returns the ticket. Repeating the same entry identity returns that ticket. A gate failure leaves a visible allocated session for retry/operator recovery; it does not allocate another spot.
+
+For exit, I lock the session, persist the accepted quote and payment intent, release the lock and call the provider. A callback reacquires the session, records the known payment outcome once, and grants gate access after success. A timeout remains pending until queried by the same provider reference. `confirmExit` closes the session and removes occupancy atomically. ₹40 for the first hour plus ₹20 per started additional hour gives ₹60 at 61 minutes; money is stored as 6,000 paise and that result is retained with its tariff version.
+
+## 3. Final design diagram
+
+[![Design Parking Lot: ParkingLot selects through SpotAllocator; SpotAllocator claims ParkingSpot; ParkingLot owns visits ParkingSession; ParkingSession quotes with PricingPolicy; ParkingSession collects through PaymentPort; ParkingLot opens after grant GatePort](designs/lld-2.svg)](designs/lld-2.svg)
 
 Build one lot before a network of lots. A *spot* is the physical place; a *ticket* records a visit; a *vehicle category* constrains what fits; a *pricing policy* computes a fee. Free-space counts are useful summaries, but the spot's allocation is the authority. The central rule is: a spot has at most one active parking session.
 
-## See allocation and the two-gate race
+## 4. Critical operation: worked execution
 
 ![Allocation and ticket creation succeed together before the gate opens.](lessons/lld-2-flow.svg)
 
@@ -45,7 +66,7 @@ Build one lot before a network of lots. A *spot* is the physical place; a *ticke
 
 *Availability is checked again where ownership changes.*
 
-### Build the first version
+### Core implementation
 
 Use a compatibility policy rather than `vehicle.type == spot.type`: a motorcycle might be allowed in a car spot, depending on the lot's rules. Keep that decision separate from the allocation algorithm, which might choose the nearest compatible spot.
 
@@ -64,7 +85,7 @@ synchronized Ticket park(Vehicle vehicle, Instant enteredAt) {
 
 `ConcurrentHashMap` would protect individual map calls, but would not make the spot search, allocation and ticket insertion atomic. In a durable version, use one transaction and a uniqueness rule for active spot occupancy; update counts only after the claim succeeds.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -118,12 +139,6 @@ ParkingLot contains Floors and ParkingSpots. Vehicle and SpotType are values. Al
 spot(id,floor,type,state,version); ticket(id,vehicle_id,spot_id,entry_at,tariff_version,status,entry_request_id)
 ```
 
-### State machine and command contracts
-
-```text
-FREE -> OCCUPIED -> FREE; ticket OPEN -> PAYMENT_PENDING -> PAID -> CLOSED
-```
-
 ### End-to-end execution trace
 
 Validate vehicle and gate; look up the entry request ID; find compatible candidates; claim one atomically; create the ticket in the same transaction; return its immutable ID. At exit compute the quote, request payment outside the spot lock, persist the payment result, then release the spot exactly once.
@@ -131,8 +146,6 @@ Validate vehicle and gate; look up the entry request ID; find compatible candida
 ### Concurrency and recovery walkthrough
 
 Two entry gates both see the last free spot. A conditional FREE-to-OCCUPIED update determines the winner. A process lock is sufficient only for one JVM; multiple gates backed by different JVMs need the database constraint or equivalent authority.
-
-
 
 ### Policy choices and extension seams
 
@@ -142,18 +155,14 @@ Nearest-spot allocation is simple but can starve some floors; balanced allocatio
 
 A payment timeout is not a decline: keep a pending exit and reconcile the provider result. Support a lost-ticket policy explicitly. Release on confirmed exit, not merely on payment initiation. Reconstruct display-board counts after a restart.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Compatibility rejects an oversized vehicle; simultaneous claims have one winner; duplicate entry returns one ticket; payment failure retains occupancy; repeated exit does not free twice.
-
-**Lab:** Race fifty gate requests against one free EV spot, then retry the winning request. Show one ticket, one allocation and a stable response.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through exit and pricing
+### Work through exit and pricing
 
 Suppose the policy is ₹40 for the first hour, then ₹20 for each started additional hour. Entry at 09:10 and exit at 10:11 is 61 minutes: charge ₹60. At exactly 10:10 the charge is ₹40. Document the boundary before writing `ceil`, and store amounts in paise so ₹60 is `6000`, not a floating-point approximation.
 
@@ -161,28 +170,30 @@ Keep `quoteExit(ticketId, now)` separate from `completeExit(paymentReference)`. 
 
 When payment is external, use `PAYMENT_PENDING`, `PAID` and `CLOSED` states. A timeout means the payment outcome may be unknown. Query the original payment reference before charging again. Release the physical spot only at the product's defined exit point, not whenever a payment HTTP call returns.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Can the floor display reserve a spot?** No. It is a read model and can be stale. The allocation operation establishes ownership.
-2. **Two exit requests use the same ticket. Should they charge twice?** No. Persist the settled result and return it on repeats; reject a different payment intent after settlement.
-3. **Add electric charging. Which class changes?** Introduce charging capability and a charging-session policy. Do not make every car an electric car or mix energy billing into spot geometry.
+**Can the floor display reserve a spot?** No. It is a read model and can be stale. The allocation operation establishes ownership.
 
-Test zero spots, incompatible free spots, two simultaneous gate claims, exact pricing boundaries and repeated exits. For the race, start both requests behind a barrier and assert one active ticket for the one spot. Counting successful HTTP responses alone can miss leaked or duplicate allocations.
+**Two exit requests use the same ticket. Should they charge twice?** No. Persist the settled result and return it on repeats; reject a different payment intent after settlement.
+
+## 7. Closing answer
+
+My design makes the parking session the visit record and the spot allocation the exclusive ownership decision. I freeze the final tariff result, reconcile uncertain payments by their original reference, and release a spot according to an explicit exit event. Displays can lag without allocating the same spot twice.
 
 === LLD 3 ===
-N|ctrl|ElevatorController|290|0|190
-N|req|Request Queue|0|0|150|cylinder
-N|sched|SchedulingStrategy|600|0|160|ellipse
-N|car|Elevator Car|290|150|160
-N|state|State: Idle/Up/Down|290|270|190|ellipse
-N|panel|Hall/Car Buttons|0|150|160
-N|door|Door|600|150|130
-E|panel|req|submit
-E|req|ctrl|poll
-E|ctrl|sched|choose car
-E|ctrl|car|dispatch
-E|car|state|current
-E|car|door|controls
+N|n0|Dispatcher|0|0|200|rect
+N|n1|ElevatorCar|250|0|200|rect
+N|n2|StopPlan|500|0|200|rect
+N|n3|DoorController|0|110|200|rect
+N|n4|SafetyInterlock|250|110|200|rect
+N|n5|HallRequest|500|110|200|rect
+N|n6|CarRequest|0|220|200|rect
+E|n0|n1|assigns to
+E|n1|n2|owns
+E|n1|n3|controls
+E|n3|n4|must satisfy
+E|n0|n5|queues
+E|n1|n6|accepts
 ---
 ## Problem
 
@@ -200,13 +211,33 @@ Design an elevator system for a building with N floors and M elevators. Users pr
 - Requests arrive concurrently from many buttons.
 - Swappable scheduling (rush-hour mode, energy-saving mode).
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-You press Up on floor 2. Someone inside a lift presses floor 7. These buttons express different intentions: a **hall request** needs a car going in a direction; a **car request** already belongs to a particular car. Treating both as an unordered list makes lifts reverse wastefully and can strand waiting riders.
+I design dispatch and car-control software for a ten-floor building with two cars. Hall requests carry floor and direction; car requests carry destination and car identity. I choose one dispatcher and a single-owner event loop per car. This provides ordered state changes without a lock around slow physical motion. Certified hardware interlocks enforce actual motor safety; this model specifies the software's responsibilities.
 
-Start with two cars in a ten-floor building. Model movement and door state separately from dispatch. The dispatcher chooses a car; the car controller decides its next safe action. A simulator can model these decisions, but a real elevator needs certified hardware safety controls outside this educational software.
+## 2. Events and selected scheduling algorithm
 
-## See dispatch and safety precedence
+```text
+HallCall(floor,direction) -> outstanding call ID, coalesced by floor/direction
+Assign(callId,carId,assignmentVersion) -> accepted or car unavailable
+CarButton(carId,destination) -> queued stop
+SensorEvent(carId,sequence,floor,doorSafe,load) -> state update
+
+Dispatcher score = estimated pickup travel + intermediate dwell + aging penalty
+Car plan = ordered upward and downward stop sets (LOOK-style)
+```
+
+On a hall call, I exclude out-of-service/full cars, estimate pickup using their existing direction/stops, and assign the lowest-cost eligible car. Aging lowers the effective cost of long-waiting calls so nearby traffic does not starve them. Within a car, I serve reachable stops in the current direction, reverse only when no relevant stop remains, and handle a stop at the current floor before selecting `higher`/`lower`.
+
+The car transitions `IDLE -> MOVING -> STOPPED -> DOOR_OPEN -> DOOR_CLOSING`; only confirmed closed-and-safe doors permit `MOVING`. Obstruction returns to `DOOR_OPEN`. When a car fails, I cancel its assignment version and requeue unserved hall calls; late arrival events cannot clear the replacement car's assignment. A 0-to-2 pickup takes about six travel seconds at an assumed three seconds/floor, whereas a downward car at 3 serving 1 first also incurs reversal and a door dwell. Direction-aware ETA therefore beats distance alone.
+
+## 3. Final design diagram
+
+[![Design Elevator System: Dispatcher assigns to ElevatorCar; ElevatorCar owns StopPlan; ElevatorCar controls DoorController; DoorController must satisfy SafetyInterlock; Dispatcher queues HallRequest; ElevatorCar accepts CarRequest](designs/lld-3.svg)](designs/lld-3.svg)
+
+I start with two cars in a ten-floor building. Model movement and door state separately from dispatch. The dispatcher chooses a car; the car controller decides its next safe action. A simulator can model these decisions, but a real elevator needs certified hardware safety controls outside this educational software.
+
+## 4. Critical operation: worked execution
 
 ![The dispatcher assigns work; the car controller owns movement and doors.](lessons/lld-3-flow.svg)
 
@@ -216,7 +247,7 @@ Start with two cars in a ten-floor building. Model movement and door state separ
 
 *A movement plan never overrides the door safety interlock.*
 
-### Build the first version
+### Core implementation
 
 Keep `CarState(currentFloor, direction, doorState, serviceMode)` and ordered stop sets. A LOOK-like policy serves requested stops in the current direction and reverses after the last relevant stop; it need not travel to the building's extreme floor like a literal SCAN sweep.
 
@@ -234,7 +265,7 @@ OptionalInt nextStop(CarSnapshot car, NavigableSet<Integer> stops) {
 
 A stop at the current floor must be handled before calling this function. Otherwise `higher`/`lower` skips it. Keep hall-call direction with the assignment so clearing an Up call does not incorrectly clear a Down call at the same floor.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -282,12 +313,6 @@ ElevatorSystem owns a collection of ElevatorCars; HallCall records floor and dir
 car_id, current_floor, direction, mode, door_state, pending_stops, version; hall_call(id,floor,direction,status)
 ```
 
-### State machine and command contracts
-
-```text
-IDLE -> MOVING_UP | MOVING_DOWN -> STOPPED -> DOOR_OPEN -> DOOR_CLOSED; FAULT overrides movement
-```
-
 ### End-to-end execution trace
 
 Validate the floor; coalesce a repeated hall call; assign a compatible healthy car; insert the pickup into its stop plan; move only after the door-closed signal; arrive, stop, open and acknowledge the call; then process selected destinations.
@@ -295,8 +320,6 @@ Validate the floor; coalesce a repeated hall call; assign a compatible healthy c
 ### Concurrency and recovery walkthrough
 
 A car changes direction while the dispatcher reads its state. Accept a proposed assignment against the controller version or re-evaluate it on the controller event loop. One controller owns each car state; several dispatchers must not mutate its stop set independently.
-
-
 
 ### Policy choices and extension seams
 
@@ -306,18 +329,14 @@ Nearest-car dispatch optimizes a simple distance estimate but can ignore directi
 
 Overload keeps doors open and suppresses movement. Fire mode and maintenance remove a car from normal dispatch. A failed car returns unserved hall calls to the pending queue. An emergency stop cannot be represented as just another destination.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** No movement with an open door; duplicate hall calls coalesce; floor bounds hold; a fault causes re-dispatch; starvation is bounded under continuous traffic.
-
-**Lab:** Simulate opposite-direction calls at the same floor, then disable the assigned car. Verify re-dispatch without losing either request.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through a dispatch decision
+### Work through a dispatch decision
 
 Car A is on floor 0 moving up with stops at 3 and 6. Car B is on floor 3 moving down to 1. A new Up call arrives at 2. Nearest-distance-only chooses B: it is one floor away while A is two floors away. But B must finish its downward service and reverse before serving an upward pickup; A can insert floor 2 on its current path. A sensible cost includes travel direction, planned stops, load and time already waited. State the example costs explicitly rather than calling a strategy “optimal.”
 
@@ -325,28 +344,30 @@ Suppose A needs 3 seconds per floor and 5 seconds per door cycle. Reaching floor
 
 Repeated hall button presses should coalesce into one outstanding `(floor,direction)` request. When a car becomes out of service, return its unserved hall assignments to the dispatcher. A fire-service mode changes which commands are legal; it should be a named operating mode, not a boolean scattered across movement methods.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Why separate dispatch from movement?** A better assignment heuristic should not rewrite door interlocks or motor commands.
-2. **What happens if the nearest car is full?** It may pass the hall request; retain the request and assign another eligible car rather than clearing it merely because a car arrived.
-3. **How do you test starvation?** Continuously generate nearby requests while one distant call waits. Measure maximum wait and add an age term or reassignment policy if the old call never wins.
+**Why separate dispatch from movement?** A better assignment heuristic should not rewrite door interlocks or motor commands.
 
-Use a fake simulation clock and an event log: request received, car assigned, door opened, rider boarded, destination served. Assert that no event sequence contains movement with an open door and that reassignment does not silently lose a hall call.
+**What happens if the nearest car is full?** It may pass the hall request; retain the request and assign another eligible car rather than clearing it merely because a car arrived.
+
+## 7. Closing answer
+
+I separate fleet assignment from each car's safe motion. A LOOK-style stop plan limits unnecessary reversals, hall-call direction is preserved, and door/interlock state outranks the dispatch schedule. One event loop per car makes state transitions deterministic; the real safety controller remains the hardware authority.
 
 === LLD 4 ===
-N|user|User|0|0|120
-N|svc|BookingService|250|0|170
-N|show|Show|560|0|140
-N|seat|ShowSeat|560|150|140
-N|lock|SeatLockProvider|250|150|170|ellipse
-N|pay|PaymentService|0|150|160
-N|booking|Booking|250|280|150
-E|user|svc|select seats
-E|svc|lock|lock(seats, ttl)
-E|svc|show|for show
-E|show|seat|has N
-E|svc|pay|charge
-E|svc|booking|create
+N|n0|BookingService|0|0|200|rect
+N|n1|ShowSeat|250|0|200|rect
+N|n2|Hold|500|0|200|rect
+N|n3|Booking|0|110|200|rect
+N|n4|PaymentIntent|250|110|200|rect
+N|n5|PaymentPort|500|110|200|rect
+N|n6|ExpiryWorker|0|220|200|rect
+E|n0|n1|locks selected
+E|n0|n2|creates
+E|n2|n3|confirms into
+E|n0|n4|records
+E|n4|n5|calls
+E|n6|n2|expires by token
 ---
 ## Problem
 
@@ -363,13 +384,35 @@ Design a movie booking system like BookMyShow: browse cities, cinemas, movies an
 - No double booking, ever.
 - Seat holds must expire without a manual cleanup step.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-Asha and Ben both click seat A7 for the same film show. The seat exists once on the screen's layout, but its availability belongs to **that show**, not to every future screening. This distinction prevents a common model error: putting one global `booked` flag on `Seat`.
+I design reserved-seat booking for a specific show, including an all-or-nothing multi-seat hold, payment, confirmation and expiry. Static `Seat` describes the physical layout; `ShowSeat(showId,seatId)` owns availability for one screening. I choose a relational transaction for allocation and a separate idempotent payment workflow.
+
+## 2. Schema and complete reservation transaction
+
+```text
+ShowSeat PK(showId,seatId): status, holdId, expiresAt, bookingId
+Hold PK(holdId): customerId, showId, expiresAt, quotedAmount, currency, state
+Booking PK(bookingId): holdId UNIQUE, customerId, acceptedPrice, state
+PaymentIntent PK(intentId): holdId, providerRef UNIQUE, state, payloadHash
+
+holdSeats(requestId,showId,seatIds,customer) -> Hold | Conflict
+confirmPayment(providerRef) -> Booking | RefundRequired | Pending
+```
+
+`holdSeats` begins a transaction, locks all requested show-seat rows in sorted seat order, verifies every row is free or expired, writes one hold identity to every seat, and commits. If any seat is unavailable, the transaction rolls back all claims. A request identity with a different payload is rejected; a true retry returns its original hold.
+
+Confirmation locks the hold and the same seat rows, verifies `now < expiresAt`, ownership of every seat, and successful payment evidence. It inserts one booking, changes all seats to SOLD and commits. Expiry competes for these same rows and releases only matching expired hold tokens. If payment completed after ownership was lost, the financial result becomes paid-but-unfulfilled and initiates one refund intent; it never overrides a newer hold. A7 and A8 at ₹250 each produce a frozen ₹500 quote, so price changes during payment cannot alter accepted terms.
+
+For browsing, `GET /movies?city=...` and `GET /shows/{id}/seats` return catalogue/read-model data; neither claims seats. `cancelBooking(bookingId,requestId)` authorizes the owner and cutoff policy, locks the booking and its seats, marks the booking cancelled, releases only seats owned by it, and writes one refund intent in the same transaction. The refund may remain pending while the seat is available again: the customer is still owed that recorded refund. A repeated cancellation returns the original disposition. A cancelled hold with a later successful charge follows the same paid-but-unfulfilled compensation path.
+
+## 3. Final design diagram
+
+[![Design BookMyShow / Movie Booking: BookingService locks selected ShowSeat; BookingService creates Hold; Hold confirms into Booking; BookingService records PaymentIntent; PaymentIntent calls PaymentPort; ExpiryWorker expires by token Hold](designs/lld-4.svg)](designs/lld-4.svg)
 
 Build one show's reservation flow first. A *hold* is temporary ownership while a customer pays. A *booking* is the confirmed purchase. A *hold token* identifies this particular ownership attempt; the seat number alone cannot distinguish an old timer from the current owner.
 
-## See hold ownership and a stale callback
+## 4. Critical operation: worked execution
 
 ![Seats remain unavailable to competitors while payment is in progress.](lessons/lld-4-flow.svg)
 
@@ -379,7 +422,7 @@ Build one show's reservation flow first. A *hold* is temporary ownership while a
 
 *Compare the hold token as well as the expiry before releasing seats.*
 
-### Build the first version
+### Core implementation
 
 Use `ShowSeat(showId, seatId, status, holdId, expiresAt, version)` and a separate `Hold` record listing all requested seats. Sort seat identifiers before locking them, so two multi-seat requests acquire locks in the same order. Either all requested seats are held or none are.
 
@@ -394,7 +437,7 @@ WHERE show_id = :show AND seat_id = :seat
 
 This statement is intentionally a release condition, not the whole booking algorithm. Confirmation must lock or conditionally update the same authoritative rows and verify that the entire hold still belongs to the payer.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -402,9 +445,9 @@ This statement is intentionally a release condition, not the whole booking algor
 |---|---|
 | `Movie`, `Cinema`, `Screen`, `Seat` | Catalogue and static layout |
 | `Show` | movie + screen + start time. Owns `ShowSeat`s |
-| `ShowSeat` | seat for a particular show. Status: `AVAILABLE`, `LOCKED`, `BOOKED` |
+| `ShowSeat` | seat for a particular show. Status: `AVAILABLE`, `HELD`, `SOLD` |
 | `SeatLockProvider` | `lock(show, seats, user, ttl)`, `unlock` and `validate` |
-| `Booking` | user, show, seats, amount. State: `PENDING → CONFIRMED / CANCELLED / EXPIRED` |
+| `Booking` | user, show, seats, amount. State: `CONFIRMED → CANCELLED`; pending/expired states belong to Hold |
 | `PaymentService` | Strategy per method, plus idempotency key |
 | `PricingStrategy` | seat category, weekday/weekend, dynamic pricing |
 
@@ -443,12 +486,6 @@ Movie, Theatre, Screen, Seat and Show describe inventory. ShowSeat is the sellab
 show_seat(show_id,seat_id,state,hold_id,expires_at,version); booking(id,hold_id,payment_id,status,amount_minor)
 ```
 
-### State machine and command contracts
-
-```text
-AVAILABLE -> HELD -> BOOKED; HELD -> AVAILABLE on expiry; payment UNKNOWN requires reconciliation
-```
-
 ### End-to-end execution trace
 
 Validate show and seat IDs; lock seats in a deterministic order; reclaim expired holds according to database time; atomically create one hold; collect payment without holding row locks; on callback verify hold owner, expiry and payment identity; atomically confirm the entire booking.
@@ -456,8 +493,6 @@ Validate show and seat IDs; lock seats in a deterministic order; reclaim expired
 ### Concurrency and recovery walkthrough
 
 Two users choose the same pair of seats while the expiry worker runs. Conditional ownership transitions use hold IDs and versions, so a late worker cannot clear a newer hold. A late payment callback cannot confirm seats now owned by another booking.
-
-
 
 ### Policy choices and extension seams
 
@@ -467,18 +502,14 @@ Pessimistic row locking is easy for small seat sets; optimistic version checks s
 
 A callback may arrive twice or before the client receives its payment result. Persist provider event identity and use a booking idempotency key. Seat maps can be stale; the confirmation response, not the map colour, establishes ownership.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** All-or-none multi-seat allocation; expired hold cannot confirm; repeated callback has one effect; a newer hold survives an old expiry job; prices remain stable.
-
-**Lab:** Interleave expiry, a second customer hold and the first payment callback. Trace why the second customer retains the seat and why the first payment enters reconciliation.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through payment and expiry
+### Work through payment and expiry
 
 Let H21 expire at 10:05:00. Define valid ownership as `now < expiresAt`; at exactly 10:05:00, it is expired. Both payment confirmation and the cleanup worker must use this rule. Cleanup timing does not establish validity: a row still labelled HELD at 10:05:02 is not an entitlement to confirm.
 
@@ -486,28 +517,30 @@ If the payment provider reports success after the hold was lost, do not sell som
 
 For ₹250 per seat, A7 and A8 cost ₹500 before documented fees. Save this quoted amount and its currency on the hold. Repricing seats between hold and confirmation makes the customer approve one amount and pay another. Seat availability from a cached theatre map is a hint; only the reservation transaction can promise ownership.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Can two customers hold different seats in the same show?** Yes. Lock the relevant show-seat rows rather than the entire cinema unless simplicity at tiny scale justifies the coarser lock.
-2. **Can a hold reserve A7 but fail on A8?** Not when the product promises adjacent seats as one selection. Roll back the transaction if any seat is unavailable.
-3. **What proves a late timer is safe?** A test expires H21, creates H22 and replays H21's timer. A7 must still belong to H22.
+**Can two customers hold different seats in the same show?** Yes. Lock the relevant show-seat rows rather than the entire cinema unless simplicity at tiny scale justifies the coarser lock.
 
-Run confirmation and expiry concurrently at the exact boundary, then verify one final owner, a coherent booking state and a recorded payment disposition. A successful payment receipt alone is insufficient evidence of a successful seat reservation.
+**Can a hold reserve A7 but fail on A8?** Not when the product promises adjacent seats as one selection. Roll back the transaction if any seat is unavailable.
+
+## 7. Closing answer
+
+I use show-seat rows as the allocation authority, expiring token-owned holds for the payment interval, and an atomic all-seat confirmation. Payment is a separate durable workflow. A late payment or stale expiry callback cannot steal or release a newer customer's hold.
 
 === LLD 5 ===
-N|atm|ATM|300|0|140
-N|state|ATMState|600|0|150|ellipse
-N|card|CardReader|0|0|140
-N|bank|BankService|0|150|150
-N|tx|Transaction|300|150|150
-N|chain|Cash Dispenser Chain|300|270|200
-N|cash|2000→500→100|600|270|150|cylinder
-E|card|atm|insert
-E|atm|state|delegates to
-E|atm|tx|creates
-E|tx|bank|authorize/debit
-E|tx|chain|dispense
-E|chain|cash|split notes
+N|n0|ATMSession|0|0|200|rect
+N|n1|Withdrawal|250|0|200|rect
+N|n2|BankPort|500|0|200|rect
+N|n3|NotePlanner|0|110|200|rect
+N|n4|CashInventory|250|110|200|rect
+N|n5|DispenserPort|500|110|200|rect
+N|n6|Reconciler|0|220|200|rect
+E|n0|n1|starts
+E|n1|n2|authorizes through
+E|n1|n3|plans with
+E|n3|n4|reserves
+E|n1|n5|dispenses through
+E|n6|n1|resolves uncertainty
 ---
 ## Problem
 
@@ -524,13 +557,31 @@ Design an ATM: card insertion, PIN entry, balance check, withdrawal, deposit and
 - Money must never be dispensed without a successful debit, and a debit must never happen without dispensing. You need a compensating action.
 - The hardware (dispenser, card reader) is unreliable.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-An ATM screen shows a balance of ₹10,000. The customer requests ₹2,500. Checking the balance is only one part of the problem: the bank must authorize funds, the machine must have suitable notes, and the dispenser may jam after releasing some cash.
+I support authenticated balance lookup and cash withdrawal at one ATM. Bank balances remain authoritative at the bank; cassette inventory belongs to the machine. The ATM never stores a clear PIN. Session control, note planning, bank access and physical dispensing are separate responsibilities so each failure can be represented.
+
+## 2. Withdrawal contract and execution
+
+```text
+withdraw(operationId, accountToken, amountMinor) -> WithdrawalState
+Withdrawal: id, amount, reservedNotePlan, bankRef, deviceRef, state, deliveredNotes
+States: CREATED -> AUTHORIZED -> DISPENSING -> COMPLETED
+                                -> PARTIAL | UNKNOWN -> RECONCILED
+Device result: COMPLETE | PARTIAL | NONE | UNKNOWN
+```
+
+I validate amount/currency, compute a bounded feasible note plan, reserve those notes, and persist the withdrawal before external actions. I authorize funds with the bank using the operation identity. A definite decline releases unused inventory. After authorization, I persist DISPENSING before issuing the device command and record the device's evidence. A known full delivery settles under the bank protocol; no delivery releases/voids according to known authorization state; partial and unknown delivery enter reconciliation.
+
+For ₹2,500, five ₹500 notes are feasible only if five notes are available. Three delivered notes mean ₹1,500 physically left the machine even if the requested amount was larger. Inventory is decremented by known delivery; unknown counts remain reserved until device-journal reconciliation. On restart I inspect unresolved withdrawals and the dispenser journal before serving a new dispense. A lost HTTP reply is retried by operation identity and cannot trigger a fresh cash command. Note selection uses bounded change-making when denominations are arbitrary; a greedy method would fail for amount 6 with notes 4 and 3 despite 3+3 being feasible.
+
+## 3. Final design diagram
+
+[![Design ATM: ATMSession starts Withdrawal; Withdrawal authorizes through BankPort; Withdrawal plans with NotePlanner; NotePlanner reserves CashInventory; Withdrawal dispenses through DispenserPort; Reconciler resolves uncertainty Withdrawal](designs/lld-5.svg)](designs/lld-5.svg)
 
 Keep two separate truths: the **bank ledger** records money movement; the **cash cassette inventory** records physical notes. A Java object cannot make a network request and a physical motor action one atomic transaction. That gap is the central design lesson, not a reason to pretend all failures can be rolled back.
 
-## See withdrawal and an uncertain dispense
+## 4. Critical operation: worked execution
 
 ![The operation ties authorization, cash delivery and settlement together.](lessons/lld-5-flow.svg)
 
@@ -540,7 +591,7 @@ Keep two separate truths: the **bank ledger** records money movement; the **cash
 
 *Resolve physical evidence before repeating the withdrawal.*
 
-### Build the first version
+### Core implementation
 
 Represent the session as states such as `IDLE`, `AUTHENTICATED`, `WITHDRAWING`, `RECONCILING` and `EJECTING_CARD`. Keep PIN validation in an adapter; never store the PIN on `Account` or print it in a trace. The ATM receives a limited authorization result, not a copy of the bank's security secrets.
 
@@ -555,7 +606,7 @@ record DispenseReport(String operationId, DispenseStatus status,
 
 The inventory update uses delivered counts, not requested counts. A partial report and an unknown report require different reconciliation procedures.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -611,12 +662,6 @@ AtmSession owns the authenticated interaction. AccountGateway authorizes debits;
 withdrawal(id,account_ref,requested_minor,dispensed_minor,authorization_ref,status); cassette(denomination,count,reserved)
 ```
 
-### State machine and command contracts
-
-```text
-IDLE -> AUTHENTICATED -> AUTHORIZED -> DISPENSING -> SETTLED | REVERSAL_PENDING | REVIEW
-```
-
 ### End-to-end execution trace
 
 Authenticate with bounded PIN retries; select account and amount; reserve a feasible denomination combination; journal the intent; request bank authorization; dispense; persist the sensor result; settle or reverse the authorization using the same operation identity; print a receipt reflecting the known outcome.
@@ -624,8 +669,6 @@ Authenticate with bounded PIN retries; select account and amount; reserve a feas
 ### Concurrency and recovery walkthrough
 
 Two withdrawal sessions compete for the last set of notes. Reserve note inventory atomically, release only the unconsumed reservation, and reconcile actual counts after partial dispense. Keep bank network calls outside the inventory lock.
-
-
 
 ### Policy choices and extension seams
 
@@ -635,18 +678,14 @@ Greedy denomination selection may fail when a valid combination exists; bounded 
 
 Power loss after cash leaves the dispenser but before a receipt needs durable recovery. A bank timeout means unknown, not safe-to-repeat. Never log PINs or card secrets. Partial dispense requires a specific compensation workflow, not a blind full refund.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Insufficient denominations despite sufficient total cash; repeated withdrawal ID; bank timeout; jammed cassette; partial dispense; restart from each journal state.
-
-**Lab:** Simulate authorization success followed by only part of the requested cash dispensing. Define the journal entries, settlement amount and operator alert.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through a partial delivery
+### Work through a partial delivery
 
 W17 requests five ₹500 notes. Device evidence says three notes were delivered and two remained in a jammed cassette. The customer received ₹1,500. Record the exact reported counts and reconcile the ₹2,500 authorization according to the bank/device protocol; do not silently mark the entire withdrawal successful. Real settlement rules depend on the acquiring bank and hardware, so this is an educational boundary model rather than a certified ATM protocol.
 
@@ -654,28 +693,30 @@ Reserve a note plan before dispensing so another session cannot consume the same
 
 On restart, inspect the durable withdrawal journal and device journal before accepting another withdrawal. If an operator refills or removes a cassette, record a cash-reconciliation event instead of overwriting counts without a trail. Availability is less important than avoiding an untracked second cash delivery.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does `synchronized withdraw()` protect the bank account globally?** No. It only serializes callers using that JVM's object. The bank's ledger/authorization service owns global funds correctness.
-2. **Should a dispenser timeout be retried with a new ID?** No. That can dispense twice. Query or reconcile the existing operation.
-3. **How do you test without hardware?** Use fake adapters for complete, partial, none and unknown delivery, including crash-after-delivery-before-response. Assert that the system preserves uncertainty and never starts a second dispense automatically.
+**Does `synchronized withdraw()` protect the bank account globally?** No. It only serializes callers using that JVM's object. The bank's ledger/authorization service owns global funds correctness.
 
-An advanced extension adds deposits, but a deposit's envelope acceptance, note validation and account credit require their own state machine. Reusing withdrawal states merely because both operations involve cash obscures their different evidence requirements.
+**Should a dispenser timeout be retried with a new ID?** No. That can dispense twice. Query or reconcile the existing operation.
+
+## 7. Closing answer
+
+I model a withdrawal as a journalled operation across bank authorization and a physical dispenser. Exact note inventory and explicit COMPLETE/PARTIAL/NONE/UNKNOWN outcomes prevent the design from pretending that a software rollback can undo delivered cash. Recovery resolves the original operation before another dispense.
 
 === LLD 6 ===
-N|cust|Customer|0|0|130
-N|svc|RentalService|280|0|160
-N|inv|Inventory|580|0|150|cylinder
-N|veh|Vehicle|580|150|140
-N|res|Reservation|280|150|150
-N|price|PricingStrategy|0|150|160|ellipse
-N|branch|Branch|580|280|130
-E|cust|svc|search/book
-E|svc|inv|availability
-E|inv|veh|tracks
-E|svc|res|creates
-E|res|price|quote
-E|veh|branch|located at
+N|n0|RentalService|0|0|200|rect
+N|n1|Vehicle|250|0|200|rect
+N|n2|Reservation|500|0|200|rect
+N|n3|RentalAgreement|0|110|200|rect
+N|n4|AvailabilityPolicy|250|110|200|rect
+N|n5|RateQuote|500|110|200|rect
+N|n6|Inspection|0|220|200|rect
+E|n0|n1|allocates
+E|n0|n2|creates
+E|n2|n3|handover creates
+E|n0|n4|checks intervals
+E|n2|n5|freezes
+E|n3|n6|closes with
 ---
 ## Problem
 
@@ -692,13 +733,32 @@ Design a car rental system like Zoomcar or Hertz: customers search vehicles by l
 - No overlapping reservations for the same vehicle.
 - New vehicle categories and pricing rules plug in without changes to existing code.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-Mira books a hatchback from Friday 10:00 until Sunday 10:00. Another customer wants the same car starting Sunday at 10:00. Whether that is allowed depends on both time intervals and the preparation buffer. A reservation is a promise about a future interval; a rental is an actual handover with an odometer, fuel level and condition report.
+I reserve a specific vehicle at a branch for a half-open time interval, then create a rental agreement at handover. Category-only overbooking is excluded from this version. Vehicle identity is stable; a reservation owns planned time, while an agreement owns actual pickup/return evidence and charges.
+
+## 2. Contracts and allocation
+
+```text
+reserve(requestId,vehicleId,start,end,customerId,quoteId) -> Reservation
+pickup(reservationId,inspection,odometer) -> RentalAgreement
+returnVehicle(agreementId,inspection,odometer,now) -> FinalInvoice
+Unavailable interval = [pickup, plannedReturn + preparationBuffer)
+```
+
+Under a vehicle allocation lock/transaction, I recheck interval overlap, validate the quote, and insert the reservation once. Overlap is `a.start < b.end && b.start < a.end`; checking only start dates is incorrect. PostgreSQL can enforce non-overlap for blocking states with an exclusion constraint using `tstzrange` and a GiST equality operator class for vehicle ID. All state changes that affect availability use that same authority.
+
+Pickup changes CONFIRMED to ACTIVE and snapshots condition/fuel. Return records actual usage before marking PREPARING, then READY after inspection. At ₹1,800 per started 24 hours, 49 hours costs ₹5,400 before other stated charges. A late return creates a readiness conflict with the next reservation; the service allocates a replacement or flags an exception instead of treating the original promise as fulfilled.
+
+`modifyReservation` locks the affected vehicle allocations, excludes the reservation's own interval from the overlap check, validates a replacement quote and commits the new interval only if it fits. A failed modification preserves the original allocation. Cancellation before pickup marks the reservation CANCELLED and releases its interval under the same authority. After pickup the operation is an early return against the active agreement, not deletion of the reservation; actual usage, fees and return condition remain recorded.
+
+## 3. Final design diagram
+
+[![Design Car Rental System: RentalService allocates Vehicle; RentalService creates Reservation; Reservation handover creates RentalAgreement; RentalService checks intervals AvailabilityPolicy; Reservation freezes RateQuote; RentalAgreement closes with Inspection](designs/lld-6.svg)](designs/lld-6.svg)
 
 A *half-open interval* `[start,end)` includes its start and excludes its end. Two reservations overlap when `a.start < b.end && b.start < a.end`. Equality at the boundary does not overlap, but cleaning may extend the unavailable interval.
 
-## See the booking lifecycle
+## 4. Critical operation: worked execution
 
 ![Vehicle identity and promised time are checked before handover.](lessons/lld-6-flow.svg)
 
@@ -708,7 +768,7 @@ A *half-open interval* `[start,end)` includes its start and excludes its end. Tw
 
 *Customer time and vehicle-ready time are distinct values.*
 
-### Build and calculate
+### Worked calculation and implementation
 
 Use `Vehicle`, `Reservation`, `RentalAgreement`, `Inspection` and `RateQuote`. Do not put historical price in a mutable `Vehicle.dailyRate` field. The agreement preserves what this customer accepted.
 
@@ -722,7 +782,7 @@ boolean overlaps(Instant aStart, Instant aEnd,
 
 At ₹1,800 per started 24-hour period, a 49-hour rental is three periods and ₹5,400 before taxes and extras. A calendar-day tariff gives different results around midnight; name the policy rather than accidentally deriving it from integer division. Store pickup timezone when local branch opening hours matter.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Key abstractions
 
@@ -732,7 +792,7 @@ At ₹1,800 per started 24-hour period, a 49-hour rental is three periods and �
 | `VehicleFactory` | Creates vehicles from a type and attributes |
 | `Branch` | Location and the vehicles currently there |
 | `Inventory` | `isAvailable(vehicle, range)` and `findAvailable(branch, type, range)` |
-| `Reservation` | customer, vehicle, range, add-ons. State: `BOOKED → PICKED_UP → RETURNED / CANCELLED` |
+| `Reservation` | customer, vehicle, range, add-ons. State: `CONFIRMED → FULFILLED / CANCELLED`; actual usage is on RentalAgreement |
 | `PricingStrategy` | `DailyRate`, `HourlyRate`, `SurgePricing`, decorated by `AddOnDecorator` |
 | `Invoice`, `Payment` | Final bill including damages and late fees |
 
@@ -760,12 +820,6 @@ Vehicle records asset identity and service status; VehicleType groups attributes
 reservation(id,vehicle_id,start_at,end_at,status,quote_version); agreement(id,reservation_id,pickup_reading,return_reading)
 ```
 
-### State machine and command contracts
-
-```text
-QUOTED -> HELD -> CONFIRMED -> PICKED_UP -> RETURNED -> CLOSED; CANCELLED is policy-dependent
-```
-
 ### End-to-end execution trace
 
 Find suitable vehicles; quote with immutable dates and tariff; atomically reserve an available interval; authorize deposit; confirm; at pickup check licence and vehicle readiness; record odometer/fuel; at return calculate charges from recorded facts and close the agreement.
@@ -773,8 +827,6 @@ Find suitable vehicles; quote with immutable dates and tariff; atomically reserv
 ### Concurrency and recovery walkthrough
 
 Two requests inspect the same free date range. Lock the vehicle schedule or use a database range exclusion constraint; checking then inserting without an authority is unsafe. Process vehicle locks in stable ID order for multi-vehicle reservations.
-
-
 
 ### Policy choices and extension seams
 
@@ -784,25 +836,25 @@ Assigning a concrete car early simplifies conflicts but reduces flexibility; boo
 
 Back-to-back rentals require turnaround time. Time zones and daylight-saving changes affect displayed pickup times; store instants plus location zone. Late returns may conflict with later reservations and require reallocation rather than silently extending a booking.
 
-### Verification and a practical lab
-
 **Topic-specific cases:** Overlap detection; boundary-touching intervals; maintenance block; deposit timeout; late return; duplicate pickup; pricing across a daylight-saving boundary.
-
-**Lab:** Book adjacent intervals [10:00,11:00) and [11:00,12:00), then add a 30-minute cleaning buffer and show which request must change.
 
 ### Further reading
 
 - [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
 - [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
 
-## Work through failure and extensions
+### Work through failure and extensions
 
 If a customer returns the car late, the next confirmed reservation may become unfulfillable. Keep reservation obligations separate from actual vehicle readiness; offer a replacement or flag an exception. Silently extending the earlier reservation's end can hide the conflict.
 
 Two concurrent bookings need interval exclusion at the authoritative allocation boundary. A Java check on each server is insufficient. At small scale, serialize allocation for one vehicle in a transaction; at category-pool scale, enforce capacity over intervals rather than pretending an unassigned category booking owns a specific registration number.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does 10:00–12:00 overlap 12:00–14:00?** Not under half-open intervals; add preparation time before deciding physical availability.
-2. **Where does a damage charge belong?** On the rental's return inspection/adjustment record, linked to evidence and a pricing rule, not on all future bookings for that car.
-3. **Exercise:** submit two overlapping requests simultaneously. One allocation must lose; non-overlapping requests should both succeed. Then add a buffer and show which formerly valid pair becomes invalid.
+**Does 10:00–12:00 overlap 12:00–14:00?** Not under half-open intervals; add preparation time before deciding physical availability.
+
+**Where does a damage charge belong?** On the rental's return inspection/adjustment record, linked to evidence and a pricing rule, not on all future bookings for that car.
+
+## 7. Closing answer
+
+I keep future reservation promises separate from actual rentals. Vehicle interval allocation includes preparation time, pricing is frozen in the accepted quote, and return inspection determines readiness. That preserves history and makes late-return conflicts visible instead of silently double-booking the next customer.

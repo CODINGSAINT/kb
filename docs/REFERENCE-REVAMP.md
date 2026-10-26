@@ -1,3 +1,9 @@
+# Current reference-answer revision
+
+This file records earlier revisions. The current completed-answer standard and validation record are in [MODEL-ANSWER-REVIEW.md](MODEL-ANSWER-REVIEW.md). The owner clarified that the sample establishes depth rather than mandatory headings.
+
+---
+
 # Student-focused reference rewrite (2026-10-26)
 
 This revision follows the owner's rejection of the previous expanded references. It replaces widely repeated prose with independently authored teaching introductions, concrete operations, worked calculations, topic-specific failures and exercises with answers across all 60 references. Existing useful technical details remain as a second pass; Chess was rewritten to use one coherent immutable-piece/copying model.
