@@ -55,7 +55,7 @@ for(let day=1;day<=20;day++){
     const designSvg=read(`public/${design}`);
     assert(designSvg.includes('<title')&&designSvg.includes('<desc'),`${key}: inaccessible selected-design SVG`);
     assert(!/<script|foreignObject|onload=/i.test(designSvg),`${key}: active SVG`);
-    const pictures=[...reference.matchAll(/!\[([^\]]+)\]\(((?:lessons|lld-figures)\/[^)]+\.svg)\)/g)];
+    const pictures=[...reference.matchAll(/!\[([^\]]+)\]\(((?:lessons|lld-figures|learning-figures)\/[^)]+\.svg)\)/g)];
     assert(pictures.length>=2,`${key}: needs operation and failure pictures`);
     for(const [,alt,url] of pictures){
       assert(alt.length>=30,`${key}: inadequate diagram text alternative`);

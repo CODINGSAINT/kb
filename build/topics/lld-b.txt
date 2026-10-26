@@ -324,161 +324,355 @@ Keep network calls outside database locks. Record intent, call the provider, the
 My order freezes accepted commercial terms and coordinates separate restaurant, financial and delivery states. Recorded milestones decide cancellation and compensation. Idempotent events advance only legal transitions, so duplicate acceptance or courier events cannot resurrect a cancelled order or repeat payment.
 
 === LLD 9 ===
-N|n0|CirculationService|0|0|200|rect
-N|n1|BookEdition|250|0|200|rect
-N|n2|BookCopy|500|0|200|rect
-N|n3|Loan|0|110|200|rect
-N|n4|Member|250|110|200|rect
-N|n5|HoldQueue|500|110|200|rect
-N|n6|FinePolicy|0|220|200|rect
-E|n0|n1|searches editions
-E|n1|n2|has copies
-E|n0|n3|creates
-E|n3|n4|belongs to
-E|n0|n5|allocates from
-E|n3|n6|calculates with
+N|n0|Circulation service|260|0|240|rect
+N|n1|BookEdition: catalogue|0|130|220|rect
+N|n2|Copy: one barcode|260|130|240|rect
+N|n3|Member has Plan|540|130|220|rect
+N|n4|Loan + return receipt|260|260|240|rect
+N|n5|Edition FIFO holds|540|260|220|rect
+E|n0|n1|search metadata
+E|n1|n2|has physical copies
+E|n0|n2|changes ownership
+E|n0|n3|checks eligibility and limit
+E|n2|n4|one active loan
+E|n4|n3|borrower and frozen terms
+E|n0|n5|allocates pickup tokens
 ---
 ## Problem
 
-Design a library management system: catalogue books, let members search, borrow, return and reserve copies, and charge fines for late returns. It's a pure OOP-modelling problem, so the interviewer is watching **entity relationships**, especially the difference between a *book* (title) and a *book item* (a physical copy).
+Design a library system that can find books, lend physical copies, accept returns, renew loans and keep a fair waiting list.
+
+Suppose A borrows the only copy of *Practical Java*. B and then C ask to borrow it next. When A returns it, the system must offer the copy to B. If B misses the pickup deadline, C gets a new assignment. A delayed timer for B must not take the book away from C.
+
+That small story gives us the central distinction: the catalogue describes a book edition; circulation tracks who currently owns the right to a particular physical copy.
 
 ## Requirements
 
-**Functional**
-- Search by title, author, subject or ISBN.
-- Borrow (limit per member, e.g. 5), return, renew (if not reserved), reserve when no copy is available.
-- Fines for overdue returns. Notify members when a reserved book is available.
-- Librarians add or remove books and copies, and manage members.
+I will choose these policies for one branch:
 
-**Non-functional**
-- Consistency: the last copy can't be lent to two members at once, even with concurrent checkouts.
-- Search stays fast across about a million titles (index title, author and ISBN).
-- Rules vary by member type (borrow limit, loan period, fine rate) without code changes.
-- Auditable: every borrow, return, renewal and fine is recorded.
+- Search edition metadata by title, author or ISBN. A physical copy has its own barcode.
+- A member has an immutable membership plan. Basic allows two active loans, a 14-day loan, one renewal and a 50-cent fine per overdue day. Plus allows four active loans, 21 days, one renewal and 25 cents per day. These are example policies, not universal library rules.
+- Only active members may borrow, renew or place a hold. They must be below their loan limit to borrow or join the queue, and may borrow only one copy of an edition at a time.
+- Holds are FIFO across copies of one edition at this branch. We do not substitute a different edition. Assign a healthy returned copy directly to the oldest eligible waiting reader.
+- An assignment made on date D is valid through `D + 2 calendar days`, inclusive. After that date it may expire and the next reader gets a new pickup token.
+- A loan is due through the end of its local due date. Renewal adds the original loan period to the existing due date, and is denied after it is overdue, after its renewal allowance is used or while another reader has an outstanding hold.
+- Returning a book closes that loan and records any fine once. An inactive member may still return. Unpaid fines do not block circulation under this simplified policy, and the return never waits for a payment network.
+- A damaged return goes to repair. It cannot be lent or offered for pickup until repair is completed.
 
-## 1. Scope and chosen solution
+The runnable example is an in-memory Java application with an injected branch clock. Authentication, payment collection, real messages, durable storage, lost-item billing and other branches are adapter or extension work; the precise transaction and recovery boundaries are explained below.
 
-I support catalogue lookup, checkout, return, renewal and title-level holds. BookEdition owns ISBN/title metadata; BookCopy owns barcode and condition; Loan connects one copy to one member. I use a circulation transaction for active-loan and member-limit checks.
+## 1. Begin with one title and one barcode
 
-## 2. Commands and state changes
+`BookEdition E1` describes *Practical Java*: its title, author and ISBN. `Copy C17` identifies the item on a shelf. If the library buys another identical copy, it creates another barcode, not another edition.
 
-```text
-checkout(requestId,copyId,memberId) -> Loan(dueDate,policyVersion)
-returnCopy(copyId,returnEventId,condition,returnedAt) -> ReturnResult
-renew(loanId,requestId) -> NewDueDate | RenewalDenied
-placeHold(editionId,memberId) -> QueuePosition
+A loan needs both the copy and the borrower. **L1** means “A's borrowing visit using C17.” Later, C can borrow C17 under **L2**. The barcode stays the same; the loan identity changes.
+
+| Object | Example | Why it is separate |
+| --- | --- | --- |
+| `BookEdition` | E1, *Practical Java* | Catalogue metadata is shared by all copies of this edition. |
+| `Copy` | Barcode C17 | Availability, damage and current ownership belong to the physical item. |
+| `Member` with `Plan` | A has Basic | Policy values do not require a subclass per membership tier. |
+| `Loan` | L1: A borrowed C17 | Due dates, renewals, return and fine belong to one borrowing visit. |
+| `Hold` | H-B: B waits for E1 | B wants the next suitable copy, not a permanent claim to C17. |
+| `Pickup` | P1: C17 is reserved for B | A specific assignment needs its own token and deadline. |
+
+[![The circulation service searches BookEdition metadata, changes Copy ownership, checks Member's composed Plan, records Loans and return receipts, and allocates edition FIFO holds with pickup tokens.](designs/lld-9.svg)](designs/lld-9.svg)
+
+The important rule is **one active loan per copy**, not one loan per title. Two copies of E1 can be on loan to different members at the same time. Our additional one-copy-per-edition-per-member rule prevents the same member taking both.
+
+[Open the copy-ownership walkthrough](learning-labs/library.html) to follow A's return, B's deadline, C's pickup and two stale events. The positions come from the Java implementation and have a complete text transcript.
+
+## 2. Keep one authority for circulation
+
+`Service` owns the editions, copies, members, loans, hold queues and command receipts. The small implementation synchronizes circulation operations on this service. A desk or browser asks it to perform a command; it cannot edit a `Copy` array or keep its own authoritative free-copy list.
+
+These are the public values used by the implementation:
+
+```java
+public enum CopyState { AVAILABLE, ON_LOAN, PICKUP, REPAIR }
+public enum HoldState { WAITING, PICKUP, FULFILLED, EXPIRED, CANCELLED }
+public enum Condition { GOOD, DAMAGED }
+public record BookEdition(String id, String isbn, String title, String author) {
+    public BookEdition { key(id); key(isbn); key(title); key(author); }
+}
+public record Plan(String name, int maxLoans, int loanDays, int maxRenewals, long fineCentsPerDay) {
+    public Plan {
+        key(name);
+        if (maxLoans < 1 || loanDays < 1 || maxRenewals < 0 || fineCentsPerDay < 0)
+            throw new IllegalArgumentException("Invalid plan");
+    }
+}
+public record Pickup(String token, String holdId, String memberId, LocalDate pickupBy) {}
+public record CopyView(String id, String editionId, CopyState state, String loanId, Pickup pickup) {}
+public record MemberView(String id, boolean active, Plan plan, long activeLoans) {}
+public record LoanView(String id, String copyId, String memberId, LocalDate checkedOut,
+                       LocalDate due, LocalDate returned, int renewals, Plan terms) {}
+public record HoldView(String id, String editionId, String memberId, HoldState state,
+                       Pickup pickup, String reason) {}
+public record ReturnReceipt(String loanId, LocalDate returnedOn, Condition condition,
+                            long overdueDays, long fineCents) {}
+public record RenewalReceipt(String loanId, LocalDate due, int renewals) {}
+public record PickupNotice(String token, String memberId, String copyId, LocalDate pickupBy) {}
 ```
 
-Checkout locks member and copy, verifies eligibility/loan limit and AVAILABLE or this member's PICKUP_HOLD, inserts the loan and changes copy to ON_LOAN atomically. A unique active-loan-per-copy constraint prevents duplicate lending. Return closes that specific loan, records condition, calculates the fine, then either marks REPAIR or assigns the copy to the first eligible hold with a pickup expiry.
+`Member` composes a `Plan`. The loan retains the plan values it received at checkout, so a future policy change need not recalculate yesterday's due date or fine rate. In this example plans and published views are immutable, and no plan-change operation is offered.
 
-Renewal locks the loan and applicable hold allocation boundary; it rejects waiting borrowers, exhausted renewal count or blocked membership. A retried renewal identity returns the same due date. A local-date policy due on the 15th and returned on the 18th counts three days: at ₹5/day the fee is ₹15 before documented grace/caps. A pickup-expiry worker compares the hold token before releasing the copy, preserving any later reassignment.
+The system preserves these facts after every completed operation:
 
-## 3. Final design diagram
+- An `ON_LOAN` copy refers to exactly one open loan; an open loan belongs to exactly one copy and member.
+- Member limits are checked together with copy ownership, so two desks cannot each consume the same last borrowing slot.
+- A `PICKUP` copy has one current member, token and deadline. It is unavailable to everyone else.
+- The edition queue assigns readers in arrival order among those still eligible. At allocation, an inactive member, a member now at their loan limit or someone already borrowing that edition is cancelled with a recorded reason; the next eligible reader is considered. Rejoining later requires a new hold.
+- A return receipt is identified by its loan. Replaying it cannot reassess the fine or modify a later loan of the same barcode.
+- Fine assessment and ownership changes contain no payment or notification network calls.
 
-[![Design Library Management System: CirculationService searches editions BookEdition; BookEdition has copies BookCopy; CirculationService creates Loan; Loan belongs to Member; CirculationService allocates from HoldQueue; Loan calculates with FinePolicy](designs/lld-9.svg)](designs/lld-9.svg)
+A pickup reservation does not reserve a borrowing slot. Eligibility is checked again at checkout. A member who fills their limit with other books must return one before collecting the pickup, or allow its deadline to expire. This is a deliberately simple policy with an explicit consequence.
 
-A **bibliographic record** describes a title/edition. A **copy** is a physical item with a barcode. A **loan** connects one copy and one member for a period. A **hold** is a claim to the next eligible copy, usually of a title or edition rather than a particular barcode.
+## 3. Checkout and renewal protect both member and copy
 
-## 4. Critical operation: worked execution
+Checkout takes a stable request ID, a barcode, a member ID and, for an assigned copy, the current pickup token.
 
-![Title metadata stays independent of physical circulation.](lessons/lld-9-flow.svg)
+It first returns any matching saved checkout receipt. A reused request ID with a different payload is rejected. For a new request, it checks membership, current loan count and the one-copy-per-edition rule; then it requires an available copy or an unexpired pickup assignment belonging to this member and token. Finally it creates a loan and changes the copy to `ON_LOAN` together.
 
-*Title metadata stays independent of physical circulation.*
-
-![The copy and active-loan constraint decide checkout ownership.](lessons/lld-9-failure.svg)
-
-*The copy and active-loan constraint decide checkout ownership.*
-
-### Worked calculation and implementation
-
-Use `BookEdition`, `BookCopy`, `Member`, `Loan` and `HoldQueue`. Catalogue search returns editions, while checkout needs a barcode. A unique active-loan constraint for each copy protects circulation independently of search indexes.
-
-```text
-checkout(copyId, memberId, now)
-Check: member active; loan limit not exceeded; copy available;
-       any pickup hold belongs to this member
-Commit: create loan with due date; copy becomes ON_LOAN
+```java
+public synchronized LoanView checkout(String requestId, String copyId, String memberId, String pickupToken) {
+    key(requestId);
+    CheckoutCommand previous = checkoutCommands.get(requestId);
+    if (previous != null) {
+        if (!Objects.equals(copyId,previous.copyId()) || !Objects.equals(memberId,previous.memberId())
+            || !Objects.equals(pickupToken,previous.pickupToken())) throw new IllegalArgumentException("Checkout ID payload conflict");
+        return previous.receipt();
+    }
+    Copy copy = item(copyId); Member member = member(memberId); LocalDate today = today();
+    requireEligible(member,copy.editionId);
+    if (copy.state == CopyState.PICKUP) {
+        if (!copy.pickup.memberId().equals(memberId) || !copy.pickup.token().equals(pickupToken)
+            || today.isAfter(copy.pickup.pickupBy())) throw new IllegalStateException("Pickup does not belong to this request or has expired");
+    } else if (copy.state != CopyState.AVAILABLE || pickupToken != null) {
+        throw new IllegalStateException("Copy unavailable or stale pickup token");
+    }
+    Loan loan = new Loan("L" + ++loanSequence,copy,member,today);
+    if (copy.pickup != null) holdRecord(copy.pickup.holdId()).state = HoldState.FULFILLED;
+    copy.pickup = null; copy.state = CopyState.ON_LOAN; copy.loanId = loan.id;
+    loans.put(loan.id,loan);
+    LoanView receipt = loan.view();
+    checkoutCommands.put(requestId,new CheckoutCommand(copyId,memberId,pickupToken,receipt));
+    return receipt;
+}
 ```
 
-Suppose a 14-day loan is due on 15 November under a local-date policy. Returning on the 18th gives three overdue days. At ₹5 per overdue day the fee is ₹15, subject to grace days and caps. A timestamp-based policy can differ; choose deliberately and store the applicable policy version.
+Choosing C17 in search does not reserve it. Two desks may see it in a result, but only one authoritative checkout can change it to `ON_LOAN`. The other desk must read the updated state. The same lock also protects the member limit when the desks choose different copies.
 
-## 5. Detailed decisions, algorithms and failure behaviour
+The checkout receipt records the original checkout response. After renewal or return, use `loan(id)` to read the current loan, rather than treating a replayed old receipt as a new observation.
 
-### Key abstractions
+### A renewal is an extension of one loan
 
-| Type | Responsibility |
-|---|---|
-| `BookEdition` | ISBN, title, authors, subject (the specific published edition) |
-| `BookCopy` | barcode, rack location, `BookStatus` (AVAILABLE, ON_LOAN, PICKUP_HOLD, LOST) |
-| `Account` (abstract) → `Member`, `Librarian` | Shared identity; role-specific operations |
-| `Loan` | member, item, issue date, due date, return date |
-| `Reservation` | member, book (not a specific copy!), status, created time |
-| `Catalog` | Indexes: `Map<String, List<BookEdition>>` by title, author, subject |
-| `FineStrategy` | `PerDayFine`, `CappedFine`, `GracePeriodFine` |
-| `NotificationService` | Email or SMS when a reservation is ready |
+For a Basic loan issued on October 1, the due date is October 15. Renewing on October 12 extends the existing due date by 14 days to October 29. It does not create another loan or count as another borrowed item.
 
-### Design decisions & trade-offs
+Renewal checks the actual loan, borrower, active membership, current date, saved renewal allowance and other readers' outstanding holds. A waiting hold and a ready pickup assignment both count as demand. The request ID prevents a lost response from extending the due date twice.
 
-**1. BookEdition vs. BookCopy.** This is the main insight. A library holds 3 copies of "Clean Code". Loans attach to *items*, and reservations attach to *books* (any copy will do). Mixing them up breaks reservations and inventory.
-
-**2. Composition over inheritance for members.** `Member` *has* an `Account` and a `MembershipPlan` (Student: 3 books / 14 days; Faculty: 10 / 30). The plan holds the limits, so new tiers mean no new subclasses.
-
-**3. Return flow.** Mark the loan returned, calculate the fine, then check the reservation queue for that `BookEdition`. If someone is waiting, set the item to `PICKUP_HOLD` for them, notify them, and start a pickup window. Otherwise set it to `AVAILABLE`.
-
-**4. Status as a small State machine.** `AVAILABLE → ON_LOAN → AVAILABLE/PICKUP_HOLD`, plus `LOST`. Invalid transitions (lending a PICKUP_HOLD item to someone else) are rejected in one place.
-
-**5. Search indexing.** In memory, use maps keyed by lower-cased tokens. At scale, use a search engine. Keep `Catalog` behind an interface so swapping is painless.
-
-### Ownership, boundaries and invariants
-
-**Central design question:** A bibliographic title and a physical lendable copy are different objects.
-
-BookTitle holds ISBN and catalogue metadata; BookCopy has barcode, branch and condition. Loan links a member to one copy and a due instant. HoldQueue belongs to a title/branch policy. LoanPolicy decides limits and due dates; FinePolicy calculates charges from immutable loan facts.
-
-**Correctness rule:** A copy has at most one open loan. Renewing a loan cannot bypass a waiting member under the chosen fairness policy. Lost copies cannot appear available because their last loan closed.
-
-```text
-book_title(isbn,title); copy(barcode,isbn,branch,state,version); loan(id,copy_id,member_id,due_at,returned_at)
+```java
+public synchronized RenewalReceipt renew(String requestId, String loanId, String memberId) {
+    key(requestId);
+    RenewalCommand previous = renewalCommands.get(requestId);
+    if (previous != null) {
+        if (!Objects.equals(loanId,previous.loanId()) || !Objects.equals(memberId,previous.memberId()))
+            throw new IllegalArgumentException("Renewal ID payload conflict");
+        return previous.receipt();
+    }
+    Loan loan = loanRecord(loanId); Member member = member(memberId);
+    if (!loan.memberId.equals(memberId) || loan.receipt != null || !member.active
+        || today().isAfter(loan.due) || loan.renewals >= loan.terms.maxRenewals())
+        throw new IllegalStateException("Loan cannot be renewed");
+    if (holds.values().stream().anyMatch(h -> h.editionId.equals(item(loan.copyId).editionId)
+        && !h.memberId.equals(memberId) && (h.state == HoldState.WAITING || h.state == HoldState.PICKUP)))
+        throw new IllegalStateException("Another reader has an outstanding hold");
+    loan.due = loan.due.plusDays(loan.terms.loanDays()); loan.renewals++;
+    RenewalReceipt receipt = new RenewalReceipt(loanId,loan.due,loan.renewals);
+    renewalCommands.put(requestId,new RenewalCommand(loanId,memberId,receipt));
+    return receipt;
+}
 ```
 
-### End-to-end execution trace
+We keep the policy conservative: an outstanding hold blocks renewal until that hold is fulfilled, expires or is cancelled during allocation. Renewal does not silently delete someone else's request to make itself succeed.
 
-Authenticate the member; check eligibility and loan count; atomically claim an available copy; persist loan and due date; at return close exactly one loan; compute late fees; inspect condition; allocate to the next eligible hold before publishing general availability.
+## 4. Return the item, assess the fine and serve the queue
 
-### Concurrency and recovery walkthrough
+A return targets **barcode plus loan ID**. Closing every loan for E1 would affect other copies; closing “whatever loan currently uses C17” would make a delayed event dangerous.
 
-Two librarians scan the same copy at different desks. A unique active-loan constraint or copy version allows one checkout. Renew versus hold placement needs a defined transaction boundary.
+The return operation does this under the circulation lock:
 
-### Policy choices and extension seams
+1. Find that loan and verify its barcode.
+2. If it already has a return receipt, return the saved receipt before touching current copy ownership. A changed condition under the same return token is rejected.
+3. Require C17's active loan to still be that loan.
+4. Compute overdue days and save the one return/fine assessment.
+5. Close the loan and move a good copy to allocation, or a damaged copy to `REPAIR`.
+6. Assign a healthy copy directly to the oldest eligible hold, or leave it available if nobody is waiting. Record a pickup-notice intent.
 
-Store availability as a projection for search, while copy/loan records remain authoritative. Strategy is appropriate for faculty-versus-student loan duration; subclassing BookEdition for every policy is not.
+```java
+public synchronized ReturnReceipt returnCopy(String copyId, String expectedLoanId, Condition condition) {
+    Objects.requireNonNull(condition);
+    Loan loan = loanRecord(expectedLoanId);
+    if (!loan.copyId.equals(copyId)) throw new IllegalArgumentException("Loan belongs to another copy");
+    if (loan.receipt != null) {
+        if (loan.receipt.condition() != condition) throw new IllegalArgumentException("Return token payload conflict");
+        return loan.receipt; // Old return replay cannot touch the copy's current owner.
+    }
+    Copy copy = item(copyId);
+    if (copy.state != CopyState.ON_LOAN || !expectedLoanId.equals(copy.loanId))
+        throw new IllegalStateException("Stale loan token");
+    LocalDate today = today();
+    if (today.isBefore(loan.checkedOut)) throw new IllegalStateException("Return date precedes checkout");
+    long overdueDays = Math.max(0,ChronoUnit.DAYS.between(loan.due,today));
+    long fine = Math.multiplyExact(overdueDays,loan.terms.fineCentsPerDay());
+    loan.receipt = new ReturnReceipt(loan.id,today,condition,overdueDays,fine);
+    copy.loanId = null; copy.state = condition == Condition.DAMAGED ? CopyState.REPAIR : CopyState.AVAILABLE;
+    allocate(copy.editionId,today); // Record ownership and ready notices, never call a payment network.
+    return loan.receipt;
+}
+```
 
-### Edge cases that change the design
+![Returning C17 closes the specific loan, records its fine once and sends a healthy copy directly to the first eligible edition hold. A damaged copy goes to repair; payment happens separately.](learning-figures/lld-9-return.svg)
 
-ISBN is not a copy identifier. A returned damaged book goes to inspection. Time-zone-aware branch closing rules affect due dates. Deleting a member must not destroy accounting history.
+There is no call to `collectPayment` here. A payment service can fail or take seconds; the library should still accept its physical book and let the next reader use it. The fine is an amount owed, keyed by the loan ID, not proof of payment. A separate payment adapter can collect against that charge with its own stable payment ID and receipt.
 
-**Topic-specific cases:** One open loan per copy; member limit; renewal with queued hold; return replay; damage inspection; hold expiration fairness.
+### Calculate calendar days explicitly
 
-### Further reading
+Configure the branch clock with its time zone; the example uses `Asia/Kolkata`. [`LocalDate`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/LocalDate.html) is a calendar date without a time or zone, so the service obtains today's date from that configured clock. It does not divide elapsed milliseconds by 86,400,000.
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+For A's Basic loan:
 
-### Work through holds and renewal
+```text
+Checkout:        2026-10-01
+Due date:        2026-10-01 + 14 calendar days = 2026-10-15
+Returned:        2026-10-18
+Overdue days:    max(0, DAYS.between(2026-10-15, 2026-10-18)) = 3
+Fine:            3 × 50 cents = 150 cents = $1.50
+```
 
-Renewal is not just `dueDate += 14`: reject it if another member has a waiting hold, the member is blocked, or the renewal count is exhausted. Two simultaneous renewals should not extend the date twice because one client retried after a lost response.
+The 15th is included as an on-time date. Return on the 15th costs zero, on the 16th costs 50 cents and on the 18th costs $1.50. Java's [`ChronoUnit.between`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/temporal/ChronoUnit.html#between(java.time.temporal.Temporal,java.time.temporal.Temporal)) supplies the date difference. We count every calendar date, with no holiday adjustment, grace period or cap in this chosen policy.
 
-A returned damaged copy is not automatically available. Move it into inspection/repair state, and allocate the next healthy copy to the waiting queue. When a pickup hold expires, compare its hold identity before releasing the copy; a later reassignment must survive a delayed timer.
+Replaying L1's return on November 1 still returns the saved $1.50 receipt. It does not recalculate a larger fine using the retry date.
+
+### FIFO holds need assignment tokens
+
+The hold queue is keyed by edition E1. `allocate` removes the oldest eligible hold, then creates a fresh pickup assignment for a specific copy. A notice is only a stored intent here; actual messaging happens outside the circulation operation.
+
+```java
+private void allocate(String editionId, LocalDate today) {
+    ArrayDeque<Hold> queue = waiting.get(editionId);
+    if (queue == null) return;
+    List<Copy> available = copies.values().stream().filter(c -> c.editionId.equals(editionId)
+        && c.state == CopyState.AVAILABLE).sorted(Comparator.comparing(c -> c.id)).toList();
+    for (Copy copy : available) {
+        while (!queue.isEmpty()) {
+            Hold hold = queue.removeFirst(); Member member = member(hold.memberId);
+            String reason = ineligibility(member,editionId);
+            if (reason != null) { hold.state = HoldState.CANCELLED; hold.reason = reason; continue; }
+            Pickup pickup = new Pickup("P" + ++pickupSequence,hold.id,hold.memberId,today.plusDays(2));
+            hold.state = HoldState.PICKUP; hold.pickup = pickup;
+            copy.state = CopyState.PICKUP; copy.pickup = pickup;
+            notices.add(new PickupNotice(pickup.token(),member.id,copy.id,pickup.pickupBy()));
+            break;
+        }
+    }
+}
+```
+
+Our example is now:
+
+| Date/event | C17 ownership | Why |
+| --- | --- | --- |
+| October 1: A checks out | Loan L1, member A | Due October 15. |
+| October 2: B then C queue | Still L1 | Waiting does not end A's loan. |
+| October 18: A returns | Pickup P1, member B | B is first; pickup through October 20. Fine $1.50 is recorded once. |
+| October 20: expiry worker runs | Still P1 | The deadline date is inclusive. |
+| October 21: P1 expires | Pickup P2, member C | C gets a fresh assignment, through October 23. |
+| Delayed P1 timer arrives | Still P2 | P1 no longer owns this assignment. |
+| C collects with P2 | Loan L2, member C | Plus gives a 21-day loan, due November 11. |
+| Delayed return for L1 arrives | Still L2 | Replay L1's saved receipt; do not free C's copy. |
+
+![Pickup token P1 can expire only its own assignment. After C gets P2 or loan L2, an old P1 timer and an old L1 return cannot release C17.](learning-figures/lld-9-tokens.svg)
+
+These are the complete hold creation and expiry operations:
+
+```java
+public synchronized HoldView placeHold(String holdId, String editionId, String memberId) {
+    key(holdId); edition(editionId); Member member = member(memberId);
+    Hold previous = holds.get(holdId);
+    if (previous != null) {
+        if (!previous.editionId.equals(editionId) || !previous.memberId.equals(memberId))
+            throw new IllegalArgumentException("Hold ID payload conflict");
+        return previous.view();
+    }
+    requireEligible(member,editionId);
+    if (holds.values().stream().anyMatch(h -> h.editionId.equals(editionId) && h.memberId.equals(memberId)
+        && (h.state == HoldState.WAITING || h.state == HoldState.PICKUP)))
+        throw new IllegalStateException("Member already has an outstanding hold for this edition");
+    Hold hold = new Hold(holdId,editionId,memberId);
+    holds.put(holdId,hold); waiting.computeIfAbsent(editionId,ignored -> new ArrayDeque<>()).addLast(hold);
+    allocate(editionId,today());
+    return hold.view();
+}
+
+public synchronized boolean expirePickup(String copyId, String expectedPickupToken) {
+    Copy copy = item(copyId);
+    if (copy.state != CopyState.PICKUP || !copy.pickup.token().equals(expectedPickupToken)
+        || !today().isAfter(copy.pickup.pickupBy())) return false;
+    holdRecord(copy.pickup.holdId()).state = HoldState.EXPIRED;
+    copy.pickup = null; copy.state = CopyState.AVAILABLE;
+    allocate(copy.editionId,today());
+    return true;
+}
+```
+
+Notice the order in `expirePickup`: check copy state and **current token** before looking at the deadline or changing anything. An old timer does not get to release whichever reservation happens to be there now. The same pattern protects a consumed pickup after checkout.
+
+The scheduler must eventually call expiry for overdue assignments. Checkout itself rejects an expired pickup; it does not let another reader take it before the queue has been advanced. Delayed job execution can reduce availability temporarily, but cannot transfer ownership incorrectly.
+
+## 5. Run the complete mechanism and keep adapter promises honest
+
+Download [Library.java](reference-code/learning/kb/library/Library.java), [LibraryDemo.java](reference-code/learning/kb/library/LibraryDemo.java) and [LibraryChecks.java](reference-code/learning/kb/library/LibraryChecks.java). Save them under `examples/learning-java/src/kb/library/`, then run with Java 21:
+
+```text
+javac --release 21 -encoding UTF-8 -d examples/learning-java/out examples/learning-java/src/kb/library/*.java
+java -cp examples/learning-java/out kb.library.LibraryDemo
+java -cp examples/learning-java/out kb.library.LibraryChecks
+```
+
+The complete source implements catalogue lookup, registration, checkout, hold creation, pickup expiry, return, renewal, repair completion and immutable views. No core operation is a null-return sketch. The mutable test clock makes deadline and overdue cases reproducible. The demo's `--json` output supplies the walkthrough's snapshots.
+
+The checks cover distinct editions/copies, composed plan terms, a member limit, last-copy contention, command retries, FIFO and ineligible readers, deadline inclusivity, stale pickup and return tokens, renewal restrictions, fine assessment once, returns by inactive members, damage/repair and calendar arithmetic across a year boundary.
+
+### What changes when there is a database?
+
+The in-memory lock protects callers sharing one service object, and the records disappear on restart. A durable adapter must commit the active loan, copy state, member capacity check, affected edition queue, return/fine receipt and notice intent as one circulation transition. Store command IDs and tokens with those records so a lost response or restarted worker can identify the original operation.
+
+For this small single branch, serializing all circulation writes behind one database transaction boundary is a valid simple starting point. If later using finer locks, every writer must coordinate the member limit, copy and edition allocation consistently. Locking only the copy does not protect a member's last slot across two different copies. Locking only the loan does not protect renewal against a newly placed hold.
+
+A database can also reject duplicate active loans or fine identities using its supported constraints/indexes, but the syntax and guarantees depend on the chosen database and transaction design. An ordinary `UNIQUE(copy_id)` over all loan history is wrong: it would prevent that copy ever being borrowed again. Do not infer complete circulation correctness from the phrase “use SQL transactions.”
+
+Catalogue search can later become a separate indexed projection. Search may be stale; checkout must still consult the authoritative circulation state. This implementation uses a simple case-insensitive scan and makes no million-title latency claim.
 
 ## 6. Interviewer follow-ups
 
-**Where does ISBN belong?** On the edition/catalogue record, not as the sole identity of every physical copy.
+**Is the hold really title-level if its key is an edition ID?** It is above the copy level: any healthy copy of E1 can satisfy it. We deliberately treat one edition as the requested catalogue title and do not substitute a translation or later edition. If the product groups editions into a work, add a `Work` identity and define which editions satisfy that queue; do not silently use ISBN as both a work and a barcode.
 
-**May returning one copy clear every loan for that title?** No. Close the active loan for the scanned copy only.
+**Why not subclass Member into Student and Faculty?** The behavior is the same; only values differ. A member has a Plan containing limits, duration, renewals and fine rate. Composition makes a new tier another value configuration. A separate policy interface becomes useful only when the rules themselves become different algorithms.
+
+**What if the oldest waiting member becomes inactive or reaches their limit?** At allocation, cancel that hold with the reason and continue in FIFO order among eligible readers. This selected policy avoids leaving a healthy copy idle behind an ineligible request. A product could instead suspend the hold, but it would need a precise rule for when it re-enters the queue.
+
+**May a ready notice free or transfer a copy?** No. The notice carries its pickup token and deadline. A sender can suppress an obsolete notice by checking the current assignment, but delivery success is not ownership. Only the circulation operation may expire or consume that matching token. A durable notice adapter should deduplicate by pickup token and retain an outbox record until handled.
+
+**Can an old return clear the current borrower's loan?** Returning by barcode alone could do that. Here the loan ID is the return token. A completed old loan returns its saved receipt before any current copy mutation. A token for another barcode is rejected. Staff can display current ownership separately if an old receipt is replayed.
+
+**Do overdue fines have to be paid before accepting a return?** No under our policy. Accepting the item, closing the loan and assessing the debt form one local circulation operation. Payment collection is separate and cannot prevent inventory from being returned. If borrowing eligibility later depends on unpaid fines, specify that policy and coordinate its authoritative debt state; do not add a slow payment call inside return.
+
+**What about a book returned damaged or reported lost?** Damage is implemented: the loan closes, but the copy enters REPAIR and waiting readers remain queued until a healthy copy is available. Lost-item handling is outside scope; it needs its own inventory state and replacement-charge policy. Closing a loan alone must never imply that a missing copy is on the shelf.
 
 ## 7. Closing answer
 
-I separate catalogue identity from physical copy identity and enforce one active loan per barcode. Return allocates healthy copies to eligible queued holds, renewal respects waiting borrowers, and fine calculations retain their due-date policy. Search remains independent of circulation ownership.
+“I would separate edition metadata, physical copies and borrowing visits. One circulation boundary checks member limits and changes copy ownership, while an edition FIFO queue assigns returned healthy copies with expiring pickup tokens. Returns target a loan ID, record the date-based fine once and move inventory without waiting on payment. Renewal respects other readers and reuses a command receipt on retry. The in-memory example demonstrates those rules; a durable adapter must preserve the same transition and token checks across commits and restarts.”
 
 === LLD 10 ===
 N|n0|ExpenseService|0|0|200|rect

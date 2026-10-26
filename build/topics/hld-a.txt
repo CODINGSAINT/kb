@@ -1,521 +1,905 @@
 === HLD 2 ===
-N|n0|Client and gateway|0|0|200|rect
-N|n1|Policy resolver|250|0|200|rect
-N|n2|Atomic quota store|500|0|200|rect
-N|n3|Backend service|0|110|200|rect
-N|n4|Config control plane|250|110|200|rect
-N|n5|Local emergency cap|500|110|200|rect
-E|n0|n1|resolves limits
-E|n1|n2|atomic decision
-E|n0|n3|only if allowed
-E|n4|n1|versioned policy
-E|n0|n5|degraded admission
+N|client|Client|20|20|140|rect
+N|gateway|Gateway + limiter plugin|210|20|210|rect
+N|redis|Redis primary shards|210|170|200|cylinder
+N|backend|Application backend|460|20|200|rect
+N|policy|Policy control plane|20|320|190|rect
+N|replica|Recovery replicas|460|170|180|cylinder
+N|metrics|Metrics + traces|460|320|180|rect
+E|client|gateway|request
+E|policy|gateway|cached policy|dashed
+E|gateway|redis|atomic admission
+E|redis|gateway|allow / deny
+E|gateway|backend|allow only
+E|redis|replica|async replication|dashed
+E|gateway|metrics|bounded labels|dashed
 ---
 ## Problem
-
-Design a distributed rate limiter that protects APIs across a fleet of gateway or service instances: limit each user, API key or IP to N requests per window, consistently, no matter which instance a request hits. The LLD algorithms (token bucket and friends) are assumed. Here the questions are **where state lives**, **atomicity across nodes**, **latency**, and **failure behaviour**.
+Design a rate limiter used by many API gateways. A customer must not receive a separate full allowance at every gateway. Explain the admission algorithm, shared state, response behavior, scale and failure policy.
 
 ## Requirements
+- Apply a trusted policy to an authenticated subject and route group before calling the backend.
+- Allow a short burst while limiting sustained traffic. Support a known server-assigned request cost.
+- Make simultaneous requests through different gateways share the same allowance.
+- Return a useful retry delay when exhausted; distinguish exhaustion from an unavailable limiter.
+- Explain clock behavior, state expiry, failover, hot subjects, policy changes and operational limits.
 
-**Functional**
-- Per-key and per-endpoint limits, configurable by tier. Respond `429` with `Retry-After` and `X-RateLimit-Remaining`.
-- Multiple rules per request (per-user and per-IP and global).
+## 1. Choose the promise before choosing Redis
 
-**Non-functional**
-- Illustrative service-side overhead target: < 1–2 ms p99; validate against network topology and the chosen store. Define availability and degraded admission policy explicitly.
-- Approximately accurate is acceptable (a few % over the limit under races), but no unbounded leaks.
+Imagine a search API that lets one customer send a burst of **five requests**, then earns **two more requests per second**. Five immediate requests may enter. A sixth at the same instant receives a rate-limit response. Half a second later, one more can enter.
 
-**Scale:** 1M req/s peak across 200 gateway nodes, and 50M active keys at ~100 bytes of state each, which is 5 GB. This is raw state only; keys, allocator/index overhead, replicas and headroom must be measured before sizing a Redis deployment.
+This is a **token bucket**. Think of five tickets in a small box. A request spends one ticket; time adds tickets back; the box cannot hold more than five. The tickets are an admission budget, not a queue. Rejected requests do not wait inside the limiter.
 
-## 1. Scope and selected policy
+I would clarify these questions in the interview:
 
-I enforce per-customer/per-route burst and sustained limits across gateways. I choose a token bucket in Redis executed atomically per policy key. Configuration is versioned. For high-impact writes, loss of the quota authority fails closed; public read routes may use explicitly allocated local emergency budgets. Independent full-size local buckets are not a global limit.
+| Question | Chosen answer and consequence |
+| --- | --- |
+| Whose allowance is shared? | Authenticated tenant plus route group; all gateways in one home region use the same bucket |
+| What does the policy promise? | Burst capacity `C`, refill `R` tokens per second and trusted cost `w`; not an exact rolling-window request count |
+| When is a request counted? | On admission, even if the backend later returns an error; a retry is another admission attempt |
+| Is this a billing ledger? | No. This controls traffic. Hard financial or inventory limits require the backend's own durable transactional rule |
+| What happens if the authority is unavailable? | Fail closed with 503 for this protected API; a public low-risk route may choose a separately bounded emergency policy |
 
-## 2. Admission contract and state
+For an interval of length `T` seconds **on this implementation's sampled millisecond clock**, admitted cost is bounded by the starting balance plus `R × T`; the starting balance is at most `C`. With `C=5`, `R=2`, ten sampled seconds can admit at most `5 + 2×10 = 25` units. The initial five are intentional burst capacity. Against a healthy continuous wall clock, flooring to milliseconds can grant one millisecond's credit at a boundary: allow up to `R × 0.001` extra tokens of resolution slack in that envelope. This is separate from clock jumps or failover. A token bucket does **not** mean “at most five in every rolling second.”
 
-```text
-key = tenant + authenticatedCustomer + route + policyVersion
-state = tokens, lastRefillTime; policy = capacity, refillRate, requestCost
-decision -> allowed, remaining, retryAfter, policyVersion, degraded
-Denied HTTP request -> 429; dependency outage -> documented 503/degraded policy
-```
+The shared-primary guarantee below assumes requests reach the correct current primary and its state is retained. Replication failover, eviction and regional partitions weaken that guarantee; I will make those limits explicit rather than describe Redis as a global exactly-once ledger.
 
-One short server-side script reads, refills to capacity, conditionally subtracts cost and writes expiry. Its clock policy prevents negative elapsed time. Independent limits use ordered admission; if combined rules require all-or-nothing consumption I colocate their state in one authoritative operation rather than claiming cross-slot atomicity. With 50 million keys at 100 bytes, raw state is 5 GB before Redis overhead and replicas. I benchmark the overhead target; it is not guaranteed merely by choosing Redis. Script latency, denied rate, degraded exposure and cardinality are operational signals.
+[Watch five tokens disappear, half a token refill, and rejected requests stay away from the backend](learning-labs/index.html?topic=ratelimit). The visual uses recorded executions of the Java model and includes a complete text trace. Redis integration is checked separately.
 
-## 3. Final design diagram
+## 2. Put the decision on the request path, with one owner for its state
 
-[![Rate Limiter: Client and gateway resolves limits Policy resolver; Policy resolver atomic decision Atomic quota store; Client and gateway only if allowed Backend service; Config control plane versioned policy Policy resolver; Client and gateway degraded admission Local emergency cap](designs/hld-2.svg)](designs/hld-2.svg)
+[![An authenticated gateway reads a trusted cached policy, asks a Redis primary for atomic admission, forwards only allowed requests, and reports exhaustion or authority failure separately.](learning-figures/ratelimit-flow.svg)](learning-figures/ratelimit-flow.svg)
 
-An **admission decision** allows or rejects work before expensive processing. A **quota key** identifies the policy subject, such as authenticated customer and route. A **fixed window**, **sliding window** and **token bucket** express different promises; they are not interchangeable implementations of one exact contract.
+Open the diagram at full size by selecting it.
 
-## 4. Critical operation: worked execution
+The gateway already sees every incoming request, so I would put a small limiter plugin there. It identifies the customer, maps the route to a policy and sends one atomic operation to Redis. A separate HTTP limiter service is possible, but it adds another network hop and deployment to the critical path. I would introduce it if several non-gateway clients need a common service boundary, not just to fill the diagram.
 
-![All servers consult the same quota authority for the relevant key.](lessons/hld-2-flow.svg)
+The components have specific jobs:
 
-*All servers consult the same quota authority for the relevant key.*
+- **Gateway plugin:** authenticate, choose a trusted subject/policy/cost, call the authority with a short deadline, and enforce its result before invoking the backend.
+- **Redis primary shards:** own bucket balances and refill watermarks. All gateways route the same subject-policy key to the same primary. Read replicas never decide admission.
+- **Policy control plane:** publishes versioned capacity/refill rules. Gateways keep a bounded, last-known-good local copy; they do not query a policy database on every request. A stale-policy deadline and rollout procedure are part of the contract.
+- **Replicas:** help recover a failed primary. Asynchronous replication is useful for availability but can lose recently acknowledged admissions on failover.
+- **Telemetry:** records allowed, exhausted and unavailable decisions, decision latency and fallback use. Avoid tenant IDs as unbounded metric labels; use sampled, access-controlled traces when investigating one customer.
 
-![Fail-open and fail-closed have different costs and should be chosen per route.](lessons/hld-2-failure.svg)
+No queue or Kafka cluster is needed to decide a synchronous request. A queue after admission can serve an asynchronous product, but it cannot retroactively prevent an overloaded backend from receiving requests already forwarded.
 
-*Fail-open and fail-closed have different costs and should be chosen per route.*
-
-### Calculate the boundary
-
-A fixed window can allow 100 requests at 12:00:59 and another 100 at 12:01:00—200 in roughly a second. A sliding log enforces a rolling interval precisely but stores per-request timestamps. At one million active keys and 100 events each, that is 100 million timestamp entries before index/container overhead. A bucket keeps constant-sized state per key but promises a different burst/refill model.
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Architecture
-
-- The limiter runs **in the gateway** (or as a sidecar). There's no extra network hop to a separate limiter service.
-- State is in a **Redis cluster** sharded by key. The check runs as a **Lua script** (atomic per key): read the bucket, refill, decrement, set the TTL, and return allowed plus remaining.
-- Rules come from a config service, cached in each gateway and hot-reloaded.
-
-```lua
--- KEYS[1]=bucket  ARGV: capacity, refill_per_ms, now_ms
-local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
-local tokens = tonumber(b[1]) or tonumber(ARGV[1]); local ts = tonumber(b[2]) or tonumber(ARGV[3])
-tokens = math.min(tonumber(ARGV[1]), tokens + (tonumber(ARGV[3]) - ts) * tonumber(ARGV[2]))
-local ok = tokens >= 1; if ok then tokens = tokens - 1 end
-redis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', ARGV[3]); redis.call('PEXPIRE', KEYS[1], 60000)
-return {ok and 1 or 0, math.floor(tokens)}
-```
-
-### Key design decisions & trade-offs
-
-**1. Centralised vs. local counters.** A central store (Redis) is accurate but costs a network round-trip per request. Local-only counters (limit/N per node) are fast but inaccurate when traffic is skewed across nodes. The **hybrid**: each node holds a local token allowance leased from Redis in batches (take 10 tokens at a time), syncing asynchronously. That trades a bit of accuracy for far fewer Redis calls.
-
-**2. Race conditions.** `GET` then `INCR` from two nodes over-admits. Use atomic Lua, or `INCR` plus `EXPIRE` for fixed windows. Never do read-modify-write from the client.
-
-**3. Algorithm choice at scale.** A sliding-window counter (two fixed-window counts, weighted) is O(1) memory and avoids boundary bursts. The token bucket allows bursts. A sliding log is too memory-heavy at 50M keys.
-
-**4. Failure mode: fail open or closed?** If Redis is unreachable, most public APIs **fail open** with a local in-memory fallback limit, because availability matters more than precise limits. Payment or abuse-sensitive endpoints may fail closed. State it per endpoint.
-
-**5. Hot keys.** A single abusive key hammers one Redis shard. A local pre-filter (deny keys already over limit for the rest of the window, cached in-process) protects Redis.
-
-**6. Multi-region.** Global limits across regions need either a per-region quota split (simple and slightly inaccurate) or async CRDT counter replication. Exact global limits would add cross-region latency, which is rarely worth it.
-
-### Scope, guarantees and sizing assumptions
-
-**Correctness requirement:** A quota decision is atomic within its declared scope; regional approximations and overshoot are stated explicitly.
-
-Assume 200,000 checks/s and 2 million active principal-route buckets. At an illustrative 100 bytes of logical state per bucket: 200 MB raw, before Redis overhead/replicas. With 20 uniform shards, average load is 10,000 checks/s each; hot tenants break uniformity.
-
-### API contracts and data ownership
+### Internal contract and key design
 
 ```text
-Internal allow(key,cost,policyVersion) returns allowed,remaining,retryAfter; gateway returns 429 only for known quota exhaustion
+check(subject, policyVersion, routeGroup, trustedCost)
+  -> ALLOW(balanceAfterSpend)
+   | EXHAUSTED(retryAfterMillis)
+   | UNAVAILABLE(reason)
+
+Example key: rl:{tenant-42:search}:v3
+Value: units, last_ms, capacity, rate
 ```
+
+The braces form a Redis Cluster hash tag. This example uses one key per decision, so it does not need a cross-key transaction. If a future design needs several keys atomically, their slot placement becomes a real constraint, not something Lua removes.
+
+Normalize routes into a small set such as `search` or `export`. Do not create a new key for every query string. Get tenant identity from verified authentication, never a caller-controlled `X-User-Id` header. Derive request cost from server policy; letting a caller submit zero cost defeats the design. Put a coarse separate abuse limit before expensive authentication if required.
+
+The script rejects a changed capacity/refill on an existing policy key. Policy versions must therefore be explicit. Moving everyone to a fresh version creates a fresh burst; for a restrictive change, migrate/clamp balances or roll out a planned transition rather than accidentally granting both old and new allowances.
+
+## 3. Refill and spend in the same atomic operation
+
+Two gateways cannot safely do `GET balance`, calculate locally and then `SET balance`. They may both read the last available token and both admit a request. The read, refill, check and deduction need one authority and one atomic decision.
+
+The arithmetic is small:
 
 ```text
-Logical records (outline, not complete DDL):
-bucket(key,tokens,last_refill,policy_version); policy(id,capacity,refill_rate,fail_mode)
-
-Primary access/partitioning boundary:
-tenant_id + principal_id + route + policy_version
+refilled = min(capacity, oldBalance + elapsedSeconds × refillRate)
+if refilled >= cost: subtract cost and allow
+else: reject and estimate when the missing cost can refill
 ```
 
-### Build the architecture in stages
+The implementation uses **1,000 units per token**. With an integer refill of two tokens per second, two units arrive each millisecond. At 250 ms, an empty bucket has 500 units: half a token. Rounding it down and discarding the fraction would unfairly delay customers who retry frequently.
 
-**Stage 3 — Partition and isolate.** Partition around tenant_id + principal_id + route + policy_version. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+Here is the complete Java decision method. Its source and tests are linked below. The synchronized method models one bucket; Redis supplies atomicity across gateway processes.
 
-### Trace the critical request
+```java
+public synchronized Decision allow(long nowMillis, int cost) {
+    timestamp(nowMillis);
+    if(cost<1 || cost*1000L>capacityUnits) throw new IllegalArgumentException("cost must fit in the bucket");
+    long horizon=ceilDiv(capacityUnits,refillPerMillis);
+    long elapsed=Math.max(0,nowMillis-lastMillis);
+    units=Math.min(capacityUnits,units+Math.min(elapsed,horizon)*refillPerMillis);
+    lastMillis=Math.max(lastMillis,nowMillis); // Never move the refill watermark backwards.
+    long need=cost*1000L;
+    boolean allowed=units>=need;
+    if(allowed) units-=need;
+    long clockDebt=lastMillis-nowMillis;
+    long retry=allowed?0:clockDebt+ceilDiv(need-units,refillPerMillis);
+    long ttl=clockDebt+ceilDiv(capacityUnits-units,refillPerMillis)+1;
+    return new Decision(allowed,units/1000.0,retry,ttl);
+}
+```
 
-Authenticate identity before choosing a key; resolve a cached policy version; route the key to one authority; atomically refill and consume tokens in one script or transaction; return decision metadata; invoke downstream only when allowed. Expire idle buckets only after their state can safely be reconstructed.
+`lastMillis` is the **refill watermark**: the time through which credit has already been accounted for. If a clock goes backwards, elapsed time becomes zero and the watermark stays put. Moving the watermark backwards would count the same time again when the clock catches up. The retry delay and idle expiry include that clock debt.
 
-### Deep dive: the decision that changes this system
+Bounding elapsed time by the time needed to fill the bucket prevents an unnecessarily large multiplication. This teaching implementation accepts integer capacity and refill values from 1 to 1,000,000 and cost from 1 to capacity. Those limits keep arithmetic exact and the contract clear. Fractional tokens per second would need a different fixed-point scale or rational-rate representation; silently converting them to integers is not supported. The clock has millisecond resolution: a tiny bucket with a very high refill rate cannot represent evenly spaced sub-millisecond admissions. Use a finer clock and recheck integer bounds if the product needs that precision.
 
-A token bucket with capacity B and refill r allows at most B+r*t tokens over interval t from a full bucket. Fixed windows can allow nearly twice the quota around a boundary. Sliding logs are exact but retain request timestamps; counters approximate with less memory. Client-provided timestamps cannot be trusted to refill tokens.
+### The actual shared Redis operation
 
-### Failure and race-condition walkthrough
+[token-bucket.lua](reference-code/learning/token-bucket.lua) is the complete script tested against **Redis 7.4.2**, an explicit reproducible baseline. It uses Redis `TIME`, validates the policy and saved state, updates one hash and sets its safe idle expiry. It does not accept a timestamp from the HTTP caller.
 
-Redis timeout means the decision may have executed. Retrying can double-spend quota unless request identity is included. For read-only public content fail-open may be acceptable; billing or expensive model requests often need conservative fail-closed or local emergency budgets.
+```text
+SCRIPT LOAD <the fixed script body>             -> script SHA
+EVALSHA <SHA> 1 rl:{tenant-42:search}:v3 5 2 1
+  arguments: capacity=5, refill=2 per second, cost=1
+  returns: [allowed, balanceUnits, retryMs, idleTtlMs, serverTimeMs]
+```
 
-### Security, tenancy and lifecycle
+A missing Redis **script-cache entry** returns `NOSCRIPT`; reload the same versioned body or use `EVAL` with that body, then retry within the request deadline. A timeout is different: the original script may have spent a token. Retrying can conservatively spend another token. This answer counts admission attempts, so that reduces availability but does not grant extra budget. If the product must count one logical operation, design trusted admission IDs and backend deduplication together; arbitrary reusable client keys can become a bypass.
 
-### Trade-offs and a starting recommendation
+Redis [executes Lua atomically while blocking other server work](https://redis.io/docs/latest/develop/programmability/eval-intro/). The script is constant work on one small key. Atomic execution does not mean arbitrary scripts have transactional rollback: validate inputs and state before writing and keep the script short.
 
-Global serialization gives a tighter quota but adds cross-region latency and partition dependence. Per-region token leases bound overshoot by outstanding lease budgets and reduce round trips. A distributed lock around each check adds unnecessary contention when the store supports atomic operations.
+## 4. Work through the numbers, including the expiry trap
 
-Measure decision p99, limiter error rate, false rejection rate, allowed overshoot and downstream saturation; do not confuse 429 with a failed infrastructure dependency.
+For the five-token example, every request costs one:
 
-**Test matrix:** Race final tokens across gateways; cross a fixed-window boundary; inject a store timeout; skew clocks; change policy versions; flood unique keys to test bounded state.
+| Time | Event | Balance after decision | Result |
+| --- | --- | --- | --- |
+| 0 ms | Requests 1–5 | 0 | All five admitted |
+| 0 ms | Request 6 | 0 | Rejected; retry in 500 ms |
+| 250 ms | Another attempt | 0.5 | Rejected; retry in 250 ms |
+| 500 ms | Another attempt | 0 | One token refilled, then spent |
+| 3,000 ms | Another attempt | 4 | Balance filled to five, then one spent |
 
-### Follow-up questions with answers
+The retry delay is an estimate assuming no one else spends the next token. It does not reserve a future slot. On HTTP, I would return:
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: A quota decision is atomic within its declared scope; regional approximations and overshoot are stated explicitly.
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+Cache-Control: no-store
+Content-Type: application/json
 
-**What is the first scaling pressure to test?** Use the actual workload: Assume 200,000 checks/s and 2 million active principal-route buckets. At an illustrative 100 bytes of logical state per bucket: 200 MB raw, before Redis overhead/replicas. With 20 uniform shards, average load is 10,000 checks/s each; hot tenants break uniformity.
+{"error":"rate_limit_exceeded","retryAfterMs":500}
+```
 
-**Which failure would invalidate the naive design?** Redis timeout means the decision may have executed. Retrying can double-spend quota unless request identity is included. For read-only public content fail-open may be acceptable; billing or expensive model requests often need conservative fail-closed or local emergency budgets.
+`Retry-After` uses whole seconds here, rounded up from the millisecond estimate. A client should add jitter rather than make every caller retry at exactly the same instant. If Redis is unavailable under the chosen fail-closed policy, return **503**, not 429: we do not know that the allowance is exhausted. A limiter rejection never invokes the backend.
 
-**Why not introduce every distributed component immediately?** Global serialization gives a tighter quota but adds cross-region latency and partition dependence. Per-region token leases bound overshoot by outstanding lease budgets and reduce round trips. A distributed lock around each check adds unnecessary contention when the store supports atomic operations.
+### Expiring state can accidentally create allowance
 
-**How would you demonstrate the design works?** Race final tokens across gateways; cross a fixed-window boundary; inject a store timeout; skew clocks; change policy versions; flood unique keys to test bounded state. Keep the expected invariant and recovery outcome visible in the results.
+[![An empty bucket of capacity 1000 refills to only 60 tokens after one minute; deleting it then would recreate 1000 tokens, so idle expiry must wait until it would be full.](learning-figures/ratelimit-expiry.svg)](learning-figures/ratelimit-expiry.svg)
 
-### Further reading
+Open the diagram at full size by selecting it.
 
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+Suppose capacity is 1,000 and refill is one token per second. After spending everything, a fixed 60-second key expiry is unsafe. At one minute the real balance is 60, but a missing key would restart with 1,000. The short expiry would grant 940 extra tokens.
 
-### Make the distributed decision explicit
+The script therefore expires a key only after its current balance would have reached full capacity:
 
-Three gateways with independent 100-request counters permit up to 300 globally. A shared atomic script or partition owner avoids that multiplication. Redis pipelining alone does not make a read-refill-consume sequence atomic; its execution boundary must do so. Cluster keys participating in one script must meet the store's routing constraints.
+```text
+idleTtlMs = clockDebtMs + ceil((capacityUnits - remainingUnits) / refillUnitsPerMs) + 1
+```
 
-Do not key solely by a spoofable forwarding header. Apply policy to authenticated identity where available and trusted proxy metadata for network controls. Bound key cardinality, expiry and request cost so an attacker cannot exhaust the limiter itself.
+An idle full bucket and a missing bucket then mean the same thing. The extra millisecond avoids forgetting fractional credit just before the boundary. Redis [expiry behavior](https://redis.io/docs/latest/commands/expire/) is part of the protocol; it is not a universal 60-second cleanup setting.
+
+A forced eviction is different from a planned expiry. It may erase an empty bucket early and recreate burst capacity. Use dedicated capacity, memory alarms and an appropriate no-eviction policy if this allowance must hold while the primary is available. No-eviction can produce write failures when memory is full; those failures follow the unavailable policy, not a silent allow.
+
+## 5. Scale the chosen design and state its failure limits
+
+For a concrete planning exercise, assume **200,000 admission checks per second at peak**, **2 million active subject-policy keys**, one region and one shared check per protected request. These are interview assumptions, not measured production traffic.
+
+Budgeting 300 bytes per active key, including a planning allowance for Redis key/hash overhead, gives `2,000,000 × 300 = 600,000,000 bytes`, about **600 MB decimal** on primaries. One replica copy roughly doubles the state to 1.2 GB before process overhead, fragmentation, replication buffers and operating headroom. Real memory depends on key length, encoding, values and Redis version; measure representative keys with `MEMORY USAGE`. A tiny local sample is not a sizing result for the full workload.
+
+If an admission exchange averages 300 bytes of application payload, `200,000 × 300 = 60 MB/s` aggregate traffic follows, before TCP/TLS and replication overhead. Use the actual wire payload in load tests; sending a cached script SHA is smaller than resending its entire body.
+
+I would start a load-test plan with eight primary shards and one replica each: average peak 25,000 checks/s per primary before skew. This is a test configuration, not evidence that a node sustains that rate. The acceptance target is the chosen peak plus explicit headroom at the required latency, with a shard unavailable. Measure p50/p95/p99 decision latency, CPU, memory and distribution. Do not infer throughput from the functional tests below.
+
+The **added p99 latency goal is 5 ms within the home region**, to be validated on the real network. Reuse connections, keep gateway/Redis placement close and enforce a short decision deadline. The deadline, retry budget and application latency budget must agree; three long retries can cost more than the backend request.
+
+### What breaks first?
+
+**A hot tenant.** Sharding distributes many keys, not one key. One very busy subject still belongs to one primary. Add a coarse local prefilter for obvious floods, or deliberately lease small token batches to gateways. Leasing reduces calls but strands unused tokens and can grant extra capacity after lease-owner failures unless its accounting is designed carefully. Do not multiply a global allowance by the gateway count.
+
+**A lost primary or network partition.** Asynchronous replication may lose recent deductions. A promoted replica can therefore admit more than the pre-failure primary would have. Waiting for replica acknowledgements reduces some loss windows but is not the same as consensus or a durable business ledger. Under the stated fail-closed policy, gateways reject while the correct authority is uncertain. If the business requires a hard cap through failures, choose a stronger transactional authority or enforce that cap at the backend and accept the availability/latency cost.
+
+**A regional partition.** Each tenant has a home region; other regions route quota decisions there. If the product instead wants independent regional availability, explicitly split its budget across regions. Giving every region the full bucket changes the guarantee to a per-region allowance. That is a different contract, not an implementation detail.
+
+**Clock adjustments.** The clamp handles backwards steps without double credit. A large forward jump can refill a bucket early; Redis wall time is not a consensus clock. Monitor time health and choose a conservative degraded policy if the temporal guarantee is strict. Failover and clock behavior must be tested together before making strong cross-failure claims.
+
+**Policy-plane outage.** Continue only within a defined last-known-good policy window. If a restrictive policy update is security-critical, stale configurations must fail closed when that window ends. Do not turn the policy store into an unbounded fallback or reset every bucket after a configuration refresh.
+
+### Run and check the mechanisms
+
+- [TokenBucket.java](reference-code/learning/kb/ratelimit/TokenBucket.java): complete Java 21 arithmetic and local synchronization.
+- [RatelimitChecks.java](reference-code/learning/kb/ratelimit/RatelimitChecks.java): fractional refill, exact boundaries, backwards clock, large elapsed time, traffic-envelope checks and a 100-caller race.
+- [RatelimitTrace.java](reference-code/learning/kb/ratelimit/RatelimitTrace.java): emits the visual's recorded steps.
+- [token-bucket.lua](reference-code/learning/token-bucket.lua): shared Redis decision, with server time and safe expiry.
+
+```sh
+javac -encoding UTF-8 -d out kb/ratelimit/*.java
+java -ea -cp out kb.ratelimit.RatelimitChecks
+```
+
+The repository's Redis check runs this exact Lua in an isolated Redis 7.4.2 container. It tests shared concurrent spending, fractional balance, clock debt, safe expiry, corrupt state, policy mismatch and script-cache recovery. The concurrent-spending case seeds a future watermark to freeze refill while clients contend. It is a functional single-primary test; replication, partitions, failover and throughput remain separate deployment validation work.
 
 ## 6. Interviewer follow-ups
 
-**Does 429 mean the backend was already called?** Admission should happen first; test that denied requests perform no expensive backend operation.
+**Why not a fixed window?** It is simple, but a customer can send the full limit just before a boundary and again just after it. That may be acceptable for an approximate product quota. A token bucket gives an explicit burst/refill contract. An exact sliding log gives different semantics and stores request timestamps; a weighted two-window counter is an approximation, not a universal cure for bursts.
 
-**Can an expired bucket always restart full?** Only when that matches the idle-time policy; premature eviction can mint allowance.
+**Does this also limit concurrent work?** No. A small request and a ten-minute export both spend admission budget. Limit simultaneous expensive work separately with a bounded concurrency mechanism and cancellation/recovery rules. Rate, concurrency and queue length answer different questions.
+
+**What if we need tenant and global limits?** Sequential checks can conservatively spend a tenant token before the global check rejects; they do not offer all-or-none accounting. Atomic multi-key checks require co-located keys and may create a hot global shard. For many products, bounded conservative accounting or allocated regional/tenant budgets are a better trade-off, but state the approximation explicitly.
+
+**Should a failed backend request refund its token?** Not under our chosen attempt-counting policy. Automatic refunds can be abused or race with refill and retries. If successful-operation quotas are required, maintain a separate operation ledger tied to backend outcomes rather than casually adding tokens back.
+
+**Can low-risk routes fail open?** They can choose that product trade-off, but a local emergency bucket is still per gateway. Its total bound depends on the number of gateways. Record fallback use, cap its duration and disable it for routes where overshoot is unacceptable; never describe it as preserving the original global limit.
 
 ## 7. Closing answer
 
-I choose shared atomic per-key token buckets at the gateway, versioned policy and bounded degraded admission. I distinguish exact decisions on a healthy owner from tolerated loss/failover behaviour. Quota keys, retry delay and outage policy are part of the API contract, not implementation afterthoughts.
+“I would enforce a token-bucket contract at the gateway, keyed by authenticated tenant and route policy. One Redis primary atomically refills and spends, with server time, preserved fractional credit and an expiry that cannot create extra allowance. Exhaustion returns 429; an unavailable authority follows an explicit route policy. Sharding handles many customers, while hot customers, replication loss, clock changes and regional partitions determine the limits of the guarantee. I would measure those limits before claiming an operational SLA.”
+
+![Selected architecture: gateways enforce versioned policies using shared Redis primary buckets, forward admitted requests and keep recovery replicas out of the decision path.](designs/hld-2.svg)
 
 === HLD 3 ===
-N|n0|Application client|0|0|200|rect
-N|n1|Cache router|250|0|200|rect
-N|n2|Cache shards|500|0|200|rect
-N|n3|Authoritative database|0|110|200|rect
-N|n4|Invalidation stream|250|110|200|rect
-N|n5|Membership control plane|500|110|200|rect
-E|n0|n1|GET and PUT
-E|n1|n2|owns key routes
-E|n0|n3|miss and writes
-E|n3|n4|versioned changes
-E|n4|n2|invalidates
-E|n5|n1|publishes owners
+N|app|Storefront service|20|20|185|rect
+N|router|Routing library|270|20|190|rect
+N|primary|Primary cache shards|530|20|215|cylinder
+N|source|Product authority|20|220|185|cylinder
+N|events|Durable invalidations|270|220|210|rect
+N|replicas|Cache replicas|530|220|215|cylinder
+N|control|Membership + epochs|270|410|220|rect
+E|app|router|GET / ticket / fill
+E|router|primary|current bucket owner
+E|app|source|miss / product write
+E|source|events|transactional outbox|dashed
+E|events|primary|minimum version|dashed
+E|primary|replicas|copy with age budget|dashed
+E|control|router|owner map|dashed
+E|control|primary|ownership epoch|dashed
 ---
 ## Problem
 
-Design a distributed in-memory cache like Memcached or Redis Cluster: a key-value store spread over many nodes, with sub-millisecond reads, that scales horizontally, survives node failures and evicts data when memory fills. The key topics are **partitioning with consistent hashing**, **replication**, **eviction**, and **cache patterns** with their consistency problems.
+A storefront shows the same travel mug thousands of times per second. Its product card contains a name, display price and currency. Reading the product database for every card is wasteful, so we keep copies in memory across several cache nodes. Now the merchant changes the price from ₹499 to ₹549 while a slow reader is still fetching the old card. The cache must get faster without inventing an unlimited period in which ₹499 keeps coming back.
+
+Design a distributed cache for this workload. Explain where a key lives, what a read or write means, how memory stays bounded, and what happens when nodes, invalidations or the origin fail.
 
 ## Requirements
 
-**Functional**
-- `get(key)`, `set(key, value, ttl)`, `delete(key)`. Values up to ~1 MB.
-- TTL expiry and LRU/LFU eviction under memory pressure.
+I would clarify the consistency promise before choosing a hash ring or an eviction policy. For this answer, use these decisions:
 
-**Non-functional**
-- p99 < 1 ms within a datacentre. 1M+ ops/s. Add or remove nodes with minimal data movement.
-- Survive a node failure without a thundering herd on the database.
+| Question | Chosen answer and consequence |
+| --- | --- |
+| What is cached? | Tenant-scoped public product-card bytes: product ID, name, display price, currency and source version. Values are at most 16 KiB; most are much smaller. |
+| How stale may a card be? | A server may use a snapshot only within **ten seconds of the load ticket issued before its authoritative read**. Invalidation normally shortens this. No stale-on-error extension beyond that hard budget. |
+| Is the displayed price binding? | No. Checkout obtains an authoritative quote; stock, payment, account permissions and financial limits are outside this cache. |
+| Who owns the truth? | The product database. Cache loss must not lose a product change. A cache write never substitutes for a database commit. |
+| What happens after a merchant writes? | The write response and merchant's immediate read come from the authority. Public card reads may remain within the stated staleness window. |
+| What availability do we choose? | Serve valid cached copies during an origin outage, then return a controlled error when their permissions end. During a cache outage, bound origin work and shed excess load. |
+| What does “distributed” add? | Key routing, node ownership, replication and migration. The Java example proves one node's fill/expiry/capacity rules; it does not implement those distributed protocols. |
 
-**Scale:** 10 TB of hot data at 64 GB per node is roughly 160 nodes (plus replicas). At ~100k ops/s per node, 1M ops/s needs only about 10 nodes for throughput, so **memory drives the node count**.
+Provide `GET`, ticketed conditional fill, versioned invalidation and explicit cache eviction. Operations affect one key at a time. We do not offer multi-key transactions, durable queues or distributed locks through this cache. The illustrative cache-hop target is p99 below 2 ms in the serving region for small values; it must be measured on the actual network and hardware.
 
-## 1. Scope and selected consistency
+## 1. Start with the record, then size one workload
 
-I design a read cache for mutable product data with a declared bounded staleness target. I choose cache-aside, virtual-bucket ownership, replicated cache shards and versioned invalidation events. The cache is disposable; a successful database write remains durable when cache operations fail.
-
-## 2. Protocol and request paths
+The database row has a stable product ID and a version increased in the same transaction as every card change:
 
 ```text
-GET(key) -> value, version, expiresAt | MISS
-PUT_IF_NEWER(key,value,version,expiresAt) -> stored | olderVersionRejected
-INVALIDATE(key,minVersion) -> tombstone/version watermark
-Entry: key, serializedValue, sourceVersion, absoluteExpiry
+ProductCard {
+  tenantId: 23, productId: 784,
+  name: "Travel mug", listPricePaise: 49900,
+  currency: "INR", sourceVersion: 41
+}
+
+cache key: card:v1:tenant:23:product:784
 ```
 
-A miss enters per-key request coalescing, reads authoritative data and fills only if its version is not below the current watermark. A write commits at the source then emits invalidation through an outbox/change stream. Tombstone/watermark retention must cover delayed fills; otherwise only the stated staleness bound is defensible. Cache outages trigger a bounded database concurrency pool and load shedding. At 20,000 reads/s and 98% hits, source load is 400/s; full loss exposes 20,000/s, so an unbounded bypass would be unsafe. Shard migration switches virtual-bucket ownership after transfer/validation and retains a rollback path.
+`v1` in the key is the **serialization schema version**. `41` in the value is the **source-record version**. They are different. The schema's codec must produce deterministic bytes for a given record/version; the mechanism rejects conflicting bytes claiming the same currently stored version. Putting the changing source version into the lookup key would require callers to discover that version before they could find the current card. Do not defeat the lookup by first querying the database for its cache key.
+
+Use one planning workload throughout: **200,000 product-card reads/s at peak**, **98% hits**, **500 product updates/s**, and **20 million hot records**. These are interview assumptions, not measured capacity.
+
+| Quantity | Derivation | Result |
+| --- | --- | --- |
+| Origin reads at the assumed hit rate | `200,000/s × 0.02` | `4,000 reads/s`, before coalescing |
+| Origin reads with no cache | `200,000/s` | 50 times the ordinary miss load |
+| Encoded bytes per planned entry | `800 B value + 64 B key + 160 B metadata` | `1,024 B` |
+| Planned resident entry bytes | `20M × 1,024 B` | `20.48 GB` decimal, about `19.07 GiB` |
+| One replica per primary | `2 × 20.48 GB` | `40.96 GB` across all cache copies, before spare capacity |
+| Aggregate GET traffic | `200,000/s × 1,024 B/exchange` | `204.8 MB/s`, before transport/replication overhead |
+| Logical cache operations | `200k GET + 4k BEGIN_LOAD + 4k FILL + 0.5k INVALIDATE` | About `208,500 ops/s`, before retries and coalescing |
+
+`GB` means `10^9` bytes; `GiB` means `2^30` bytes. The metadata allowance must include the measured cost of keys, routing/expiry information and invalidation-only slots. A memory plan also needs allocator fragmentation, replication buffers, connection buffers and process overhead. A cache advertised as “16 GiB per node” cannot spend every byte on values.
+
+For an initial load-test configuration, choose six primary shards and one replica each. At equal distribution that is about `34,750 logical cache ops/s` and `3.41 GB` of planned entry bytes per primary. If a measured allocation factor were 1.4, that becomes roughly `4.78 GB`, or `4.45 GiB`, per primary. An 8 GiB entry/allocation budget within a 16 GiB process/node envelope would leave room for buffers and growth. None of those constants is a universal node capacity. Test representative values and skew before purchasing or promising this layout.
+
+Suppose the origin admission budget is 6,000 reads/s, pending validation. Normal 4,000/s misses fit; a cold-cache 200,000/s burst does not. Even perfect failover cannot make an unbounded origin fallback safe. Memory, operations, bandwidth, origin protection and the hottest key all constrain sizing; pick the largest demonstrated requirement rather than dividing raw payload by RAM alone.
+
+## 2. Contracts and ownership
+
+### Separate cache operations from product operations
+
+```text
+GET(key, routingEpoch)
+  -> HIT(valueBytes, sourceVersion, remainingAgeBudgetMs)
+   | MISS
+   | ROUTE_CHANGED(newMapVersion)
+   | UNAVAILABLE
+
+BEGIN_LOAD(key, routingEpoch)
+  -> opaqueTicket(key, ownerEpoch, slotIncarnation, generation, issuedAt)
+
+FILL(ticket, sourceVersion, valueBytes)
+  -> STORED | RETIRED | INVALIDATED | TOO_OLD | OLDER_VERSION | TOO_LARGE
+
+INVALIDATE(key, minimumSourceVersion, routingEpoch)
+  -> accepted | alreadyCovered | ROUTE_CHANGED
+
+EVICT(key) -> removed | absent
+```
+
+All cache calls use authenticated internal clients and bounded deadlines. An external shopper cannot submit arbitrary cache bytes or choose a price. `BEGIN_LOAD` grants permission to attempt a fill; it does not prove the value is current and is not an exclusive lock. The source version and deadline still need checking.
+
+`EVICT` removes a cache copy to reclaim space. It does **not** delete the product. Product deletion goes through the authoritative product API and emits an invalidation with its new source version. IDs are not recycled for unrelated products. Initial misses for absent products are not cached; if negative caching is added, it needs its own short age budget and a stated creation-visibility policy.
+
+Store each retained slot as:
+
+```text
+key -> {
+  slotIncarnation, generation, minimumSourceVersion,
+  optional(valueBytes, sourceVersion, loadStartedAt, maxAge)
+}
+```
+
+The database owns the card and its source version. A cache primary owns the temporary slot and load tickets for its current ownership epoch. The membership authority owns `bucket -> primary, replicas, epoch`. Invalidation delivery does not become another product database; it carries evidence that versions below a given value must no longer fill a retained slot.
+
+### Read and write paths
+
+A storefront read asks the routed cache primary. On a usable hit, it receives bytes plus the remaining age budget. On a miss, a bounded per-key coalescing group obtains a load ticket, reads the current database primary in a fresh statement/snapshot, and attempts `FILL`. The storefront may return that origin result only while the same age budget remains valid. A twenty-second origin read cannot bypass a ten-second policy merely because it was never cached: discard it and retry within a separate bounded request budget, or return an error.
+
+For a product update, the product service authenticates the merchant, changes the row to version 42 and records an outbox event **in the same database transaction**. The committed write remains successful if the cache is unavailable. An outbox worker retries `INVALIDATE(key, 42)` until delivered; consumers tolerate duplicate and out-of-order versions. Merchant read-after-write bypasses the public cache. A plain database write followed by an unreliable best-effort message would leave an avoidable delivery hole.
+
+Return `Cache-Control: no-store` for this server-owned card response policy. An independently cacheable browser/CDN response would introduce another freshness boundary. This design's ten-second statement concerns server decisions, not packets already sent or a shopper's screenshots.
 
 ## 3. Final design diagram
 
-[![Distributed Cache: Application client GET and PUT Cache router; Cache router owns key routes Cache shards; Application client miss and writes Authoritative database; Authoritative database versioned changes Invalidation stream; Invalidation stream invalidates Cache shards; Membership control plane publishes owners Cache router](designs/hld-3.svg)](designs/hld-3.svg)
+[![A storefront uses a routing library to reach cache primaries; misses read the product authority, committed changes emit versioned invalidations, replicas support recovery and a membership authority publishes bucket ownership.](designs/hld-3.svg)](designs/hld-3.svg)
 
-A **cache miss** fetches the authoritative value. **Eviction** removes entries to reclaim space; **expiry** removes them after a lifetime. **Invalidation** removes or supersedes stale data after change. These mechanisms solve different problems.
+The **storefront service** authenticates its callers and decides which data can be cached. Its **routing library** hashes the canonical key to a virtual bucket and uses a cached owner map. The **primary cache shards** make atomic per-key get/fill/invalidate decisions and enforce capacity. **Replicas** keep recoverable copies with preserved age budgets, not another authority for product writes.
 
-## 4. Critical operation: worked execution
+On a miss, the storefront reads the **product authority** through its normal origin path. A committed update writes an event to the **durable invalidation/outbox path**, which delivers minimum versions to the current cache owners. The **membership authority** publishes owners and monotonically increasing ownership epochs; it does not process every GET. There is no synchronous dependency on the control plane or invalidation consumer for a healthy cached read.
 
-![The database stays authoritative when the cache is empty.](lessons/hld-3-flow.svg)
+Solid request arrows identify who is consulted. Background arrows copy cache state, deliver invalidations or publish routing changes. Losing the cache path changes performance and availability; it never transfers product ownership away from the database.
 
-*The database stays authoritative when the cache is empty.*
+## 4. Critical operations: the stale fill and the forgotten fence
 
-![A delayed reader can race a writer and resurrect a stale value.](lessons/hld-3-failure.svg)
+### Why deleting after a write is not enough
 
-*A delayed reader can race a writer and resurrect a stale value.*
+![A load ticket issued before reading version 41 is retired when invalidation for version 42 advances the slot generation. A late fill with the old ticket is rejected; a fresh ticket can fill version 42.](learning-figures/hld-3-stale-fill.svg)
 
-### Calculate the benefit and risk
+**Why this picture:** read and invalidation are individually simple, but their ordering can resurrect an old value. We must identify the reader whose permission changed.
 
-At 20,000 reads/s and 98% hit rate, database traffic is 400 reads/s. Losing the cache can multiply it by 50. If the database safely serves 1,000/s, only bounded fallback and admission can prevent overload; the cache outage cannot be solved by giving every request another retry.
+1. At `t=0`, the card is absent. Reader A obtains a ticket for slot 1, generation 0, then reads database version 41 at ₹499. Its result is delayed.
+2. At `t=1`, the merchant commits version 42 at ₹549. The invalidation sets the slot's minimum version to 42, advances its generation and removes an older cached value.
+3. At `t=2`, A tries to fill version 41 with generation 0. The slot now has generation 1, so the cache rejects it. The cached price does not move backwards.
+4. Reader B gets a new ticket and a fresh authoritative version 42. Its fill succeeds. A replayed invalidation for version 41 cannot remove this newer copy.
 
-For one million 1 KB values, raw payload is about 1 GB decimal. Keys, object overhead, allocator fragmentation, replication and headroom make provisioned memory larger. Estimate those separately instead of sizing a node to raw payload alone.
+If invalidation is delayed or lost temporarily, generation cannot help before the event arrives. The hard age budget provides the separate bound: A's ticket from `t=0` ends at `t=10`, even if its fill arrives at `t=9`. It receives only one second of remaining life. At equality, the cache returns a miss; insertion time does not grant a new ten seconds.
+
+### Why bounded memory needs a slot incarnation
+
+![Evicting a key retires its slot identity. Recreating the same key uses a new identity, so an old ticket cannot become valid again even if its generation number matches. Both metadata slots and payload bytes are bounded.](learning-figures/hld-3-capacity.svg)
+
+**Why this picture:** keeping every invalidation tombstone forever would eventually exhaust memory. Simply deleting a generation counter, however, can make an old ticket look current when the key is recreated with generation zero. That is an **ABA problem**: a name appears to return to the same state while its ownership history has changed.
+
+The cache ties a ticket to both the generation and the slot incarnation. Evicting a slot retires that incarnation. Recreating `card:784` produces a different slot, so a delayed ticket for the old one fails even when the new generation is zero. This applies to entries evicted for memory, metadata-only invalidation slots, an explicit clear and a node restart. A distributed wire implementation additionally binds tickets to the node/ownership epoch and authenticates them; a guessed integer is not permission to fill.
+
+[Step through invalidation, delayed TTL and eviction](learning-labs/distributed-cache.html). Each state is generated by the Java mechanism below. The controls are manual and the complete recorded text is available on the same page.
+
+The two protections have distinct jobs: generation/incarnation checks stop known-invalid or retired fills; the hard age budget bounds old data when an invalidation has not arrived. Neither promises a globally linearizable cache or eliminates origin failures.
 
 ## 5. Detailed decisions, algorithms and failure behaviour
 
-### Architecture
+### Route many keys without reshuffling all of them
 
-- **Partitioning:** a consistent hash ring with ~100–200 **virtual nodes** per physical node, which smooths the distribution. Adding a node moves only ~1/N of the keys.
-- **Routing:** a smart client library holds the ring (as in Memcached clients or Redis Cluster's slot map), or a proxy (twemproxy, Envoy). The client avoids a hop; the proxy simplifies clients.
-- **Replication:** each shard has a primary plus 1–2 async replicas. Failover is promoted by a membership service (Sentinel, ZooKeeper or etcd).
-- **Node internals:** a hash table plus an LRU doubly linked list (or Redis's approximated LRU by sampling). A single-threaded event loop per shard, or sharded locks.
+Choose **4,096 fixed virtual buckets** for this design. A stable hash of the complete canonical key selects a bucket; a directory maps that bucket to a primary, replica and ownership epoch. The bucket count is independent of today's six primaries. Adding a seventh node moves a selected set of buckets instead of changing `hash(key) % nodeCount` and remapping most records. Four thousand ninety-six is a manageable planning choice here, not a required constant.
 
-### Key design decisions & trade-offs
+A consistent-hash ring with many virtual nodes is another reasonable design. Each physical node owns several positions on the ring; weighted positions accommodate different node sizes. With balanced independent keys and equal capacities, adding one node to N existing nodes moves roughly `1/(N+1)` of the key space **in expectation**, not an exact fraction of traffic or bytes. Virtual nodes smooth key placement; neither rings nor buckets split one hot key's traffic across nodes.
 
-**1. Consistent hashing vs. hash slots.** Redis Cluster uses 16,384 fixed slots assigned to nodes. Rebalancing moves whole slots, which is easier to reason about and migrate. A virtual-node ring is equivalent in spirit. Both beat `hash % N`, which reshuffles almost everything when N changes.
+The routing library keeps the owner map and opens pooled connections directly to owners. A proxy would simplify client upgrades and centralize routing at the cost of another hop and another capacity/failure boundary. I start with a shared internal client library because there are few controlled application languages. An unrecognized epoch or a moved bucket returns `ROUTE_CHANGED`; the client refreshes its map and retries once within its original deadline. Do not let redirect loops consume an unbounded retry budget.
 
-**2. Cache-aside vs. read-through vs. write-through vs. write-behind.**
-- *Cache-aside* (the app reads the cache, falls back to the DB, then fills the cache) is the most common. Stale data is possible, so you need a TTL plus invalidation.
-- *Write-through* keeps the cache fresh but adds write latency. *Write-behind* is fast but risks data loss.
+Membership is more than detecting that a TCP connection failed. Use a quorum-backed control plane to publish ownership epochs, and fence an old owner before activating a replacement. Owners must stop accepting writes/ticket fills when their ownership permission expires. A minority partition cannot independently declare itself the new owner. If ownership is uncertain, fail the cache operation and use bounded origin fallback; the cache is not important enough to invent split-brain authority.
 
-**3. Invalidation races.** A read fills the cache with an old value right after a writer deletes it. Mitigations: delete after the DB commit, a short TTL, versioned values, or "delete twice" (delayed double delete). Facebook's *leases* stop stale sets and thundering herds.
+As a concrete existing protocol reference, [Redis Cluster's specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) documents 16,384 hash slots, client routing changes, ownership epochs and acknowledged-write loss with asynchronous replication. Our 4,096-bucket ticket protocol is an application design, not a claim that Redis implements these custom operations directly.
 
-**4. Thundering herd / stampede.** A hot key expires and 10k requests hit the DB. Use request coalescing (single-flight), probabilistic early refresh, and serve stale while revalidating.
+### Rebalance a bucket as an ownership operation
 
-**5. Hot keys.** One key on one node gets 200k req/s. Replicate hot keys to several nodes (key#1..k), or add a small in-process L1 cache in front.
+For a warm migration from node A to B:
 
-**6. Consistency on failover.** With async replication, recent writes can be lost on promotion. For a cache, that's usually acceptable: the DB is the source of truth.
+1. Mark the bucket as moving, while A remains the sole serving owner. Start transferring a snapshot and an ordered stream of fills/invalidations/evictions to B. Preserve source versions and remaining age budgets.
+2. Bound migration bandwidth and destination memory. A ten-second-lived item may expire during transfer; skipping it is better than extending its life to justify copying it.
+3. Briefly stop new fill tickets for the bucket, drain or retire existing ones, fence A and catch B up through the cutover point. Invalidation delivery during this interval must be buffered/replayed against the new owner, not acknowledged and discarded.
+4. Publish B with a higher ownership epoch. Old tickets cannot fill B. Clients refresh their maps; A rejects old-epoch writes and can return the new route.
+5. Validate routing and miss/origin load before moving another batch. A rollback is a **new** ownership transition with a higher epoch, never a return to an old epoch that makes delayed tickets valid again.
 
-### Scope, guarantees and sizing assumptions
+For this disposable cache, cold migration is a simpler option: retire the bucket's cache state, switch a fenced owner and warm on demand under origin admission limits. Warm transfer is worth its complexity only when the cold-miss cost is worse. Neither route loses authoritative product data.
 
-**Correctness requirement:** The cache is expendable; losing cached bytes must not silently lose the authoritative record.
+### TTL, replicas and local copies must share the original age budget
 
-Assume 100,000 reads/s and 95% hits: 5,000 misses/s reach storage. Ten million 1 KB values consume about 10 GB raw, excluding keys, allocator overhead, replicas and headroom. At zero hits the origin sees a 20x increase.
+Within one process, use a duration clock and compare `now - startedAt` with the maximum age. Do not compare unrelated `nanoTime()` values from two machines or serialize them as UTC timestamps. Java's [System.nanoTime documentation](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/System.html#nanoTime()) specifies elapsed-time use within one JVM and notes that nanosecond precision does not imply nanosecond resolution.
 
-### API contracts and data ownership
+A copied value needs a **remaining duration**, not a newly granted TTL. For an application L1 cache, note local monotonic time before sending GET. If the primary replies with 800 ms remaining, set the local limit conservatively from that request-start time plus 800 ms, rounded down. Network delay consumes the budget instead of extending it. A reply that arrives after that limit is already unusable.
 
-```text
-GET key, SET key value ttl, conditional compare-version write, DELETE key; administrative drain/rebalance
+Use the same conservative pattern for replica-initiated replication pulls: the replica records its local request start; the primary sends each value's remaining duration at serialization; the replica anchors that duration to its earlier local request start. A delayed pull can shorten a copy's useful life, never renew it. Values and corresponding invalidation/version state are transferred in an ordered stream. If a copy's age cannot be established safely, discard it and warm again. Do not copy raw primary-process tick values into another process and hope their origins match.
+
+These arguments assume sufficiently accurate duration clocks. A real ten-second product promise must include measured resolution/rate error and suspend/restart behavior, subtract a conservative margin, and discard cached state when clock health cannot support it. The Java mechanism's injected clock makes its equality rule exact in the model; it does not certify all machines' clocks.
+
+On primary failure, the control plane fences its ownership and promotes a replica with a new epoch. Already replicated copies can be used only within their preserved budgets. Lost invalidations or recent fills can cause a miss or a bounded stale card, not loss of the product write. Retire old-primary tickets; do not inherit its in-flight permissions merely because a replica has the same key bytes. If the replica's age or stream state is uncertain, choose a cold shard. This trades some hit rate for a comprehensible safety boundary.
+
+### Keep memory bounded without making recency a correctness rule
+
+**Expiry** answers “is this copy too old?” **Eviction** answers “which copy should leave to make room?” **Invalidation** answers “what source change makes earlier work unusable?” An entry can be fresh but evicted; it can be old even when nobody needs its memory. Always check expiry on read, even if a background sweeper has not removed the bytes.
+
+For the small mechanism, exact LRU makes the example deterministic: a successful access moves a slot to the most-recent end, and capacity pressure retires the least-recent eligible slot. Both the number of slots and the sum of encoded payload bytes are bounded. Metadata-only fences count toward the slot limit. An oversized fill is rejected without evicting the world to fit one value. Payload arrays are defensively copied so a caller cannot alter cached bytes after insertion.
+
+An actual multi-gigabyte node needs measured byte accounting and a lower-contention eviction policy. Exact LRU updates shared recency on every read and a sequential scan can displace the useful working set. Sampled recency, frequency-based eviction or a small admission filter are alternatives; choose with trace replay of the real access pattern. [Redis's eviction reference](https://redis.io/docs/latest/develop/reference/eviction/) distinguishes memory limits and LRU/LFU policies, documents sampled LRU, and explains why replication/persistence buffers need additional headroom.
+
+Shorter, jittered lifetimes can spread refreshes **across different keys**. Jitter must reduce our hard ten-second budget; adding random seconds above it breaks the policy. Eviction removes a remembered version floor, so we do not promise globally monotonic values across an evict/recreate/failover cycle. New loads must still read current authority; retired tickets never regain permission. Keeping all version floors forever would trade a performance cache for an unbounded history store.
+
+### Complete Java 21 node mechanism
+
+`BoundedCache` implements ticketed fills, version floors, invalidation generations, monotonic expiry, exact LRU slot retirement and a payload-byte budget. All public mutations/read decisions use one monitor. It accepts up to 16 KiB per value and a maximum configured age of one hour; this case constructs it with ten seconds. The byte budget counts encoded values, while a separate slot limit bounds keys/metadata. It is not a measurement of Java heap occupancy.
+
+The read and ticket operations are taken directly from the compiled source:
+
+```java
+public synchronized Optional<Hit> get(String key) {
+    validateKey(key);
+    Slot slot=slots.get(key);
+    if (slot==null || slot.value==null) return Optional.empty();
+    long age=ticker.getAsLong()-slot.loadedAt;
+    if (age<0 || age>=ttlNanos) { removeValue(slot); return Optional.empty(); }
+    return Optional.of(new Hit(slot.value,ttlNanos-age));
+}
+
+public synchronized Ticket beginLoad(String key) {
+    validateKey(key);
+    Slot slot=ensureSlot(key);
+    return new Ticket(this,key,slot,ticker.getAsLong());
+}
 ```
 
-```text
-Logical records (outline, not complete DDL):
-cache_entry(key,value,version,expires_at); routing(virtual_bucket,owner,epoch)
+The fill/invalidation decision rejects an old slot, old generation, exhausted time budget or lower source version. It also detects different bytes claiming the same currently stored source version. `slot.loadedAt` comes from the ticket, so the fill cannot grant itself another lifetime.
 
-Primary access/partitioning boundary:
-namespace + tenant_id + entity_id + data_version
+```java
+public synchronized Fill fill(Ticket ticket, Value value) {
+    Objects.requireNonNull(ticket); Objects.requireNonNull(value);
+    Slot slot=slots.get(ticket.key);
+    if (ticket.issuer!=this || slot!=ticket.slot) return Fill.RETIRED_SLOT;
+    if (slot.generation!=ticket.generation) return Fill.INVALIDATED;
+    long age=ticker.getAsLong()-ticket.startedAt;
+    if (age<0 || age>=ttlNanos) return Fill.TOO_OLD;
+    if (value.version()<slot.minimumVersion) return Fill.OLDER_VERSION;
+    if (slot.value!=null && slot.value.version()==value.version()
+            && !Arrays.equals(slot.value.payload,value.payload)) return Fill.CONFLICTING_VALUE;
+    int size=value.payload.length;
+    if (size>MAX_VALUE_BYTES || size>maxPayloadBytes) return Fill.TOO_LARGE;
+    long previous=slot.value==null?0:slot.value.payload.length;
+    while (payloadBytes-previous+size>maxPayloadBytes) evictOldestExcept(slot);
+    removeValue(slot);
+    slot.value=value;
+    slot.loadedAt=ticket.startedAt; // A late fill never receives a fresh lifetime.
+    slot.minimumVersion=Math.max(slot.minimumVersion,value.version());
+    payloadBytes+=size;
+    return Fill.STORED;
+}
+
+public synchronized void invalidate(String key, long minimumVersion) {
+    validateKey(key);
+    if (minimumVersion<1) throw new IllegalArgumentException("positive source version");
+    Slot slot=ensureSlot(key);
+    if (minimumVersion<=slot.minimumVersion) return; // Duplicate/older event is harmless.
+    long nextGeneration=Math.incrementExact(slot.generation);
+    removeValue(slot);
+    slot.minimumVersion=minimumVersion;
+    slot.generation=nextGeneration;
+}
 ```
 
-### Build the architecture in stages
+The complete source supplies immutable byte values, `Ticket`, `Slot`, LRU eviction and diagnostics. A production RPC implementation needs authenticated opaque tokens with node/ownership epoch binding; Java object identity works only inside this model. It also needs bounded origin requests/coalescing, membership, transport, replica transfer and routing. None is secretly supplied by `synchronized`.
 
-**Stage 3 — Partition and isolate.** Partition around namespace + tenant_id + entity_id + data_version. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+With Java 21 on PATH, run from the repository root:
 
-### Trace the critical request
+```powershell
+New-Item -ItemType Directory -Force .learning-work/cache-classes | Out-Null
+javac -encoding UTF-8 -d .learning-work/cache-classes examples/learning-java/src/kb/cache/*.java
+java -cp .learning-work/cache-classes kb.cache.CacheChecks
+java -cp .learning-work/cache-classes kb.cache.CacheTrace
+```
 
-Client hashes a key to a virtual bucket; route to the current owner; check expiration on read; return a miss or current value. On miss coalesce identical origin requests, read durable data and populate with TTL jitter. Writes update the authority then invalidate or replace with a version-aware rule.
+The checks cover stale generations, retained version floors, late-fill age, expiry at equality, slot and payload bounds, LRU, evict/recreate identity, defensive copies, timer wrap arithmetic and concurrent invalidations. `CacheTrace` emits the walkthrough states from this implementation. These are local mechanism checks, not distributed consistency, network or performance evidence.
 
-### Deep dive: the decision that changes this system
+### Stampedes, hot keys and an unavailable cache
 
-Consistent hashing reduces movement when nodes change but does not solve skew inside one hot key. A directory/epoch prevents stale routing during bucket migration. TTL bounds age only from insertion, not from the time an old value was read; stale refill can extend staleness without version checks.
+For one application instance, coalesce concurrent misses for the same canonical key into one origin read and a bounded set of waiting callers. Give that group a deadline, a maximum waiter count and cleanup on success/error/cancellation. A failed fetch must complete the waiters exceptionally and release its permit, not leave an immortal “loading” future. Several application instances can still each fetch once; local coalescing is not a global lease.
 
-### Failure and race-condition walkthrough
+For a very hot key, a cache-owner load lease can further reduce concurrent origin reads, but that requires lease identity, expiry and old-owner fill rejection. Do not use a volatile cache lease as durable business mutual exclusion. Starting with bounded local coalescing plus a global/per-origin admission budget is simpler for this product. An early refresh may renew a popular card **only by reading the authority again**; re-inserting its old bytes cannot renew freshness.
 
-Losing a node causes correlated misses. Bound concurrent origin fetches, shed low-priority requests and warm gradually. Retrying blindly across replicas can return inconsistent versions. If the cache provides distributed locks, eviction and failover semantics must not be treated as durable mutual exclusion.
+One mug becoming viral can saturate one primary even if the other five are idle. Add a small application L1 copy using the preserved age budget, and measure fanout. Alternatively distribute verified hot-key replicas across read nodes, accepting extra invalidation fanout and requiring the same version/age rules. Inventing `key#1` through `key#10` without a write/invalidation protocol creates ten stale copies rather than a complete solution.
 
-### Security, tenancy and lifecycle
+During a cache outage, use a short cache deadline/circuit breaker, then a bounded origin concurrency pool, request-rate admission and bounded queues. The origin's assumed 6,000 reads/s budget is for the whole deployment, not 6,000 per application process; fixed per-instance allowances must sum to that budget under the maximum instance count or be centrally allocated. Preserve origin capacity for merchant writes and checkout. Return `503` for excess card work instead of letting retries turn the product database into the next failure.
 
-### Trade-offs and a starting recommendation
+No stale-on-error beyond the hard budget is chosen here. If a different product prefers an old card to an error, agree an explicit second stale window and label that response. Do not quietly call it the same ten-second guarantee. After recovery, warm gradually from current demand or a bounded hot-key list; a mass preload and a rebalance should not compete with customer misses unchecked.
 
-LRU approximates recency; LFU protects popular long-lived values; admission policies prevent scans evicting the working set. Write-through simplifies population but creates a dual-write failure problem unless durable authority remains clear.
+### Observability, tenants and the failures to test
 
-Observe hit ratio by namespace, eviction rate, origin concurrency, memory fragmentation, replication lag, stampede group size and stale-value rate.
+Track hit/miss rate and **bytes served** by namespace, lookup p50/p95/p99, miss-group/waiter counts, origin permits/queue time, invalidation lag, rejected fills by reason, payload/metadata occupancy, evictions, expired reads, replica lag and routing/epoch retries. High hit ratio can coexist with wrong data; sample cached versions against authority to measure stale-card age and post-invalidation regressions. Keep metric labels bounded rather than creating one series per product or tenant. Use sampled access-controlled traces for an individual incident.
 
-**Test matrix:** Cold start, hot key expiration, a failed shard, origin slowdown, stale refill after update, memory pressure and repeated rebalancing with old clients.
+Authenticate internal cache clients, restrict fill/invalidation operations to their namespace, encrypt node/client traffic and isolate administrative eviction/rebalance endpoints. Canonical tenant-qualified keys prevent cross-tenant collisions; authorization still belongs in the application. Public card caches must not accidentally share account-specific discounts or permission-filtered data under the same key. Bound key/value/decompression sizes and request work; untrusted serialized Java objects do not belong in the cache protocol. Avoid logging full confidential payloads or credentials in keys.
 
-### Follow-up questions with answers
+| Failure exercise | Required observation |
+| --- | --- |
+| Old fill after invalidation | Old generation is rejected; a new ticket cannot fill below the retained source floor |
+| Invalidation delayed past an old read | The old read/copy stops at its original hard budget; late fill does not reset it |
+| Eviction, then the same key is recreated | Old slot ticket stays retired; metadata remains bounded |
+| Cold start, popular-key expiry or one failed shard | Origin work stays within its deployment budget; excess requests fail within their deadlines |
+| Replica promotion or moving bucket | Old epoch cannot fill; transferred copies retain age; uncertain copies become misses |
+| Old clients and a network partition | Bounded route refresh/retry; fenced owner refuses stale authority; no infinite redirect loop |
+| Memory pressure and scan workload | Byte/metadata limits hold, hot working set behavior is measured, invalidation fences cannot grow forever |
+| Origin slowdown/outage | Valid copies serve only until their budget ends; no unbounded waiters or stale extension |
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: The cache is expendable; losing cached bytes must not silently lose the authoritative record.
-
-**What is the first scaling pressure to test?** Use the actual workload: Assume 100,000 reads/s and 95% hits: 5,000 misses/s reach storage. Ten million 1 KB values consume about 10 GB raw, excluding keys, allocator overhead, replicas and headroom. At zero hits the origin sees a 20x increase.
-
-**Which failure would invalidate the naive design?** Losing a node causes correlated misses. Bound concurrent origin fetches, shed low-priority requests and warm gradually. Retrying blindly across replicas can return inconsistent versions. If the cache provides distributed locks, eviction and failover semantics must not be treated as durable mutual exclusion.
-
-**Why not introduce every distributed component immediately?** LRU approximates recency; LFU protects popular long-lived values; admission policies prevent scans evicting the working set. Write-through simplifies population but creates a dual-write failure problem unless durable authority remains clear.
-
-**How would you demonstrate the design works?** Cold start, hot key expiration, a failed shard, origin slowdown, stale refill after update, memory pressure and repeated rebalancing with old clients. Keep the expected invariant and recovery outcome visible in the results.
-
-### Further reading
-
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
-
-### Work through partitioning and hot keys
-
-Hash partitioning spreads different keys. It does not split the load of a single viral key. Local short-lived caches, replication or edge caching may help that case, each adding another freshness boundary. Consistent hashing reduces remapping when nodes change; it does not eliminate migration or ownership coordination.
-
-Request coalescing lets one caller fetch a missing key while others wait within a bound. Jittered TTLs reduce synchronized expiry across keys. Negative caching must be short and invalidated on creation, or newly created products can appear missing.
+The 2 ms cache-hop target and 200,000 reads/s workload require a separate distributed load/failure run. Measure cache-hit latency separately from origin-backed product-response latency and report errors alongside percentiles. The design cannot meet a low-latency service target by silently discarding slow failures from its measurement.
 
 ## 6. Interviewer follow-ups
 
-**Does a cache replica guarantee fresh reads?** No. Replica lag is separate from key TTL.
+**Why not use `hash(key) % nodeCount`?** Changing node count changes many key destinations at once. Fixed buckets or a virtual-node ring let us move selected ownership ranges and control the cold-miss cost.
 
-**Should a database write fail because cache population failed?** Usually the durable write remains successful; document read-after-write fallback and invalidation recovery.
+**Is a TTL enough to bound staleness?** Only if its start and every copy are defined. Ten seconds from a late PUT can extend a much older read. This design starts before the origin read and preserves the remaining budget across cache copies.
+
+**Why are version and generation both needed?** Source version orders product changes. Generation retires pending work when a change is observed. Slot incarnation prevents an evicted generation history being recreated in a form that accepts an old ticket. Ownership epoch handles a different node becoming the owner.
+
+**Does a replica preserve the latest invalidation?** Not necessarily with asynchronous replication. Its copies remain subject to the original age budget, old-primary tickets are retired on promotion, and uncertain state is discarded. We do not claim global read-after-write or monotonic reads across failures.
+
+**Can we serve an expired card when the database is down?** Under the chosen policy, no. That would trade the stated freshness guarantee for availability. A product may choose a separate documented stale window, but checkout and permissions would still need their own authority.
+
+**What is the difference between cache-aside, read-through and write-through?** Here the application owns miss loading: cache-aside. A read-through cache would own the origin loader instead. Write-through synchronously updates a cache on the write path but still needs a clear durable commit/dual-write policy; it does not automatically make cache and database atomic. Write-behind would make the cache responsible for uncommitted product changes, which we avoid for this disposable read cache.
+
+**Why not add L1 everywhere?** It can reduce hot-key load, but every copy must preserve remaining age and consume memory. Invalidation becomes less immediate. Add it for measured hot paths rather than resetting TTLs in several hidden layers.
+
+**What would you implement first?** A single bounded cache node with a clear record/age contract, ordinary cache-aside loading, per-key coalescing and origin admission. Add controlled shard routing and replicas when measured capacity or recovery requirements call for them. A cache should reduce origin pressure during normal operation without creating an unbounded origin incident during its own failure.
 
 ## 7. Closing answer
 
-My cache design makes routing and eviction explicit but retains the database as authority. Version-aware fills and a documented freshness window address stale writes; coalescing and bounded fallback prevent cache loss from becoming a database outage. Hot-key load is treated separately from distributing different keys.
+I would cache versioned product-card bytes while keeping product writes and checkout authoritative in the database. Virtual buckets and ownership epochs make routing and movement explicit. Ticket generations reject stale fills, slot incarnations survive eviction safely, and a hard age budget starts before the origin read and follows every copy. Memory, origin work and waiting callers are bounded. Replication and failover improve recovery but do not turn this into a durable or globally linearizable store; measured skew, freshness and failure behavior determine the final capacity and service promises.
 
 === HLD 4 ===
-N|n0|Business outbox|0|0|200|rect
-N|n1|Notification ingest|250|0|200|rect
-N|n2|Priority queues|500|0|200|rect
-N|n3|Channel workers|0|110|200|rect
-N|n4|Provider adapters|250|110|200|rect
-N|n5|Delivery records|500|110|200|rect
-N|n6|Preference store|0|220|200|rect
-E|n0|n1|durable events
-E|n1|n2|routes
-E|n2|n3|leased work
-E|n3|n4|sends
-E|n3|n5|records attempts
-E|n3|n6|checks consent
+N|business|Business outbox|20|20|190|cylinder
+N|ingest|Notification ingest|280|20|210|rect
+N|records|Delivery records + outbox|550|20|240|cylinder
+N|queues|Channel queues|550|210|210|rect
+N|workers|Channel workers|280|210|210|rect
+N|policy|Preferences + templates|20|210|220|cylinder
+N|providers|Provider adapters|280|410|220|rect
+E|business|ingest|retry stable event
+E|ingest|records|atomic acceptance
+E|records|queues|outbox publication|dashed
+E|queues|workers|delivery ID
+E|workers|records|claim / outcome
+E|workers|policy|fresh authorization
+E|workers|providers|immutable request
+E|providers|records|verified evidence|dashed
 ---
 ## Problem
 
-Design a notification platform that many internal services use to send email, SMS, push and in-app notifications to millions of users: transactional (OTP, order shipped) and bulk (campaigns). It must be reliable, respect preferences and rate limits, retry failures and never block the callers. The topics are **queues and fan-out**, **retries and DLQ**, **priority isolation**, and **multi-channel delivery**.
+Order O847 becomes ready for pickup. Customer U21 should see one item in the application's notification inbox and, if currently enabled, receive email and push reminders. The order service must finish its transaction without waiting for an email provider. A worker may crash, a queue may repeat work, and a provider may accept the email just before its response disappears.
+
+Design that path completely. The important question is not simply which queue to use: it is what the service can honestly say happened to this customer's message after each failure.
 
 ## Requirements
 
-**Functional**
-- `POST /notify {userIds|segment, template, data, channels?, priority}`.
-- Per-user preferences, opt-outs, quiet hours, localisation, templates.
-- Delivery status tracking (sent, delivered, opened), and a campaign scheduler.
+Use these answers to the questions I would clarify first:
 
-**Non-functional**
-- At-least-once delivery with deduplication, so users see effectively-once.
-- OTP latency < 5 s even during a 50M-user campaign.
+| Question | Chosen answer and consequence |
+| --- | --- |
+| Which notification are we designing first? | `OrderReady(O847, version 9)` for its owning customer U21. In-app is the durable notification; email and push are optional reminders. |
+| What is accepted? | The notification service has committed the event and its notification/delivery work. An HTTP `202` does not mean that a provider accepted anything. |
+| What freshness/deadline matters? | Start provider attempts for normal order updates promptly; use an illustrative healthy-service p99 target of 30 seconds from ingest to provider acceptance. Stop this example's reminders after 15 minutes. Provider delivery and user attention have separate, channel-dependent timing. |
+| Can preferences change while work waits? | Yes. Check current category/channel permission, verified target, expiry and obsolescence immediately before authorizing each attempt. |
+| What happens after an uncertain provider call? | Reconcile or query the same immutable request through a verified read-only provider lookup. If neither is safe, quarantine for reconciliation rather than blindly create another message. |
+| Is exactly-once external delivery required? | No such general promise. Durable identity and deduplicated internal work are achievable; remote delivery depends on the provider and channel. |
+| What is initially outside scope? | SMS, one-time codes, broadcast campaigns, billing and mandatory-notice policy. Explain how to isolate them later without mixing their deadlines or permissions into this order update. |
 
-**Scale:** 1B notifications per day is ~12k/s average and 100k/s peak during campaigns. A campaign to a segment fans out 1 request into 50M messages.
+The platform supports event ingestion, recipient/channel delivery work, immutable templates, preferences, scheduled due times, bounded retries, status queries and operator recovery. It never treats a queue acknowledgement, a provider response, an email open or a push-service acknowledgement as the same fact.
 
-## 1. Scope and selected architecture
+## 1. Define the lifecycle and size one workload
 
-I deliver transactional and opted-in bulk notifications by email, SMS and push. I choose a business outbox, durable priority queues, independently scaled channel workers and a delivery database. Provider acceptance is distinct from delivery/read evidence. The default is at-least-once processing with provider deduplication when supported, not an unsupported exactly-once claim.
+For U21, the order-ready event creates one notification inbox row and up to two channel-delivery rows. Each row has its own identity and job:
 
-## 2. API, records and delivery transaction
+| Fact | Meaning | What it does not prove |
+| --- | --- | --- |
+| Business committed | Order O847 is ready; its event is in the order database's outbox | Notification service has received it |
+| Notification accepted | Notification service committed the event and resulting work | Any queue/provider/user has seen it |
+| Enqueued | A broker acknowledged delivery work | A worker completed it |
+| Provider accepted | The channel provider acknowledged this request/message ID | Recipient device/mailbox delivery or user read |
+| Provider delivery evidence | A verified provider event reports the channel's delivery milestone | Universal end-to-end delivery or human attention |
+| User read | An authenticated application action marked its inbox item read | That every email or push copy was read |
 
-```text
-POST /notifications {eventId,recipient,templateVersion,category,expiresAt} -> 202 id
-GET /notifications/{id} -> current intent/attempt/receipt states
-Intent UNIQUE(eventId,recipient,channel): template, consentScope, expiry
-Attempt PK(attemptId): intentId, providerKey, state, nextRetryAt
+Keep the durable in-app item independently of email/push success. The customer can open the app and inspect the order even when a provider is down. Email/push are reminders, not the authoritative order state.
+
+Use **10 million order events/day**, one recipient/event, two possible external channels/event, and a **20-times peak factor**. Assume both channels are enabled for this capacity envelope; actual suppression reduces work.
+
+| Quantity | Calculation | Planning result |
+| --- | --- | --- |
+| Event ingress | `10M / 86,400 s` | `115.7 events/s` average; `2,315/s` peak |
+| Channel deliveries | `2 × 10M/day` | `231.5/s` average; `4,630/s` peak |
+| Peak per channel | One email and one push/event | `2,315/s` each |
+| Outbox/event bytes | `10M × 1,000 B` | `10 GB/day` raw |
+| Inbox bytes | `10M × 500 B` | `5 GB/day` raw |
+| Delivery metadata + frozen request | `20M × 1,400 B` | `28 GB/day` raw |
+| Thirty-day retained records | `30 × (10 + 5 + 28) GB` | `1.29 TB` decimal, before indexes, replicas and broker storage |
+
+These are assumptions to validate, including record sizes and retention. Sensitive rendered bodies may need shorter retention than non-sensitive outcome metadata. Queues, attempts, receipts and indexes add storage; the table is not a complete hardware bill.
+
+For a healthy provider averaging 200 ms per request, a channel sustaining 2,315 sends/s needs about `2,315 × 0.2 ≈ 463` simultaneous requests in steady state, before headroom. This estimates concurrency, not worker CPU or p99 latency. Bound connections and in-flight work, then measure the provider and network. Extra application threads cannot increase an external quota.
+
+Suppose a provider is permitted 3,000 requests/s for this account and channel; that is a planning contract to verify. The chosen peak fits with some room for retries. If degradation drops completions to 1,500/s while arrivals stay at 2,315/s, backlog grows by `815/s`, or `48,900` in one minute. After recovery to 3,000/s, continued 2,315/s arrivals leave only 685/s for draining, so that one-minute backlog needs about 71 seconds to clear. Queue age and remaining usefulness matter more than a reassuring “workers are running” count.
+
+## 2. APIs, schemas and the durable handoff
+
+### Producer and user interfaces
+
+The order service writes `OrderReady/O847/v9` to its outbox in the **same transaction** that marks the order ready. A relay calls the notification service with that stable event identity:
+
+```http
+POST /notification-events
+Authorization: Bearer <internal-producer-token>
+Idempotency-Key: OrderReady/O847/v9
+Content-Type: application/json
+
+{"eventId":"OrderReady/O847/v9","type":"ORDER_READY","schemaVersion":1,
+ "orderId":"O847","orderVersion":9,"recipientUserId":"U21",
+ "templateBundle":"order-ready/v3","dueAt":"2026-10-26T12:00:00Z",
+ "expiresAt":"2026-10-26T12:15:00Z","data":{"pickupLabel":"North counter"}}
 ```
 
-Ingest deduplicates, resolves allowed channels and queues work. A worker checks current consent/expiry, records an attempt, calls the provider with its stable key, and stores evidence before acknowledging queue work. If acceptance is uncertain, it queries or follows the stated duplicate-risk policy rather than assuming unsent. Permanent address errors terminate; throttling backs off within the deadline. At arrivals 5,000/s and completion 4,000/s, backlog grows 60,000/minute; priority isolation prevents bulk work from consuming OTP capacity. Related status events retain business sequence/version to suppress obsolete messages.
+```http
+HTTP/1.1 202 Accepted
+Location: /notification-events/OrderReady%2FO847%2Fv9
+
+{"notificationId":"N501","state":"ACCEPTED"}
+```
+
+Authenticate the producer and verify it may emit this event/category for the tenant and recipient. Do not accept an arbitrary target email address, HTML body, priority or consent override from a browser. Validate the versioned payload and immutable template bundle before accepting it. The order link in the template is an application-owned URL; opening it still requires customer authorization.
+
+Same event identity and producer-payload fingerprint returns the original acceptance result; changed input returns `409`. Deduplicate **before** regenerating recipients or resnapshotting contacts/templates, so an ingest retry does not silently change its original work. The producer retains its outbox until notification acceptance is known; a lost `202` is retried with the same event identity. This HTTP relay is the chosen initial handoff; an event broker can replace it when many subscribers/replay requirements justify that boundary.
+
+The user interfaces are owner-scoped:
+
+```text
+GET  /me/notifications?cursor=...       -> inbox items, source order link, readAt
+POST /me/notifications/{id}/read        -> first readAt; repeated request is harmless
+GET  /notification-events/{id}          -> authorized internal lifecycle/outcome summary
+PUT  /me/notification-preferences       -> versioned category/channel settings
+POST /notification-providers/{id}/events -> authenticated provider callback only
+```
+
+The notification service owns the preferences and verified notification targets used by dispatch. Their edit endpoint commits to that authority; a profile screen must not acknowledge a notification preference change while updating only an unrelated stale cache. A preference-store outage is a retryable authorization dependency failure, not evidence that the customer opted out.
+
+### Records and access paths
+
+The following is a logical schema. Row ownership and unique keys are essential; the database adapter is separate from the local dispatch mechanism.
+
+| Record | Key/index and important fields |
+| --- | --- |
+| Business `outbox` | `event_id` primary key; order ID/version, event payload, created/published times. Unique business transition identity prevents duplicate logical events after order-command retries. Lives with the order transaction. |
+| `event_inbox` | Unique `(producer, event_id)`; producer-payload hash, accepted result, schema version. Owns notification-ingest replay. |
+| `notification` | ID primary key; unique `(producer, event_id, recipient_id)`; order/version, category, in-app content, `read_at`. Index `(recipient_id, created_at, id)` for cursor lists. |
+| `delivery` | ID primary key; unique `(notification_id, channel)`; frozen template/locale/target/request bytes, provider binding/key, due/expiry, state, attempt count, next-attempt time, claim owner/epoch/lease, provider message ID. Index due/retry states and expired leases. |
+| `delivery_outbox` | Delivery ID + publication identity; queue/channel/priority, published time. Created with delivery rows so a crash cannot strand accepted work before publication. |
+| `preference/contact` | `(recipient, category, channel)` plus version, enabled flag and verified destination reference. Read consistently at send authorization. |
+| `attempt` / `provider_fact` | `(delivery_id, attempt_number)` for execution history; unique `(provider, account, provider_event_id)` for callback dedup. Correlate provider message ID to the stable delivery identity. |
+| `reconciliation` | Delivery ID/reason, uncertain attempt/provider references, next action, operator/replay audit. Holds unresolved outcomes instead of relying on a transient log line. |
+
+Notification acceptance commits the `event_inbox` result, the one inbox notification, its delivery rows and `delivery_outbox` together. If the transaction fails, it accepts nothing. If a concurrent event duplicate loses the unique-key race, roll back its whole candidate work and read/compare the winning committed result in a fresh transaction. A pre-insert lookup alone does not serialize new event IDs.
+
+The delivery-outbox publisher waits for the broker's acknowledgement before recording publication. A crash after publication but before that mark may publish again. That is expected: the delivery ID remains unchanged and workers claim the durable delivery row. [Amazon SQS's at-least-once documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues-at-least-once-delivery.html) gives a concrete example of why even receive/delete processing can encounter another copy. A queue is a scheduling/delivery mechanism, not the only record that work exists.
 
 ## 3. Final design diagram
 
-[![Notification System: Business outbox durable events Notification ingest; Notification ingest routes Priority queues; Priority queues leased work Channel workers; Channel workers sends Provider adapters; Channel workers records attempts Delivery records; Channel workers checks consent Preference store](designs/hld-4.svg)](designs/hld-4.svg)
+[![A business outbox feeds notification ingest; delivery records and their outbox publish channel queues; workers recheck preferences and call providers while recording evidence.](designs/hld-4.svg)](designs/hld-4.svg)
 
-A **notification intent** records what should be sent. **Fan-out** creates recipient/channel work. A **delivery receipt** records provider evidence. An **outbox** stores intent in the same transaction as the business fact so a crash cannot lose the fact-to-message handoff.
+The **business outbox** bridges the order transaction to **notification ingest/fanout** without waiting for a provider. Ingest writes **notification/delivery records and a delivery outbox**, which publishes **separate channel queues**. The durable rows decide identity, state and ownership; repeated queue messages merely point back to them.
 
-## 4. Critical operation: worked execution
+**Channel workers** claim those rows, apply current policy from the **preference/contact and immutable-template authority**, and call the **provider adapters** outside database locks. They record immediate outcomes; verified later provider events append delivery evidence. Preference/template reads and provider I/O have different failure policies, even when the overview groups their authorities together.
 
-![Durable intent separates business correctness from slow delivery.](lessons/hld-4-flow.svg)
+This layout can begin with one notification application, one database and two worker pools. Splitting every box into a separate deployable service is not needed to preserve these boundaries. Scale channel pools and provider/account quotas independently when measurements justify it.
 
-*Durable intent separates business correctness from slow delivery.*
+## 4. Critical operations: what can safely be repeated?
 
-![Queue redelivery cannot by itself guarantee one external message.](lessons/hld-4-failure.svg)
+### A durable identity survives duplicate work
 
-*Queue redelivery cannot by itself guarantee one external message.*
+![Order-ready state and its outbox commit together; ingest deduplicates the event, then writes recipient/channel work and a delivery outbox together. Repeated publications retain the same delivery ID.](learning-figures/hld-4-handoff.svg)
 
-### Calculate queue behaviour
+**Why this picture:** there are two database-to-network gaps, and each has a different owner. The business outbox protects the order-to-notification handoff; the delivery outbox protects accepted work-to-channel-queue publication. Neither alone proves an external email was sent once.
 
-If arrivals are 5,000/s and providers complete 4,000/s, backlog grows 1,000 every second: 60,000 messages in a minute. Adding workers helps only when worker capacity is the bottleneck; it does not change provider quota. Separate urgent and bulk traffic so an OTP's deadline is not hidden behind marketing work.
+O847/version9 creates event E9 and notification N501 for U21. N501 has delivery D-email and D-push. A repeated producer request replays N501. A repeated queue copy asks to claim the same D-email; it does not create D-email-2. Once a worker owns a live claim, another worker cannot execute it merely because it received the duplicate queue message.
+
+### A provider can accept before a timeout
+
+![Worker A sends one immutable delivery and loses the acceptance response. A later worker looks up the same provider key without creating another message. Claim epochs fence local state updates, not remote side effects.](learning-figures/hld-4-uncertainty.svg)
+
+**Why this picture:** “we did not receive success” and “the provider did not accept” are different facts. Recording a local sent flag before the call can lose a notification; recording it only after a response can cause duplicate remote calls.
+
+In this teaching scenario, the fake provider retains an accepted request for 60 seconds and supports a **read-only lookup** by its original key and bytes. A sends once; the provider accepts but its response is lost. A later uncertain attempt is marked `lookupOnly`: it can recover the original provider ID, but it can never create a new message. Even if authorization happens at second 59 and the lookup arrives at second 61, an expired lookup returns unknown and goes to reconciliation; it does not become a fresh send.
+
+This requires an actual provider lookup API that never creates a message. Ordinary idempotent POST replay is weaker: a provider may accept a new operation after forgetting its key. A client-side time check before network I/O cannot prevent a pause or transit delay crossing that boundary. Set `lookupWindowMillis` to zero when the adapter cannot establish the read-only contract, and reconcile uncertainty without automatic sends. Definitive not-accepted outcomes may still retry within the attempt budget. Changing providers while acceptance is unknown can also create a duplicate.
+
+[Step through timeout recovery, opt-out and a stale worker](learning-labs/notification.html). The states come from the local Java mechanism and fake provider; no real messages or credentials are used. The page has manual controls and a complete text trace.
 
 ## 5. Detailed decisions, algorithms and failure behaviour
 
-### Architecture
+### Fanout, priorities and provider limits
 
-1. The **Notification API** validates, assigns a `notificationId` and writes to **Kafka**, with separate topics per priority (`critical`, `transactional`, `bulk`).
-2. A **fan-out service** expands segments into per-user messages (paged from the user DB) for bulk campaigns.
-3. **Channel workers** (separate consumer groups per channel) load preferences and the template, render, apply per-user rate limits and dedup, then call the vendor.
-4. Failures go to a **retry topic** with exponential backoff, then a **DLQ** after N attempts for inspection and replay.
-5. Vendor callbacks (delivered, bounced) update the **status store** (Cassandra/DynamoDB keyed by notificationId and by userId+time).
+This event has exactly one known recipient, so direct recipient/channel row creation is enough. Do not scan a user table for an order update. Delivery identity is separate from recipient count: email and push are different work with different outcomes, even though both refer to N501.
 
-### Key design decisions & trade-offs
+For a later campaign, create a campaign identity and a paged recipient snapshot, then checkpoint expansion with unique `(campaign_id, recipient_id, channel)` rows. Expand bounded batches; do not put a 50-million-address array in one broker message or one database transaction. A recipient snapshot records whom the campaign targets; current opt-out checks still occur at dispatch. An interrupted fanout resumes from durable progress without creating another copy of each delivery.
 
-**1. Queue between producers and senders.** It decouples callers from vendor latency and outages, absorbs spikes, and makes retry and replay possible. Kafka gives ordering per partition plus replay; SQS/RabbitMQ are simpler for per-message ack and delay.
+Use separate email and push queues, each with transactional and bulk lanes when bulk is added. Separate worker pools, connection budgets and provider/account token budgets reserve capacity for transactional work. A high-priority queue alone is insufficient if bulk still occupies every outbound connection or spends the entire account quota. A future OTP path needs its own short expiry, reserved capacity and security model; the current 15-minute order reminder must not be presented as an OTP design.
 
-**2. Priority isolation.** Separate topics and worker pools per priority stop a campaign from starving OTPs. Bulk workers get a hard cap on vendor throughput.
+Provider rate limits are normally shared by an account/channel/region, not multiplied by worker count. Per-recipient/category limits prevent a noisy source from sending hundreds of reminders to one person. Tenant fairness and bounded fanout prevent one merchant from monopolizing queues. A provider circuit breaker stops repeated expensive failures; it does not turn uncertain prior attempts into definitely unsent messages.
 
-**3. Idempotency.** Workers may process a message twice (at-least-once). Record `notificationId` in a dedup store with a TTL before sending, and pass an idempotency key to vendors that support one.
+### Immutable templates and a fresh send authorization
 
-**4. Retries done right.** Exponential backoff with jitter. Classify errors (4xx permanent vs. 5xx or timeout transient). Use per-vendor **circuit breakers** and failover vendors (SES down, so SendGrid).
+Select an immutable bundle such as `order-ready/v3`, its channel variants and locale during preparation. Validate required data and render deterministic, escaped request bytes. Store a content hash and encrypted target/payload snapshot, or enough immutable references to reproduce exactly those bytes. Editing a published template creates v4; it must not silently change the body of a retry already sent under v3's provider key.
 
-**5. Rate limits both ways.** Per-user (no spamming) and per-vendor (respect provider quotas). Token buckets in Redis.
+Before **every** new external attempt, perform one short authorization transaction: verify claim epoch/lease, notification expiry, current category/channel permission, current verified target and whether a later business event made this reminder obsolete. An opt-out committed before this authorization suppresses the attempt. If the target changed, suppress the old frozen delivery rather than reuse its provider key for a different address. A separately authorized replacement would need a new explicit identity and awareness of any uncertain old acceptance. In the local model, the trusted business authority calls `obsolete(eventId)` before a new authorization. Enqueuing an unrelated new notification does not infer business cancellation: the order-cancellation protocol must explicitly invalidate its old reminder, and production authorization must consult current business authority. This fixture models the marker, not the complete order aggregate.
 
-**6. Templates and preferences cached** in workers with short TTLs. Each is read for every message, so this is where the database load comes from.
+This gate cannot be atomic with another company's network side effect. A request already authorized or in flight may complete after an opt-out; its response cannot be recalled. State that boundary in the product policy. A stricter category-specific policy needs an explicitly coordinated stop/reconciliation procedure, not a cached preference read at ingest and an immediate-revocation promise.
 
-### Scope, guarantees and sizing assumptions
+### Claim a row briefly; call the provider without holding it
 
-**Correctness requirement:** One accepted business notification has a durable identity even if several delivery attempts occur.
+States in the mechanism are `READY → CLAIMED → SENDING`, followed by `PROVIDER_ACCEPTED`, `RETRY_WAIT`, `SUPPRESSED` or `DEAD_LETTER`. A claim has an owner, an increasing epoch and a 30-second lease. Reclaiming at the deadline increments the epoch. A late response from epoch1 cannot overwrite epoch2's current dispatch state.
 
-Assume 10 million notifications/day: 116/s average. At 20x campaign bursts: about 2,315/s. A provider sustaining 1,000/s needs over two hours for an 8-million-message campaign even without retries; enqueue speed is not delivery speed.
+In PostgreSQL, workers can select due rows with `FOR UPDATE SKIP LOCKED`, then update owner/epoch/lease and commit. [PostgreSQL 17's SELECT documentation](https://www.postgresql.org/docs/17/sql-select.html#SQL-FOR-UPDATE-SHARE) describes skipping locked rows as useful for queue-like consumers, while warning that it is not a general consistent view. The claim transaction must use database time, check due/expiry and update the row atomically; no provider call runs while holding its row lock.
 
-### API contracts and data ownership
+After a worker crashes, a sweeper finds expired claims and requeues their delivery IDs. A reclaimed `SENDING` row is **uncertain**, because the prior worker might have reached the provider. Queue visibility timeouts help schedule this recovery but are not fencing tokens. Even when a stale worker's state update is rejected, retain authenticated provider acceptance evidence in a separate deduplicated fact/reconciliation record. Fencing local state must not erase something that actually happened externally.
 
-```text
-POST /notifications with request key; GET /notifications/{id}; provider delivery callback with signed event identity
+### Classify outcomes and spend a bounded retry budget
+
+Use four adapter outcomes:
+
+| Outcome | Chosen action |
+| --- | --- |
+| Provider accepted with message ID | Record acceptance and stop normal sends for that delivery. Await separate delivery events if supported. |
+| Definitely not accepted, retryable | Retry the same delivery within attempts/expiry and quota budgets. A documented throttling rejection is an example. |
+| Unknown | Use a documented read-only lookup by the original provider reference. If lookup is unavailable, expired or still unknown, quarantine for reconciliation; do not issue another creating request. |
+| Permanent target/content failure | Stop and record a final failure/reconciliation disposition. Do not endlessly retry an invalid address or poison template. |
+
+Do not classify all 4xx as permanent or all 5xx as definitely unsent. A timeout, disconnected response or some server errors can leave acceptance uncertain. The adapter's documented semantics determine the category.
+
+The example allows three authorized attempts. It uses exponentially increasing full-jitter windows of up to 1, 2 and then 4 seconds, capped by configuration; the third failed attempt exhausts its budget. The deterministic check chooses the window's upper end. Production uses a random value in the permitted window, honors provider retry hints within the notification's deadline, and applies a deployment-wide retry-rate budget. No retry may renew the original expiry or lookup deadline. After uncertainty, the attempts are read-only lookups, not fresh sends.
+
+The stable provider key belongs to the **delivery**, not the queue receipt, attempt number, worker or claim epoch. Deduplicating only the internal delivery row prevents duplicate local objects; it cannot prevent two external sends when a provider does not honor that key. Likewise, marking a dedup row “sent” before calling the provider trades duplicate risk for loss risk. The chosen uncertain-outcome quarantine makes that trade-off explicit.
+
+### Complete Java 21 dispatch mechanism
+
+`DispatchEngine` is a complete in-process state machine with immutable drafts, identity checks, current preferences, scheduled eligibility, claim epochs, send authorization, bounded retries and accepted-provider observations. `FakeProvider` can accept, reject, fail or time out **after** accepting. Its accepted-request record lasts 60 seconds; uncertain attempts may only look up that record. This is a controlled test contract, with no network calls.
+
+The claim/authorization methods show exactly where ownership and the fresh policy gate apply:
+
+```java
+public synchronized Optional<Claim> claim(String deliveryId,String worker) {
+    text(worker); Work item=required(deliveryId); long now=now();
+    if (terminal(item)) return Optional.empty();
+    boolean leased=item.state==State.CLAIMED || item.state==State.SENDING;
+    if (leased && now<item.leaseUntil) return Optional.empty();
+    if (now>=item.draft.expiresAt()) { suppress(item,"notification expired"); return Optional.empty(); }
+    if (leased && item.state==State.SENDING) item.uncertain=true;
+    if (now<item.nextAt) return Optional.empty();
+    item.epoch=Math.incrementExact(item.epoch); item.owner=worker;
+    item.leaseUntil=Math.addExact(now,LEASE_MILLIS); item.state=State.CLAIMED;
+    item.reason="leased to "+worker;
+    return Optional.of(new Claim(item.id,worker,item.epoch));
+}
+
+public synchronized Optional<Attempt> authorize(Claim claim) {
+    Work item=required(claim.deliveryId()); long now=now();
+    if (!owns(item,claim,now) || item.state!=State.CLAIMED) return Optional.empty();
+    if (now>=item.draft.expiresAt()) { suppress(item,"notification expired"); return Optional.empty(); }
+    if (obsoleteEvents.contains(item.draft.eventId())) { suppress(item,"business event is obsolete"); return Optional.empty(); }
+    Preference pref=preferences.get(new PreferenceKey(item.draft.recipient(),item.draft.channel()));
+    if (pref==null || !pref.enabled()) { suppress(item,"channel is not currently enabled"); return Optional.empty(); }
+    if (!item.draft.target().equals(pref.verifiedTarget())) { suppress(item,"verified target changed"); return Optional.empty(); }
+    if (item.attempts>=MAX_ATTEMPTS) { dead(item,"attempt budget exhausted"); return Optional.empty(); }
+    if (item.uncertain && !safeLookup(item,now)) { dead(item,"uncertain outcome requires reconciliation"); return Optional.empty(); }
+    if (item.firstAuthorizedAt<0) item.firstAuthorizedAt=now;
+    item.attempts++; item.state=State.SENDING; item.reason="send authorized";
+    return Optional.of(new Attempt(item.id,item.providerKey,item.draft.target(),item.draft.payload(),
+            item.draft.templateVersion(),item.attempts,item.epoch,item.uncertain));
+}
 ```
 
-```text
-Logical records (outline, not complete DDL):
-notification(id,tenant,recipient,template_version,consent_version,status); attempt(id,notification_id,provider,event_id,outcome,next_at)
+Completion records external acceptance evidence even when its state update loses the epoch race, and never converts provider acceptance into user-read state:
 
-Primary access/partitioning boundary:
-recipient or tenant for fairness; notification_id for deduplication; provider/account for rate budgets
+```java
+public synchronized Completion complete(Claim claim,Result result) {
+    Objects.requireNonNull(result); Work item=required(claim.deliveryId()); long now=now();
+    // External acceptance is evidence even when this worker no longer owns the state update.
+    if (result.kind()==Kind.ACCEPTED) {
+        text(result.providerMessageId());
+        Fact fact=new Fact(item.id,result.providerMessageId());
+        Fact previous=providerFacts.putIfAbsent(new FactKey(item.draft.channel(),result.providerMessageId()),fact);
+        if (previous!=null && !previous.equals(fact)) throw new IllegalArgumentException("provider ID bound to another delivery");
+    }
+    if (!owns(item,claim,now) || item.state!=State.SENDING) return Completion.STALE;
+    if (result.kind()==Kind.ACCEPTED) {
+        item.state=State.PROVIDER_ACCEPTED; item.providerMessageId=result.providerMessageId();
+        item.uncertain=false; item.reason="provider accepted; not proof of delivery or read";
+    } else if (result.kind()==Kind.PERMANENT_FAILURE) {
+        dead(item,result.detail());
+    } else {
+        item.uncertain|=result.kind()==Kind.UNKNOWN;
+        if (item.attempts>=MAX_ATTEMPTS || (item.uncertain && !safeLookup(item,now))) {
+            dead(item,item.uncertain?"uncertain outcome requires reconciliation":"attempt budget exhausted");
+        } else {
+            long window=Math.min(60_000L,1_000L<<(item.attempts-1));
+            long delay=chooseDelay.applyAsLong(window);
+            if (delay<0 || delay>window) throw new IllegalStateException("jitter must stay within its window");
+            item.nextAt=Math.addExact(now,delay); item.state=State.RETRY_WAIT; item.reason=result.detail();
+        }
+    }
+    return Completion.APPLIED;
+}
 ```
 
-### Build the architecture in stages
+The full source defines the records, lookup-window check, fake-provider behavior and diagnostics. Its local IDs and channel-scoped fake message IDs are teaching identities; production uses globally unique delivery IDs and provider/account-scoped receipts. A monitor and maps are not a durable outbox, database lease or cross-server claim. The clock is injected with explicit epoch-millisecond semantics; deployment decisions use a monitored authoritative database clock and deadlines, not worker-supplied time.
 
-**Stage 3 — Partition and isolate.** Partition around recipient or tenant for fairness; notification_id for deduplication; provider/account for rate budgets. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+From the repository root with Java 21 on PATH:
 
-### Trace the critical request
+```powershell
+New-Item -ItemType Directory -Force .learning-work/notification-classes | Out-Null
+javac -encoding UTF-8 -d .learning-work/notification-classes examples/learning-java/src/kb/notification/*.java
+java -cp .learning-work/notification-classes kb.notification.NotificationChecks
+java -cp .learning-work/notification-classes kb.notification.NotificationTrace
+```
 
-Authenticate producer; validate consent and template; commit notification plus outbox; publish to channel queues; workers render from a snapshot, respect provider quotas, send, record acceptance and later delivery callbacks. Retry only classified transient failures with jitter and deadlines.
+The check covers duplicate identity/changed content, lookup after a lost acceptance response, fresh opt-out/contact and obsolete-event checks, lease equality and stale-owner fencing, retained provider evidence, a lookup delayed across record expiry, bounded retries, scheduling/expiry boundaries and 32 local claimants. It does not verify a real provider's lookup contract, database durability, broker failover or production throughput.
 
-### Deep dive: the decision that changes this system
+### Scheduled delivery, order and dead-letter recovery
 
-Queue delivery is normally at least once. Deduplicating worker records does not guarantee exactly-once external SMS when a timeout follows provider acceptance. Use provider idempotency/reference lookup where available; otherwise expose the residual duplicate risk. Separate transactional password resets from bulk marketing queues.
+Keep long schedules in indexed database rows by `next_attempt_at`, rather than holding a worker asleep or assuming an unlimited broker delay. A scheduler leases due rows and publishes delivery IDs through an outbox. Repeated publication is safe because claiming still consults the row. Store due instants in UTC. Quiet hours and recurring schedules need an IANA time zone and an explicit daylight-saving ambiguity policy; calculate the next eligible instant with the platform's time-zone library. Recheck preferences and usefulness again when the scheduled work becomes due.
 
-### Failure and race-condition walkthrough
+Partition/order related events by recipient/order when order is useful, but a queue partition does not preserve completion order across retries or separate channels. Record the business aggregate version. If O847 is cancelled at version10 before its version9 reminder is authorized, suppress the obsolete reminder. Do not suppress unrelated order updates merely because another event for the same user has a larger sequence. Email and push can still arrive in different orders after provider acceptance; use wording and a live order link that remains understandable.
 
-Provider outage grows backlog and can make messages obsolete. Expire one-time codes and cancel superseded notifications instead of delivering stale work after recovery. A poison template is quarantined rather than retried forever.
+`DEAD_LETTER` is a durable disposition with an owner, reason and next action. A broker's poison-message queue may mirror it, but merely moving bytes is not resolution. Invalid templates require a corrected new template/version and a reviewed replacement identity. A temporary outage can replay the same safe delivery after checking its current expiry/preferences and original provider reference. An uncertain acceptance needs provider lookup, verified callback evidence or a recorded operator decision. Do not give every redrive a fresh provider key and accidentally turn reconciliation into another send.
 
-### Security, tenancy and lifecycle
+Keep dispatch state separate from provider facts: delivered, bounced, complained, expired or opened events can be duplicated, delayed or arrive before the worker stores its acceptance response. Verify callback signatures/source binding; deduplicate by provider/account/event identity and correlate by provider message ID or trusted delivery metadata. Retain unmatched evidence for later binding instead of dropping it. Define how conflicting events are retained/reconciled rather than blindly overwriting one status with whichever callback arrived last.
 
-### Trade-offs and a starting recommendation
+For a concrete channel example, [Amazon SES's event reference](https://docs.aws.amazon.com/ses/latest/dg/event-publishing-retrieving-sns-contents.html) distinguishes send, delivery, bounce, complaint, open and click events. Its email delivery event concerns delivery to a recipient mail server. That is useful evidence, not a universal human-read signal. Push services and devices have different available milestones; report only what the chosen channel can actually establish.
 
-Push channels differ in delivery receipts and device availability; failover to SMS changes cost and consent requirements. Partitioning per recipient preserves useful order but requires fairness so one tenant cannot occupy every worker.
+### Reliability, privacy and useful measurements
 
-Track accepted-to-delivered latency by priority, delivery outcome, oldest queue age, retries, dead letters, provider quotas and duplicate reports.
+Deploy replicated durable notification storage and queues across zones, with explicit acknowledgement and recovery policies. If the order-to-notification relay is down, the business outbox grows and alarms; a completed order does not roll back because email is slow. If notification storage is unavailable, ingress does not return accepted. If a provider is down, channel work backs off without consuming every other channel's capacity. A large backlog is processed by remaining usefulness, quota and priority, not by a storm of simultaneous retries.
 
-**Test matrix:** Duplicate queue delivery, out-of-order callbacks, provider timeout after acceptance, unsubscribe during backlog, expired OTP, campaign surge and a malformed template.
+Authenticate producers and provider callbacks; authorize tenant/category/template access. Encrypt targets and rendered bodies, restrict support/operator access, and keep signed user-action links short-lived and scoped. Never put raw secrets, order details or target addresses in broad-access logs/queue metric labels. Escape template parameters per output context, constrain deep links, limit message sizes and avoid arbitrary template code. Opt-out endpoints must identify the intended recipient/category without exposing account information. Maintain suppression for invalid/bounced targets as channel evidence warrants, with a clear owner and retention policy.
 
-### Follow-up questions with answers
+Track accepted-to-enqueued, due-to-first-attempt, accepted-to-provider-accepted and provider-reported-delivery times separately. Report in-app user-read independently. Measure oldest **eligible** queue age by channel/priority, outbox age, retry/unknown counts, expired/suppressed reasons, claim-recovery rate, provider quota use, callback lag/unmatched facts and oldest unresolved reconciliation. Backlog for tomorrow's scheduled work is different from work already late today.
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: One accepted business notification has a durable identity even if several delivery attempts occur.
-
-**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million notifications/day: 116/s average. At 20x campaign bursts: about 2,315/s. A provider sustaining 1,000/s needs over two hours for an 8-million-message campaign even without retries; enqueue speed is not delivery speed.
-
-**Which failure would invalidate the naive design?** Provider outage grows backlog and can make messages obsolete. Expire one-time codes and cancel superseded notifications instead of delivering stale work after recovery. A poison template is quarantined rather than retried forever.
-
-**Why not introduce every distributed component immediately?** Push channels differ in delivery receipts and device availability; failover to SMS changes cost and consent requirements. Partitioning per recipient preserves useful order but requires fairness so one tenant cannot occupy every worker.
-
-**How would you demonstrate the design works?** Duplicate queue delivery, out-of-order callbacks, provider timeout after acceptance, unsubscribe during backlog, expired OTP, campaign surge and a malformed template. Keep the expected invariant and recovery outcome visible in the results.
-
-### Further reading
-
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
-
-### Work through ordering and lifecycle
-
-“Order delivered” may overtake “out for delivery” if workers process them independently. Partition related updates by order/recipient when order matters, or suppress obsolete events using business sequence numbers. A recipient's opt-out must be checked near delivery as well as at enqueue time for messages where consent applies.
-
-Transient failures use bounded retries with jitter; invalid addresses and expired intents go to a final disposition. A dead-letter queue is not resolution by itself: include reason, retry history and a safe replay identity. Avoid storing raw message secrets such as OTP codes in broad-access logs.
+Failure validation includes a lost ingress response, duplicate fanout/publication, a worker crash before and after a provider call, old-worker completion after reclaim, opt-out/contact change during backlog, expired order updates, delayed/out-of-order callbacks, replay-window expiry, poison templates and one provider outage under peak arrival. Load tests must include retry traffic and quota fairness. Functional fake-provider tests establish decision logic, not message deliverability or an operational SLA.
 
 ## 6. Interviewer follow-ups
 
-**Is provider accepted equal to user read?** No. Model acceptance, delivery and read evidence separately when available.
+**Does an outbox prevent duplicate email?** It prevents a lost database-to-network intent handoff. Publication and provider calls can still repeat. Internal unique identities and the provider's actual replay/reconciliation semantics address different boundaries.
 
-**Does an outbox prevent duplicate email?** It prevents lost intent; duplicate publication and provider calls still need handling.
+**Why not record sent before making the call?** A crash afterwards can leave a message never attempted but permanently marked sent. Record durable work first, then record evidence. Preserve uncertainty when the external outcome is unknown.
+
+**Does a lease prevent an old worker from sending?** It fences local state updates when checked correctly; it cannot unsend a call already authorized or in flight. Stable provider identity and reconciliation still matter.
+
+**What if the user opts out after enqueue?** Every attempt checks the current dispatch authority. Work not yet authorized is suppressed. A prior authorized/in-flight request may still complete; that boundary must be explicit.
+
+**Can we fail over to another provider immediately?** Only when the first outcome is known or the duplicate-risk policy explicitly permits it. Two providers do not share an idempotency store, and the second path may have different cost, target permissions or channel semantics.
+
+**Will a queue preserve message order?** It may preserve dequeue order within a chosen partition, but retries, concurrent workers and channels can change completion/arrival order. Use aggregate versions to suppress obsolete work before send and make the destination show current state.
+
+**Is provider delivered the same as user read?** No. Record the provider's specific milestone. Only the application's authenticated read action establishes its in-app read fact; an email open event is different evidence.
+
+**What is the first implementation?** One order outbox, durable notification/delivery rows with replay keys, a delivery outbox, separate email/push workers and current send authorization. Add campaign fanout and additional channels only with their own permissions, quotas and lifecycle rules.
 
 ## 7. Closing answer
 
-I persist notification intent before asynchronous delivery, isolate urgent and bulk queues, and enforce provider quotas at channel workers. Stable identities and explicit acceptance uncertainty address redelivery. Delivery receipts, consent, expiry and ordering are first-class semantics rather than one sent boolean.
+I would preserve the business event in an outbox, accept it under a durable identity, and create one inbox item plus independently tracked channel deliveries. Workers claim with epochs, recheck current permission and usefulness, then call providers with immutable request identity outside database locks. Retries are bounded and provider uncertainty is retained or reconciled rather than called failure. Queueing, provider acceptance, delivery evidence and user read remain separate facts. That gives a recoverable notification system with explicit limits instead of an unsupported exactly-once claim.
 
 === HLD 5 ===
 N|n0|Post service|0|0|200|rect

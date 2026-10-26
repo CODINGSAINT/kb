@@ -1,0 +1,341 @@
+{
+  "source": "kb.cache.CacheTrace (Java 21 one-node mechanism)",
+  "scenarios": [
+    {
+      "id": "invalidation",
+      "title": "An invalidation retires the old reader",
+      "description": "One product changes from v41 / INR 499.00 to v42 / INR 549.00. Watch the ticket generation, source floor and fill result.",
+      "maxSlots": 2,
+      "maxPayloadBytes": 128,
+      "steps": [
+        {
+          "title": "Reader A gets a ticket before reading v41",
+          "millis": 0,
+          "result": "Ticket: slot 1 / generation 0",
+          "note": "The origin fixture supplies v41 at INR 499.00. The cache has no value yet, but it has a bounded metadata slot and a ticket issued at t=0.",
+          "focus": "slots",
+          "payloadBytes": 0,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 0,
+              "cachedVersion": 0,
+              "remainingMillis": 0
+            }
+          ]
+        },
+        {
+          "title": "The committed v42 invalidation arrives",
+          "millis": 1000,
+          "result": "INVALIDATE minimumVersion 42",
+          "note": "The slot's generation advances and its version floor becomes 42. An invalidation retires pending work as well as removing old bytes.",
+          "focus": "slots",
+          "payloadBytes": 0,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 1,
+              "minimumVersion": 42,
+              "cachedVersion": 0,
+              "remainingMillis": 0
+            }
+          ]
+        },
+        {
+          "title": "The delayed v41 fill is rejected",
+          "millis": 2000,
+          "result": "INVALIDATED",
+          "note": "Reader A's ticket names generation 0 while the slot now has generation 1. The cache stays empty; the old price cannot refill it with this ticket.",
+          "focus": "decision",
+          "payloadBytes": 0,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 1,
+              "minimumVersion": 42,
+              "cachedVersion": 0,
+              "remainingMillis": 0
+            }
+          ]
+        },
+        {
+          "title": "A new ticket fills the current version",
+          "millis": 2000,
+          "result": "STORED",
+          "note": "A fresh authoritative fixture supplies v42 at INR 549.00. It meets the retained floor and generation. This ticket starts its own ten-second budget at t=2.",
+          "focus": "slots",
+          "payloadBytes": 23,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 1,
+              "minimumVersion": 42,
+              "cachedVersion": 42,
+              "remainingMillis": 10000
+            }
+          ]
+        },
+        {
+          "title": "An older invalidation is harmless",
+          "millis": 2100,
+          "result": "Older event already covered",
+          "note": "Version 41 is below the retained floor 42, so the event cannot lower the floor or delete the newer value.",
+          "focus": "slots",
+          "payloadBytes": 23,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 1,
+              "minimumVersion": 42,
+              "cachedVersion": 42,
+              "remainingMillis": 9900
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "age",
+      "title": "A delayed fill does not get a new TTL",
+      "description": "The hard age starts before reading the origin and survives the fill. This is independent of invalidation delivery.",
+      "maxSlots": 2,
+      "maxPayloadBytes": 128,
+      "steps": [
+        {
+          "title": "The load starts at t=0",
+          "millis": 0,
+          "result": "Ticket issued",
+          "note": "No invalidation arrives in this case. The separate age budget must stop a delayed origin snapshot from being renewed indefinitely.",
+          "focus": "decision",
+          "payloadBytes": 0,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 0,
+              "cachedVersion": 0,
+              "remainingMillis": 0
+            }
+          ]
+        },
+        {
+          "title": "At t=9, a late fill has one second left",
+          "millis": 9000,
+          "result": "STORED",
+          "note": "The cache stores the original ticket start, not the fill time. remainingMillis is 1000, so this cannot become a new ten-second copy.",
+          "focus": "slots",
+          "payloadBytes": 23,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 41,
+              "cachedVersion": 41,
+              "remainingMillis": 1000
+            }
+          ]
+        },
+        {
+          "title": "Just before the deadline",
+          "millis": 9999,
+          "result": "HIT",
+          "note": "The original permission has one millisecond left in this controlled ticker scenario. A read does not reset it.",
+          "focus": "slots",
+          "payloadBytes": 23,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 41,
+              "cachedVersion": 41,
+              "remainingMillis": 1
+            }
+          ]
+        },
+        {
+          "title": "Equality ends the permission",
+          "millis": 10000,
+          "result": "MISS",
+          "note": "At t=10, age equals the ten-second limit. get removes the value and returns a miss. Retained metadata still carries its version floor.",
+          "focus": "decision",
+          "payloadBytes": 0,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 41,
+              "cachedVersion": 0,
+              "remainingMillis": 0
+            }
+          ]
+        },
+        {
+          "title": "The same old ticket cannot renew it",
+          "millis": 10000,
+          "result": "TOO_OLD",
+          "note": "fill rejects the exhausted ticket. A new ticket and a new authoritative read are needed; reinserting the old bytes is insufficient.",
+          "focus": "decision",
+          "payloadBytes": 0,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "card:v1:tenant:23:product:784",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 41,
+              "cachedVersion": 0,
+              "remainingMillis": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": "Eviction retires both data and old permission",
+      "description": "Use tiny capacities to see exact LRU, the separate byte bound, and why a recreated key needs a new slot incarnation.",
+      "maxSlots": 2,
+      "maxPayloadBytes": 6,
+      "steps": [
+        {
+          "title": "Two slots and six payload bytes are full",
+          "millis": 0,
+          "result": "A=3 bytes; B=3 bytes",
+          "note": "Slot order is least-recent to most-recent. Tickets can remain in flight, but cache-owned metadata itself is bounded.",
+          "focus": "capacity",
+          "payloadBytes": 6,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "A",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 1,
+              "cachedVersion": 1,
+              "remainingMillis": 10000
+            },
+            {
+              "key": "B",
+              "slotId": 2,
+              "generation": 0,
+              "minimumVersion": 1,
+              "cachedVersion": 1,
+              "remainingMillis": 10000
+            }
+          ]
+        },
+        {
+          "title": "Reading A changes recency, not age",
+          "millis": 1,
+          "result": "HIT A",
+          "note": "B is now least recent. A's remaining budget still comes from its original ticket; a hit does not refresh its TTL.",
+          "focus": "slots",
+          "payloadBytes": 6,
+          "evictions": 0,
+          "slots": [
+            {
+              "key": "B",
+              "slotId": 2,
+              "generation": 0,
+              "minimumVersion": 1,
+              "cachedVersion": 1,
+              "remainingMillis": 9999
+            },
+            {
+              "key": "A",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 1,
+              "cachedVersion": 1,
+              "remainingMillis": 9999
+            }
+          ]
+        },
+        {
+          "title": "Loading C evicts B's entire slot",
+          "millis": 2,
+          "result": "A and C retained",
+          "note": "The slot count stays at two and payload stays at six bytes. B's old slot identity is retired, including its generation history.",
+          "focus": "capacity",
+          "payloadBytes": 6,
+          "evictions": 1,
+          "slots": [
+            {
+              "key": "A",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 1,
+              "cachedVersion": 1,
+              "remainingMillis": 9998
+            },
+            {
+              "key": "C",
+              "slotId": 3,
+              "generation": 0,
+              "minimumVersion": 1,
+              "cachedVersion": 1,
+              "remainingMillis": 10000
+            }
+          ]
+        },
+        {
+          "title": "Four bytes for A require C to leave",
+          "millis": 3,
+          "result": "A=4 bytes; one slot retained",
+          "note": "Slot capacity alone is insufficient when values grow. The encoded-payload budget evicts C before accepting the larger A.",
+          "focus": "capacity",
+          "payloadBytes": 4,
+          "evictions": 2,
+          "slots": [
+            {
+              "key": "A",
+              "slotId": 1,
+              "generation": 0,
+              "minimumVersion": 2,
+              "cachedVersion": 2,
+              "remainingMillis": 10000
+            }
+          ]
+        },
+        {
+          "title": "Recreating A does not revive its old ticket",
+          "millis": 4,
+          "result": "RETIRED_SLOT",
+          "note": "A is now slot 4, while the old ticket still names slot 1. Matching key text and generation zero do not restore old permission.",
+          "focus": "decision",
+          "payloadBytes": 0,
+          "evictions": 3,
+          "slots": [
+            {
+              "key": "A",
+              "slotId": 4,
+              "generation": 0,
+              "minimumVersion": 0,
+              "cachedVersion": 0,
+              "remainingMillis": 0
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
