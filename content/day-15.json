@@ -12,103 +12,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "user",
-            "label": "User",
+            "id": "n0",
+            "label": "TransferService",
             "x": 0,
             "y": 0,
-            "w": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "wallet",
-            "label": "WalletService",
+            "id": "n1",
+            "label": "Wallet",
             "x": 250,
             "y": 0,
-            "w": 160,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "idem",
-            "label": "Idempotency Store",
-            "x": 560,
+            "id": "n2",
+            "label": "Transfer",
+            "x": 500,
             "y": 0,
-            "w": 180,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "acct",
-            "label": "Wallet Account",
-            "x": 250,
-            "y": 150,
-            "w": 160,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "ledger",
-            "label": "Ledger Entries",
-            "x": 560,
-            "y": 150,
-            "w": 160,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "gw",
-            "label": "PaymentGateway",
+            "id": "n3",
+            "label": "LedgerEntry",
             "x": 0,
-            "y": 150,
-            "w": 160,
+            "y": 110,
+            "w": 200,
             "h": 50,
-            "shape": "ellipse"
+            "shape": "rect"
           },
           {
-            "id": "txn",
-            "label": "Txn State",
+            "id": "n4",
+            "label": "BalanceProjection",
             "x": 250,
-            "y": 280,
-            "w": 150,
+            "y": 110,
+            "w": 200,
             "h": 50,
-            "shape": "ellipse"
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "PaymentPort",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Reconciler",
+            "x": 0,
+            "y": 220,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "user",
-            "to": "wallet",
-            "label": "transfer(key)"
+            "from": "n0",
+            "to": "n1",
+            "label": "locks in order"
           },
           {
-            "from": "wallet",
-            "to": "idem",
-            "label": "check key"
+            "from": "n0",
+            "to": "n2",
+            "label": "records once"
           },
           {
-            "from": "wallet",
-            "to": "acct",
-            "label": "lock & update"
+            "from": "n2",
+            "to": "n3",
+            "label": "posts balanced"
           },
           {
-            "from": "acct",
-            "to": "ledger",
-            "label": "append debit/credit"
+            "from": "n3",
+            "to": "n4",
+            "label": "projects"
           },
           {
-            "from": "wallet",
-            "to": "gw",
-            "label": "top-up"
+            "from": "n0",
+            "to": "n5",
+            "label": "external boundary"
           },
           {
-            "from": "wallet",
-            "to": "txn",
-            "label": "transitions"
+            "from": "n6",
+            "to": "n2",
+            "label": "resolves pending"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a digital wallet like Paytm or PhonePe: users top up from a bank or card, pay merchants, transfer to other users, and see a history. Money moves must be **atomic**, **idempotent** and **auditable**. This combines a transaction **State machine**, **Strategy** for payment instruments, and careful concurrency.\n\n## Requirements\n\n**Functional**\n- Create a wallet, top up via a gateway, pay a merchant, P2P transfer, withdraw to a bank, view the statement.\n- Limits (per-transaction, daily, KYC tier). Refunds and reversals.\n\n**Non-functional**\n- Never lose or create money. Balances must match the ledger exactly.\n- Client retries must not double-charge. Concurrent transfers must not overdraw.\n\n## Learn through a concrete example\n\nAnita transfers ₹200 from wallet A to B. The money must leave A exactly once and arrive at B exactly once. A pair of mutable balance fields does not explain what happened after a crash, duplicate request or dispute. A **ledger** records immutable movements; a balance is a projection of those entries.\n\nBegin with one currency and one database transaction. A wallet identifies an account; a transfer identifies the business operation; balanced ledger entries explain its effect. External card or bank payments add a separate uncertain network boundary.\n\n## See a balanced transfer\n\n![Both sides commit together under one transfer identity.](lessons/lld-15-flow.svg)\n\n*Both sides commit together under one transfer identity.*\n\n![Retry returns the original transfer instead of debiting again.](lessons/lld-15-failure.svg)\n\n*Retry returns the original transfer instead of debiting again.*\n\n### Build and calculate\n\nIf A has 50,000 paise and transfers 20,000 to B, A ends with 30,000 and B increases by 20,000. The signed entry sum for the internal transfer is zero. Fees require explicit entries to a fee account; otherwise conservation appears to break.\n\n```text\nTransfer(id, fromWallet, toWallet, currency, amountMinor, payloadHash)\nLedgerEntry(transferId, walletId, signedAmountMinor)\nT4/A: -20000 INR paise\nT4/B: +20000 INR paise\n```\n\n## Design details and alternatives\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Wallet` | id, user, `balance` (derived or cached), status, version |\n| `LedgerEntry` | Immutable: txnId, walletId, `DEBIT/CREDIT`, amount, balanceAfter |\n| `Transaction` | id, type, amount, from, to, `TxnState`, idempotencyKey |\n| `TxnState` | `INITIATED → PROCESSING → SUCCESS / FAILED → REVERSED` |\n| `PaymentInstrument` (Strategy) | `Card`, `UPI`, `NetBanking` for top-ups |\n| `IdempotencyStore` | key → result (first result wins) |\n| `LimitPolicy` | Chain of checks: KYC tier, daily cap, velocity |\n\n### Design decisions & trade-offs\n\n**1. Double-entry ledger as the source of truth.** Each transfer writes two entries (debit A, credit B) that sum to zero, in one transaction. A balance is the sum of entries. Cache it on the wallet row for speed, but you can always rebuild and reconcile it.\n\n**2. Atomic transfer without deadlocks.**\n```java\nvoid transfer(Wallet a, Wallet b, Money amt) {\n    Wallet first = a.id().compareTo(b.id()) < 0 ? a : b, second = first == a ? b : a;\n    synchronized (first) { synchronized (second) {\n        if (a.balance().lt(amt)) throw new InsufficientFunds();\n        a.debit(amt); b.credit(amt); ledger.append(/* two entries */);\n    }}\n}\n```\nLock in a global order (by ID) to avoid A→B / B→A deadlock. In a DB: `SELECT … FOR UPDATE` in ID order, or a conditional `UPDATE wallet SET balance = balance - :x WHERE id=:a AND balance >= :x`.\n\n**3. Idempotency.** The client sends `Idempotency-Key`. The first request stores `key → PROCESSING`, then the result. Retries return the stored result. The key's insert must be atomic (unique constraint).\n\n**4. External top-ups are a State machine.** Gateway calls are slow and may time out with an unknown outcome. Mark the transaction `PROCESSING`, credit the wallet only on a confirmed webhook or status poll, and reconcile pending ones on a schedule.\n\n**5. Reversal, never deletion.** A refund is a new transaction with opposite entries. The ledger is append-only for audit.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** An append-only balanced ledger is the authority; a wallet balance is a projection of that ledger.\n\nWallet holds owner and currency. Transfer identifies source, destination, amount and idempotency key. LedgerTransaction owns balanced Debit/Credit entries. PaymentGateway handles external funding; ReconciliationService resolves uncertain external outcomes. Money stores currency plus integral minor units.\n\n**Correctness rule:** Each posted transfer balances to zero per currency, and a wallet cannot go negative unless overdraft is explicitly permitted. A repeated operation key with the same payload returns the same transfer; a different payload is rejected.\n\n```text\nwallet(id,currency,balance_minor,version); transfer(id,request_key,payload_hash,status); entry(transfer_id,wallet_id,delta_minor)\n```\n\n### State machine and command contracts\n\n```text\nCREATED -> POSTED | REJECTED; external transfer PENDING -> SETTLED | RECONCILIATION_REQUIRED\n```\n\n### End-to-end execution trace\n\nAuthenticate and authorize; validate positive amount and currency; lock wallet rows in stable ID order; check balance; insert transfer and balanced entries atomically; update cached balances; commit; publish events using an outbox. External funding follows a separate pending/settled protocol.\n\n### Concurrency and recovery walkthrough\n\nConcurrent debits both observe enough funds. A database conditional debit or row lock serializes the balance check with the debit. An in-memory synchronized method cannot protect other service instances.\n\n\n\n### Policy choices and extension seams\n\nStoring just a mutable balance is quick but loses auditability. Ledger entries enable reconstruction and reconciliation. Avoid distributed transactions with a card provider; use operation identities and compensation.\n\n### Edge cases that change the design\n\nTimeout after bank acceptance means UNKNOWN. Reversal is a new balanced transaction, never deletion of the original. Currency conversion needs an explicit rate snapshot and balancing entries in each currency domain.\n\n### Verification and a practical lab\n\n**Topic-specific cases:** Concurrent overdraft prevention; payload mismatch; self-transfer policy; arithmetic overflow; balanced reversal; provider timeout; ledger-to-balance reconciliation.\n\n**Lab:** Race two 80-unit debits against a 100-unit wallet, then replay the winning operation and issue its reversal. Verify nonnegative balance and ledger conservation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n## Work through contention and corrections\n\nTwo transfers of ₹400 each compete against ₹500. Checking the balance before entering the transaction permits both. Serialize the spendable-funds decision or use a conditional debit; one must lose. Locking A then B in one transfer and B then A in another can deadlock, so establish a consistent order and a retry policy for transaction conflicts.\n\nA correction is a reversing transaction linked to the original, never deletion of posted ledger history. For an external provider timeout, record `PENDING` or `UNKNOWN` and reconcile by provider reference. A database rollback cannot reverse a successful card charge.\n\n## Practise, then check your reasoning\n\n1. **Can different currencies share one arithmetic balance?** No. Model conversion with explicit amounts, currency pair, rate and rounding.\n2. **Can the same transfer ID carry another amount?** Reject it as conflicting intent, even if the original operation succeeded.\n3. **Exercise:** race two ₹400 debits against ₹500, retry the winner, then reverse it. Check immutable entries, nonnegative spendable funds under the chosen policy, and conservation after every committed transition.\n"
+      "markdown": "## Problem\n\nDesign a digital wallet like Paytm or PhonePe: users top up from a bank or card, pay merchants, transfer to other users, and see a history. Money moves must be **atomic**, **idempotent** and **auditable**. This combines a transaction **State machine**, **Strategy** for payment instruments, and careful concurrency.\n\n## Requirements\n\n**Functional**\n- Create a wallet, top up via a gateway, pay a merchant, P2P transfer, withdraw to a bank, view the statement.\n- Limits (per-transaction, daily, KYC tier). Refunds and reversals.\n\n**Non-functional**\n- Never lose or create money. Balances must match the ledger exactly.\n- Client retries must not double-charge. Concurrent transfers must not overdraw.\n\n## 1. Scope and chosen solution\n\nI transfer INR minor units between internal wallets with no overdraft. Wallet identity and transfer identity are separate; the ledger explains balances. External top-up/cash-out uses a separate provider workflow, not the internal atomic transfer transaction.\n\n## 2. Internal transfer transaction\n\n```text\ntransfer(id,from,to,amount,currency):\n  validate positive amount, same currency, distinct wallets and actor permission\n  return existing result for matching id/payload, reject conflicting reuse\n  lock wallets in stable ID order\n  verify spendable balance; insert transfer and debit/credit entries\n  update protected balance projection and commit\n```\n\nFor ₹500 in A and a ₹200 transfer, entries are A −20,000 paise and B +20,000. The sum is zero and A becomes ₹300. Two ₹400 debits against ₹500 cannot both pass the locked funds check. Fee collection adds balanced entries to an explicit fee account. Reversal is another uniquely identified transfer linked to the original. A provider timeout remains pending under its original reference; reconciliation confirms whether collection happened before another attempt or refund is authorized.\n\n## 3. Final design diagram\n\n[![Design Wallet / Payment System: TransferService locks in order Wallet; TransferService records once Transfer; Transfer posts balanced LedgerEntry; LedgerEntry projects BalanceProjection; TransferService external boundary PaymentPort; Reconciler resolves pending Transfer](designs/lld-15.svg)](designs/lld-15.svg)\n\nI begin with one currency and one database transaction. A wallet identifies an account; a transfer identifies the business operation; balanced ledger entries explain its effect. External card or bank payments add a separate uncertain network boundary.\n\n## 4. Critical operation: worked execution\n\n![Both sides commit together under one transfer identity.](lessons/lld-15-flow.svg)\n\n*Both sides commit together under one transfer identity.*\n\n![Retry returns the original transfer instead of debiting again.](lessons/lld-15-failure.svg)\n\n*Retry returns the original transfer instead of debiting again.*\n\n### Worked calculation and implementation\n\nIf A has 50,000 paise and transfers 20,000 to B, A ends with 30,000 and B increases by 20,000. The signed entry sum for the internal transfer is zero. Fees require explicit entries to a fee account; otherwise conservation appears to break.\n\n```text\nTransfer(id, fromWallet, toWallet, currency, amountMinor, payloadHash)\nLedgerEntry(transferId, walletId, signedAmountMinor)\nT4/A: -20000 INR paise\nT4/B: +20000 INR paise\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Wallet` | id, user, `balance` (derived or cached), status, version |\n| `LedgerEntry` | Immutable: txnId, walletId, `DEBIT/CREDIT`, amount, balanceAfter |\n| `Transfer` | id, type, amount, from, to, `TransferState`, idempotencyKey |\n| `TransferState` | `POSTED → REVERSED`; external funding intents separately track pending/unknown results |\n| `PaymentInstrument` (Strategy) | `Card`, `UPI`, `NetBanking` for top-ups |\n| `IdempotencyStore` | key → result (first result wins) |\n| `LimitPolicy` | Chain of checks: KYC tier, daily cap, velocity |\n\n### Design decisions & trade-offs\n\n**1. Double-entry ledger as the source of truth.** Each transfer writes two entries (debit A, credit B) that sum to zero, in one transaction. A balance is the sum of entries. Cache it on the wallet row for speed, but you can always rebuild and reconcile it.\n\n**2. Atomic transfer without deadlocks.**\n```java\nvoid transfer(Wallet a, Wallet b, Money amt) {\n    Wallet first = a.id().compareTo(b.id()) < 0 ? a : b, second = first == a ? b : a;\n    synchronized (first) { synchronized (second) {\n        if (a.balance().lt(amt)) throw new InsufficientFunds();\n        a.debit(amt); b.credit(amt); ledger.append(/* two entries */);\n    }}\n}\n```\nLock in a global order (by ID) to avoid A→B / B→A deadlock. In a DB: `SELECT … FOR UPDATE` in ID order, or a conditional `UPDATE wallet SET balance = balance - :x WHERE id=:a AND balance >= :x`.\n\n**3. Idempotency.** The client sends `Idempotency-Key`. The first request stores `key → PROCESSING`, then the result. Retries return the stored result. The key's insert must be atomic (unique constraint).\n\n**4. External top-ups are a State machine.** Gateway calls are slow and may time out with an unknown outcome. Mark the transaction `PROCESSING`, credit the wallet only on a confirmed webhook or status poll, and reconcile pending ones on a schedule.\n\n**5. Reversal, never deletion.** A refund is a new transaction with opposite entries. The ledger is append-only for audit.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** An append-only balanced ledger is the authority; a wallet balance is a projection of that ledger.\n\nWallet holds owner and currency. Transfer identifies source, destination, amount and idempotency key. LedgerTransaction owns balanced Debit/Credit entries. PaymentGateway handles external funding; ReconciliationService resolves uncertain external outcomes. Money stores currency plus integral minor units.\n\n**Correctness rule:** Each posted transfer balances to zero per currency, and a wallet cannot go negative unless overdraft is explicitly permitted. A repeated operation key with the same payload returns the same transfer; a different payload is rejected.\n\n```text\nwallet(id,currency,balance_minor,version); transfer(id,request_key,payload_hash,status); entry(transfer_id,wallet_id,delta_minor)\n```\n\n### End-to-end execution trace\n\nAuthenticate and authorize; validate positive amount and currency; lock wallet rows in stable ID order; check balance; insert transfer and balanced entries atomically; update cached balances; commit; publish events using an outbox. External funding follows a separate pending/settled protocol.\n\n### Concurrency and recovery walkthrough\n\nConcurrent debits both observe enough funds. A database conditional debit or row lock serializes the balance check with the debit. An in-memory synchronized method cannot protect other service instances.\n\n### Policy choices and extension seams\n\nStoring just a mutable balance is quick but loses auditability. Ledger entries enable reconstruction and reconciliation. Avoid distributed transactions with a card provider; use operation identities and compensation.\n\n### Edge cases that change the design\n\nTimeout after bank acceptance means UNKNOWN. Reversal is a new balanced transaction, never deletion of the original. Currency conversion needs an explicit rate snapshot and balancing entries in each currency domain.\n\n**Topic-specific cases:** Concurrent overdraft prevention; payload mismatch; self-transfer policy; arithmetic overflow; balanced reversal; provider timeout; ledger-to-balance reconciliation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through contention and corrections\n\nTwo transfers of ₹400 each compete against ₹500. Checking the balance before entering the transaction permits both. Serialize the spendable-funds decision or use a conditional debit; one must lose. Locking A then B in one transfer and B then A in another can deadlock, so establish a consistent order and a retry policy for transaction conflicts.\n\nA correction is a reversing transaction linked to the original, never deletion of posted ledger history. For an external provider timeout, record `PENDING` or `UNKNOWN` and reconcile by provider reference. A database rollback cannot reverse a successful card charge.\n\n## 6. Interviewer follow-ups\n\n**Can different currencies share one arithmetic balance?** No. Model conversion with explicit amounts, currency pair, rate and rounding.\n\n**Can the same transfer ID carry another amount?** Reject it as conflicting intent, even if the original operation succeeded.\n\n## 7. Closing answer\n\nI use immutable balanced ledger entries, stable transfer identities and one transactional spendable-funds decision. Corrections reverse rather than erase entries. External provider uncertainty has a pending reconciliation state because a database rollback cannot undo a captured payment.\n"
     },
     {
       "category": "HLD",
@@ -118,103 +118,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "api",
-            "label": "Job API",
+            "id": "n0",
+            "label": "Schedule API",
             "x": 0,
             "y": 0,
-            "w": 120,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "store",
-            "label": "Job Store (next_run idx)",
-            "x": 200,
+            "id": "n1",
+            "label": "Schedule store",
+            "x": 250,
             "y": 0,
-            "w": 210,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "sched",
-            "label": "Scheduler (leader)",
-            "x": 200,
-            "y": 150,
-            "w": 180,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "zk",
-            "label": "Leader Election (etcd)",
+            "id": "n2",
+            "label": "Due-time dispatcher",
+            "x": 500,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n3",
+            "label": "Execution queue",
             "x": 0,
-            "y": 150,
-            "w": 170,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "queue",
-            "label": "Ready Queue",
-            "x": 500,
-            "y": 150,
-            "w": 150,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "workers",
-            "label": "Worker Pool",
-            "x": 500,
-            "y": 0,
-            "w": 150,
+            "y": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "dlq",
-            "label": "Retry / DLQ",
+            "id": "n4",
+            "label": "Workers",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Execution journal",
             "x": 500,
-            "y": 280,
-            "w": 150,
-            "h": 62,
-            "shape": "cylinder"
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Fenced destination",
+            "x": 0,
+            "y": 220,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "api",
-            "to": "store",
-            "label": "register"
+            "from": "n0",
+            "to": "n1",
+            "label": "defines"
           },
           {
-            "from": "sched",
-            "to": "store",
-            "label": "poll due jobs"
+            "from": "n2",
+            "to": "n1",
+            "label": "finds due"
           },
           {
-            "from": "zk",
-            "to": "sched",
-            "label": "lease"
+            "from": "n2",
+            "to": "n3",
+            "label": "unique occurrence"
           },
           {
-            "from": "sched",
-            "to": "queue",
-            "label": "enqueue"
+            "from": "n3",
+            "to": "n4",
+            "label": "leased attempts"
           },
           {
-            "from": "queue",
-            "to": "workers",
-            "label": "pull"
+            "from": "n4",
+            "to": "n5",
+            "label": "checkpoints"
           },
           {
-            "from": "workers",
-            "to": "dlq",
-            "label": "on failure"
+            "from": "n4",
+            "to": "n6",
+            "label": "token writes"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a distributed job scheduler (like a cloud cron, Airflow's scheduler core, or Quartz at scale): users register one-off and recurring jobs; the system triggers them on time, runs them on a worker fleet, retries failures and ensures a job isn't run twice by accident. The key topics are **scheduling**, **workers and queues**, **leader election** and **retries/exactly-once semantics**.\n\n## Requirements\n\n**Functional**\n- Create jobs: a cron expression or a one-time `runAt`, payload or command, timeout, retry policy, optional dependencies.\n- Execute on time (± a few seconds). Track runs (status, logs). Cancel or pause.\n\n**Non-functional**\n- Millions of jobs; tens of thousands firing per minute at peaks (on-the-hour spikes).\n- No missed runs when nodes die. Avoid duplicate runs (or make them harmless).\n\n## Learn through a concrete example\n\nA report should run at 09:00, but two scheduler replicas wake together. Both may enqueue it unless one authority claims that occurrence. A **schedule** defines future intent; an **execution** is one occurrence; an **attempt** is one worker's try. Keeping these separate makes retries and audit history understandable.\n\nStart with a durable jobs table and leases. A **lease** expires after a bounded time so another worker can recover abandoned work. A **fencing token** increases with each ownership grant so an old worker can be rejected after losing its lease.\n\n## See scheduling and stale ownership\n\n![Schedule identity plus intended fire time deduplicates dispatch.](lessons/hld-15-flow.svg)\n\n*Schedule identity plus intended fire time deduplicates dispatch.*\n\n![The side-effect boundary must reject stale fencing tokens.](lessons/hld-15-failure.svg)\n\n*The side-effect boundary must reject stale fencing tokens.*\n\n### Calculate backlog\n\nAt 100 jobs/s and a 5-second average runtime, nominal concurrency is about 500. If workers sustain only 80 completions/s, backlog grows 20/s. A larger polling batch does not fix insufficient execution capacity. Keep queue depth, oldest-ready age and running lease age separate.\n\n## Design details and alternatives\n\n### Architecture\n\n- **Job store** (SQL or a partitioned KV) with an index on `next_run_at`.\n- **Scheduler**: poll for due jobs (`next_run_at <= now`) in small batches, enqueue a *run* to a queue, and compute the next `next_run_at` (for cron) in the same transaction.\n- **Partitioning**: shard jobs by `jobId` hash across N scheduler partitions. Each partition is owned by one scheduler instance via **leader election / leases** (etcd, ZooKeeper, or a DB lease row). That gives horizontal scale without double-dispatch.\n- **Workers** pull runs from the queue, heartbeat while running, write results, and ack. Failed runs are retried with backoff, then go to a DLQ.\n- An optional **timing wheel** in memory holds jobs due in the next minute for precise firing.\n\n### Key design decisions & trade-offs\n\n**1. Claiming due jobs safely.** Multiple scheduler replicas could pick up the same row. Either use partition ownership via leases, or atomically claim with `UPDATE … SET status='ENQUEUED', owner=? WHERE id=? AND status='SCHEDULED'` / `SELECT … FOR UPDATE SKIP LOCKED`.\n\n**2. Exactly-once is a myth; aim for at-least-once plus idempotency.** A worker can finish the job and crash before acking, so the run is retried. Give each run a `runId` (jobId + scheduled time) that the job uses as an idempotency key.\n\n**3. Worker failure detection.** Workers renew a visibility timeout or heartbeat. If it expires, the run is re-queued. Pick the timeout from the job's expected duration plus margin; too short gives duplicates, too long delays recovery.\n\n**4. Thundering herd at :00.** Many cron jobs fire on the hour. Spread them with jitter when allowed, pre-fetch due jobs slightly early into the timing wheel, and autoscale workers on queue depth.\n\n**5. Missed runs after downtime.** Define a policy per job: run once to catch up, run all missed, or skip.\n\n**6. DAG dependencies.** For workflows, a run becomes ready only when its upstream runs succeed. Store dependencies and evaluate on completion events.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A schedule firing has a stable identity and stale workers cannot commit after lease ownership changes.\n\nAssume 10 million scheduled jobs distributed evenly over a day: 116 due/s. A million jobs scheduled at midnight create a burst orders of magnitude larger. With 1 KB metadata each, 10 GB raw metadata excludes run history.\n\n### API contracts and data ownership\n\n```text\nPOST /schedules with timezone and misfire policy; cancel schedule; GET /runs/{id}; worker claim/heartbeat/complete\n```\n\n```text\nLogical records (outline, not complete DDL):\nschedule(id,next_at,zone,rule,misfire_policy); run(id,schedule_id,scheduled_at,state,lease_owner,lease_epoch,lease_until)\n\nPrimary access/partitioning boundary:\ndue_time bucket for discovery; job_id/run_id for state and execution idempotency\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around due_time bucket for discovery; job_id/run_id for state and execution idempotency. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nPersist schedule; find due buckets; atomically create/claim a unique firing; assign a worker lease and fencing epoch; execute with a run identity; heartbeat within a bounded lifetime; conditionally commit completion; compute next firing under the chosen recurrence policy.\n\n### Deep dive: the decision that changes this system\n\nAt-least-once execution is realistic when a worker may perform an effect and crash before recording success. The downstream operation needs the run idempotency key. A fencing epoch must be checked by the resource being modified, not merely logged by the scheduler.\n\n### Failure and race-condition walkthrough\n\nA paused worker outlives its lease, another worker completes the run, then the old worker resumes. Reject stale completion and stale resource writes. A lock TTL without resource-side epoch validation does not solve this.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nPolling a small due-time range is simple; timing wheels reduce scheduling overhead but need durable recovery. Cron local times need policies for skipped/repeated daylight-saving instants and missed firings after outage.\n\n### SLOs, failure drills and lab\n\nStart lateness, successful completion, duplicate effects, oldest due job, lease churn and dead-letter age.\n\n**Test matrix:** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A schedule firing has a stable identity and stale workers cannot commit after lease ownership changes.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million scheduled jobs distributed evenly over a day: 116 due/s. A million jobs scheduled at midnight create a burst orders of magnitude larger. With 1 KB metadata each, 10 GB raw metadata excludes run history.\n\n**Which failure would invalidate the naive design?** A paused worker outlives its lease, another worker completes the run, then the old worker resumes. Reject stale completion and stale resource writes. A lock TTL without resource-side epoch validation does not solve this.\n\n**Why not introduce every distributed component immediately?** Polling a small due-time range is simple; timing wheels reduce scheduling overhead but need durable recovery. Cron local times need policies for skipped/repeated daylight-saving instants and missed firings after outage.\n\n**How would you demonstrate the design works?** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n## Work through delivery semantics\n\nMost practical schedulers offer at-least-once attempts. Side effects need job-level idempotency or a destination that enforces fencing. A lease alone cannot stop a paused process from acting. Retries should preserve execution identity but create new attempt IDs.\n\nCron schedules need a timezone and a policy for missed/duplicated local times and downtime: skip, run once or catch up every occurrence. A poison job needs bounded retries and an inspectable final state; infinite immediate retry can starve useful work.\n\n## Practise, then check your reasoning\n\n1. **Is “job started” equivalent to completed?** No. Record attempts, heartbeat/checkpoint and final result.\n2. **Can a scheduler promise one email merely by using a lock?** No. The email boundary must handle retries/uncertainty too.\n3. **Exercise:** pause a worker past its lease, allow reassignment and resume the old worker. Verify the external write rejects the stale token and only the valid attempt can complete the execution.\n"
+      "markdown": "## Problem\n\nDesign a distributed job scheduler (like a cloud cron, Airflow's scheduler core, or Quartz at scale): users register one-off and recurring jobs; the system triggers them on time, runs them on a worker fleet, retries failures and ensures a job isn't run twice by accident. The key topics are **scheduling**, **workers and queues**, **leader election** and **retries/exactly-once semantics**.\n\n## Requirements\n\n**Functional**\n- Create jobs: a cron expression or a one-time `runAt`, payload or command, timeout, retry policy, optional dependencies.\n- Execute on time (± a few seconds). Track runs (status, logs). Cancel or pause.\n\n**Non-functional**\n- Millions of jobs; tens of thousands firing per minute at peaks (on-the-hour spikes).\n- No missed runs when nodes die. Avoid duplicate runs (or make them harmless).\n\n## 1. Scope and selected execution model\n\nI support delayed/recurring jobs, retries, cancellation and worker recovery. I choose a durable schedule store, partitioned due-time dispatch and leased worker execution. Timezone, misfire and retry policies are persisted with the schedule.\n\n## 2. Claim and execute algorithm\n\n```text\nSchedule: id,rule,zone,nextFire,misfirePolicy\nExecution UNIQUE(scheduleId,intendedFireTime): state,leaseOwner,leaseExpiry,fence\nAttempt: id,executionId,startedAt,result\nclaim: conditional READY/expired -> RUNNING, increment fence\ncomplete: conditional matching owner/fence and live lease -> COMPLETED\n```\n\nDispatch inserts each intended occurrence once and enqueues its ID. A worker claims, checkpoints and executes using the occurrence identity and fencing token. A destination rejecting old tokens prevents a resumed expired worker from overwriting newer work; an email-like effect instead needs idempotency/reconciliation support. Three hundred jobs/s lasting two seconds need roughly 600 active slots under those assumptions. Retries retain execution identity but create new attempts and honor the original task deadline. Cancellation stops future claims and requests cooperative running cancellation; it does not erase a side effect already performed.\n\n## 3. Final design diagram\n\n[![Distributed Job Scheduler: Schedule API defines Schedule store; Due-time dispatcher finds due Schedule store; Due-time dispatcher unique occurrence Execution queue; Execution queue leased attempts Workers; Workers checkpoints Execution journal; Workers token writes Fenced destination](designs/hld-15.svg)](designs/hld-15.svg)\n\nI start with a durable jobs table and leases. A **lease** expires after a bounded time so another worker can recover abandoned work. A **fencing token** increases with each ownership grant so an old worker can be rejected after losing its lease.\n\n## 4. Critical operation: worked execution\n\n![Schedule identity plus intended fire time deduplicates dispatch.](lessons/hld-15-flow.svg)\n\n*Schedule identity plus intended fire time deduplicates dispatch.*\n\n![The side-effect boundary must reject stale fencing tokens.](lessons/hld-15-failure.svg)\n\n*The side-effect boundary must reject stale fencing tokens.*\n\n### Calculate backlog\n\nAt 100 jobs/s and a 5-second average runtime, nominal concurrency is about 500. If workers sustain only 80 completions/s, backlog grows 20/s. A larger polling batch does not fix insufficient execution capacity. Keep queue depth, oldest-ready age and running lease age separate.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n- **Job store** (SQL or a partitioned KV) with an index on `next_run_at`.\n- **Scheduler**: poll for due jobs (`next_run_at <= now`) in small batches, enqueue a *run* to a queue, and compute the next `next_run_at` (for cron) in the same transaction.\n- **Partitioning**: shard jobs by `jobId` hash across N scheduler partitions. Each partition is owned by one scheduler instance via **leader election / leases** (etcd, ZooKeeper, or a DB lease row). That gives horizontal scale without double-dispatch.\n- **Workers** pull runs from the queue, heartbeat while running, write results, and ack. Failed runs are retried with backoff, then go to a DLQ.\n- An optional **timing wheel** in memory holds jobs due in the next minute for precise firing.\n\n### Key design decisions & trade-offs\n\n**1. Claiming due jobs safely.** Multiple scheduler replicas could pick up the same row. Either use partition ownership via leases, or atomically claim with `UPDATE … SET status='ENQUEUED', owner=? WHERE id=? AND status='SCHEDULED'` / `SELECT … FOR UPDATE SKIP LOCKED`.\n\n**2. Exactly-once is a myth; aim for at-least-once plus idempotency.** A worker can finish the job and crash before acking, so the run is retried. Give each run a `runId` (jobId + scheduled time) that the job uses as an idempotency key.\n\n**3. Worker failure detection.** Workers renew a visibility timeout or heartbeat. If it expires, the run is re-queued. Pick the timeout from the job's expected duration plus margin; too short gives duplicates, too long delays recovery.\n\n**4. Thundering herd at :00.** Many cron jobs fire on the hour. Spread them with jitter when allowed, pre-fetch due jobs slightly early into the timing wheel, and autoscale workers on queue depth.\n\n**5. Missed runs after downtime.** Define a policy per job: run once to catch up, run all missed, or skip.\n\n**6. DAG dependencies.** For workflows, a run becomes ready only when its upstream runs succeed. Store dependencies and evaluate on completion events.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A schedule firing has a stable identity and stale workers cannot commit after lease ownership changes.\n\nAssume 10 million scheduled jobs distributed evenly over a day: 116 due/s. A million jobs scheduled at midnight create a burst orders of magnitude larger. With 1 KB metadata each, 10 GB raw metadata excludes run history.\n\n### API contracts and data ownership\n\n```text\nPOST /schedules with timezone and misfire policy; cancel schedule; GET /runs/{id}; worker claim/heartbeat/complete\n```\n\n```text\nLogical records (outline, not complete DDL):\nschedule(id,next_at,zone,rule,misfire_policy); run(id,schedule_id,scheduled_at,state,lease_owner,lease_epoch,lease_until)\n\nPrimary access/partitioning boundary:\ndue_time bucket for discovery; job_id/run_id for state and execution idempotency\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around due_time bucket for discovery; job_id/run_id for state and execution idempotency. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nPersist schedule; find due buckets; atomically create/claim a unique firing; assign a worker lease and fencing epoch; execute with a run identity; heartbeat within a bounded lifetime; conditionally commit completion; compute next firing under the chosen recurrence policy.\n\n### Deep dive: the decision that changes this system\n\nAt-least-once execution is realistic when a worker may perform an effect and crash before recording success. The downstream operation needs the run idempotency key. A fencing epoch must be checked by the resource being modified, not merely logged by the scheduler.\n\n### Failure and race-condition walkthrough\n\nA paused worker outlives its lease, another worker completes the run, then the old worker resumes. Reject stale completion and stale resource writes. A lock TTL without resource-side epoch validation does not solve this.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nPolling a small due-time range is simple; timing wheels reduce scheduling overhead but need durable recovery. Cron local times need policies for skipped/repeated daylight-saving instants and missed firings after outage.\n\nStart lateness, successful completion, duplicate effects, oldest due job, lease churn and dead-letter age.\n\n**Test matrix:** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A schedule firing has a stable identity and stale workers cannot commit after lease ownership changes.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million scheduled jobs distributed evenly over a day: 116 due/s. A million jobs scheduled at midnight create a burst orders of magnitude larger. With 1 KB metadata each, 10 GB raw metadata excludes run history.\n\n**Which failure would invalidate the naive design?** A paused worker outlives its lease, another worker completes the run, then the old worker resumes. Reject stale completion and stale resource writes. A lock TTL without resource-side epoch validation does not solve this.\n\n**Why not introduce every distributed component immediately?** Polling a small due-time range is simple; timing wheels reduce scheduling overhead but need durable recovery. Cron local times need policies for skipped/repeated daylight-saving instants and missed firings after outage.\n\n**How would you demonstrate the design works?** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through delivery semantics\n\nMost practical schedulers offer at-least-once attempts. Side effects need job-level idempotency or a destination that enforces fencing. A lease alone cannot stop a paused process from acting. Retries should preserve execution identity but create new attempt IDs.\n\nCron schedules need a timezone and a policy for missed/duplicated local times and downtime: skip, run once or catch up every occurrence. A poison job needs bounded retries and an inspectable final state; infinite immediate retry can starve useful work.\n\n## 6. Interviewer follow-ups\n\n**Is “job started” equivalent to completed?** No. Record attempts, heartbeat/checkpoint and final result.\n\n**Can a scheduler promise one email merely by using a lock?** No. The email boundary must handle retries/uncertainty too.\n\n## 7. Closing answer\n\nI separate schedules, occurrences and attempts. Unique occurrence identities avoid duplicate dispatch, leases recover abandoned execution and fencing/idempotency protects effects from stale workers. At-least-once attempts are explicit; exactly-once external effects require cooperation from the destination.\n"
     },
     {
       "category": "AI",
@@ -224,88 +224,108 @@
       "diagram": {
         "nodes": [
           {
-            "id": "host",
-            "label": "AI App (MCP Client)",
-            "x": 0,
-            "y": 130,
-            "w": 190,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "s1",
-            "label": "MCP Server: Jira",
-            "x": 360,
-            "y": 0,
-            "w": 190,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "s2",
-            "label": "MCP Server: DB",
-            "x": 360,
-            "y": 130,
-            "w": 190,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "s3",
-            "label": "MCP Server: Files",
-            "x": 360,
-            "y": 260,
-            "w": 190,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "prims",
-            "label": "Tools · Resources · Prompts",
-            "x": 640,
-            "y": 130,
-            "w": 120,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "llm",
-            "label": "LLM",
+            "id": "n0",
+            "label": "Host application",
             "x": 0,
             "y": 0,
-            "w": 110,
+            "w": 200,
             "h": 50,
-            "shape": "ellipse"
+            "shape": "rect"
+          },
+          {
+            "id": "n1",
+            "label": "MCP client",
+            "x": 250,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n2",
+            "label": "Configured transport",
+            "x": 500,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n3",
+            "label": "MCP server",
+            "x": 0,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n4",
+            "label": "Tool and resource registry",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Domain authority",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Validated observation",
+            "x": 0,
+            "y": 220,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "llm",
-            "to": "host",
-            "label": "tool calls"
+            "from": "n0",
+            "to": "n1",
+            "label": "owns policy"
           },
           {
-            "from": "host",
-            "to": "s1",
-            "label": "stdio / HTTP"
+            "from": "n1",
+            "to": "n2",
+            "label": "authenticated session"
           },
           {
-            "from": "host",
-            "to": "s2",
-            "label": "JSON-RPC"
+            "from": "n2",
+            "to": "n3",
+            "label": "protocol messages"
           },
           {
-            "from": "host",
-            "to": "s3"
+            "from": "n3",
+            "to": "n4",
+            "label": "advertises"
           },
           {
-            "from": "s2",
-            "to": "prims",
-            "label": "exposes"
+            "from": "n3",
+            "to": "n5",
+            "label": "authorized calls"
+          },
+          {
+            "from": "n3",
+            "to": "n6",
+            "label": "bounded results"
+          },
+          {
+            "from": "n6",
+            "to": "n0",
+            "label": "external data"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain the Model Context Protocol (MCP): an open standard for connecting AI applications to external tools and data through a common client-server protocol, instead of bespoke integrations per app. Cover its primitives (tools, resources, prompts), transports, how MCP clients and servers are built with Spring AI, and the security implications of remote tool ecosystems.\n\n## Requirements\n\n- The problem MCP solves (M apps × N integrations becomes M + N).\n- Roles: host/client and server. Primitives: **tools** (actions), **resources** (readable context), **prompts** (reusable templates).\n- Transports: stdio for local processes, Streamable HTTP for remote servers.\n- Spring AI MCP client and server starters, and exposing `@Tool` methods via an MCP server.\n- Security: auth, least privilege, tool poisoning, trust boundaries.\n\n## Learn through a concrete example\n\nSeveral assistants need the same document-search capability. Model Context Protocol, or **MCP**, standardizes how a host/client communicates with servers exposing tools, resources and prompts. It is an integration protocol, not a new model and not a universal trust certificate for connected servers.\n\nThe **host** is the application using model capabilities. A **client** manages a server connection. A **server** exposes selected capabilities. This chapter anchors protocol concepts to the versioned 2025-06-18 specification; use the chosen SDK/version contract for concrete Java configuration.\n\n## See discovery and invocation\n\n![Discovery describes capabilities; host policy decides what may be used.](lessons/ai-15-flow.svg)\n\n*Discovery describes capabilities; host policy decides what may be used.*\n\n![Discovered metadata does not override host or user authority.](lessons/ai-15-failure.svg)\n\n*Discovered metadata does not override host or user authority.*\n\n### Build a narrow example\n\nExpose `searchApprovedDocs(query, limit)` returning document IDs, revisions and short excerpts. Derive tenant scope from the authenticated connection or application policy, not an arbitrary model-supplied tenant argument. Set maximum query size, result count and response bytes before integrating a real corpus.\n\n```text\nRequest: tool=searchApprovedDocs, args={query:\"transaction isolation\",limit:3}\nResponse: {sources:[{id:\"db-guide\",revision:4,excerpt:\"...\"}]}\nHost checks: connection identity, permitted tool, argument schema, result size\n```\n\n## Design details and alternatives\n\n### Key concepts and learning objective\n\n**Question to answer:** What does MCP standardize, and which responsibilities stay with the host application?\n\nMCP defines communication among hosts, clients and servers with capability negotiation and structured messages. Servers may expose tools, resources and prompts. MCP is a protocol boundary, not an agent planner, vector database or automatic authorization system. Transport/session behavior depends on the negotiated version.\n\n### Architecture and contracts\n\n```text\nHost authenticates/approves server -> client initializes capabilities -> list permitted tools/resources -> validate requested operation -> server execution -> bounded result -> host model context\n\nApplication contracts (design outline):\nServerIdentity(endpoint,allowedScopes); ToolDescriptor(name,inputSchema); ToolCall(id,name,args); Result(content,isError)\n```\n\nSpring AI MCP integration can adapt protocol tools to model tools. Select matching client/server starter and SDK documentation for the pinned release; keep the underlying service independently testable.\n\n### Worked reasoning and capacity example\n\nA model context containing 200 large tool schemas can waste thousands of tokens. Expose a task-relevant authorized subset and cap result sizes; protocol standardization does not remove model context limits.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord ApprovedServer(java.net.URI endpoint, java.util.Set<String> scopes) {}\nrecord Call(String tool, String operationId, String jsonArguments) {}\n// Negotiate protocol capabilities, then validate schema and authorize each call.\n// Do not forward another resource audience's credential to this server.\n```\n\n### Design decisions and alternatives\n\nPin the protocol revision and SDK versions in an implementation. Use trusted server registration, least privilege and explicit tenant boundaries. Keep local stdio process execution and remote HTTP authentication risks distinct.\n\n### Failure scenario and safe recovery\n\nA server changes a tool description to instruct the host to upload private files. Treat descriptors/results as untrusted data; the host authorization policy, not returned prose, decides permitted resources and destinations.\n\n### Security, privacy and provenance\n\nOAuth tokens for one audience must not be forwarded to a different resource merely because a tool requests it. A connection is not blanket authorization for every future action.\n\n### Hands-on lab and evaluation\n\n**Build:** Expose one read-only documentation lookup service, enumerate capabilities and call it with valid/invalid schemas. Test server outage, oversized result, unknown tool and a forged resource identifier.\n\n**Measure:** Protocol conformance, scope enforcement, resource isolation, cancellation, error propagation and result bounds. Inspect the actual negotiated capabilities rather than assuming every server supports every feature.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n## Work through deployment trust\n\nA local process transport and a remote HTTP transport have different credential, process and network boundaries. Do not send tokens intended for one resource to an arbitrary downstream server. Server discovery, reconnect and capability changes need application policy; previously reviewed descriptors may change after an upgrade.\n\nSpring AI can integrate MCP clients/servers, but SDK/module APIs change across releases. Keep protocol concepts separate from a runnable configuration and verify the exact dependency family before presenting code as executable. A standard wire format does not make every tool idempotent or every server safe.\n\n## Practise, then check your reasoning\n\n1. **Does MCP grant a server access to the whole computer?** No. Actual process credentials, exposed capabilities and host controls determine access.\n2. **Is tool output an instruction?** It is external data that may contain hostile instructions; application authority remains separate.\n3. **Exercise:** implement a stub server with one safe search, one oversized result and one changed schema. Verify bounded parsing, explicit compatibility failure and no automatic acceptance of newly advertised capabilities.\n"
+      "markdown": "## Problem\n\nExplain the Model Context Protocol (MCP): an open standard for connecting AI applications to external tools and data through a common client-server protocol, instead of bespoke integrations per app. Cover its primitives (tools, resources, prompts), transports, how MCP clients and servers are built with Spring AI, and the security implications of remote tool ecosystems.\n\n## Requirements\n\n- The problem MCP solves (M apps × N integrations becomes M + N).\n- Roles: host/client and server. Primitives: **tools** (actions), **resources** (readable context), **prompts** (reusable templates).\n- Transports: stdio for local processes, Streamable HTTP for remote servers.\n- Spring AI MCP client and server starters, and exposing `@Tool` methods via an MCP server.\n- Security: auth, least privilege, tool poisoning, trust boundaries.\n\n## 1. Protocol answer and selected deployment\n\nThe host is the AI application, its MCP client manages a server connection, and the server advertises tools/resources/prompts. I use the versioned 2025-06-18 protocol concepts and a deliberately narrow `searchApprovedDocs` capability. Concrete Java SDK configuration is pinned separately to avoid mixing framework generations.\n\n## 2. Session and tool execution\n\n```text\nConfigured transport -> initialize compatible version/capabilities\n -> discover reviewed tools/resources -> propose scoped call\n -> validate schema/permission/budget -> invoke -> validate result\nsearchApprovedDocs({query,limit<=3}) -> sourceId,revision,excerpt\n```\n\nTenant scope comes from authenticated connection/application policy, never an arbitrary model-supplied tenant ID. Local process transport inherits a different process boundary from remote HTTP; neither grants universal computer access. Credentials are audience-scoped and not forwarded to arbitrary destinations. A changed schema or newly advertised tool is reevaluated under host policy, not automatically trusted.\n\nReturned excerpts carry source revisions and bounded bytes. An oversized result fails explicitly. A malicious descriptor asking to export secrets remains untrusted metadata; the host has not authorized that action. Reconnect restores the session under reviewed capabilities and deadlines. Standard transport interoperability does not make an external business action idempotent, so state-changing tools retain their own operation contracts.\n\n## 3. Final design diagram\n\n[![MCP / MCP Client/Server: Host application owns policy MCP client; MCP client authenticated session Configured transport; Configured transport protocol messages MCP server; MCP server advertises Tool and resource registry; MCP server authorized calls Domain authority; MCP server bounded results Validated observation; Validated observation external data Host application](designs/ai-15.svg)](designs/ai-15.svg)\n\nThe **host** is the application using model capabilities. A **client** manages a server connection. A **server** exposes selected capabilities. This chapter anchors protocol concepts to the versioned 2025-06-18 specification; use the chosen SDK/version contract for concrete Java configuration.\n\n## 4. Critical operation: worked execution\n\n![Discovery describes capabilities; host policy decides what may be used.](lessons/ai-15-flow.svg)\n\n*Discovery describes capabilities; host policy decides what may be used.*\n\n![Discovered metadata does not override host or user authority.](lessons/ai-15-failure.svg)\n\n*Discovered metadata does not override host or user authority.*\n\n### Build a narrow example\n\nExpose `searchApprovedDocs(query, limit)` returning document IDs, revisions and short excerpts. Derive tenant scope from the authenticated connection or application policy, not an arbitrary model-supplied tenant argument. Set maximum query size, result count and response bytes before integrating a real corpus.\n\n```text\nRequest: tool=searchApprovedDocs, args={query:\"transaction isolation\",limit:3}\nResponse: {sources:[{id:\"db-guide\",revision:4,excerpt:\"...\"}]}\nHost checks: connection identity, permitted tool, argument schema, result size\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** What does MCP standardize, and which responsibilities stay with the host application?\n\nMCP defines communication among hosts, clients and servers with capability negotiation and structured messages. Servers may expose tools, resources and prompts. MCP is a protocol boundary, not an agent planner, vector database or automatic authorization system. Transport/session behavior depends on the negotiated version.\n\n### Architecture and contracts\n\n```text\nHost authenticates/approves server -> client initializes capabilities -> list permitted tools/resources -> validate requested operation -> server execution -> bounded result -> host model context\n\nApplication contracts (design outline):\nServerIdentity(endpoint,allowedScopes); ToolDescriptor(name,inputSchema); ToolCall(id,name,args); Result(content,isError)\n```\n\nSpring AI MCP integration can adapt protocol tools to model tools. Select matching client/server starter and SDK documentation for the pinned release; keep the underlying service independently testable.\n\n### Worked reasoning and capacity example\n\nA model context containing 200 large tool schemas can waste thousands of tokens. Expose a task-relevant authorized subset and cap result sizes; protocol standardization does not remove model context limits.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord ApprovedServer(java.net.URI endpoint, java.util.Set<String> scopes) {}\nrecord Call(String tool, String operationId, String jsonArguments) {}\n// Negotiate protocol capabilities, then validate schema and authorize each call.\n// Do not forward another resource audience's credential to this server.\n```\n\n### Design decisions and alternatives\n\nPin the protocol revision and SDK versions in an implementation. Use trusted server registration, least privilege and explicit tenant boundaries. Keep local stdio process execution and remote HTTP authentication risks distinct.\n\n### Failure scenario and safe recovery\n\nA server changes a tool description to instruct the host to upload private files. Treat descriptors/results as untrusted data; the host authorization policy, not returned prose, decides permitted resources and destinations.\n\n### Security, privacy and provenance\n\nOAuth tokens for one audience must not be forwarded to a different resource merely because a tool requests it. A connection is not blanket authorization for every future action.\n\n\n**Verification criteria:** Protocol conformance, scope enforcement, resource isolation, cancellation, error propagation and result bounds. Inspect the actual negotiated capabilities rather than assuming every server supports every feature.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through deployment trust\n\nA local process transport and a remote HTTP transport have different credential, process and network boundaries. Do not send tokens intended for one resource to an arbitrary downstream server. Server discovery, reconnect and capability changes need application policy; previously reviewed descriptors may change after an upgrade.\n\nSpring AI can integrate MCP clients/servers, but SDK/module APIs change across releases. Keep protocol concepts separate from a runnable configuration and verify the exact dependency family before presenting code as executable. A standard wire format does not make every tool idempotent or every server safe.\n\n## 6. Interviewer follow-ups\n\n**Does MCP grant a server access to the whole computer?** No. Actual process credentials, exposed capabilities and host controls determine access.\n\n**Is tool output an instruction?** It is external data that may contain hostile instructions; application authority remains separate.\n\n## 7. Closing answer\n\nMCP standardizes capability discovery and invocation, not trust or permission. I choose a scoped documentation-search server, validate compatibility and bounded schemas, and keep identity/egress/action policy in the host and domain service. Discovered text and results cannot override user authority.\n"
     }
   ]
 }

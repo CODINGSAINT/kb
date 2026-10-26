@@ -1,18 +1,17 @@
 === LLD 1 ===
-N|player|Player ×2|30|0|140|rect
-N|game|Game|310|0|140|rect
-N|state|GameState|600|0|150|ellipse
-N|move|Move (history)|30|140|150|rect
-N|board|Board 8×8|310|140|140|rect
-N|validator|MoveValidator|600|140|150|rect
-N|piece|Piece ▸ K Q R B N P|270|270|220|rect
-E|game|player|has 2|
-E|game|state|status|
-E|game|move|records|
-E|game|board|owns|
-E|game|validator|asks|
-E|validator|board|reads|
-E|board|piece|holds|
+N|n0|Game|0|0|200|rect
+N|n1|PositionState|250|0|200|rect
+N|n2|MoveGenerator|500|0|200|rect
+N|n3|AttackMap|0|110|200|rect
+N|n4|MoveHistory|250|110|200|rect
+N|n5|Piece|500|110|200|rect
+N|n6|Player|0|220|200|rect
+E|n0|n1|owns
+E|n0|n2|generates
+E|n2|n3|checks safety
+E|n0|n4|records
+E|n1|n5|contains
+E|n0|n6|has two
 ---
 ## Problem
 
@@ -31,15 +30,36 @@ Design a two-player game of chess as an object model in Java. The exercise asks 
 - Single process, in-memory. No persistence, no networking.
 - Extensible: new variants (Chess960, a different promotion rule) shouldn't need edits all over the codebase.
 
-## Learn through a concrete example
+## 1. Scope and chosen solution
 
-Imagine two people sharing one chessboard. White asks to move a rook from a1 to a4. The rook's shape permits a straight move, but a pawn on a2 blocks it. Even an unobstructed move can be illegal if moving the rook exposes White's king. These are three different questions: whose turn is it, can this piece travel there, and is the resulting position safe?
+I am designing a standard two-player chess engine in one JVM. The public operation is `makeMove(playerId, expectedVersion, from, to, promotion)`. I include special moves, check/checkmate, stalemate, resignation and draw agreement. Network matchmaking and a computer opponent are outside this engine. A complete tournament-rules extension also needs the specific claimable and automatic draw rules; I do not equate an incomplete rule subset with full FIDE compliance.
 
-Start with **one in-memory game**, two human players and no network. A *value object* represents a value, such as square a1; an *entity* has an identity, such as this particular game. An *invariant* is a rule that must hold after every accepted move. Here, one invariant is that the moving side's king is not attacked after the move.
+I choose composition: immutable `Piece(kind, side)` values, one `PositionState`, and movement policies selected by kind. `Game` owns the current position and history. `AttackMap` computes attacked squares directly; it does not call legal-move generation recursively. This lets a pinned enemy piece still contribute attacks under chess rules.
 
-Read the worked move first. Then study the classes below. If you already build Java services, concentrate on the difference between an attack map and legal moves, and on restoring state exactly during undo.
+## 2. Public contract and commit algorithm
 
-## See the operation and its hidden trap
+```text
+makeMove(playerId, expectedVersion, Move) -> Accepted(position, version)
+Errors: WrongPlayer, StaleVersion, InvalidSquare, IllegalMove, GameFinished
+
+Under the per-game lock:
+  verify version, active result and player's turn
+  validate pseudo-legal geometry and special-move preconditions
+  copy the complete position and apply all move effects
+  reject if moving side's king is attacked in the trial
+  store before-position in history; commit trial and increment version
+  evaluate opponent's legal replies; set checkmate/stalemate if applicable
+```
+
+For e2–e4, the board changes, the en-passant target becomes e3 and Black receives the turn in one accepted transition. A rejected request leaves every field and version unchanged. A copy touches 64 squares; a simple all-piece legal-reply scan is acceptable here. Per-game serialization prevents two moves against version 12 both becoming position 13. Separate games use separate locks. Undo restores the entire saved position, including rights and counters, rather than merely moving the piece backward.
+
+## 3. Final design diagram
+
+[![Design Chess: Game owns PositionState; Game generates MoveGenerator; MoveGenerator checks safety AttackMap; Game records MoveHistory; PositionState contains Piece; Game has two Player](designs/lld-1.svg)](designs/lld-1.svg)
+
+I start with **one in-memory game**, two human players and no network. A *value object* represents a value, such as square a1; an *entity* has an identity, such as this particular game. An *invariant* is a rule that must hold after every accepted move. Here, one invariant is that the moving side's king is not attacked after the move.
+
+## 4. Critical operation: worked execution
 
 ![Only a validated trial position becomes the live position.](lessons/lld-1-flow.svg)
 
@@ -53,7 +73,7 @@ Read the worked move first. Then study the classes below. If you already build J
 
 *Use the actual board to follow the pinned-rook example before reading the code.*
 
-### Build the first version
+### Core implementation
 
 Represent the board with 64 squares. Use immutable `Piece(kind, colour)` values and keep castling rights and en-passant target in `PositionState`, rather than mutating shared piece objects. A shallow board copy is safe only when its elements are immutable. Avoid bitboards until you can explain and test the array version.
 
@@ -71,7 +91,7 @@ MoveResult tryMove(PositionState live, Move request) {
 
 Notice that attack detection must not recursively ask whether the attacker can make a legal move: that would ask about its king, then the other king, indefinitely. Implement attack geometry directly, including pawn diagonals, king adjacency and sliding-piece blockers.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### One coherent ownership model
 
@@ -125,7 +145,7 @@ In one JVM a per-game lock can surround expected-version validation and commit. 
 
 For further reading, use the [Java 21 value and concurrency APIs](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) for implementation mechanics and the [FIDE Laws of Chess](https://handbook.fide.com/chapter/e012023) for game semantics. A programming API is not a source of chess rules.
 
-## Work through the boundary cases
+### Work through the boundary cases
 
 After e2–e4, record e3 as the en-passant target for the immediately following turn. A later move clears that right. Undo must restore the previous target, castling rights, halfmove clock, captured piece and side to move—not just move a piece backward.
 
@@ -133,28 +153,30 @@ Castling requires more than a safe destination: the king cannot start in check o
 
 For a network extension, accept `gameId`, `expectedVersion` and a client move identity. Two moves using version 12 cannot both advance the game to version 13. A per-game lock works in one JVM; a database version condition is needed when multiple servers can write the same game. Keep network synchronization outside pure chess-rule evaluation.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **White king e1, White rook e2, Black rook e8: can White play Re2–f2?** No. The rook has a geometrically valid move, but the resulting position exposes the king along the e-file.
-2. **Is no legal move always checkmate?** No. If the side to move is not attacked, it is stalemate. Checkmate needs both an attacked king and no legal reply.
-3. **Implement undo for promotion. What must be saved?** The original pawn, any captured piece, all position rights/counters and the prior turn. Restoring a queen to its old square would not restore the position.
+**White king e1, White rook e2, Black rook e8: can White play Re2–f2?** No. The rook has a geometrically valid move, but the resulting position exposes the king along the e-file.
 
-For a deeper exercise, generate every legal move from the starting position: there should be 20. Then play each move and undo it; compare the complete restored state, not only the board drawing. This catches accidental sharing of mutable objects between trial and live positions.
+**Is no legal move always checkmate?** No. If the side to move is not attacked, it is stalemate. Checkmate needs both an attacked king and no legal reply.
+
+## 7. Closing answer
+
+I would keep one versioned Game as the mutation boundary, immutable pieces inside a copied PositionState, separate geometric move generation from attack detection, and commit only a king-safe result. Exact position snapshots make undo reliable. I would optimize representation only after the legal-move tests pass.
 
 === HLD 1 ===
-N|client|Client|0|130|110|rect
-N|lb|Load Balancer|150|130|130|rect
-N|api|Shortener API|330|130|150|rect
-N|ids|ID Range Svc|330|0|150|ellipse
-N|cache|Redis Cache|580|0|150|cylinder
-N|db|KV DB code→url|580|120|170|cylinder
-N|kafka|Kafka → Analytics|560|250|190|rect
-E|client|lb||
-E|lb|api||
-E|api|ids|lease 1M IDs|
-E|api|cache|1. lookup|
-E|api|db|2. on miss|
-E|api|kafka|click event|dashed
+N|n0|Clients and routing|0|0|200|rect
+N|n1|URL service|250|0|200|rect
+N|n2|Redis cache|500|0|200|rect
+N|n3|Mapping database|0|110|200|rect
+N|n4|ID generator|250|110|200|rect
+N|n5|Click stream|500|110|200|rect
+N|n6|Analytics consumers|0|220|200|rect
+E|n0|n1|HTTP
+E|n1|n2|cache aside
+E|n1|n3|durable mapping
+E|n1|n4|allocates code
+E|n1|n5|async clicks
+E|n5|n6|aggregates
 ---
 ## Problem
 
@@ -177,13 +199,29 @@ Design a URL shortener like bit.ly or TinyURL. Given a long URL, return a short 
 - 5 years × 1.2B/yr = **6B records**. At ~500 bytes each that is **≈ 3 TB**, which fits on a sharded KV store easily.
 - Code length: base62 gives 62⁶ ≈ 56.8B and 62⁷ ≈ 3.5T. **7 characters** leaves plenty of headroom.
 
-## Learn through a concrete example
+## 1. Scope, assumptions and selected architecture
 
-You share a long product URL as `sho.rt/aZ3kQ9p`. Creating that link writes a mapping; opening it reads the mapping and returns an HTTP redirect. The redirect service does not normally download the destination page. This simple distinction explains why the design is read-heavy and why destination scraping, if added, needs its own security boundary.
+I support creation, redirect, custom aliases, expiration and owner deletion. I choose random seven-character Base62 with a database uniqueness constraint, PostgreSQL initially, Redis cache-aside when read load warrants it, and asynchronous click analytics. A single authoritative write region avoids multi-writer alias conflicts. The detailed sizing below uses 100 million creations/month and a 100:1 redirect ratio as interview assumptions, not measured traffic.
+
+## 2. API and authoritative records
+
+```text
+POST /urls {longUrl,customAlias?,expiresAt?} + Idempotency-Key -> 201 {code,shortUrl}
+GET /{code} -> 302 Location; absent/expired -> documented 404/410 policy
+DELETE /urls/{code} + owner identity -> 204 or denied
+url_mapping PK(code): long_url, owner_id, expires_at, active, version
+create_request UNIQUE(owner_id,key): payload_hash, code, committed_result
+```
+
+Creation validates input, allocates a candidate, and atomically persists mapping plus request result. A collision retries with a new random candidate; an alias conflict returns 409. Redirect checks cached expiry/status, uses the authoritative database on a miss, and publishes analytics outside the response dependency. Cache population failure after a database commit does not undo creation. I choose a documented bounded revocation window unless the product requires an authoritative status check; TTL by itself is not immediate revocation. The architecture, exact calculations and race analyses below complete these choices.
+
+## 3. Final design diagram
+
+[![URL Shortener: Clients and routing HTTP URL service; URL service cache aside Redis cache; URL service durable mapping Mapping database; URL service allocates code ID generator; URL service async clicks Click stream; Click stream aggregates Analytics consumers](designs/hld-1.svg)](designs/hld-1.svg)
 
 A **mapping** connects code to destination. A **cache** keeps a temporary fast copy. A **replica** is another database copy that can lag. **Sharding** splits different mappings across owners; it is not the same as making copies.
 
-## See the small system before scaling it
+## 4. Critical operation: worked execution
 
 ![One durable indexed store is sufficient to explain correctness.](lessons/hld-1-flow.svg)
 
@@ -201,7 +239,7 @@ A **mapping** connects code to destination. A **cache** keeps a temporary fast c
 
 At 100 million creates per 30-day month, average writes are `100,000,000 / 2,592,000 ≈ 38.6/s`. At 100 reads per write, reads average about 3,860/s. If cache hit rate is 95%, the database still sees about 193 reads/s; a cache outage changes that to the entire read load. That difference motivates bounded fallback rather than unlimited retry.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Reference walkthrough
 
@@ -452,7 +490,7 @@ Avoid synchronous increments on the primary mapping row. Analytics can be best-e
 | Region fails | Global routing to healthy region; replication/RPO/RTO must be explicit |
 | Cache cold | Controlled warm-up, request coalescing, DB concurrency limits |
 
-Start with one authoritative write region, multi-AZ database replication, and regional caches. Multi-region active-active writes add uniqueness and conflict-resolution complexity.
+I start with one authoritative write region, multi-AZ database replication, and regional caches. Multi-region active-active writes add uniqueness and conflict-resolution complexity.
 
 ### 14. Latency budget and observability
 
@@ -519,7 +557,6 @@ A modular Spring Boot application is sufficient to demonstrate this design; sepa
 5. **Stream** analytics outside the hot path.
 6. **Survive** failures without losing acknowledged links.
 
-**Practice prompt:** Draw the system from memory, narrate a create request and a redirect, then explain what happens when Redis fails or a replica lags.
 
 ---
 
@@ -594,7 +631,7 @@ Sharding is a **later-stage scaling decision**, not a requirement merely because
 
 **Snowflake-like IDs:** Decentralized and collision-free only if worker IDs are unique and clocks/sequence rollover are correctly handled. A 63-bit positive value needs up to 11 Base62 characters. For a product that prioritizes very short, difficult-to-guess links, random 7–8 character codes may be preferable. For distributed generation and roughly time-ordered IDs, Snowflake is attractive.
 
-**Recommendation for this workload:** Start with random Base62 + unique insert, or a well-managed pre-generated pool if tail latency from retries is a concern. Choose Snowflake when distributed ID generation is a strong operational requirement; don't claim it inherently yields shorter codes.
+**Recommendation for this workload:** I start with random Base62 + unique insert, or a well-managed pre-generated pool if tail latency from retries is a concern. Choose Snowflake when distributed ID generation is a strong operational requirement; don't claim it inherently yields shorter codes.
 
 ### 23. Partitioning and resharding
 
@@ -658,31 +695,36 @@ A viral link can dominate requests. Redis cluster throughput does not guarantee 
 
 The URL-shortener manuscript supplied for this revamp is the depth benchmark. Primary specifications for independent checking: [HTTP semantics](https://www.rfc-editor.org/rfc/rfc9110.html), [PostgreSQL isolation](https://www.postgresql.org/docs/current/transaction-iso.html), and [Kafka design](https://kafka.apache.org/41/design/design/).
 
-## Reconstruct the design from the pictures
+### Reconstruct the design from the pictures
 
 The detailed URL-shortener case study above carries the attachment's API, capacity, code-generation, sharding and failure discussions. Read it in three passes: first create/redirect, then the scaling calculations, then consistency races. Do not memorize Redis and Kafka as mandatory boxes: Redis optimizes the read path; Kafka is optional asynchronous analytics. Neither should be needed to understand what a redirect means.
 
 Random seven-character Base62 has `62^7` possible values. A unique database constraint still decides collisions. “A collision somewhere is likely” and “the next request is likely to collide” are different probabilities; the detailed calculation explains both. A short code also is not authorization to edit or delete the link.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Why might a just-created code return 404?** A stale replica may not have received the acknowledged mapping. Route appropriately or use a consistent fallback.
-2. **Does Redis TTL guarantee immediate deletion?** No. Existing cache entries and cache-fill races require a documented revocation policy.
-3. **Exercise:** draw the no-cache MVP, then add Redis and async analytics in different colours. For each component, name the measured problem it solves and what happens if it disappears. A useful design remains understandable after optional boxes are removed.
+**Why might a just-created code return 404?** A stale replica may not have received the acknowledged mapping. Route appropriately or use a consistent fallback.
+
+**Does Redis TTL guarantee immediate deletion?** No. Existing cache entries and cache-fill races require a documented revocation policy.
+
+## 7. Closing answer
+
+I would begin with a stateless URL API and durable unique mapping inserts, choose random Base62 codes with collision retries, and return revocable 302 redirects. Redis scales popular reads, while sharding and regional replication follow measured needs. Analytics is asynchronous, and revocation/read-after-write guarantees determine the cache policy.
 
 === AI 1 ===
-N|prompt|Prompt text|0|40|130|rect
-N|tok|Tokenizer|190|40|130|rect
-N|ctx|Context window|380|40|170|rect
-N|llm|LLM weights|620|40|140|ellipse
-N|samp|Sampler|620|230|140|diamond
-N|out|Next token|400|230|130|rect
-E|prompt|tok|text|
-E|tok|ctx|tokens|
-E|ctx|llm|prefill|
-E|llm|samp|probabilities|
-E|samp|out|temp / top-p|
-E|out|ctx|append + repeat|dashed
+N|n0|Authenticated question|0|0|200|rect
+N|n1|Context builder|250|0|200|rect
+N|n2|Tokenizer|500|0|200|rect
+N|n3|Transformer inference|0|110|200|rect
+N|n4|Decoder|250|110|200|rect
+N|n5|Evidence validator|500|110|200|rect
+N|n6|Cited response|0|220|200|rect
+E|n0|n1|scopes data
+E|n1|n2|counts input
+E|n2|n3|token IDs
+E|n3|n4|next-token scores
+E|n4|n5|draft claims
+E|n5|n6|support or abstain
 ---
 ## Problem
 
@@ -696,13 +738,33 @@ Explain how a language model processes a request, then design a small private-do
 - Translate concepts into Java/Spring application boundaries and measurable exercises.
 - Preserve tenant isolation and never treat fluent text as proof of truth or authority.
 
-## Learn through a concrete example
+## 1. Complete conceptual answer and selected application
 
-Ask a language model “What is Java?” and it can produce a plausible explanation. Ask “What is our company's current leave policy?” and fluent text may still appear—even though the policy was never supplied. The first lesson is that producing likely text and possessing current authoritative evidence are different capabilities.
+A language model estimates a distribution for the next token conditioned on earlier tokens. Training adjusts weights to reduce prediction error; inference uses those weights without learning each submitted conversation into them. Tokenization maps text to model-specific IDs, embeddings represent those IDs numerically, and transformer layers mix context before the output head produces vocabulary scores.
+
+In attention, queries and keys produce scaled scores `QKᵀ/√d`; softmax weights combine values V. A causal mask prevents an autoregressive position from reading future tokens. This explains contextual representation, not guaranteed reasoning or factual truth. During decoding the selected token is appended and the process repeats until a stop/limit. KV caching reuses intermediate attention state; it is not the application's persistent user memory.
+
+I apply this to a private-document assistant: the application authenticates, selects permitted context, budgets tokens, invokes the model and validates evidence. The same model can discuss public Java concepts but cannot know yesterday's private policy unless authorized evidence is supplied.
+
+## 2. Request contract and budget
+
+```text
+Ask(question,conversationId) -> Answer(text,sourceIds,abstained,usage)
+Prompt = task instructions + selected history + question + permitted evidence
+Illustrative total allowance 16000:
+  output 2000 + instructions 1000 + history 3000 + question/margin 1000
+  leaves 9000 tokens for evidence under this simplified accounting
+```
+
+The context limit and tokenizer depend on the model; tokens are not fixed words/pages. I count with the configured tokenizer where supported and account for provider-specific reasoning/caching categories. Missing evidence produces abstention, not an invented policy. Prompting changes request context, retrieval supplies documents, tools fetch live facts, and fine-tuning changes weights for learned behaviour; these are distinct mechanisms. Exact eligibility/financial arithmetic stays in deterministic Java services.
+
+## 3. Final design diagram
+
+[![AI/LLM Fundamentals: Authenticated question scopes data Context builder; Context builder counts input Tokenizer; Tokenizer token IDs Transformer inference; Transformer inference next-token scores Decoder; Decoder draft claims Evidence validator; Evidence validator support or abstain Cited response](designs/ai-1.svg)](designs/ai-1.svg)
 
 A **token** is a model-specific text unit, not always a word. The **context window** bounds the tokens available for a request and its response under the model's rules. **Training** changes model weights; **inference** uses existing weights to produce a result. An application can store history, but that does not mean every chat message retrains the model.
 
-## See generation and grounded answering
+## 4. Critical operation: worked execution
 
 ![Generation predicts tokens; the application supplies evidence and constraints.](lessons/ai-1-flow.svg)
 
@@ -718,11 +780,11 @@ For an illustrative 16,000-token total budget, reserve 2,000 output, 1,000 instr
 
 Attention mixes representations from token positions. The model's KV cache saves intermediate computation for existing context; it is not an editable customer database. At generation time the model cannot query a private order table unless the application exposes an authorized retrieval/tool path.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
-### Key concepts and learning objective
+### Mechanism and rationale
 
-**Question to answer:** Why can a fluent model answer a public question but invent the answer to a private company-policy question?
+**Design question:** Why can a fluent model answer a public question but invent the answer to a private company-policy question?
 
 Training changes weights; inference conditions on the supplied context without updating those weights. Tokenization maps text to model-specific integer units. Transformer attention mixes information across token positions; autoregressive decoding predicts successive tokens. A KV cache reuses intermediate attention state but is neither an editable business database nor permanent conversation memory.
 
@@ -765,11 +827,8 @@ The model gives a confident answer unsupported by the retrieved policy. Treat fl
 
 AI, machine learning, deep learning and generative modelling are related categories, not one perfect universal nesting diagram. Not every language model is a Transformer, and not every generative model is a language model.
 
-### Hands-on lab and evaluation
 
-**Build:** Build a documentation assistant in increments: one model request, labelled context, lexical/vector retrieval, structured answer, a read-only lookup tool and finally a bounded multi-step loop. At each step add a failure case before adding another abstraction.
-
-**Measure:** Compare a prompt-only baseline with grounded answers on known, missing and adversarial questions. Track supported-answer rate, abstention precision, context overflow, first-token latency and token usage.
+**Verification criteria:** Compare a prompt-only baseline with grounded answers on known, missing and adversarial questions. Track supported-answer rate, abstention precision, context overflow, first-token latency and token usage.
 
 ### Further reading
 
@@ -778,7 +837,7 @@ AI, machine learning, deep learning and generative modelling are related categor
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
 
-## Separate the mechanisms before combining them
+### Separate the mechanisms before combining them
 
 | Need | First mechanism to consider | What it does not establish |
 |---|---|---|
@@ -788,10 +847,14 @@ AI, machine learning, deep learning and generative modelling are related categor
 | Preserve prior conversation | Application-owned memory | Weight updates or infinite context |
 | Adapt recurring behaviour/style | Prompting, then evaluate fine-tuning if justified | Fresh private facts by default |
 
-Begin with a stub model that returns a fixed answer so request validation and UI states can be tested without inference. Then add a real model and compare grounded answers on a versioned set of questions. Arithmetic and authorization remain deterministic application work.
+I begin with a stub model that returns a fixed answer so request validation and UI states can be tested without inference. Then add a real model and compare grounded answers on a versioned set of questions. Arithmetic and authorization remain deterministic application work.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **If the model remembers your name in the same conversation, did its weights change?** Usually no. The application/provider likely included relevant history or stored memory.
-2. **Does temperature zero prove truth?** No. It changes sampling; systematic unsupported answers can remain.
-3. **Exercise:** ask one public, one private and one deliberately unanswerable question. Repeat after supplying a short policy passage with an ID. Record whether every factual policy claim is supported and whether missing evidence leads to an explicit “I don't know.”
+**If the model remembers your name in the same conversation, did its weights change?** Usually no. The application/provider likely included relevant history or stored memory.
+
+**Does temperature zero prove truth?** No. It changes sampling; systematic unsupported answers can remain.
+
+## 7. Closing answer
+
+I explain an LLM as a trained conditional sequence model, then keep private facts, permissions and exact calculations in application-owned systems. Tokens, context and sampling explain generation; retrieval and tools supply missing evidence. Fluent continuation is never itself proof of a business fact.

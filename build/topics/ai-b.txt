@@ -1,16 +1,17 @@
 === AI 8 ===
-N|pojo|Java record / POJO|0|0|180
-N|conv|BeanOutputConverter|0|150|190
-N|schema|JSON schema + format instr.|260|0|230|ellipse
-N|llm|LLM (JSON mode)|300|150|160
-N|parse|Parse + Bean Validation|560|150|200
-N|retry|Retry with error feedback|560|0|200
-E|pojo|conv|
-E|conv|schema|generates
-E|schema|llm|in prompt
-E|llm|parse|JSON text
-E|parse|retry|invalid?
-E|retry|llm|re-ask
+N|n0|User input|0|0|200|rect
+N|n1|Schema contract|250|0|200|rect
+N|n2|ChatClient converter|500|0|200|rect
+N|n3|Model output|0|110|200|rect
+N|n4|DTO validator|250|110|200|rect
+N|n5|Evidence and policy|500|110|200|rect
+N|n6|Typed result|0|220|200|rect
+E|n0|n2|bounded text
+E|n1|n2|shape requirements
+E|n2|n3|requests
+E|n3|n4|parse then validate
+E|n4|n5|semantic checks
+E|n5|n6|accept or reject
 ---
 ## Problem
 
@@ -23,13 +24,29 @@ Explain how to get reliable, typed, structured output from LLMs in Java: mapping
 - Provider-native JSON or structured-output modes vs. prompt-based format instructions.
 - Validation (Jakarta Bean Validation), retry-with-feedback, and fallbacks.
 
-## Learn through a concrete example
+## 1. Selected structured-output design
 
-A support assistant should return `category`, `priority` and `summary`. Free prose is difficult for downstream code to consume. Structured output asks for a typed shape, but a parseable object can still contain an invalid category or an unsupported decision.
+I classify support tickets into an allow-listed category and summary, returning a review flag when evidence is incomplete. I use ChatClient DTO conversion and provider schema support when available. Deterministic code enforces the domain contract after generation.
+
+## 2. DTO and validation algorithm
+
+```java
+record Classification(String category, String summary, boolean needsReview) {}
+Classification value = client.prompt().user(ticketText)
+    .call().entity(Classification.class);
+```
+
+The application checks non-null required fields, an allowed category, summary length and evidence rules. An invalid category is rejected even when JSON parsed successfully. Unknown dates remain null/unknown under the explicit schema rather than defaulting to today. The API returns `VALID`, `NEEDS_REVIEW` or `CONTRACT_FAILURE`; it does not silently treat malformed output as an empty success.
+
+I allow one syntax-repair attempt within the same budget and then fail visibly. Critical unsupported decisions do not gain authority through repair. Contract versions are stored with results, and deployments compare a fixed corpus containing malformed, missing, oversized and semantically invalid cases. A model-generated `refundApproved=true` cannot bypass the separate refund service's eligibility and permission checks.
+
+## 3. Final design diagram
+
+[![Structured Output: User input bounded text ChatClient converter; Schema contract shape requirements ChatClient converter; ChatClient converter requests Model output; Model output parse then validate DTO validator; DTO validator semantic checks Evidence and policy; Evidence and policy accept or reject Typed result](designs/ai-8.svg)](designs/ai-8.svg)
 
 Separate **syntax validation** (is it valid JSON?), **schema validation** (are required fields/types present?) and **business validation** (is this category allowed and justified?). A Java record describes a shape; it does not establish truth.
 
-## See conversion and semantic checks
+## 4. Critical operation: worked execution
 
 ![Parsing is one step before business validation.](lessons/ai-8-flow.svg)
 
@@ -51,11 +68,11 @@ Classification result = client.prompt()
 
 Represent missing evidence explicitly rather than forcing the model to invent required facts. An empty list of citations and `abstained=true` can be valid for an unanswerable question. `null`, empty string and unknown are different concepts; define which fields allow each.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
-### Key concepts and learning objective
+### Mechanism and rationale
 
-**Question to answer:** How can model output become a reliable application object instead of fragile text parsing?
+**Design question:** How can model output become a reliable application object instead of fragile text parsing?
 
 There are three separate checks: syntactic JSON validity, schema conformance and business correctness. Native provider schemas can constrain format when supported; framework converters can guide/parse output but cannot prove that a cited document exists or that an amount is valid.
 
@@ -94,11 +111,8 @@ The response is valid JSON but invents an authorized-looking order ID. Resolve i
 
 A schema can describe the shape of a tool argument but not establish the caller’s authority to use that argument.
 
-### Hands-on lab and evaluation
 
-**Build:** Feed malformed JSON, missing fields, unknown enum values, oversized lists and semantically invalid IDs through the pipeline. Show which layer rejects each case.
-
-**Measure:** Track syntax success, schema success, domain validity, repair rate, repair cost and accepted incorrect outputs on a labelled set.
+**Verification criteria:** Track syntax success, schema success, domain validity, repair rate, repair cost and accepted incorrect outputs on a labelled set.
 
 ### Further reading
 
@@ -107,30 +121,36 @@ A schema can describe the shape of a tool argument but not establish the caller�
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
 
-## Work through repair and evolution
+### Work through repair and evolution
 
 Allow at most a bounded repair attempt for malformed output and count it in the same request budget. Repeatedly asking until parsing succeeds can hide cost and still produce semantic errors. A strict provider schema improves shape compliance where supported, but resource authorization remains outside generation.
 
 Version the output contract. Adding a required field can break old consumers or archived responses. Keep raw-output retention restricted and redacted where needed; diagnostics should preserve enough schema/version information without collecting every private ticket in general logs.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does `entity()` authorize a refund?** No. The domain service validates and executes approved actions.
-2. **Should a missing date become today's date?** Only if the contract explicitly defines that default; otherwise preserve unknown.
-3. **Exercise:** feed valid JSON with an illegal category, malformed JSON, missing evidence and oversized text. Assert four distinct outcomes and verify bounded repair. A test that only checks successful deserialization misses the important failures.
+**Does `entity()` authorize a refund?** No. The domain service validates and executes approved actions.
+
+**Should a missing date become today's date?** Only if the contract explicitly defines that default; otherwise preserve unknown.
+
+## 7. Closing answer
+
+I require syntax, schema and domain validity as separate gates. A typed model response is a candidate classification, not authorization. Missing facts remain explicit, repair is bounded, and contract versions make changes reviewable and reproducible.
 
 === AI 9 ===
-N|user|User msg + conversationId|0|130|210
-N|adv|MessageChatMemoryAdvisor|270|130|220
-N|mem|ChatMemory (window N)|270|0|200
-N|repo|Repository (JDBC/Redis)|560|0|200|cylinder
-N|llm|LLM|560|130|110|ellipse
-N|sum|Summarise old turns|270|270|190
-E|user|adv|prompt
-E|adv|mem|load history
-E|mem|repo|persist
-E|adv|llm|history + msg
-E|mem|sum|overflow
+N|n0|Authenticated principal|0|0|200|rect
+N|n1|Conversation service|250|0|200|rect
+N|n2|Message store|500|0|200|rect
+N|n3|Memory selector|0|110|200|rect
+N|n4|Context budgeter|250|110|200|rect
+N|n5|ChatClient|500|110|200|rect
+N|n6|Turn journal|0|220|200|rect
+E|n0|n1|owned scope
+E|n1|n2|ordered history
+E|n2|n3|selects messages
+E|n3|n4|token bound
+E|n4|n5|request context
+E|n5|n6|completed turn
 ---
 ## Problem
 
@@ -144,13 +164,30 @@ Explain conversation memory for LLM apps: LLMs are stateless, so "memory" means 
 - Conversation IDs, multi-user isolation, persistence, retention.
 - Context-window management: windowing, summarisation, retrieval-based memory.
 
-## Learn through a concrete example
+## 1. Selected memory model
 
-“What did I ask earlier?” requires prior conversation content. Most model calls are stateless from the application's perspective; memory means selecting and supplying stored context. It is not an unlimited transcript and does not update model weights.
+I choose tenant/user/conversation-scoped message storage and serialized turns per conversation. Recent complete turns are selected by token budget, with optional versioned summaries for older discussion. The authoritative conversation record stays separate from the prompt window.
+
+## 2. Turn contract and consistency
+
+```text
+POST /conversations/{id}/turns {requestId,expectedVersion,question}
+ -> completedAnswer | conflict | denied | partialFailure
+Conversation: tenantId,userId,id,version,retentionPolicy
+Message: conversationId,sequence,role,content,state,requestId
+```
+
+I resolve the submitted ID against authenticated ownership, acquire the conversation turn lease/version, select bounded history and call the model. Final output and the committed turn are recorded once. Two tabs using version 7 cannot silently append unrelated answers based on the same old history; one conflicts or waits under the chosen serialization policy. A failed stream remains partial, not a successful assistant memory turn.
+
+Ten 600-token turns consume roughly 6,000 tokens before instructions/evidence/output. I preserve coherent tool-call/result groups when pruning. Summaries can omit or distort constraints, so allergies, permissions and financial facts belong in typed authoritative state. Deletion invalidates messages, summaries, vectors and relevant caches, rather than only hiding the visible transcript.
+
+## 3. Final design diagram
+
+[![Conversation Memory: Authenticated principal owned scope Conversation service; Conversation service ordered history Message store; Message store selects messages Memory selector; Memory selector token bound Context budgeter; Context budgeter request context ChatClient; ChatClient completed turn Turn journal](designs/ai-9.svg)](designs/ai-9.svg)
 
 A **conversation ID** identifies stored history, a **memory window** selects retained messages, and a **summary** compresses older content with possible information loss. A user's ownership of the conversation must be verified independently of the ID they submit.
 
-## See scoped memory and a collision
+## 4. Critical operation: worked execution
 
 ![Only selected, owned history enters the model request.](lessons/ai-9-flow.svg)
 
@@ -170,11 +207,11 @@ Request context: instructions + selected history + question + evidence
 Persisted turn: requestId + sequence + final output + state
 ```
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
-### Key concepts and learning objective
+### Mechanism and rationale
 
-**Question to answer:** How can a chat remember prior turns without leaking another user’s conversation or exhausting context?
+**Design question:** How can a chat remember prior turns without leaking another user’s conversation or exhausting context?
 
 Persisted conversation history is application state. Each model request includes a selected view of it; provider-side caches do not replace this store. Window memory drops old turns; summaries compress them; retrieval can recover relevant past facts but adds ranking and privacy concerns.
 
@@ -215,11 +252,8 @@ Two tabs append to one conversation concurrently. Sequence or version the append
 
 A summary generated by an LLM can turn uncertainty into a false permanent fact. Keep provenance and allow users to correct retained information.
 
-### Hands-on lab and evaluation
 
-**Build:** Create two users with the same supplied conversation ID and verify isolation. Run simultaneous turns, delete a conversation and confirm summaries/retrieval copies follow the deletion policy.
-
-**Measure:** Measure cross-user leakage, retained facts, summary drift, context tokens and correctness after truncation. Use adversarial conversations that try to claim another tenant’s identity.
+**Verification criteria:** Measure cross-user leakage, retained facts, summary drift, context tokens and correctness after truncation. Use adversarial conversations that try to claim another tenant’s identity.
 
 ### Further reading
 
@@ -228,30 +262,36 @@ A summary generated by an LLM can turn uncertainty into a false permanent fact. 
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
 
-## Work through concurrent turns
+### Work through concurrent turns
 
 Two tabs send follow-ups to the same conversation simultaneously. Without sequencing, both can answer against the same old history and append in an arbitrary order. Serialize per conversation, use optimistic version checks or explicitly represent branching. Do not pretend arrival timestamps alone define user intent.
 
 A summary can accidentally omit an allergy, a constraint or a quoted negation. Keep critical application facts in typed authoritative state; do not entrust them only to a generated summary. Deletion must consider messages, summaries, vectors and caches under the retention policy.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Can a conversation ID supplied by the model establish ownership?** No. Resolve it against authenticated application identity.
-2. **Does pruning history change old stored messages?** It need not; prompt selection and storage retention are separate policies.
-3. **Exercise:** create two users with identical visible conversation labels, race two turns and delete one conversation. Verify isolation, deterministic order and removal from every memory representation you actually use.
+**Can a conversation ID supplied by the model establish ownership?** No. Resolve it against authenticated application identity.
+
+**Does pruning history change old stored messages?** It need not; prompt selection and storage retention are separate policies.
+
+## 7. Closing answer
+
+Conversation memory is application-selected context, not model retraining. I enforce ownership before reading history, order concurrent turns explicitly and keep critical business facts out of lossy summaries. Retention/deletion covers every representation used by the application.
 
 === AI 10 ===
-N|app|Spring app|0|130|130
-N|vs|VectorStore API|210|130|160
-N|pg|PGVector|470|0|140|cylinder
-N|redis|Redis|470|100|140|cylinder
-N|os|OpenSearch/ES|470|200|170|cylinder
-N|filter|Metadata filter: dept == 'HR'|180|280|260|ellipse
-E|app|vs|add / search
-E|vs|pg|impl
-E|vs|redis|impl
-E|vs|os|impl
-E|filter|vs|filterExpression
+N|n0|Source registry|0|0|200|rect
+N|n1|Embedding pipeline|250|0|200|rect
+N|n2|Versioned vector index|500|0|200|rect
+N|n3|Metadata filters|0|110|200|rect
+N|n4|Query service|250|110|200|rect
+N|n5|Document revisions|500|110|200|rect
+N|n6|Lifecycle worker|0|220|200|rect
+E|n0|n1|authorized sources
+E|n1|n2|upserts
+E|n3|n2|restricts candidates
+E|n4|n2|nearest search
+E|n2|n5|resolves evidence
+E|n6|n2|retires chunks
 ---
 ## Problem
 
@@ -265,13 +305,30 @@ Explain vector stores: what they add beyond storing arrays of floats (ANN indexe
 - Choosing a store for an enterprise Java stack.
 - Spring AI `VectorStore`, `SearchRequest`, the portable filter expression DSL.
 
-## Learn through a concrete example
+## 1. Selected store contract
 
-A vector store holds embeddings and associated document metadata so the application can retrieve neighbours. It is an index of selected evidence, not a replacement for document lifecycle, access control or a source-of-truth database.
+I choose a database-backed vector index for an initially moderate corpus, with typed metadata and source revisions. Document/query embeddings use one compatible model version. Search filters enforce tenant and document permissions before evidence reaches generation.
+
+## 2. Records and update transaction boundary
+
+```text
+Chunk: id,documentId,revision,tenant,permissionScope,text,embeddingModel,vector
+IndexGeneration: id,model,dimension,publishedAt,state
+search(scope,queryVector,k,generation) -> permitted chunk IDs and scores
+publishRevision(doc,newChunks): stage -> verify -> switch -> retire old chunks
+```
+
+An update from chunks A/B/C to A/D must retire B and C explicitly; upsert alone leaves stale evidence. New embedding models build a separate generation, evaluate recall and switch query embedding/index together. Equal vector dimensions do not prove compatible spaces. One million 1,536-dimensional float32 vectors occupy 6.144 GB raw before text, metadata, index structures and replicas.
+
+I test filter placement using a deliberately nearest forbidden vector, not random separation. Approximate indexing settings are selected by measured recall/latency and operating capacity. Source deletion tombstones immediately suppress access under current policy, with asynchronous physical cleanup verified later. Backups and re-ingestion have different recovery times, so both index/source provenance and recovery expectations are documented.
+
+## 3. Final design diagram
+
+[![Vector Stores: Source registry authorized sources Embedding pipeline; Embedding pipeline upserts Versioned vector index; Metadata filters restricts candidates Versioned vector index; Query service nearest search Versioned vector index; Versioned vector index resolves evidence Document revisions; Lifecycle worker retires chunks Versioned vector index](designs/ai-10.svg)](designs/ai-10.svg)
 
 An **index namespace** separates logical collections, a **metadata filter** constrains candidates, and a **document revision** tells you what was embedded. **Approximate search** improves speed by potentially missing some exact nearest neighbours; measure recall rather than assuming an index configuration is universally best.
 
-## See indexing and revision cleanup
+## 4. Critical operation: worked execution
 
 ![Text, embedding model and permissions remain traceable together.](lessons/ai-10-flow.svg)
 
@@ -285,11 +342,11 @@ An **index namespace** separates logical collections, a **metadata filter** cons
 
 One million vectors × 1,536 dimensions × four bytes is about 6.144 GB raw values. Index graph/list structures, stored text, metadata, replicas and write headroom add to that. If your documents are small and the corpus modest, an existing database with vector support may be simpler than a new distributed dependency.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
-### Key concepts and learning objective
+### Mechanism and rationale
 
-**Question to answer:** How should embeddings be indexed, filtered, updated and migrated in a real application?
+**Design question:** How should embeddings be indexed, filtered, updated and migrated in a real application?
 
 A vector store combines numerical vectors, metadata and an index. Exact search establishes a correctness baseline; approximate methods such as HNSW/IVF trade search recall, memory, build time and latency. The storage engine may also support lexical indexes; vectors are not a separate mandatory database category.
 
@@ -318,7 +375,7 @@ record IndexVersion(String embeddingModel, int dimensions, String chunkerVersion
 
 ### Design decisions and alternatives
 
-Start with a store that fits operating skills and consistency needs. Use stable content/revision keys for repeatable ingestion; rebuild into a new collection when model/chunker changes. Swap an index alias after validation rather than mixing incompatible vectors.
+I start with a store that fits operating skills and consistency needs. Use stable content/revision keys for repeatable ingestion; rebuild into a new collection when model/chunker changes. Swap an index alias after validation rather than mixing incompatible vectors.
 
 ### Failure scenario and safe recovery
 
@@ -328,11 +385,8 @@ Deletion removes source text but leaves indexed chunks retrievable. Tombstone or
 
 Two models with equal vector dimension are not interchangeable. Distance thresholds are metric/model dependent and must be calibrated on your corpus.
 
-### Hands-on lab and evaluation
 
-**Build:** Create an exact-search baseline, compare ANN recall on a labelled subset, then change embedding dimensions and demonstrate a staged reindex plus rollback.
-
-**Measure:** Recall@k, filtered recall, insert/update lag, deletion propagation, memory and query p99 under concurrent ingestion. Benchmark skewed tenants, not only uniform random vectors.
+**Verification criteria:** Recall@k, filtered recall, insert/update lag, deletion propagation, memory and query p99 under concurrent ingestion. Benchmark skewed tenants, not only uniform random vectors.
 
 ### Further reading
 
@@ -341,33 +395,37 @@ Two models with equal vector dimension are not interchangeable. Distance thresho
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
 
-## Work through filter correctness
+### Work through filter correctness
 
 Filtering before candidate selection and filtering a small top-k afterward can produce different recall and security properties. A post-filter cannot repair a design that exposes forbidden text to another processing step. Test tenant/resource filters with intentionally nearest forbidden vectors, not merely random fixtures.
 
 Changing embedding models requires a versioned migration. Even equal-dimensional vectors can represent different spaces. Build a new index, test retrieval, switch query embedding and index together, and keep a rollback plan. Index backup and source re-ingestion are different recovery strategies with different time/cost.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Is vector distance comparable across arbitrary models?** No. Use a compatible model/index and calibrated task evaluation.
-2. **Does deleting a document row guarantee vector deletion?** Only if your lifecycle explicitly performs and verifies that propagation.
-3. **Exercise:** reindex a document with fewer chunks, delete another and inject a forbidden nearest match. Verify no orphaned evidence, no forbidden disclosure and a measured retrieval recall after migration.
+**Is vector distance comparable across arbitrary models?** No. Use a compatible model/index and calibrated task evaluation.
+
+**Does deleting a document row guarantee vector deletion?** Only if your lifecycle explicitly performs and verifies that propagation.
+
+## 7. Closing answer
+
+I treat the vector store as a versioned retrieval index with explicit source lifecycle. Model compatibility, permission filters, stale-chunk retirement and recall measurement determine correctness; selecting a vector database alone does not solve these responsibilities.
 
 === AI 11 ===
-N|q|User query|0|0|120
-N|rewrite|Query rewrite / multi-query|180|0|230|ellipse
-N|bm25|BM25 search|470|0|140|cylinder
-N|vec|Vector search|470|130|140|cylinder
-N|fuse|RRF fusion|180|130|140
-N|rerank|Cross-encoder rerank|180|270|200
-N|llm|LLM w/ top 5|470|270|140|ellipse
-E|q|rewrite|
-E|rewrite|bm25|keywords
-E|rewrite|vec|embedding
-E|bm25|fuse|
-E|vec|fuse|
-E|fuse|rerank|top 50
-E|rerank|llm|top 5
+N|n0|Source lifecycle|0|0|200|rect
+N|n1|Hybrid retriever|250|0|200|rect
+N|n2|Reranker|500|0|200|rect
+N|n3|Evidence packer|0|110|200|rect
+N|n4|Generation|250|110|200|rect
+N|n5|Claim validator|500|110|200|rect
+N|n6|Evaluation and traces|0|220|200|rect
+E|n0|n1|published scope
+E|n1|n2|candidates
+E|n2|n3|ranked passages
+E|n3|n4|bounded evidence
+E|n4|n5|claims citations
+E|n6|n1|measures recall
+E|n6|n5|measures support
 ---
 ## Problem
 
@@ -381,13 +439,30 @@ Take RAG from demo to production: the techniques that move answer quality from "
 - Query transformation: rewriting, multi-query, HyDE, conversational compression.
 - Operational concerns: incremental ingestion, dedup, ACLs, evals and monitoring.
 
-## Learn through a concrete example
+## 1. Selected production pipeline
 
-A demonstration answers correctly from one PDF. Production adds thousands of documents, changing permissions, conflicting revisions and questions whose answers are absent. Production RAG makes evidence lifecycle and measurable failure behaviour part of the design rather than treating retrieval as a single library call.
+I choose hybrid retrieval, optional reranking, bounded evidence packing and a typed cited-answer validator. Every answer records source revisions, prompt/model/index versions and a request trace. Current authorization applies before exposure, while index cleanup can remain asynchronous within the lifecycle contract.
+
+## 2. Execution and measurable acceptance
+
+```text
+Question -> authorize -> lexical/vector retrieval -> fuse/rerank
+         -> pack source spans -> generate -> validate citations/support
+Result: SUPPORTED | INSUFFICIENT_EVIDENCE | CONFLICTING_EVIDENCE | FAILURE
+Cache scope: tenant + permission/freshness + corpus/prompt/model versions
+```
+
+For 100 answerable cases, retrieving relevant evidence for 85 gives recall 85%; 75 supported final answers give end-to-end success 75%, and conditional generation success 75/85≈88.2%. I also evaluate unanswerable questions; otherwise a system that fabricates every missing answer can look strong. Revoked/deleted sources and conflicting revisions form independent critical slices.
+
+I change chunking, embedding model, fusion, reranking or prompting one at a time against that corpus. Increasing k can add contradictions and token cost, so it is accepted only if measured support improves. Failed queries retain inspectable candidate/selected source IDs without dumping confidential text into general logs. A cached answer is reused only when permission and evidence freshness still match; semantic question similarity does not establish that equivalence.
+
+## 3. Final design diagram
+
+[![Production RAG: Source lifecycle published scope Hybrid retriever; Hybrid retriever candidates Reranker; Reranker ranked passages Evidence packer; Evidence packer bounded evidence Generation; Generation claims citations Claim validator; Evaluation and traces measures recall Hybrid retriever; Evaluation and traces measures support Claim validator](designs/ai-11.svg)](designs/ai-11.svg)
 
 **Recall@k** measures whether relevant evidence appears among retrieved candidates. A **reranker** reorders candidates with a more expensive relevance judgement. **Groundedness** evaluates whether the answer is supported by selected evidence. Improve the failing stage instead of blindly increasing every limit.
 
-## See retrieval stages and a permission change
+## 4. Critical operation: worked execution
 
 ![Each stage leaves evidence for diagnosis and versioned evaluation.](lessons/ai-11-flow.svg)
 
@@ -403,11 +478,11 @@ On 100 answerable questions, relevant evidence may appear for 85. If 75 of those
 
 Reserve a separate unanswerable set. A system that confidently answers every question can score well on answer-present cases while failing dangerously when evidence is missing. Evaluate abstention precision/recall and critical security failures separately.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
-### Key concepts and learning objective
+### Mechanism and rationale
 
-**Question to answer:** What turns a successful RAG demo into a dependable multi-tenant documentation product?
+**Design question:** What turns a successful RAG demo into a dependable multi-tenant documentation product?
 
 Production RAG is a lifecycle of ingestion, revisioning, retrieval, authorization, evaluation and operations. Hybrid search retrieves lexical and semantic candidates; reranking orders a small candidate set; context assembly removes duplicates and respects token budget.
 
@@ -446,11 +521,8 @@ A shared semantic answer cache serves a correct answer to a user lacking access 
 
 A more complex pipeline can be harder to debug and less reliable. Keep a measurable baseline and change one retrieval/generation component at a time.
 
-### Hands-on lab and evaluation
 
-**Build:** Replay a golden dataset against two chunkers and a hybrid pipeline. Add a document deletion, permission revocation, embedding outage and a cold-index rollback scenario.
-
-**Measure:** Supported-answer rate, retrieval recall, citation correctness, abstention, p99 latency, indexing freshness and unauthorized evidence exposure. Slice metrics by tenant, language and document type.
+**Verification criteria:** Supported-answer rate, retrieval recall, citation correctness, abstention, p99 latency, indexing freshness and unauthorized evidence exposure. Slice metrics by tenant, language and document type.
 
 ### Further reading
 
@@ -459,30 +531,36 @@ A more complex pipeline can be harder to debug and less reliable. Keep a measura
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
 
-## Work through release changes
+### Work through release changes
 
 Change one variable at a time: chunking, embedding model, hybrid weights, reranker or prompt. Version the corpus and expected evidence, then compare by topic, document age, language and answerability. A larger k increases latency/context and may add contradictory evidence; it is not an automatic quality improvement.
 
 Cache keys need tenant, permission/freshness scope and relevant corpus/prompt/model versions. Similar questions are not sufficient grounds for sharing answers across users. Preserve source spans in traces so support review can inspect a claim without rerunning today's changed index.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Should generation be blamed when the source was never retrieved?** First diagnose retrieval; the generator cannot reliably cite missing evidence.
-2. **Is a retrieval score a confidence score for the final answer?** No.
-3. **Exercise:** create answer-present, absent, conflicting-version and revoked-source cases. Record retrieval candidates, packed evidence and final claims. Explain each failure at the responsible stage and compare one improvement against the same versioned suite.
+**Should generation be blamed when the source was never retrieved?** First diagnose retrieval; the generator cannot reliably cite missing evidence.
+
+**Is a retrieval score a confidence score for the final answer?** No.
+
+## 7. Closing answer
+
+Production RAG is a lifecycle and quality pipeline, not one vector lookup. I version sources and components, measure evidence recall separately from answer support, and enforce current permissions even when indexes or caches lag. Release decisions use critical-case gates and inspected regressions.
 
 === AI 12 ===
-N|req|ChatClientRequest|0|130|180
-N|a1|Logger (outer)|240|0|150
-N|a2|Memory advisor|240|130|160
-N|a3|RAG advisor|240|260|150
-N|model|ChatModel call|520|130|160|ellipse
-N|resp|ChatClientResponse|520|0|180
-E|req|a1|before
-E|a1|a2|order
-E|a2|a3|order
-E|a3|model|augmented prompt
-E|model|resp|after (reverse)
+N|n0|Application policy|0|0|200|rect
+N|n1|Request context|250|0|200|rect
+N|n2|Memory advisor|500|0|200|rect
+N|n3|Retrieval advisor|0|110|200|rect
+N|n4|Final budget check|250|110|200|rect
+N|n5|ChatClient model call|500|110|200|rect
+N|n6|Response observation|0|220|200|rect
+E|n0|n1|verified identity
+E|n1|n2|owned conversation
+E|n2|n3|augmented request
+E|n3|n4|authorized evidence
+E|n4|n5|bounded prompt
+E|n5|n6|result and metadata
 ---
 ## Problem
 
@@ -495,13 +573,30 @@ Explain Spring AI advisors, the interceptor or middleware chain around every `Ch
 - Ordering via `getOrder()`, and sharing data between advisors via the advisor context.
 - Writing custom `CallAdvisor` / `StreamAdvisor` implementations.
 
-## Learn through a concrete example
+## 1. Selected advisor composition
 
-Several endpoints need memory, evidence retrieval and telemetry before model invocation. Copying all of that into every controller causes inconsistent behaviour. An **advisor** participates in the model-request processing chain, adding or inspecting context and responses according to its contract.
+I use the pinned Spring AI 1.1 family to compose memory, authorized retrieval and observation around one ChatClient boundary. Application code resolves principal/conversation before advisor execution. Each component receives immutable request-scoped policy; singleton advisors do not hold mutable per-user state.
+
+## 2. Ordering and request contract
+
+```text
+ApplicationContext: principal,ownedConversation,evidenceScope,remainingBudget
+Effective order: memory selection -> scoped retrieval -> final context check
+                -> model -> output validation/telemetry
+Memory output: bounded messages; retrieval output: source IDs/revisions/spans
+```
+
+I configure and verify ordering using the selected API's ordering contract rather than assuming registration order is always execution order. The final budget check matters because a prior 4,000-token check becomes obsolete if memory adds 3,000 and retrieval adds 8,000 later. Token contributions are attributed to their components.
+
+The same advisor chain is tested with two concurrent users and distinguishable history/evidence. Any cross-request state fails isolation. Retry re-entry cannot duplicate memory writes or business effects; completed-turn persistence stays in the application workflow. Observation records versions, latency and usage with redaction, not unrestricted prompt bodies. This composition reduces duplicated endpoint integration while keeping ownership and failure transitions visible.
+
+## 3. Final design diagram
+
+[![Spring AI Advisors: Application policy verified identity Request context; Request context owned conversation Memory advisor; Memory advisor augmented request Retrieval advisor; Retrieval advisor authorized evidence Final budget check; Final budget check bounded prompt ChatClient model call; ChatClient model call result and metadata Response observation](designs/ai-12.svg)](designs/ai-12.svg)
 
 Advisors are integration middleware, not permission to hide business decisions in invisible interceptors. Their order, state scope and error behaviour need to be visible in the application's design. This chapter uses the pinned Spring AI 1.1 family; later versions may change chain/tool integration.
 
-## See composition and ordering
+## 4. Critical operation: worked execution
 
 ![Understand what each advisor receives and contributes.](lessons/ai-12-flow.svg)
 
@@ -523,11 +618,11 @@ Request context:
   budget: remaining tokens and deadline after all augmentation
 ```
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
-### Key concepts and learning objective
+### Mechanism and rationale
 
-**Question to answer:** Where should cross-cutting prompt transformations live without making their order invisible?
+**Design question:** Where should cross-cutting prompt transformations live without making their order invisible?
 
 Advisors wrap the model interaction and can transform requests and responses. Their order determines whether logging sees raw or redacted text, whether memory precedes retrieval and which errors are visible. A call path and a streaming path may have different contracts.
 
@@ -566,11 +661,8 @@ A debug logger is ordered before redaction and captures private evidence. Tests 
 
 Retries wrapped around the entire advisor chain may repeat retrieval, memory writes or tool effects. Assign retry ownership deliberately.
 
-### Hands-on lab and evaluation
 
-**Build:** Add one timing advisor and one bounded context enrichment step, then write a test that records before/after order for success, exception and cancellation.
-
-**Measure:** Order correctness, exception propagation, stream cancellation, context isolation and redaction coverage. Record advisor latency in traces without raw sensitive content.
+**Verification criteria:** Order correctness, exception propagation, stream cancellation, context isolation and redaction coverage. Record advisor latency in traces without raw sensitive content.
 
 ### Further reading
 
@@ -579,31 +671,37 @@ Retries wrapped around the entire advisor chain may repeat retrieval, memory wri
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
 
-## Work through hidden costs
+### Work through hidden costs
 
 If memory adds 3,000 tokens and retrieval adds 8,000 after an earlier 4,000-token budget check, that check no longer protects a 12,000-token limit with output reserve. Validate the assembled prompt near the final model boundary. Record which component contributed tokens so tuning is explainable.
 
 Retries can re-enter parts of a chain depending on the API. Memory writes or external side effects should not repeat blindly. Test ordering with spies/stubs and a known request, then inspect the actual assembled evidence and final result. The repository's general API compile check does not establish every advisor configuration's runtime behaviour.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does registering both memory and retrieval automatically guarantee their intended order?** Inspect the selected API's ordering contract and verify the effective chain.
-2. **Should an advisor read an arbitrary conversation ID from generated text?** No. Use application-authorized context.
-3. **Exercise:** build two advisors that annotate a request trace, reverse their order and observe the difference. Then inject two concurrent users and verify no memory or evidence crosses requests.
+**Does registering both memory and retrieval automatically guarantee their intended order?** Inspect the selected API's ordering contract and verify the effective chain.
+
+**Should an advisor read an arbitrary conversation ID from generated text?** No. Use application-authorized context.
+
+## 7. Closing answer
+
+Advisors compose integration concerns, but the application still owns identity and final budgets. I verify effective ordering and request isolation, then inspect the assembled prompt and response. The selected framework version's contracts determine chain behaviour; a newer API example is not assumed compatible.
 
 === AI 13 ===
-N|user|User|0|0|110
-N|app|ChatClient + tools|200|0|180
-N|llm|LLM|500|0|110|ellipse
-N|tool|@Tool methods|200|150|160
-N|svc|Bank / internal APIs|200|280|180|cylinder
-N|ctx|ToolContext (userId, auth)|500|150|210
-E|user|app|question
-E|app|llm|prompt + tool schemas
-E|llm|app|tool_call(args)
-E|app|tool|invoke
-E|tool|svc|real call
-E|ctx|tool|injected
+N|n0|User request|0|0|200|rect
+N|n1|Model proposal|250|0|200|rect
+N|n2|Tool policy|500|0|200|rect
+N|n3|Authorized order service|0|110|200|rect
+N|n4|Order database|250|110|200|rect
+N|n5|Typed tool result|500|110|200|rect
+N|n6|Final response|0|220|200|rect
+E|n0|n1|intent
+E|n1|n2|name arguments
+E|n2|n3|allowed call
+E|n3|n4|current facts
+E|n3|n5|minimal fields
+E|n5|n1|observation
+E|n1|n6|grounded explanation
 ---
 ## Problem
 
@@ -617,13 +715,36 @@ Explain tool (function) calling: how an LLM requests the execution of your code 
 - Read vs. write tools, confirmations, idempotency, errors and timeouts.
 - Security: least privilege, never trusting model-supplied arguments blindly.
 
-## Learn through a concrete example
+## 1. Selected tool and authority boundary
 
-A customer asks “Where is order O123?” The model can interpret the question, but the order service knows the current status. A **tool** is an application function described to the model. The model proposes its name and arguments; application code decides whether and how to execute it.
+I implement a read-only order-status assistant. The model sees a schema for `lookupOrder(orderId)` and can propose it; the application checks the current principal's access before the order service reads data. Identity is application-owned and is not an argument the model can override.
 
-Start with a read-only lookup. Do not expose a general SQL executor or arbitrary HTTP client when one narrow domain operation meets the need. A tool description improves selection; it is not an authorization rule.
+## 2. Spring boundary and flow
 
-## See proposal and enforcement
+```java
+import org.springframework.ai.tool.annotation.Tool;
+final class OrderTools {
+    private final AuthorizedOrderLookup orders;
+    OrderTools(AuthorizedOrderLookup orders) { this.orders = orders; }
+    @Tool(description="Read status of an order authorized for the current user")
+    public OrderStatus lookupOrder(String orderId) {
+        return orders.lookupForCurrentPrincipal(orderId);
+    }
+}
+// Registered on the selected ChatClient request using .tools(orderTools).
+```
+
+The service validates ID format, ownership, deadline and result bounds. O123 for its owner returns current status evidence; O999 belonging to someone else returns denial without private fields. A timeout is a typed unavailable result, not permission for the model to invent delivery status. Verified identity is explicitly propagated/bound in asynchronous execution rather than assuming thread-local security survives every boundary.
+
+A refund extension would use a separate tool with current eligibility, amount/currency checks, stable refund identity and the product's approval rule. Repeated invocation returns the recorded operation; provider uncertainty is reconciled before another effect. Tool results remain untrusted external data for instruction purposes and cannot expand the caller's authority.
+
+## 3. Final design diagram
+
+[![Tool Calling / Function Calling: User request intent Model proposal; Model proposal name arguments Tool policy; Tool policy allowed call Authorized order service; Authorized order service current facts Order database; Authorized order service minimal fields Typed tool result; Typed tool result observation Model proposal; Model proposal grounded explanation Final response](designs/ai-13.svg)](designs/ai-13.svg)
+
+I start with a read-only lookup. Do not expose a general SQL executor or arbitrary HTTP client when one narrow domain operation meets the need. A tool description improves selection; it is not an authorization rule.
+
+## 4. Critical operation: worked execution
 
 ![Authenticated application identity governs access to model-proposed arguments.](lessons/ai-13-flow.svg)
 
@@ -651,11 +772,11 @@ final class OrderTools {
 
 The model does not get to supply `isAdmin=true` or choose another principal. In asynchronous work, propagate or explicitly bind the verified principal through an application-owned context; do not rely on a thread-local surviving arbitrary executor changes.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
-### Key concepts and learning objective
+### Mechanism and rationale
 
-**Question to answer:** How can an assistant look up a live order without being allowed to act on arbitrary accounts?
+**Design question:** How can an assistant look up a live order without being allowed to act on arbitrary accounts?
 
 The model proposes a tool name and arguments. The application validates schema, derives authenticated identity, authorizes the resource and executes the tool. Tool result text returns as untrusted data for a later model step; the model never becomes the security principal.
 
@@ -688,7 +809,7 @@ final class OrderTools {
 
 ### Design decisions and alternatives
 
-Begin with read-only lookup tools. Side effects need operation IDs and a review/confirmation policy appropriate to the action. Descriptions should explain inputs and output semantics but cannot grant permissions.
+I begin with read-only lookup tools. Side effects need operation IDs and a review/confirmation policy appropriate to the action. Descriptions should explain inputs and output semantics but cannot grant permissions.
 
 ### Failure scenario and safe recovery
 
@@ -698,11 +819,8 @@ A malicious user asks for another account’s order and provides a plausible use
 
 A read-only label is descriptive metadata. Enforce read-only behavior in the implementation and database credentials.
 
-### Hands-on lab and evaluation
 
-**Build:** Implement a read-only stock/order tool; test nonexistent IDs, foreign-tenant IDs, oversized arguments, duplicate calls and a provider timeout following a completed tool.
-
-**Measure:** Task success, correct tool selection, unauthorized attempts blocked, argument validity, duplicate effects and tool latency/error classification.
+**Verification criteria:** Task success, correct tool selection, unauthorized attempts blocked, argument validity, duplicate effects and tool latency/error classification.
 
 ### Further reading
 
@@ -711,14 +829,18 @@ A read-only label is descriptive metadata. Enforce read-only behavior in the imp
 - [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
 - [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
 
-## Work through write tools
+### Work through write tools
 
 A refund tool needs stronger handling than a status lookup: validate amount, eligibility, current state, operation identity and required user review. Persist intent and reconcile provider uncertainty. A model retry after a lost response must not create another refund.
 
 Limit tool count, payload size and duration. Validate tool results before sending them back; external results can contain instructions and should remain data. For the pinned 1.1 API family, use its documented execution behaviour rather than copying a newer-version advisor loop without verification.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does `@Tool` make a method safe?** No. It exposes a callable contract; domain authorization and validation remain necessary.
-2. **Should tools return raw database rows?** Return minimal typed data needed for the task, excluding secrets and unrelated personal fields.
-3. **Exercise:** test owned order, forbidden order, malformed ID, service timeout and repeated refund intent. Assert no unauthorized reads and at most one committed financial effect.
+**Does `@Tool` make a method safe?** No. It exposes a callable contract; domain authorization and validation remain necessary.
+
+**Should tools return raw database rows?** Return minimal typed data needed for the task, excluding secrets and unrelated personal fields.
+
+## 7. Closing answer
+
+Tool calling separates language intent from deterministic execution. I expose a narrow authorized order lookup, validate every proposed call and return minimal typed evidence. Write tools add explicit eligibility, operation identity and review policy; model arguments never become permission.

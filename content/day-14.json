@@ -12,103 +12,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "client",
-            "label": "Client Request",
-            "x": 0,
-            "y": 0,
-            "w": 150,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "limiter",
+            "id": "n0",
             "label": "RateLimiter",
-            "x": 290,
-            "y": 0,
-            "w": 150,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "registry",
-            "label": "Per-key Buckets",
-            "x": 590,
-            "y": 0,
-            "w": 170,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "algo",
-            "label": "Algorithm (Strategy)",
-            "x": 290,
-            "y": 150,
-            "w": 190,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "tb",
-            "label": "Token Bucket",
             "x": 0,
-            "y": 280,
-            "w": 150,
+            "y": 0,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "sw",
-            "label": "Sliding Window",
-            "x": 290,
-            "y": 280,
-            "w": 160,
+            "id": "n1",
+            "label": "KeyPolicy",
+            "x": 250,
+            "y": 0,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "fw",
-            "label": "Fixed Window",
-            "x": 600,
-            "y": 280,
-            "w": 150,
+            "id": "n2",
+            "label": "BucketRegistry",
+            "x": 500,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n3",
+            "label": "TokenBucket",
+            "x": 0,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n4",
+            "label": "MonotonicClock",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "AdmissionResult",
+            "x": 500,
+            "y": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "client",
-            "to": "limiter",
-            "label": "tryAcquire(key)"
+            "from": "n0",
+            "to": "n1",
+            "label": "resolves key"
           },
           {
-            "from": "limiter",
-            "to": "registry",
-            "label": "lookup"
+            "from": "n0",
+            "to": "n2",
+            "label": "looks up"
           },
           {
-            "from": "limiter",
-            "to": "algo",
-            "label": "delegates"
+            "from": "n2",
+            "to": "n3",
+            "label": "owns per key"
           },
           {
-            "from": "algo",
-            "to": "tb",
-            "label": "impl"
+            "from": "n3",
+            "to": "n4",
+            "label": "measures elapsed"
           },
           {
-            "from": "algo",
-            "to": "sw",
-            "label": "impl"
-          },
-          {
-            "from": "algo",
-            "to": "fw",
-            "label": "impl"
+            "from": "n3",
+            "to": "n5",
+            "label": "returns"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a rate limiter class in Java (the LLD version, inside one JVM): `boolean allow(String key)` limits each user or API key to N requests per time window. You must implement the algorithms correctly, make them **thread-safe**, and make the algorithm swappable (**Strategy**).\n\n## Requirements\n\n**Functional**\n- Per-key limits (user ID, IP, API key), with different limits per tier or endpoint.\n- Algorithms: fixed window, sliding window log, sliding window counter, token bucket, leaky bucket.\n- Return allowed or denied, plus metadata (remaining requests, retry-after).\n\n**Non-functional**\n- O(1) per call where possible, safe under many concurrent threads, and bounded memory (evict idle keys).\n\n## Learn through a concrete example\n\nAn API allows five requests immediately and then replenishes two requests per second. A counter reset every second cannot express that burst policy cleanly. A **token bucket** stores permits: requests consume permits and elapsed time replenishes them up to a capacity.\n\nStart with one JVM and one caller. Then add multiple callers and finally multiple servers. The algorithm's arithmetic and its deployment authority are separate lessons; a correct local bucket does not automatically become a global quota.\n\n## See admission and a concurrent race\n\n![Refill and consumption form one atomic operation.](lessons/lld-14-flow.svg)\n\n*Refill and consumption form one atomic operation.*\n\n![Atomic check-and-consume prevents overspending the bucket.](lessons/lld-14-failure.svg)\n\n*Atomic check-and-consume prevents overspending the bucket.*\n\n![Five-token capacity empties after five requests; at two tokens per second, 1.25 seconds refills 2.5 tokens.](lessons/lld-14-bucket.svg)\n\n*Fractional permits explain why two requests can pass now while the next must wait.*\n\n### Build and calculate\n\nWith capacity 5, rate 2/s and an empty bucket at t=0, t=1.25 has 2.5 tokens. Two unit-cost requests succeed, leaving 0.5. The next needs another 0.5 token, so its earliest retry is 0.25 seconds later. Do not round retry delay downward.\n\n```text\nelapsed = max(0, nowNanos - previousNanos)\ntokens = min(capacity, tokens + elapsedSeconds * rate)\nif tokens >= requestCost: tokens -= requestCost; ALLOW\nelse: DENY, retryAfter = (requestCost - tokens) / rate\n```\n\nHandle nonpositive capacity/rate and cost greater than capacity explicitly. Floating-point arithmetic can be acceptable for an educational bucket with bounded values; fixed-point arithmetic is an alternative when exact quotas and reproducibility require it.\n\n## Design details and alternatives\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `RateLimiter` | Facade: `allow(key)`; looks up the key's limiter |\n| `RateLimitAlgorithm` (Strategy) | `allow()` on one key's state |\n| `TokenBucket`, `SlidingWindowLog`, `SlidingWindowCounter`, `FixedWindow` | Implementations |\n| `RateLimitConfig` | capacity, refill rate or window, per tier |\n| `LimiterRegistry` | `ConcurrentHashMap<String, RateLimitAlgorithm>` plus idle eviction |\n| `Clock` | Injected time source, so tests are deterministic |\n\n```java\nfinal class TokenBucket implements RateLimitAlgorithm {\n    private final long capacity; private final double refillPerNano;\n    private double tokens; private long last;\n    public synchronized boolean allow() {\n        long now = clock.nanoTime();\n        tokens = Math.min(capacity, tokens + (now - last) * refillPerNano);\n        last = now;\n        if (tokens >= 1) { tokens -= 1; return true; }\n        return false;\n    }\n}\n```\n\n### Design decisions & trade-offs\n\n| Algorithm | Pros | Cons |\n|---|---|---|\n| Fixed window | Tiny state, simple | Up to 2× burst at window edges |\n| Sliding log | Exact | O(N) memory per key |\n| Sliding counter | ~Exact, O(1) memory (weighted previous window) | Approximation |\n| Token bucket | Allows controlled bursts, smooth refill | Two params to tune |\n| Leaky bucket | Smooths output rate | Queues add latency |\n\n**1. Lazy refill.** Never use a background thread to add tokens. Compute the refill from elapsed time on each call. That's O(1) and scales to millions of keys.\n\n**2. Thread safety.** `synchronized` per bucket means contention only on the same key, which is usually fine. For a lock-free version, pack state into an `AtomicLong` or use `AtomicReference<State>` with a CAS loop. `computeIfAbsent` on the registry avoids creating duplicate buckets.\n\n**3. Memory.** Evict keys idle longer than the window (a Caffeine cache with `expireAfterAccess`, or a periodic sweep).\n\n**4. Testability.** Inject a `Clock`. Never call `System.currentTimeMillis()` inside the algorithm.\n\n**5. Distributed version (preview of HLD #2).** State moves to Redis, and the logic runs atomically as a Lua script.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Time measurement and atomic token accounting define a limiter more than the chosen class pattern.\n\nRateLimitKey identifies principal, route and policy version. RatePolicy contains capacity and refill rate. TokenBucket owns tokens and last refill time. Clock is monotonic for elapsed time. LimiterRegistry supplies bounded per-key state; Decision includes allowed, remaining and retry delay.\n\n**Correctness rule:** At a fixed instant, accepted requests never spend more tokens than available. Refilling cannot exceed capacity, and elapsed-time calculations cannot create tokens from a backward wall clock jump.\n\n```text\nkey(principal,route,policy_version); bucket(tokens,last_refill_nanos); policy(capacity,rate_per_second)\n```\n\n### State machine and command contracts\n\n```text\nTokens evolve by refill and debit; policy changes are versioned rather than silently reusing incompatible state\n```\n\n### End-to-end execution trace\n\nResolve policy; locate the bucket; acquire its synchronization boundary; calculate elapsed monotonic time; refill with a cap; consume if enough; return a retry delay based on the deficit; release the lock before request processing.\n\n### Concurrency and recovery walkthrough\n\nOne hundred threads request the final token simultaneously. Refill and consume must be one critical section; a thread-safe map does not make a read-modify-write bucket sequence atomic.\n\n\n\n### Policy choices and extension seams\n\nToken bucket permits bounded bursts; leaky bucket smooths output; fixed windows permit boundary bursts; sliding logs offer exact windows at higher memory cost. Single-JVM correctness does not imply global quotas across replicas.\n\n### Edge cases that change the design\n\nIdle-key eviction can reset quota if implemented carelessly. Fractional refill needs numeric care and overflow-safe elapsed handling. Costs must be positive; reject configuration with zero refill when retry calculation divides by rate.\n\n### Verification and a practical lab\n\n**Topic-specific cases:** Initial burst cap; concurrent last-token race; fractional refill; clock behavior; bounded key eviction; exact retry-after calculation.\n\n**Lab:** Use a fake monotonic clock to exhaust a bucket, advance half a refill interval, then race two requests. Show expected decisions without sleeping.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n## Work through deployment boundaries\n\nThree servers each allowing five immediate requests can collectively allow fifteen. For a global five-request burst, use a shared atomic decision store, route each key to one owner, or explicitly allocate sub-budgets. The latter can underuse quota and needs reassignment rules.\n\nUse monotonic elapsed time for a local bucket; wall-clock corrections must not mint tokens. Evicting idle callers is safe only when the recreated state matches the policy. Deleting an exhausted bucket and recreating it full immediately grants another burst.\n\n## Practise, then check your reasoning\n\n1. **Does a thread-safe map make the whole bucket algorithm atomic?** No. Coordinate state calculation and consumption for each key.\n2. **Does a denied request consume a token?** Define it; a common admission policy consumes only allowed work.\n3. **Exercise:** release 24 threads against a full bucket of capacity 5 with a frozen clock. Exactly five unit-cost requests should succeed. Advance the fake clock by 500 ms and expect one more permit at 2/s.\n"
+      "markdown": "## Problem\n\nDesign a rate limiter class in Java (the LLD version, inside one JVM): `boolean allow(String key)` limits each user or API key to N requests per time window. You must implement the algorithms correctly, make them **thread-safe**, and make the algorithm swappable (**Strategy**).\n\n## Requirements\n\n**Functional**\n- Per-key limits (user ID, IP, API key), with different limits per tier or endpoint.\n- Algorithms: fixed window, sliding window log, sliding window counter, token bucket, leaky bucket.\n- Return allowed or denied, plus metadata (remaining requests, retry-after).\n\n**Non-functional**\n- O(1) per call where possible, safe under many concurrent threads, and bounded memory (evict idle keys).\n\n## 1. Scope and chosen solution\n\nI enforce capacity 5 and refill 2 permits/second per authenticated caller in one JVM. `RateLimiter` resolves keys, `TokenBucket` owns state, and an injected monotonic clock makes arithmetic testable. Costs are positive and no larger than capacity.\n\n## 2. Atomic decision\n\n```text\nsynchronized tryAcquire(cost,nowNanos):\n  elapsed = max(0,nowNanos-lastNanos)\n  tokens = min(capacity,tokens + elapsed/1e9*rate)\n  lastNanos = max(lastNanos,nowNanos)\n  if tokens >= cost: tokens -= cost; return ALLOW\n  return DENY with retryAfterNanos = ceil((cost-tokens)/rate * 1e9)\n```\n\nAfter depletion, 1.25 seconds refills 2.5 permits: two unit requests pass, then the next waits 0.25 seconds before HTTP-header rounding. I use fine-grained retry durations internally; a whole-second header rounds upward. Registry lookup is thread-safe but bucket synchronization covers the multi-field calculation. Idle eviction occurs only after a period long enough to restore a full bucket under the policy; premature deletion would grant another burst. Twenty-four simultaneous calls with frozen time admit exactly five. Multiple servers do not share this lock, so I do not claim global enforcement from this implementation.\n\n## 3. Final design diagram\n\n[![Design Rate Limiter: RateLimiter resolves key KeyPolicy; RateLimiter looks up BucketRegistry; BucketRegistry owns per key TokenBucket; TokenBucket measures elapsed MonotonicClock; TokenBucket returns AdmissionResult](designs/lld-14.svg)](designs/lld-14.svg)\n\nI start with one JVM and one caller. Then add multiple callers and finally multiple servers. The algorithm's arithmetic and its deployment authority are separate lessons; a correct local bucket does not automatically become a global quota.\n\n## 4. Critical operation: worked execution\n\n![Refill and consumption form one atomic operation.](lessons/lld-14-flow.svg)\n\n*Refill and consumption form one atomic operation.*\n\n![Atomic check-and-consume prevents overspending the bucket.](lessons/lld-14-failure.svg)\n\n*Atomic check-and-consume prevents overspending the bucket.*\n\n![Five-token capacity empties after five requests; at two tokens per second, 1.25 seconds refills 2.5 tokens.](lessons/lld-14-bucket.svg)\n\n*Fractional permits explain why two requests can pass now while the next must wait.*\n\n### Worked calculation and implementation\n\nWith capacity 5, rate 2/s and an empty bucket at t=0, t=1.25 has 2.5 tokens. Two unit-cost requests succeed, leaving 0.5. The next needs another 0.5 token, so its earliest retry is 0.25 seconds later. Do not round retry delay downward.\n\n```text\nelapsed = max(0, nowNanos - previousNanos)\ntokens = min(capacity, tokens + elapsedSeconds * rate)\nif tokens >= requestCost: tokens -= requestCost; ALLOW\nelse: DENY, retryAfter = (requestCost - tokens) / rate\n```\n\nHandle nonpositive capacity/rate and cost greater than capacity explicitly. Floating-point arithmetic can be acceptable for an educational bucket with bounded values; fixed-point arithmetic is an alternative when exact quotas and reproducibility require it.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `RateLimiter` | Facade: `allow(key)`; looks up the key's limiter |\n| `RateLimitAlgorithm` (Strategy) | `allow()` on one key's state |\n| `TokenBucket`, `SlidingWindowLog`, `SlidingWindowCounter`, `FixedWindow` | Implementations |\n| `RateLimitConfig` | capacity, refill rate or window, per tier |\n| `LimiterRegistry` | `ConcurrentHashMap<String, RateLimitAlgorithm>` plus idle eviction |\n| `Clock` | Injected time source, so tests are deterministic |\n\n\n### Design decisions & trade-offs\n\n| Algorithm | Pros | Cons |\n|---|---|---|\n| Fixed window | Tiny state, simple | Up to 2× burst at window edges |\n| Sliding log | Exact | O(N) memory per key |\n| Sliding counter | ~Exact, O(1) memory (weighted previous window) | Approximation |\n| Token bucket | Allows controlled bursts, smooth refill | Two params to tune |\n| Leaky bucket | Smooths output rate | Queues add latency |\n\n**1. Lazy refill.** Never use a background thread to add tokens. Compute the refill from elapsed time on each call. That's O(1) and scales to millions of keys.\n\n**2. Thread safety.** `synchronized` per bucket means contention only on the same key, which is usually fine. For a lock-free version, pack state into an `AtomicLong` or use `AtomicReference<State>` with a CAS loop. `computeIfAbsent` on the registry avoids creating duplicate buckets.\n\n**3. Memory.** Evict keys idle longer than the window (a Caffeine cache with `expireAfterAccess`, or a periodic sweep).\n\n**4. Testability.** Inject a `Clock`. Never call `System.currentTimeMillis()` inside the algorithm.\n\n**5. Distributed version (preview of HLD #2).** State moves to Redis, and the logic runs atomically as a Lua script.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Time measurement and atomic token accounting define a limiter more than the chosen class pattern.\n\nRateLimitKey identifies principal, route and policy version. RatePolicy contains capacity and refill rate. TokenBucket owns tokens and last refill time. Clock is monotonic for elapsed time. LimiterRegistry supplies bounded per-key state; Decision includes allowed, remaining and retry delay.\n\n**Correctness rule:** At a fixed instant, accepted requests never spend more tokens than available. Refilling cannot exceed capacity, and elapsed-time calculations cannot create tokens from a backward wall clock jump.\n\n```text\nkey(principal,route,policy_version); bucket(tokens,last_refill_nanos); policy(capacity,rate_per_second)\n```\n\n### End-to-end execution trace\n\nResolve policy; locate the bucket; acquire its synchronization boundary; calculate elapsed monotonic time; refill with a cap; consume if enough; return a retry delay based on the deficit; release the lock before request processing.\n\n### Concurrency and recovery walkthrough\n\nOne hundred threads request the final token simultaneously. Refill and consume must be one critical section; a thread-safe map does not make a read-modify-write bucket sequence atomic.\n\n### Policy choices and extension seams\n\nToken bucket permits bounded bursts; leaky bucket smooths output; fixed windows permit boundary bursts; sliding logs offer exact windows at higher memory cost. Single-JVM correctness does not imply global quotas across replicas.\n\n### Edge cases that change the design\n\nIdle-key eviction can reset quota if implemented carelessly. Fractional refill needs numeric care and overflow-safe elapsed handling. Costs must be positive; reject configuration with zero refill when retry calculation divides by rate.\n\n**Topic-specific cases:** Initial burst cap; concurrent last-token race; fractional refill; clock behavior; bounded key eviction; exact retry-after calculation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through deployment boundaries\n\nThree servers each allowing five immediate requests can collectively allow fifteen. For a global five-request burst, use a shared atomic decision store, route each key to one owner, or explicitly allocate sub-budgets. The latter can underuse quota and needs reassignment rules.\n\nUse monotonic elapsed time for a local bucket; wall-clock corrections must not mint tokens. Evicting idle callers is safe only when the recreated state matches the policy. Deleting an exhausted bucket and recreating it full immediately grants another burst.\n\n## 6. Interviewer follow-ups\n\n**Does a thread-safe map make the whole bucket algorithm atomic?** No. Coordinate state calculation and consumption for each key.\n\n**Does a denied request consume a token?** Define it; a common admission policy consumes only allowed work.\n\n## 7. Closing answer\n\nI choose a per-key token bucket with atomic refill-and-consume, monotonic time and explicit retry delay. The local implementation serializes one bucket without blocking unrelated keys. A global quota needs one shared decision authority or consciously allocated local sub-budgets.\n"
     },
     {
       "category": "HLD",
@@ -118,108 +104,108 @@
       "diagram": {
         "nodes": [
           {
-            "id": "merchant",
-            "label": "Merchant/Client",
+            "id": "n0",
+            "label": "Merchant API",
             "x": 0,
             "y": 0,
-            "w": 160,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "api",
-            "label": "Payment API (idempotent)",
-            "x": 240,
-            "y": 0,
-            "w": 210,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "ledger",
-            "label": "Ledger DB (double-entry)",
-            "x": 540,
-            "y": 0,
-            "w": 220,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "psp",
-            "label": "PSP / Card networks",
-            "x": 540,
-            "y": 150,
-            "w": 190,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "webhook",
-            "label": "Webhook Handler",
-            "x": 240,
-            "y": 150,
-            "w": 170,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "recon",
-            "label": "Reconciliation (daily)",
-            "x": 240,
-            "y": 280,
             "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "outbox",
-            "label": "Outbox → Kafka",
-            "x": 540,
-            "y": 280,
-            "w": 170,
-            "h": 62,
-            "shape": "cylinder"
+            "id": "n1",
+            "label": "Payment intents",
+            "x": 250,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n2",
+            "label": "Provider adapter",
+            "x": 500,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n3",
+            "label": "Provider",
+            "x": 0,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n4",
+            "label": "Webhook inbox",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Ledger",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Reconciliation",
+            "x": 0,
+            "y": 220,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "merchant",
-            "to": "api",
-            "label": "pay(key)"
+            "from": "n0",
+            "to": "n1",
+            "label": "idempotent intent"
           },
           {
-            "from": "api",
-            "to": "ledger",
-            "label": "PENDING"
+            "from": "n1",
+            "to": "n2",
+            "label": "stable provider key"
           },
           {
-            "from": "api",
-            "to": "psp",
-            "label": "authorize"
+            "from": "n2",
+            "to": "n3",
+            "label": "authorize capture"
           },
           {
-            "from": "psp",
-            "to": "webhook",
-            "label": "async result"
+            "from": "n3",
+            "to": "n4",
+            "label": "verified evidence"
           },
           {
-            "from": "webhook",
-            "to": "ledger",
-            "label": "finalize"
+            "from": "n4",
+            "to": "n1",
+            "label": "legal transitions"
           },
           {
-            "from": "recon",
-            "to": "psp",
-            "label": "settlement files"
+            "from": "n1",
+            "to": "n5",
+            "label": "posts once"
           },
           {
-            "from": "ledger",
-            "to": "outbox",
-            "label": "events"
+            "from": "n6",
+            "to": "n3",
+            "label": "queries settlement"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a payment system like Stripe's core or an internal payments platform: accept payments via cards, UPI and wallets through external payment service providers (PSPs), record every movement accurately, notify merchants, and reconcile with bank settlement files. Everything revolves around **correctness**: **idempotency**, **transactions/state machines**, **retries**, **webhooks** and **reconciliation**.\n\n## Requirements\n\n**Functional**\n- Create a payment (authorise, then capture), refunds (full or partial), payouts to merchants.\n- Merchant webhooks on status changes. Dashboard and reports.\n\n**Non-functional**\n- Never charge twice, never lose a transaction, a full audit trail.\n- Availability matters, but **correctness beats latency**. External PSPs are slow and unreliable.\n\n**Scale:** modest QPS compared with social apps (~1–10k TPS), but every request is high-value and multi-step.\n\n## Learn through a concrete example\n\nA merchant submits a ₹500 payment and sees a timeout. Retrying with a new identity may charge the customer twice. The payment system must distinguish the transport result from the financial operation's durable state.\n\nA **payment intent** describes what should be collected. An **authorization** reserves funds; **capture** collects them under the provider protocol. A **ledger** records financial movements. A **webhook** is asynchronous evidence that may be duplicated or arrive out of order.\n\n## See intent and provider reconciliation\n\n![Operation identity remains stable across network uncertainty.](lessons/hld-14-flow.svg)\n\n*Operation identity remains stable across network uncertainty.*\n\n![An unknown result needs reconciliation before another charge.](lessons/hld-14-failure.svg)\n\n*An unknown result needs reconciliation before another charge.*\n\n### Calculate and reconcile\n\nIf 100,000 payments/day have a 0.1% unknown-outcome rate, that is 100 cases/day needing resolution—not a rounding error in reliability. Track their age and monetary exposure. For an internal ₹500 movement, signed ledger entries sum to zero once fees and clearing accounts are explicitly represented.\n\n## Design details and alternatives\n\n### Architecture\n\n1. `POST /payments` with an **Idempotency-Key**. The API stores the key plus a request hash atomically. Retries return the saved response.\n2. Create a payment record `CREATED`, call the PSP (with *its* idempotency key = our payment ID), and move to `AUTHORIZED / FAILED / PENDING_UNKNOWN`.\n3. PSP **webhooks** (and polling for unknowns) drive final states. Every money movement is written as **double-entry ledger** entries in the same DB transaction as the state change.\n4. An **outbox table** in the same transaction, then Kafka, then merchant webhooks (with retries plus signatures), analytics and notifications.\n5. A **reconciliation** job compares the internal ledger with PSP/bank settlement files daily and flags mismatches.\n\n### Key design decisions & trade-offs\n\n**1. Idempotency end to end.** Client to us (Idempotency-Key), us to PSP (payment ID as their key), PSP to us (dedupe webhooks by event ID). Every hop can be retried safely.\n\n**2. Unknown outcomes are normal.** A timeout to the PSP doesn't mean failure. Mark `PENDING_UNKNOWN`, never retry with a *new* charge, and resolve by status query or webhook. This is the most-probed point in interviews.\n\n**3. Double-entry ledger.** An immutable, append-only set of debits and credits summing to zero per transaction. Balances are derived. That makes audits, refunds (reverse entries) and reconciliation tractable.\n\n**4. Transactional outbox.** State change and event in one local transaction. A relay publishes to Kafka. That avoids the \"DB committed but event lost\" (or the reverse) dual-write problem.\n\n**5. SQL for the core.** Strong consistency and transactions (Postgres/MySQL, sharded by merchant or account). Analytics live in separate stores fed by events.\n\n**6. Webhooks to merchants.** At-least-once with exponential backoff, signed payloads, and event IDs merchants can dedupe on. Merchants must be able to fetch the current state too, so webhooks are hints rather than the source of truth.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A posted monetary transaction balances per currency, and its durable business identity prevents repeated external effects.\n\nAssume 10 million payment attempts/day: 116/s average; at 10x peak about 1,160/s. With six 300-byte ledger rows per successful payment, 10 million successes add about 18 GB logical ledger rows/day before indexes and replication.\n\n### API contracts and data ownership\n\n```text\nPOST /payments with amount,currency,merchant and idempotency key; GET /payments/{id}; signed webhook; POST /refunds\n```\n\n```text\nLogical records (outline, not complete DDL):\npayment(id,merchant,key,payload_hash,state); attempt(id,payment_id,provider_ref,state); ledger_tx(id); ledger_entry(tx_id,account,currency,delta_minor)\n\nPrimary access/partitioning boundary:\npayment_id for workflow; merchant + idempotency_key for deduplication; account_id for ledger ownership\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around payment_id for workflow; merchant + idempotency_key for deduplication; account_id for ledger ownership. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAuthenticate merchant; validate amount/currency; persist operation and intent; call provider with stable idempotency identity; classify authorized/captured/failed/unknown; commit balanced ledger entries when settlement policy requires; process signed callbacks and reconciliation statements; issue refunds as new operations.\n\n### Deep dive: the decision that changes this system\n\nA timeout is uncertainty, not a decline. Exactly-once effects require cooperation at every side-effect boundary; a Kafka transaction cannot force a card provider to accept a payment only once. Reconciliation compares independent provider statements with internal attempts and ledger entries.\n\n### Failure and race-condition walkthrough\n\nProvider captures but response and webhook are lost. Query by merchant reference or ingest settlement records; keep status unknown until resolved. Never blindly retry with a new payment identity.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nUse transactional local ledger writes and outbox delivery; avoid pretending a distributed transaction spans external providers. Strong auditability and safe handling of uncertainty matter more than shaving a cache lookup from a payment state query.\n\n### SLOs, failure drills and lab\n\nKnown-outcome latency, duplicate charge count, unbalanced postings, unresolved payment age and reconciliation mismatch count; operational amounts are illustrative design assumptions.\n\n**Test matrix:** Double-submit, same key/different amount, concurrent debit, duplicate/out-of-order webhook, partial refund, missing provider result and ledger reconciliation after restart.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A posted monetary transaction balances per currency, and its durable business identity prevents repeated external effects.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million payment attempts/day: 116/s average; at 10x peak about 1,160/s. With six 300-byte ledger rows per successful payment, 10 million successes add about 18 GB logical ledger rows/day before indexes and replication.\n\n**Which failure would invalidate the naive design?** Provider captures but response and webhook are lost. Query by merchant reference or ingest settlement records; keep status unknown until resolved. Never blindly retry with a new payment identity.\n\n**Why not introduce every distributed component immediately?** Use transactional local ledger writes and outbox delivery; avoid pretending a distributed transaction spans external providers. Strong auditability and safe handling of uncertainty matter more than shaving a cache lookup from a payment state query.\n\n**How would you demonstrate the design works?** Double-submit, same key/different amount, concurrent debit, duplicate/out-of-order webhook, partial refund, missing provider result and ledger reconciliation after restart. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n## Work through boundaries\n\nThe same merchant key with another amount is a conflict, not a retry. Verify webhook authenticity, deduplicate event IDs and apply only legal transitions. A late “processing” event cannot downgrade a captured payment. A refund is a new operation referencing a captured payment; deleting the original ledger entry destroys auditability.\n\nDaily provider settlement files and internal ledger totals provide reconciliation beyond API responses. Separate card data handling from general application storage and follow the actual provider integration boundary. Educational examples here explain state and idempotency; they are not a complete payment compliance implementation.\n\n## Practise, then check your reasoning\n\n1. **Is exactly-once HTTP delivery required?** Networks cannot supply that simple promise; durable identities and state transitions establish effective once-only financial effects.\n2. **Does a failed database transaction undo provider capture?** No.\n3. **Exercise:** replay one intent ten times, deliver success before processing, and lose the capture response. Assert one collection, balanced entries and a visible reconciliation path for uncertainty.\n"
+      "markdown": "## Problem\n\nDesign a payment system like Stripe's core or an internal payments platform: accept payments via cards, UPI and wallets through external payment service providers (PSPs), record every movement accurately, notify merchants, and reconcile with bank settlement files. Everything revolves around **correctness**: **idempotency**, **transactions/state machines**, **retries**, **webhooks** and **reconciliation**.\n\n## Requirements\n\n**Functional**\n- Create a payment (authorise, then capture), refunds (full or partial), payouts to merchants.\n- Merchant webhooks on status changes. Dashboard and reports.\n\n**Non-functional**\n- Never charge twice, never lose a transaction, a full audit trail.\n- Availability matters, but **correctness beats latency**. External PSPs are slow and unreliable.\n\n**Scale:** modest QPS compared with social apps (~1–10k TPS), but every request is high-value and multi-step.\n\n## 1. Scope and selected guarantees\n\nI support merchant payment intents, authorization/capture, refunds and reconciliation in a declared currency. I choose a payment-state database, immutable ledger and provider adapter. Internal transactions cannot roll back external collection, so unknown results remain explicit.\n\n## 2. APIs and transition authority\n\n```text\nPOST /payment-intents + Idempotency-Key {merchant,amount,currency} -> intent\nPOST /payment-intents/{id}/capture -> state\nPOST /refunds {refundId,paymentId,amount} -> state\nIntent UNIQUE(merchant,key): payloadHash,providerRef,state,version\nWebhookInbox UNIQUE(provider,eventId); Ledger UNIQUE(operation,account,entryKind)\n```\n\nI persist intent before calling the provider using a stable reference. Matching retries return the result; conflicting key reuse fails. The response or authenticated webhook enters a serialized legal transition and posts required ledger entries atomically with local state. A delayed PROCESSING event cannot downgrade CAPTURED. Timeout remains pending until query/settlement evidence resolves it. Refunds are separate bounded operations against captured refundable value. At 100,000 daily payments with 0.1% uncertain outcomes, 100 cases/day need a visible reconciliation process with age and amount exposure, not blind retries or hidden success assumptions.\n\n## 3. Final design diagram\n\n[![Payment System: Merchant API idempotent intent Payment intents; Payment intents stable provider key Provider adapter; Provider adapter authorize capture Provider; Provider verified evidence Webhook inbox; Webhook inbox legal transitions Payment intents; Payment intents posts once Ledger; Reconciliation queries settlement Provider](designs/hld-14.svg)](designs/hld-14.svg)\n\nA **payment intent** describes what should be collected. An **authorization** reserves funds; **capture** collects them under the provider protocol. A **ledger** records financial movements. A **webhook** is asynchronous evidence that may be duplicated or arrive out of order.\n\n## 4. Critical operation: worked execution\n\n![Operation identity remains stable across network uncertainty.](lessons/hld-14-flow.svg)\n\n*Operation identity remains stable across network uncertainty.*\n\n![An unknown result needs reconciliation before another charge.](lessons/hld-14-failure.svg)\n\n*An unknown result needs reconciliation before another charge.*\n\n### Calculate and reconcile\n\nIf 100,000 payments/day have a 0.1% unknown-outcome rate, that is 100 cases/day needing resolution—not a rounding error in reliability. Track their age and monetary exposure. For an internal ₹500 movement, signed ledger entries sum to zero once fees and clearing accounts are explicitly represented.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n1. `POST /payments` with an **Idempotency-Key**. The API stores the key plus a request hash atomically. Retries return the saved response.\n2. Create a payment record `CREATED`, call the PSP (with *its* idempotency key = our payment ID), and move to `AUTHORIZED / FAILED / PENDING_UNKNOWN`.\n3. PSP **webhooks** (and polling for unknowns) drive final states. Every money movement is written as **double-entry ledger** entries in the same DB transaction as the state change.\n4. An **outbox table** in the same transaction, then Kafka, then merchant webhooks (with retries plus signatures), analytics and notifications.\n5. A **reconciliation** job compares the internal ledger with PSP/bank settlement files daily and flags mismatches.\n\n### Key design decisions & trade-offs\n\n**1. Idempotency end to end.** Client to us (Idempotency-Key), us to PSP (payment ID as their key), PSP to us (dedupe webhooks by event ID). Every hop can be retried safely.\n\n**2. Unknown outcomes are normal.** A timeout to the PSP doesn't mean failure. Mark `PENDING_UNKNOWN`, never retry with a *new* charge, and resolve by status query or webhook. This is the most-probed point in interviews.\n\n**3. Double-entry ledger.** An immutable, append-only set of debits and credits summing to zero per transaction. Balances are derived. That makes audits, refunds (reverse entries) and reconciliation tractable.\n\n**4. Transactional outbox.** State change and event in one local transaction. A relay publishes to Kafka. That avoids the \"DB committed but event lost\" (or the reverse) dual-write problem.\n\n**5. SQL for the core.** Strong consistency and transactions (Postgres/MySQL, sharded by merchant or account). Analytics live in separate stores fed by events.\n\n**6. Webhooks to merchants.** At-least-once with exponential backoff, signed payloads, and event IDs merchants can dedupe on. Merchants must be able to fetch the current state too, so webhooks are hints rather than the source of truth.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A posted monetary transaction balances per currency, and its durable business identity prevents repeated external effects.\n\nAssume 10 million payment attempts/day: 116/s average; at 10x peak about 1,160/s. With six 300-byte ledger rows per successful payment, 10 million successes add about 18 GB logical ledger rows/day before indexes and replication.\n\n### API contracts and data ownership\n\n```text\nPOST /payments with amount,currency,merchant and idempotency key; GET /payments/{id}; signed webhook; POST /refunds\n```\n\n```text\nLogical records (outline, not complete DDL):\npayment(id,merchant,key,payload_hash,state); attempt(id,payment_id,provider_ref,state); ledger_tx(id); ledger_entry(tx_id,account,currency,delta_minor)\n\nPrimary access/partitioning boundary:\npayment_id for workflow; merchant + idempotency_key for deduplication; account_id for ledger ownership\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around payment_id for workflow; merchant + idempotency_key for deduplication; account_id for ledger ownership. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAuthenticate merchant; validate amount/currency; persist operation and intent; call provider with stable idempotency identity; classify authorized/captured/failed/unknown; commit balanced ledger entries when settlement policy requires; process signed callbacks and reconciliation statements; issue refunds as new operations.\n\n### Deep dive: the decision that changes this system\n\nA timeout is uncertainty, not a decline. Exactly-once effects require cooperation at every side-effect boundary; a Kafka transaction cannot force a card provider to accept a payment only once. Reconciliation compares independent provider statements with internal attempts and ledger entries.\n\n### Failure and race-condition walkthrough\n\nProvider captures but response and webhook are lost. Query by merchant reference or ingest settlement records; keep status unknown until resolved. Never blindly retry with a new payment identity.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nUse transactional local ledger writes and outbox delivery; avoid pretending a distributed transaction spans external providers. Strong auditability and safe handling of uncertainty matter more than shaving a cache lookup from a payment state query.\n\nKnown-outcome latency, duplicate charge count, unbalanced postings, unresolved payment age and reconciliation mismatch count; operational amounts are illustrative design assumptions.\n\n**Test matrix:** Double-submit, same key/different amount, concurrent debit, duplicate/out-of-order webhook, partial refund, missing provider result and ledger reconciliation after restart.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A posted monetary transaction balances per currency, and its durable business identity prevents repeated external effects.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million payment attempts/day: 116/s average; at 10x peak about 1,160/s. With six 300-byte ledger rows per successful payment, 10 million successes add about 18 GB logical ledger rows/day before indexes and replication.\n\n**Which failure would invalidate the naive design?** Provider captures but response and webhook are lost. Query by merchant reference or ingest settlement records; keep status unknown until resolved. Never blindly retry with a new payment identity.\n\n**Why not introduce every distributed component immediately?** Use transactional local ledger writes and outbox delivery; avoid pretending a distributed transaction spans external providers. Strong auditability and safe handling of uncertainty matter more than shaving a cache lookup from a payment state query.\n\n**How would you demonstrate the design works?** Double-submit, same key/different amount, concurrent debit, duplicate/out-of-order webhook, partial refund, missing provider result and ledger reconciliation after restart. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through boundaries\n\nThe same merchant key with another amount is a conflict, not a retry. Verify webhook authenticity, deduplicate event IDs and apply only legal transitions. A late “processing” event cannot downgrade a captured payment. A refund is a new operation referencing a captured payment; deleting the original ledger entry destroys auditability.\n\nDaily provider settlement files and internal ledger totals provide reconciliation beyond API responses. Separate card data handling from general application storage and follow the actual provider integration boundary. Educational examples here explain state and idempotency; they are not a complete payment compliance implementation.\n\n## 6. Interviewer follow-ups\n\n**Is exactly-once HTTP delivery required?** Networks cannot supply that simple promise; durable identities and state transitions establish effective once-only financial effects.\n\n**Does a failed database transaction undo provider capture?** No.\n\n## 7. Closing answer\n\nA payment is a durable business intent spanning unreliable transport. I preserve one operation identity across requests, reconcile unknown outcomes and post balanced ledger movements once. Verified asynchronous evidence can complete the intent, but duplicate or stale events cannot regress it or collect twice.\n"
     },
     {
       "category": "AI",
@@ -229,92 +215,108 @@
       "diagram": {
         "nodes": [
           {
-            "id": "goal",
-            "label": "Goal",
+            "id": "n0",
+            "label": "Run controller",
             "x": 0,
-            "y": 130,
-            "w": 110,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "plan",
-            "label": "Plan / Reason",
-            "x": 190,
             "y": 0,
-            "w": 160,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "act",
-            "label": "Act (tool call)",
-            "x": 460,
-            "y": 0,
-            "w": 160,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "obs",
-            "label": "Observe result",
-            "x": 460,
-            "y": 260,
-            "w": 160,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "reflect",
-            "label": "Reflect / update state",
-            "x": 190,
-            "y": 260,
             "w": 200,
             "h": 50,
-            "shape": "ellipse"
+            "shape": "rect"
           },
           {
-            "id": "done",
-            "label": "Final answer",
-            "x": 640,
-            "y": 130,
-            "w": 130,
+            "id": "n1",
+            "label": "Run journal",
+            "x": 250,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n2",
+            "label": "Model planner",
+            "x": 500,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n3",
+            "label": "Policy and budgets",
+            "x": 0,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n4",
+            "label": "Allowed tools",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "Observation log",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Final answer validator",
+            "x": 0,
+            "y": 220,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "goal",
-            "to": "plan"
+            "from": "n0",
+            "to": "n1",
+            "label": "checkpoints"
           },
           {
-            "from": "plan",
-            "to": "act",
-            "label": "choose tool"
+            "from": "n0",
+            "to": "n2",
+            "label": "next step"
           },
           {
-            "from": "act",
-            "to": "obs",
-            "label": "execute"
+            "from": "n2",
+            "to": "n3",
+            "label": "proposes action"
           },
           {
-            "from": "obs",
-            "to": "reflect"
+            "from": "n3",
+            "to": "n4",
+            "label": "authorized execution"
           },
           {
-            "from": "reflect",
-            "to": "plan",
-            "label": "loop (≤ N)"
+            "from": "n4",
+            "to": "n5",
+            "label": "typed outcome"
           },
           {
-            "from": "reflect",
-            "to": "done",
-            "label": "goal met"
+            "from": "n5",
+            "to": "n2",
+            "label": "updated evidence"
+          },
+          {
+            "from": "n0",
+            "to": "n6",
+            "label": "completion gate"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain AI agents: systems where an LLM decides *which* steps to take, calls tools, observes results and iterates toward a goal, as opposed to a fixed pipeline. Cover the agent loop (ReAct), planning, state, reflection, termination and guardrails, the patterns between \"workflow\" and \"fully autonomous agent\", and how to build them in Spring AI.\n\n## Requirements\n\n- Workflow vs. agent: predefined control flow vs. model-driven control flow.\n- The ReAct loop: reason, act (tool), observe, repeat.\n- Planning (plan-then-execute), state and scratchpads, reflection and self-critique.\n- Termination conditions, budgets, failure handling, human-in-the-loop.\n- Common workflow patterns: chaining, routing, parallelisation, orchestrator-workers, evaluator-optimiser.\n\n## Learn through a concrete example\n\nA fixed workflow retrieves a policy and answers once. An **agent loop** lets a model choose the next step based on results: search, inspect, ask another tool or stop. That flexibility introduces termination, cost and side-effect risks; use it only when the task genuinely needs adaptive steps.\n\nA **run** owns one task's state and budget. A **step** records a proposal, approved action and observation. A **stop condition** is enforced by application code, not simply a sentence asking the model to behave responsibly.\n\n## See bounded investigation\n\n![Every proposed action passes deterministic policy and budget checks.](lessons/ai-14-flow.svg)\n\n*Every proposed action passes deterministic policy and budget checks.*\n\n![A model can keep choosing the same unhelpful step unless the application intervenes.](lessons/ai-14-failure.svg)\n\n*A model can keep choosing the same unhelpful step unless the application intervenes.*\n\n### Calculate the run budget\n\nWith a 20-second deadline, a 6-second first model call and 5-second tool call leave 9 seconds for subsequent work, not a new 20 seconds at each step. If the run allows four tools and each tool request can retry three times, define whether retries count toward those four and enforce a separate attempt bound.\n\n```text\nRunState = RUNNING | COMPLETED | NEEDS_INPUT | FAILED | BUDGET_EXHAUSTED\nBefore every step: check deadline, remaining tokens, allowed tool and step count\nAfter every step: persist action identity, observation and updated budget\n```\n\n## Design details and alternatives\n\n### Key concepts and learning objective\n\n**Question to answer:** When does a task need an agent loop rather than one predictable application workflow?\n\nAn agent chooses its next step from observations. A workflow follows a predeclared graph. Both still need durable state, bounded execution and explicit terminal outcomes. The loop alternates model decisions, validated tool execution and observations until success, abstention, approval-needed or budget exhaustion.\n\n### Architecture and contracts\n\n```text\nStart run -> decide -> validate action -> execute authorized tool -> persist observation/checkpoint -> decide again -> final validation -> terminal result\n\nApplication contracts (design outline):\nRun(id,step,deadline,maxCalls,budget,status); Decision(finalAnswer|toolCall); Observation(toolCallId,result)\n```\n\nKeep a RunState and operation ledger outside the model. A bounded Java while loop is often easier to understand than a new orchestration framework for the first implementation.\n\n### Worked reasoning and capacity example\n\nAt an illustrative 1,500 input + 300 output tokens per step, six independent calls consume 10,800 tokens before history replay. If each call includes every preceding observation, total input grows further; sum actual per-step usage.\n\n### Java and Spring AI implementation outline\n\n```java\nfor (int step = 0; step < maxSteps && !deadlineExpired(); step++) {\n  Decision d = decideFromAuthorizedState();\n  if (d.isFinal()) return validateFinal(d);\n  Observation o = executeAuthorizedAndDeduplicated(d);\n  checkpoint(o);\n}\nreturn incomplete(\"Run budget exhausted\");\n```\n\n### Design decisions and alternatives\n\nUse a deterministic RAG pipeline for simple grounded Q&A. Introduce an agent when branching cannot be specified reasonably in advance and measurable benefit exceeds added cost and failure paths.\n\n### Failure scenario and safe recovery\n\nThe agent repeatedly calls the same failing search tool or invents new arguments after each error. Detect repeated action fingerprints, apply per-tool retry policy and terminate with an honest incomplete result.\n\n### Security, privacy and provenance\n\nThe model’s claim that it completed a tool action is not proof. Only validated tool outcomes can advance durable workflow state.\n\n### Hands-on lab and evaluation\n\n**Build:** Implement a three-step documentation investigation with one search and one read tool. Inject no evidence, an invalid tool name and a budget exhaustion. Confirm no unbounded loops.\n\n**Measure:** Completion quality, tool efficiency, loop termination, unauthorized actions, recovery behavior and total cost. Evaluate traces, not only polished final prose.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n## Work through restarts\n\nA restart after a tool succeeded but before the result was recorded creates uncertainty. Resume by the original tool-operation identity; do not ask the model to guess whether the action probably happened. Checkpointing helps only when the side-effect boundary supports reconciliation or idempotency.\n\nA fixed workflow is often easier to test for predictable tasks. Compare it with the agent on task success, latency, cost and harmful actions. More steps are not evidence of more reasoning quality. Keep completion grounded in the task's acceptance criteria, not merely the model returning “done.”\n\n## Practise, then check your reasoning\n\n1. **Is tool calling alone an autonomous agent?** Not necessarily. A fixed one-tool workflow may have no adaptive loop.\n2. **Does max-steps alone bound cost?** Not if each step can make unbounded requests or consume unbounded context.\n3. **Exercise:** use a scripted model that loops forever, requests a forbidden tool and stops without evidence. Verify three distinct bounded outcomes and no unauthorized execution.\n"
+      "markdown": "## Problem\n\nExplain AI agents: systems where an LLM decides *which* steps to take, calls tools, observes results and iterates toward a goal, as opposed to a fixed pipeline. Cover the agent loop (ReAct), planning, state, reflection, termination and guardrails, the patterns between \"workflow\" and \"fully autonomous agent\", and how to build them in Spring AI.\n\n## Requirements\n\n- Workflow vs. agent: predefined control flow vs. model-driven control flow.\n- The ReAct loop: reason, act (tool), observe, repeat.\n- Planning (plan-then-execute), state and scratchpads, reflection and self-critique.\n- Termination conditions, budgets, failure handling, human-in-the-loop.\n- Common workflow patterns: chaining, routing, parallelisation, orchestrator-workers, evaluator-optimiser.\n\n## 1. Selected agent loop\n\nI investigate documentation questions requiring adaptive searches. Fixed questions stay on a simpler one-pass workflow. Each run owns its budget, task state and permitted tools; the model proposes actions but cannot widen that scope.\n\n## 2. Complete control algorithm\n\n```text\nwhile RUNNING:\n  check deadline, token balance, step/attempt limits\n  ask planner for Answer | ToolProposal | NeedsInput\n  if Answer: validate evidence; complete or fail with unsupported outcome\n  if NeedsInput: persist NEEDS_INPUT and stop\n  if ToolProposal: validate allow-list/schema/authority\n    record step identity; execute within remaining deadline\n    record typed observation; reject repeated no-progress cycles\non exhausted allowance: persist BUDGET_EXHAUSTED and stop\n```\n\nA 20-second run spending six seconds on the first model call and five on a tool has nine seconds left, not a fresh 20 for each step. Retries count toward attempts and shared spend. A repeated empty search triggers no-progress termination rather than an infinite loop.\n\nOn restart I inspect the step journal and resolve uncertain effects by original operation identity. Read-only tools simplify recovery; writes would need idempotency/reconciliation and the required user policy. I compare the loop with a deterministic workflow on supported completion, latency, cost and unauthorized-action counts before choosing the extra autonomy.\n\n## 3. Final design diagram\n\n[![AI Agents & Agent Loops: Run controller checkpoints Run journal; Run controller next step Model planner; Model planner proposes action Policy and budgets; Policy and budgets authorized execution Allowed tools; Allowed tools typed outcome Observation log; Observation log updated evidence Model planner; Run controller completion gate Final answer validator](designs/ai-14.svg)](designs/ai-14.svg)\n\nA **run** owns one task's state and budget. A **step** records a proposal, approved action and observation. A **stop condition** is enforced by application code, not simply a sentence asking the model to behave responsibly.\n\n## 4. Critical operation: worked execution\n\n![Every proposed action passes deterministic policy and budget checks.](lessons/ai-14-flow.svg)\n\n*Every proposed action passes deterministic policy and budget checks.*\n\n![A model can keep choosing the same unhelpful step unless the application intervenes.](lessons/ai-14-failure.svg)\n\n*A model can keep choosing the same unhelpful step unless the application intervenes.*\n\n### Calculate the run budget\n\nWith a 20-second deadline, a 6-second first model call and 5-second tool call leave 9 seconds for subsequent work, not a new 20 seconds at each step. If the run allows four tools and each tool request can retry three times, define whether retries count toward those four and enforce a separate attempt bound.\n\n```text\nRunState = RUNNING | COMPLETED | NEEDS_INPUT | FAILED | BUDGET_EXHAUSTED\nBefore every step: check deadline, remaining tokens, allowed tool and step count\nAfter every step: persist action identity, observation and updated budget\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** When does a task need an agent loop rather than one predictable application workflow?\n\nAn agent chooses its next step from observations. A workflow follows a predeclared graph. Both still need durable state, bounded execution and explicit terminal outcomes. The loop alternates model decisions, validated tool execution and observations until success, abstention, approval-needed or budget exhaustion.\n\n### Architecture and contracts\n\n```text\nStart run -> decide -> validate action -> execute authorized tool -> persist observation/checkpoint -> decide again -> final validation -> terminal result\n\nApplication contracts (design outline):\nRun(id,step,deadline,maxCalls,budget,status); Decision(finalAnswer|toolCall); Observation(toolCallId,result)\n```\n\nKeep a RunState and operation ledger outside the model. A bounded Java while loop is often easier to understand than a new orchestration framework for the first implementation.\n\n### Worked reasoning and capacity example\n\nAt an illustrative 1,500 input + 300 output tokens per step, six independent calls consume 10,800 tokens before history replay. If each call includes every preceding observation, total input grows further; sum actual per-step usage.\n\n### Java and Spring AI implementation outline\n\n```java\nfor (int step = 0; step < maxSteps && !deadlineExpired(); step++) {\n  Decision d = decideFromAuthorizedState();\n  if (d.isFinal()) return validateFinal(d);\n  Observation o = executeAuthorizedAndDeduplicated(d);\n  checkpoint(o);\n}\nreturn incomplete(\"Run budget exhausted\");\n```\n\n### Design decisions and alternatives\n\nUse a deterministic RAG pipeline for simple grounded Q&A. Introduce an agent when branching cannot be specified reasonably in advance and measurable benefit exceeds added cost and failure paths.\n\n### Failure scenario and safe recovery\n\nThe agent repeatedly calls the same failing search tool or invents new arguments after each error. Detect repeated action fingerprints, apply per-tool retry policy and terminate with an honest incomplete result.\n\n### Security, privacy and provenance\n\nThe model’s claim that it completed a tool action is not proof. Only validated tool outcomes can advance durable workflow state.\n\n\n**Verification criteria:** Completion quality, tool efficiency, loop termination, unauthorized actions, recovery behavior and total cost. Evaluate traces, not only polished final prose.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through restarts\n\nA restart after a tool succeeded but before the result was recorded creates uncertainty. Resume by the original tool-operation identity; do not ask the model to guess whether the action probably happened. Checkpointing helps only when the side-effect boundary supports reconciliation or idempotency.\n\nA fixed workflow is often easier to test for predictable tasks. Compare it with the agent on task success, latency, cost and harmful actions. More steps are not evidence of more reasoning quality. Keep completion grounded in the task's acceptance criteria, not merely the model returning “done.”\n\n## 6. Interviewer follow-ups\n\n**Is tool calling alone an autonomous agent?** Not necessarily. A fixed one-tool workflow may have no adaptive loop.\n\n**Does max-steps alone bound cost?** Not if each step can make unbounded requests or consume unbounded context.\n\n## 7. Closing answer\n\nI choose a bounded read-only investigation loop only where the next step depends on observations. The run controller enforces deadlines, tokens, attempts and allowed actions, while durable step identities support recovery. Completion requires supported task output, not the model merely saying done.\n"
     }
   ]
 }

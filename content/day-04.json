@@ -12,103 +12,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "user",
-            "label": "User",
-            "x": 0,
-            "y": 0,
-            "w": 120,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "svc",
+            "id": "n0",
             "label": "BookingService",
-            "x": 250,
-            "y": 0,
-            "w": 170,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "show",
-            "label": "Show",
-            "x": 560,
-            "y": 0,
-            "w": 140,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "seat",
-            "label": "ShowSeat",
-            "x": 560,
-            "y": 150,
-            "w": 140,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "lock",
-            "label": "SeatLockProvider",
-            "x": 250,
-            "y": 150,
-            "w": 170,
-            "h": 50,
-            "shape": "ellipse"
-          },
-          {
-            "id": "pay",
-            "label": "PaymentService",
             "x": 0,
-            "y": 150,
-            "w": 160,
+            "y": 0,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "booking",
-            "label": "Booking",
+            "id": "n1",
+            "label": "ShowSeat",
             "x": 250,
-            "y": 280,
-            "w": 150,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n2",
+            "label": "Hold",
+            "x": 500,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n3",
+            "label": "Booking",
+            "x": 0,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n4",
+            "label": "PaymentIntent",
+            "x": 250,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n5",
+            "label": "PaymentPort",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "ExpiryWorker",
+            "x": 0,
+            "y": 220,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "user",
-            "to": "svc",
-            "label": "select seats"
+            "from": "n0",
+            "to": "n1",
+            "label": "locks selected"
           },
           {
-            "from": "svc",
-            "to": "lock",
-            "label": "lock(seats, ttl)"
+            "from": "n0",
+            "to": "n2",
+            "label": "creates"
           },
           {
-            "from": "svc",
-            "to": "show",
-            "label": "for show"
+            "from": "n2",
+            "to": "n3",
+            "label": "confirms into"
           },
           {
-            "from": "show",
-            "to": "seat",
-            "label": "has N"
+            "from": "n0",
+            "to": "n4",
+            "label": "records"
           },
           {
-            "from": "svc",
-            "to": "pay",
-            "label": "charge"
+            "from": "n4",
+            "to": "n5",
+            "label": "calls"
           },
           {
-            "from": "svc",
-            "to": "booking",
-            "label": "create"
+            "from": "n6",
+            "to": "n2",
+            "label": "expires by token"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a movie booking system like BookMyShow: browse cities, cinemas, movies and shows, pick seats and pay. The core interview challenge is **concurrency on seat selection**: two users must never book the same seat, and seats held by an abandoned checkout must free up automatically.\n\n## Requirements\n\n**Functional**\n- Search movies by city. List shows per cinema and screen. Show a seat map.\n- Select seats, hold them for a few minutes, pay, and confirm the booking.\n- Cancel bookings (with a refund policy) and release unpaid holds after a TTL.\n\n**Non-functional**\n- No double booking, ever.\n- Seat holds must expire without a manual cleanup step.\n\n## Learn through a concrete example\n\nAsha and Ben both click seat A7 for the same film show. The seat exists once on the screen's layout, but its availability belongs to **that show**, not to every future screening. This distinction prevents a common model error: putting one global `booked` flag on `Seat`.\n\nBuild one show's reservation flow first. A *hold* is temporary ownership while a customer pays. A *booking* is the confirmed purchase. A *hold token* identifies this particular ownership attempt; the seat number alone cannot distinguish an old timer from the current owner.\n\n## See hold ownership and a stale callback\n\n![Seats remain unavailable to competitors while payment is in progress.](lessons/lld-4-flow.svg)\n\n*Seats remain unavailable to competitors while payment is in progress.*\n\n![Compare the hold token as well as the expiry before releasing seats.](lessons/lld-4-failure.svg)\n\n*Compare the hold token as well as the expiry before releasing seats.*\n\n### Build the first version\n\nUse `ShowSeat(showId, seatId, status, holdId, expiresAt, version)` and a separate `Hold` record listing all requested seats. Sort seat identifiers before locking them, so two multi-seat requests acquire locks in the same order. Either all requested seats are held or none are.\n\n```sql\n-- Ownership condition, inside the release transaction.\nUPDATE show_seat\nSET status = 'AVAILABLE', hold_id = NULL, expires_at = NULL\nWHERE show_id = :show AND seat_id = :seat\n  AND status = 'HELD' AND hold_id = :expected_hold\n  AND expires_at <= :now;\n```\n\nThis statement is intentionally a release condition, not the whole booking algorithm. Confirmation must lock or conditionally update the same authoritative rows and verify that the entire hold still belongs to the payer.\n\n## Design details and alternatives\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Movie`, `Cinema`, `Screen`, `Seat` | Catalogue and static layout |\n| `Show` | movie + screen + start time. Owns `ShowSeat`s |\n| `ShowSeat` | seat for a particular show. Status: `AVAILABLE`, `LOCKED`, `BOOKED` |\n| `SeatLockProvider` | `lock(show, seats, user, ttl)`, `unlock` and `validate` |\n| `Booking` | user, show, seats, amount. State: `PENDING → CONFIRMED / CANCELLED / EXPIRED` |\n| `PaymentService` | Strategy per method, plus idempotency key |\n| `PricingStrategy` | seat category, weekday/weekend, dynamic pricing |\n\n### Design decisions & trade-offs\n\n**1. Lock then pay, not pay then lock.** Hold seats when the user selects them, with a TTL of about 5 minutes. Confirm with payment. If payment happens first, two users can both pay for the same seat.\n\n**2. Implementing the lock (in-process LLD).**\n```java\nclass InMemorySeatLockProvider implements SeatLockProvider {\n    private final ConcurrentHashMap<SeatKey, SeatLock> locks = new ConcurrentHashMap<>();\n    public synchronized boolean lock(Show s, List<Seat> seats, String user, Duration ttl) {\n        if (seats.stream().anyMatch(x -> isLocked(s, x))) return false;  // all-or-nothing\n        seats.forEach(x -> locks.put(new SeatKey(s, x), new SeatLock(user, now().plus(ttl))));\n        return true;\n    }\n}\n```\nAll-or-nothing matters: a user selecting 4 seats shouldn't get 3. Sort seat keys before locking if you use per-seat locks, so two threads can't deadlock.\n\n**3. Expiry.** Do a lazy check (`expiresAt < now` means it's free) plus a scheduled sweeper that moves `PENDING` bookings to `EXPIRED`. In a distributed setup this becomes Redis `SET NX PX` per seat, or a DB row with `status, locked_until` and a conditional `UPDATE … WHERE status='AVAILABLE'`.\n\n**4. Booking as a State machine.** Only `PENDING` can become `CONFIRMED`, and only if the lock is still held by this user. Re-validate the lock at confirmation time, because the TTL may have passed during a slow payment.\n\n**5. Idempotent payment callbacks.** Gateways retry. Key the confirmation on `paymentId` so a duplicate callback can't double-confirm.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** A seat hold is temporary ownership with an expiry; payment does not magically make it a booking.\n\nMovie, Theatre, Screen, Seat and Show describe inventory. ShowSeat is the sellable resource because the same chair belongs to different shows. Hold contains user, seats and expiry; Booking contains a price snapshot and payment reference. SeatSelectionPolicy and PaymentPort stay outside seat state.\n\n**Correctness rule:** For a particular show-seat, at most one unexpired hold or confirmed booking owns it. All seats of a multi-seat request are claimed together or none are.\n\n```text\nshow_seat(show_id,seat_id,state,hold_id,expires_at,version); booking(id,hold_id,payment_id,status,amount_minor)\n```\n\n### State machine and command contracts\n\n```text\nAVAILABLE -> HELD -> BOOKED; HELD -> AVAILABLE on expiry; payment UNKNOWN requires reconciliation\n```\n\n### End-to-end execution trace\n\nValidate show and seat IDs; lock seats in a deterministic order; reclaim expired holds according to database time; atomically create one hold; collect payment without holding row locks; on callback verify hold owner, expiry and payment identity; atomically confirm the entire booking.\n\n### Concurrency and recovery walkthrough\n\nTwo users choose the same pair of seats while the expiry worker runs. Conditional ownership transitions use hold IDs and versions, so a late worker cannot clear a newer hold. A late payment callback cannot confirm seats now owned by another booking.\n\n\n\n### Policy choices and extension seams\n\nPessimistic row locking is easy for small seat sets; optimistic version checks suit low contention but require whole-request retries. A Redis countdown is a UI convenience, not the sales authority. Reject or refund a late success according to a documented policy.\n\n### Edge cases that change the design\n\nA callback may arrive twice or before the client receives its payment result. Persist provider event identity and use a booking idempotency key. Seat maps can be stale; the confirmation response, not the map colour, establishes ownership.\n\n### Verification and a practical lab\n\n**Topic-specific cases:** All-or-none multi-seat allocation; expired hold cannot confirm; repeated callback has one effect; a newer hold survives an old expiry job; prices remain stable.\n\n**Lab:** Interleave expiry, a second customer hold and the first payment callback. Trace why the second customer retains the seat and why the first payment enters reconciliation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n## Work through payment and expiry\n\nLet H21 expire at 10:05:00. Define valid ownership as `now < expiresAt`; at exactly 10:05:00, it is expired. Both payment confirmation and the cleanup worker must use this rule. Cleanup timing does not establish validity: a row still labelled HELD at 10:05:02 is not an entitlement to confirm.\n\nIf the payment provider reports success after the hold was lost, do not sell somebody else's seat. Record the paid-but-unfulfilled outcome, then refund or ask the customer to select new seats according to product policy. The payment reference is unique so a duplicated webhook cannot create a second booking or refund.\n\nFor ₹250 per seat, A7 and A8 cost ₹500 before documented fees. Save this quoted amount and its currency on the hold. Repricing seats between hold and confirmation makes the customer approve one amount and pay another. Seat availability from a cached theatre map is a hint; only the reservation transaction can promise ownership.\n\n## Practise, then check your reasoning\n\n1. **Can two customers hold different seats in the same show?** Yes. Lock the relevant show-seat rows rather than the entire cinema unless simplicity at tiny scale justifies the coarser lock.\n2. **Can a hold reserve A7 but fail on A8?** Not when the product promises adjacent seats as one selection. Roll back the transaction if any seat is unavailable.\n3. **What proves a late timer is safe?** A test expires H21, creates H22 and replays H21's timer. A7 must still belong to H22.\n\nRun confirmation and expiry concurrently at the exact boundary, then verify one final owner, a coherent booking state and a recorded payment disposition. A successful payment receipt alone is insufficient evidence of a successful seat reservation.\n"
+      "markdown": "## Problem\n\nDesign a movie booking system like BookMyShow: browse cities, cinemas, movies and shows, pick seats and pay. The core interview challenge is **concurrency on seat selection**: two users must never book the same seat, and seats held by an abandoned checkout must free up automatically.\n\n## Requirements\n\n**Functional**\n- Search movies by city. List shows per cinema and screen. Show a seat map.\n- Select seats, hold them for a few minutes, pay, and confirm the booking.\n- Cancel bookings (with a refund policy) and release unpaid holds after a TTL.\n\n**Non-functional**\n- No double booking, ever.\n- Seat holds must expire without a manual cleanup step.\n\n## 1. Scope and chosen solution\n\nI design reserved-seat booking for a specific show, including an all-or-nothing multi-seat hold, payment, confirmation and expiry. Static `Seat` describes the physical layout; `ShowSeat(showId,seatId)` owns availability for one screening. I choose a relational transaction for allocation and a separate idempotent payment workflow.\n\n## 2. Schema and complete reservation transaction\n\n```text\nShowSeat PK(showId,seatId): status, holdId, expiresAt, bookingId\nHold PK(holdId): customerId, showId, expiresAt, quotedAmount, currency, state\nBooking PK(bookingId): holdId UNIQUE, customerId, acceptedPrice, state\nPaymentIntent PK(intentId): holdId, providerRef UNIQUE, state, payloadHash\n\nholdSeats(requestId,showId,seatIds,customer) -> Hold | Conflict\nconfirmPayment(providerRef) -> Booking | RefundRequired | Pending\n```\n\n`holdSeats` begins a transaction, locks all requested show-seat rows in sorted seat order, verifies every row is free or expired, writes one hold identity to every seat, and commits. If any seat is unavailable, the transaction rolls back all claims. A request identity with a different payload is rejected; a true retry returns its original hold.\n\nConfirmation locks the hold and the same seat rows, verifies `now < expiresAt`, ownership of every seat, and successful payment evidence. It inserts one booking, changes all seats to SOLD and commits. Expiry competes for these same rows and releases only matching expired hold tokens. If payment completed after ownership was lost, the financial result becomes paid-but-unfulfilled and initiates one refund intent; it never overrides a newer hold. A7 and A8 at ₹250 each produce a frozen ₹500 quote, so price changes during payment cannot alter accepted terms.\n\nFor browsing, `GET /movies?city=...` and `GET /shows/{id}/seats` return catalogue/read-model data; neither claims seats. `cancelBooking(bookingId,requestId)` authorizes the owner and cutoff policy, locks the booking and its seats, marks the booking cancelled, releases only seats owned by it, and writes one refund intent in the same transaction. The refund may remain pending while the seat is available again: the customer is still owed that recorded refund. A repeated cancellation returns the original disposition. A cancelled hold with a later successful charge follows the same paid-but-unfulfilled compensation path.\n\n## 3. Final design diagram\n\n[![Design BookMyShow / Movie Booking: BookingService locks selected ShowSeat; BookingService creates Hold; Hold confirms into Booking; BookingService records PaymentIntent; PaymentIntent calls PaymentPort; ExpiryWorker expires by token Hold](designs/lld-4.svg)](designs/lld-4.svg)\n\nBuild one show's reservation flow first. A *hold* is temporary ownership while a customer pays. A *booking* is the confirmed purchase. A *hold token* identifies this particular ownership attempt; the seat number alone cannot distinguish an old timer from the current owner.\n\n## 4. Critical operation: worked execution\n\n![Seats remain unavailable to competitors while payment is in progress.](lessons/lld-4-flow.svg)\n\n*Seats remain unavailable to competitors while payment is in progress.*\n\n![Compare the hold token as well as the expiry before releasing seats.](lessons/lld-4-failure.svg)\n\n*Compare the hold token as well as the expiry before releasing seats.*\n\n### Core implementation\n\nUse `ShowSeat(showId, seatId, status, holdId, expiresAt, version)` and a separate `Hold` record listing all requested seats. Sort seat identifiers before locking them, so two multi-seat requests acquire locks in the same order. Either all requested seats are held or none are.\n\n```sql\n-- Ownership condition, inside the release transaction.\nUPDATE show_seat\nSET status = 'AVAILABLE', hold_id = NULL, expires_at = NULL\nWHERE show_id = :show AND seat_id = :seat\n  AND status = 'HELD' AND hold_id = :expected_hold\n  AND expires_at <= :now;\n```\n\nThis statement is intentionally a release condition, not the whole booking algorithm. Confirmation must lock or conditionally update the same authoritative rows and verify that the entire hold still belongs to the payer.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Movie`, `Cinema`, `Screen`, `Seat` | Catalogue and static layout |\n| `Show` | movie + screen + start time. Owns `ShowSeat`s |\n| `ShowSeat` | seat for a particular show. Status: `AVAILABLE`, `HELD`, `SOLD` |\n| `SeatLockProvider` | `lock(show, seats, user, ttl)`, `unlock` and `validate` |\n| `Booking` | user, show, seats, amount. State: `CONFIRMED → CANCELLED`; pending/expired states belong to Hold |\n| `PaymentService` | Strategy per method, plus idempotency key |\n| `PricingStrategy` | seat category, weekday/weekend, dynamic pricing |\n\n### Design decisions & trade-offs\n\n**1. Lock then pay, not pay then lock.** Hold seats when the user selects them, with a TTL of about 5 minutes. Confirm with payment. If payment happens first, two users can both pay for the same seat.\n\n**2. Implementing the lock (in-process LLD).**\n```java\nclass InMemorySeatLockProvider implements SeatLockProvider {\n    private final ConcurrentHashMap<SeatKey, SeatLock> locks = new ConcurrentHashMap<>();\n    public synchronized boolean lock(Show s, List<Seat> seats, String user, Duration ttl) {\n        if (seats.stream().anyMatch(x -> isLocked(s, x))) return false;  // all-or-nothing\n        seats.forEach(x -> locks.put(new SeatKey(s, x), new SeatLock(user, now().plus(ttl))));\n        return true;\n    }\n}\n```\nAll-or-nothing matters: a user selecting 4 seats shouldn't get 3. Sort seat keys before locking if you use per-seat locks, so two threads can't deadlock.\n\n**3. Expiry.** Do a lazy check (`expiresAt < now` means it's free) plus a scheduled sweeper that moves `PENDING` bookings to `EXPIRED`. In a distributed setup this becomes Redis `SET NX PX` per seat, or a DB row with `status, locked_until` and a conditional `UPDATE … WHERE status='AVAILABLE'`.\n\n**4. Booking as a State machine.** Only `PENDING` can become `CONFIRMED`, and only if the lock is still held by this user. Re-validate the lock at confirmation time, because the TTL may have passed during a slow payment.\n\n**5. Idempotent payment callbacks.** Gateways retry. Key the confirmation on `paymentId` so a duplicate callback can't double-confirm.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** A seat hold is temporary ownership with an expiry; payment does not magically make it a booking.\n\nMovie, Theatre, Screen, Seat and Show describe inventory. ShowSeat is the sellable resource because the same chair belongs to different shows. Hold contains user, seats and expiry; Booking contains a price snapshot and payment reference. SeatSelectionPolicy and PaymentPort stay outside seat state.\n\n**Correctness rule:** For a particular show-seat, at most one unexpired hold or confirmed booking owns it. All seats of a multi-seat request are claimed together or none are.\n\n```text\nshow_seat(show_id,seat_id,state,hold_id,expires_at,version); booking(id,hold_id,payment_id,status,amount_minor)\n```\n\n### End-to-end execution trace\n\nValidate show and seat IDs; lock seats in a deterministic order; reclaim expired holds according to database time; atomically create one hold; collect payment without holding row locks; on callback verify hold owner, expiry and payment identity; atomically confirm the entire booking.\n\n### Concurrency and recovery walkthrough\n\nTwo users choose the same pair of seats while the expiry worker runs. Conditional ownership transitions use hold IDs and versions, so a late worker cannot clear a newer hold. A late payment callback cannot confirm seats now owned by another booking.\n\n### Policy choices and extension seams\n\nPessimistic row locking is easy for small seat sets; optimistic version checks suit low contention but require whole-request retries. A Redis countdown is a UI convenience, not the sales authority. Reject or refund a late success according to a documented policy.\n\n### Edge cases that change the design\n\nA callback may arrive twice or before the client receives its payment result. Persist provider event identity and use a booking idempotency key. Seat maps can be stale; the confirmation response, not the map colour, establishes ownership.\n\n**Topic-specific cases:** All-or-none multi-seat allocation; expired hold cannot confirm; repeated callback has one effect; a newer hold survives an old expiry job; prices remain stable.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through payment and expiry\n\nLet H21 expire at 10:05:00. Define valid ownership as `now < expiresAt`; at exactly 10:05:00, it is expired. Both payment confirmation and the cleanup worker must use this rule. Cleanup timing does not establish validity: a row still labelled HELD at 10:05:02 is not an entitlement to confirm.\n\nIf the payment provider reports success after the hold was lost, do not sell somebody else's seat. Record the paid-but-unfulfilled outcome, then refund or ask the customer to select new seats according to product policy. The payment reference is unique so a duplicated webhook cannot create a second booking or refund.\n\nFor ₹250 per seat, A7 and A8 cost ₹500 before documented fees. Save this quoted amount and its currency on the hold. Repricing seats between hold and confirmation makes the customer approve one amount and pay another. Seat availability from a cached theatre map is a hint; only the reservation transaction can promise ownership.\n\n## 6. Interviewer follow-ups\n\n**Can two customers hold different seats in the same show?** Yes. Lock the relevant show-seat rows rather than the entire cinema unless simplicity at tiny scale justifies the coarser lock.\n\n**Can a hold reserve A7 but fail on A8?** Not when the product promises adjacent seats as one selection. Roll back the transaction if any seat is unavailable.\n\n## 7. Closing answer\n\nI use show-seat rows as the allocation authority, expiring token-owned holds for the payment interval, and an atomic all-seat confirmation. Payment is a separate durable workflow. A late payment or stale expiry callback cannot steal or release a newer customer's hold.\n"
     },
     {
       "category": "HLD",
@@ -118,103 +118,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "prod",
-            "label": "Producers (services)",
+            "id": "n0",
+            "label": "Business outbox",
             "x": 0,
             "y": 0,
-            "w": 180,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "api",
-            "label": "Notification API",
+            "id": "n1",
+            "label": "Notification ingest",
+            "x": 250,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n2",
+            "label": "Priority queues",
+            "x": 500,
+            "y": 0,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "n3",
+            "label": "Channel workers",
             "x": 0,
-            "y": 150,
-            "w": 170,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "kafka",
-            "label": "Kafka topics",
-            "x": 260,
             "y": 110,
-            "w": 150,
-            "h": 62,
-            "shape": "cylinder"
-          },
-          {
-            "id": "workers",
-            "label": "Channel Workers",
-            "x": 480,
-            "y": 115,
-            "w": 160,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "vendors",
-            "label": "APNs/FCM/SES/SMS",
-            "x": 480,
-            "y": 250,
-            "w": 180,
+            "id": "n4",
+            "label": "Provider adapters",
+            "x": 250,
+            "y": 110,
+            "w": 200,
             "h": 50,
-            "shape": "ellipse"
+            "shape": "rect"
           },
           {
-            "id": "dlq",
-            "label": "Retry + DLQ",
-            "x": 260,
-            "y": 258,
-            "w": 150,
-            "h": 62,
-            "shape": "cylinder"
+            "id": "n5",
+            "label": "Delivery records",
+            "x": 500,
+            "y": 110,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           },
           {
-            "id": "prefs",
-            "label": "Prefs/Template DB",
-            "x": 480,
-            "y": 0,
-            "w": 170,
-            "h": 62,
-            "shape": "cylinder"
+            "id": "n6",
+            "label": "Preference store",
+            "x": 0,
+            "y": 220,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "prod",
-            "to": "kafka",
-            "label": "events"
+            "from": "n0",
+            "to": "n1",
+            "label": "durable events"
           },
           {
-            "from": "api",
-            "to": "kafka",
-            "label": "enqueue"
+            "from": "n1",
+            "to": "n2",
+            "label": "routes"
           },
           {
-            "from": "kafka",
-            "to": "workers",
-            "label": "consume"
+            "from": "n2",
+            "to": "n3",
+            "label": "leased work"
           },
           {
-            "from": "workers",
-            "to": "prefs",
-            "label": "lookup"
+            "from": "n3",
+            "to": "n4",
+            "label": "sends"
           },
           {
-            "from": "workers",
-            "to": "vendors",
-            "label": "send"
+            "from": "n3",
+            "to": "n5",
+            "label": "records attempts"
           },
           {
-            "from": "workers",
-            "to": "dlq",
-            "label": "fail"
+            "from": "n3",
+            "to": "n6",
+            "label": "checks consent"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a notification platform that many internal services use to send email, SMS, push and in-app notifications to millions of users: transactional (OTP, order shipped) and bulk (campaigns). It must be reliable, respect preferences and rate limits, retry failures and never block the callers. The topics are **queues and fan-out**, **retries and DLQ**, **priority isolation**, and **multi-channel delivery**.\n\n## Requirements\n\n**Functional**\n- `POST /notify {userIds|segment, template, data, channels?, priority}`.\n- Per-user preferences, opt-outs, quiet hours, localisation, templates.\n- Delivery status tracking (sent, delivered, opened), and a campaign scheduler.\n\n**Non-functional**\n- At-least-once delivery with deduplication, so users see effectively-once.\n- OTP latency < 5 s even during a 50M-user campaign.\n\n**Scale:** 1B notifications per day is ~12k/s average and 100k/s peak during campaigns. A campaign to a segment fans out 1 request into 50M messages.\n\n## Learn through a concrete example\n\nA shop generates a million delivery updates. Email can wait a minute; an OTP expires quickly; marketing messages require consent. One universal queue and retry rule can let slow promotional traffic delay security messages.\n\nA **notification intent** records what should be sent. **Fan-out** creates recipient/channel work. A **delivery receipt** records provider evidence. An **outbox** stores intent in the same transaction as the business fact so a crash cannot lose the fact-to-message handoff.\n\n## See durable intent and uncertain delivery\n\n![Durable intent separates business correctness from slow delivery.](lessons/hld-4-flow.svg)\n\n*Durable intent separates business correctness from slow delivery.*\n\n![Queue redelivery cannot by itself guarantee one external message.](lessons/hld-4-failure.svg)\n\n*Queue redelivery cannot by itself guarantee one external message.*\n\n### Calculate queue behaviour\n\nIf arrivals are 5,000/s and providers complete 4,000/s, backlog grows 1,000 every second: 60,000 messages in a minute. Adding workers helps only when worker capacity is the bottleneck; it does not change provider quota. Separate urgent and bulk traffic so an OTP's deadline is not hidden behind marketing work.\n\n## Design details and alternatives\n\n### Architecture\n\n1. The **Notification API** validates, assigns a `notificationId` and writes to **Kafka**, with separate topics per priority (`critical`, `transactional`, `bulk`).\n2. A **fan-out service** expands segments into per-user messages (paged from the user DB) for bulk campaigns.\n3. **Channel workers** (separate consumer groups per channel) load preferences and the template, render, apply per-user rate limits and dedup, then call the vendor.\n4. Failures go to a **retry topic** with exponential backoff, then a **DLQ** after N attempts for inspection and replay.\n5. Vendor callbacks (delivered, bounced) update the **status store** (Cassandra/DynamoDB keyed by notificationId and by userId+time).\n\n### Key design decisions & trade-offs\n\n**1. Queue between producers and senders.** It decouples callers from vendor latency and outages, absorbs spikes, and makes retry and replay possible. Kafka gives ordering per partition plus replay; SQS/RabbitMQ are simpler for per-message ack and delay.\n\n**2. Priority isolation.** Separate topics and worker pools per priority stop a campaign from starving OTPs. Bulk workers get a hard cap on vendor throughput.\n\n**3. Idempotency.** Workers may process a message twice (at-least-once). Record `notificationId` in a dedup store with a TTL before sending, and pass an idempotency key to vendors that support one.\n\n**4. Retries done right.** Exponential backoff with jitter. Classify errors (4xx permanent vs. 5xx or timeout transient). Use per-vendor **circuit breakers** and failover vendors (SES down, so SendGrid).\n\n**5. Rate limits both ways.** Per-user (no spamming) and per-vendor (respect provider quotas). Token buckets in Redis.\n\n**6. Templates and preferences cached** in workers with short TTLs. Each is read for every message, so this is where the database load comes from.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** One accepted business notification has a durable identity even if several delivery attempts occur.\n\nAssume 10 million notifications/day: 116/s average. At 20x campaign bursts: about 2,315/s. A provider sustaining 1,000/s needs over two hours for an 8-million-message campaign even without retries; enqueue speed is not delivery speed.\n\n### API contracts and data ownership\n\n```text\nPOST /notifications with request key; GET /notifications/{id}; provider delivery callback with signed event identity\n```\n\n```text\nLogical records (outline, not complete DDL):\nnotification(id,tenant,recipient,template_version,consent_version,status); attempt(id,notification_id,provider,event_id,outcome,next_at)\n\nPrimary access/partitioning boundary:\nrecipient or tenant for fairness; notification_id for deduplication; provider/account for rate budgets\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around recipient or tenant for fairness; notification_id for deduplication; provider/account for rate budgets. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAuthenticate producer; validate consent and template; commit notification plus outbox; publish to channel queues; workers render from a snapshot, respect provider quotas, send, record acceptance and later delivery callbacks. Retry only classified transient failures with jitter and deadlines.\n\n### Deep dive: the decision that changes this system\n\nQueue delivery is normally at least once. Deduplicating worker records does not guarantee exactly-once external SMS when a timeout follows provider acceptance. Use provider idempotency/reference lookup where available; otherwise expose the residual duplicate risk. Separate transactional password resets from bulk marketing queues.\n\n### Failure and race-condition walkthrough\n\nProvider outage grows backlog and can make messages obsolete. Expire one-time codes and cancel superseded notifications instead of delivering stale work after recovery. A poison template is quarantined rather than retried forever.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nPush channels differ in delivery receipts and device availability; failover to SMS changes cost and consent requirements. Partitioning per recipient preserves useful order but requires fairness so one tenant cannot occupy every worker.\n\n### SLOs, failure drills and lab\n\nTrack accepted-to-delivered latency by priority, delivery outcome, oldest queue age, retries, dead letters, provider quotas and duplicate reports.\n\n**Test matrix:** Duplicate queue delivery, out-of-order callbacks, provider timeout after acceptance, unsubscribe during backlog, expired OTP, campaign surge and a malformed template.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: One accepted business notification has a durable identity even if several delivery attempts occur.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million notifications/day: 116/s average. At 20x campaign bursts: about 2,315/s. A provider sustaining 1,000/s needs over two hours for an 8-million-message campaign even without retries; enqueue speed is not delivery speed.\n\n**Which failure would invalidate the naive design?** Provider outage grows backlog and can make messages obsolete. Expire one-time codes and cancel superseded notifications instead of delivering stale work after recovery. A poison template is quarantined rather than retried forever.\n\n**Why not introduce every distributed component immediately?** Push channels differ in delivery receipts and device availability; failover to SMS changes cost and consent requirements. Partitioning per recipient preserves useful order but requires fairness so one tenant cannot occupy every worker.\n\n**How would you demonstrate the design works?** Duplicate queue delivery, out-of-order callbacks, provider timeout after acceptance, unsubscribe during backlog, expired OTP, campaign surge and a malformed template. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n## Work through ordering and lifecycle\n\n“Order delivered” may overtake “out for delivery” if workers process them independently. Partition related updates by order/recipient when order matters, or suppress obsolete events using business sequence numbers. A recipient's opt-out must be checked near delivery as well as at enqueue time for messages where consent applies.\n\nTransient failures use bounded retries with jitter; invalid addresses and expired intents go to a final disposition. A dead-letter queue is not resolution by itself: include reason, retry history and a safe replay identity. Avoid storing raw message secrets such as OTP codes in broad-access logs.\n\n## Practise, then check your reasoning\n\n1. **Is provider accepted equal to user read?** No. Model acceptance, delivery and read evidence separately when available.\n2. **Does an outbox prevent duplicate email?** It prevents lost intent; duplicate publication and provider calls still need handling.\n3. **Exercise:** stop workers for two minutes, then restart with a known drain capacity. Calculate recovery time, expire obsolete OTPs and verify bulk traffic cannot starve urgent messages.\n"
+      "markdown": "## Problem\n\nDesign a notification platform that many internal services use to send email, SMS, push and in-app notifications to millions of users: transactional (OTP, order shipped) and bulk (campaigns). It must be reliable, respect preferences and rate limits, retry failures and never block the callers. The topics are **queues and fan-out**, **retries and DLQ**, **priority isolation**, and **multi-channel delivery**.\n\n## Requirements\n\n**Functional**\n- `POST /notify {userIds|segment, template, data, channels?, priority}`.\n- Per-user preferences, opt-outs, quiet hours, localisation, templates.\n- Delivery status tracking (sent, delivered, opened), and a campaign scheduler.\n\n**Non-functional**\n- At-least-once delivery with deduplication, so users see effectively-once.\n- OTP latency < 5 s even during a 50M-user campaign.\n\n**Scale:** 1B notifications per day is ~12k/s average and 100k/s peak during campaigns. A campaign to a segment fans out 1 request into 50M messages.\n\n## 1. Scope and selected architecture\n\nI deliver transactional and opted-in bulk notifications by email, SMS and push. I choose a business outbox, durable priority queues, independently scaled channel workers and a delivery database. Provider acceptance is distinct from delivery/read evidence. The default is at-least-once processing with provider deduplication when supported, not an unsupported exactly-once claim.\n\n## 2. API, records and delivery transaction\n\n```text\nPOST /notifications {eventId,recipient,templateVersion,category,expiresAt} -> 202 id\nGET /notifications/{id} -> current intent/attempt/receipt states\nIntent UNIQUE(eventId,recipient,channel): template, consentScope, expiry\nAttempt PK(attemptId): intentId, providerKey, state, nextRetryAt\n```\n\nIngest deduplicates, resolves allowed channels and queues work. A worker checks current consent/expiry, records an attempt, calls the provider with its stable key, and stores evidence before acknowledging queue work. If acceptance is uncertain, it queries or follows the stated duplicate-risk policy rather than assuming unsent. Permanent address errors terminate; throttling backs off within the deadline. At arrivals 5,000/s and completion 4,000/s, backlog grows 60,000/minute; priority isolation prevents bulk work from consuming OTP capacity. Related status events retain business sequence/version to suppress obsolete messages.\n\n## 3. Final design diagram\n\n[![Notification System: Business outbox durable events Notification ingest; Notification ingest routes Priority queues; Priority queues leased work Channel workers; Channel workers sends Provider adapters; Channel workers records attempts Delivery records; Channel workers checks consent Preference store](designs/hld-4.svg)](designs/hld-4.svg)\n\nA **notification intent** records what should be sent. **Fan-out** creates recipient/channel work. A **delivery receipt** records provider evidence. An **outbox** stores intent in the same transaction as the business fact so a crash cannot lose the fact-to-message handoff.\n\n## 4. Critical operation: worked execution\n\n![Durable intent separates business correctness from slow delivery.](lessons/hld-4-flow.svg)\n\n*Durable intent separates business correctness from slow delivery.*\n\n![Queue redelivery cannot by itself guarantee one external message.](lessons/hld-4-failure.svg)\n\n*Queue redelivery cannot by itself guarantee one external message.*\n\n### Calculate queue behaviour\n\nIf arrivals are 5,000/s and providers complete 4,000/s, backlog grows 1,000 every second: 60,000 messages in a minute. Adding workers helps only when worker capacity is the bottleneck; it does not change provider quota. Separate urgent and bulk traffic so an OTP's deadline is not hidden behind marketing work.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n1. The **Notification API** validates, assigns a `notificationId` and writes to **Kafka**, with separate topics per priority (`critical`, `transactional`, `bulk`).\n2. A **fan-out service** expands segments into per-user messages (paged from the user DB) for bulk campaigns.\n3. **Channel workers** (separate consumer groups per channel) load preferences and the template, render, apply per-user rate limits and dedup, then call the vendor.\n4. Failures go to a **retry topic** with exponential backoff, then a **DLQ** after N attempts for inspection and replay.\n5. Vendor callbacks (delivered, bounced) update the **status store** (Cassandra/DynamoDB keyed by notificationId and by userId+time).\n\n### Key design decisions & trade-offs\n\n**1. Queue between producers and senders.** It decouples callers from vendor latency and outages, absorbs spikes, and makes retry and replay possible. Kafka gives ordering per partition plus replay; SQS/RabbitMQ are simpler for per-message ack and delay.\n\n**2. Priority isolation.** Separate topics and worker pools per priority stop a campaign from starving OTPs. Bulk workers get a hard cap on vendor throughput.\n\n**3. Idempotency.** Workers may process a message twice (at-least-once). Record `notificationId` in a dedup store with a TTL before sending, and pass an idempotency key to vendors that support one.\n\n**4. Retries done right.** Exponential backoff with jitter. Classify errors (4xx permanent vs. 5xx or timeout transient). Use per-vendor **circuit breakers** and failover vendors (SES down, so SendGrid).\n\n**5. Rate limits both ways.** Per-user (no spamming) and per-vendor (respect provider quotas). Token buckets in Redis.\n\n**6. Templates and preferences cached** in workers with short TTLs. Each is read for every message, so this is where the database load comes from.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** One accepted business notification has a durable identity even if several delivery attempts occur.\n\nAssume 10 million notifications/day: 116/s average. At 20x campaign bursts: about 2,315/s. A provider sustaining 1,000/s needs over two hours for an 8-million-message campaign even without retries; enqueue speed is not delivery speed.\n\n### API contracts and data ownership\n\n```text\nPOST /notifications with request key; GET /notifications/{id}; provider delivery callback with signed event identity\n```\n\n```text\nLogical records (outline, not complete DDL):\nnotification(id,tenant,recipient,template_version,consent_version,status); attempt(id,notification_id,provider,event_id,outcome,next_at)\n\nPrimary access/partitioning boundary:\nrecipient or tenant for fairness; notification_id for deduplication; provider/account for rate budgets\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around recipient or tenant for fairness; notification_id for deduplication; provider/account for rate budgets. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAuthenticate producer; validate consent and template; commit notification plus outbox; publish to channel queues; workers render from a snapshot, respect provider quotas, send, record acceptance and later delivery callbacks. Retry only classified transient failures with jitter and deadlines.\n\n### Deep dive: the decision that changes this system\n\nQueue delivery is normally at least once. Deduplicating worker records does not guarantee exactly-once external SMS when a timeout follows provider acceptance. Use provider idempotency/reference lookup where available; otherwise expose the residual duplicate risk. Separate transactional password resets from bulk marketing queues.\n\n### Failure and race-condition walkthrough\n\nProvider outage grows backlog and can make messages obsolete. Expire one-time codes and cancel superseded notifications instead of delivering stale work after recovery. A poison template is quarantined rather than retried forever.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nPush channels differ in delivery receipts and device availability; failover to SMS changes cost and consent requirements. Partitioning per recipient preserves useful order but requires fairness so one tenant cannot occupy every worker.\n\nTrack accepted-to-delivered latency by priority, delivery outcome, oldest queue age, retries, dead letters, provider quotas and duplicate reports.\n\n**Test matrix:** Duplicate queue delivery, out-of-order callbacks, provider timeout after acceptance, unsubscribe during backlog, expired OTP, campaign surge and a malformed template.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: One accepted business notification has a durable identity even if several delivery attempts occur.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million notifications/day: 116/s average. At 20x campaign bursts: about 2,315/s. A provider sustaining 1,000/s needs over two hours for an 8-million-message campaign even without retries; enqueue speed is not delivery speed.\n\n**Which failure would invalidate the naive design?** Provider outage grows backlog and can make messages obsolete. Expire one-time codes and cancel superseded notifications instead of delivering stale work after recovery. A poison template is quarantined rather than retried forever.\n\n**Why not introduce every distributed component immediately?** Push channels differ in delivery receipts and device availability; failover to SMS changes cost and consent requirements. Partitioning per recipient preserves useful order but requires fairness so one tenant cannot occupy every worker.\n\n**How would you demonstrate the design works?** Duplicate queue delivery, out-of-order callbacks, provider timeout after acceptance, unsubscribe during backlog, expired OTP, campaign surge and a malformed template. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through ordering and lifecycle\n\n“Order delivered” may overtake “out for delivery” if workers process them independently. Partition related updates by order/recipient when order matters, or suppress obsolete events using business sequence numbers. A recipient's opt-out must be checked near delivery as well as at enqueue time for messages where consent applies.\n\nTransient failures use bounded retries with jitter; invalid addresses and expired intents go to a final disposition. A dead-letter queue is not resolution by itself: include reason, retry history and a safe replay identity. Avoid storing raw message secrets such as OTP codes in broad-access logs.\n\n## 6. Interviewer follow-ups\n\n**Is provider accepted equal to user read?** No. Model acceptance, delivery and read evidence separately when available.\n\n**Does an outbox prevent duplicate email?** It prevents lost intent; duplicate publication and provider calls still need handling.\n\n## 7. Closing answer\n\nI persist notification intent before asynchronous delivery, isolate urgent and bulk queues, and enforce provider quotas at channel workers. Stable identities and explicit acceptance uncertainty address redelivery. Delivery receipts, consent, expiry and ordering are first-class semantics rather than one sent boolean.\n"
     },
     {
       "category": "AI",
@@ -224,89 +224,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "docs",
-            "label": "Text / Docs",
+            "id": "n0",
+            "label": "Source documents",
             "x": 0,
             "y": 0,
-            "w": 130,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "emb",
-            "label": "Embedding Model",
-            "x": 220,
+            "id": "n1",
+            "label": "Chunker",
+            "x": 250,
             "y": 0,
-            "w": 170,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "vec",
-            "label": "Vectors [0.12, -0.4, ...]",
-            "x": 470,
+            "id": "n2",
+            "label": "Embedding model",
+            "x": 500,
             "y": 0,
-            "w": 230,
-            "h": 62,
-            "shape": "cylinder"
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           },
           {
-            "id": "q",
-            "label": "Query",
+            "id": "n3",
+            "label": "Vector index",
             "x": 0,
-            "y": 200,
-            "w": 110,
+            "y": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "qemb",
-            "label": "Query vector",
-            "x": 220,
-            "y": 200,
-            "w": 160,
+            "id": "n4",
+            "label": "Query embedder",
+            "x": 250,
+            "y": 110,
+            "w": 200,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "sim",
-            "label": "Cosine top-k",
-            "x": 470,
-            "y": 200,
-            "w": 160,
+            "id": "n5",
+            "label": "Scoped retriever",
+            "x": 500,
+            "y": 110,
+            "w": 200,
             "h": 50,
-            "shape": "ellipse"
+            "shape": "rect"
+          },
+          {
+            "id": "n6",
+            "label": "Ranked evidence",
+            "x": 0,
+            "y": 220,
+            "w": 200,
+            "h": 50,
+            "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "docs",
-            "to": "emb",
-            "label": "embed"
+            "from": "n0",
+            "to": "n1",
+            "label": "versioned text"
           },
           {
-            "from": "emb",
-            "to": "vec",
-            "label": "store"
+            "from": "n1",
+            "to": "n2",
+            "label": "embeds chunks"
           },
           {
-            "from": "q",
-            "to": "qemb",
-            "label": "embed"
+            "from": "n2",
+            "to": "n3",
+            "label": "stores vectors"
           },
           {
-            "from": "qemb",
-            "to": "sim",
-            "label": "compare"
+            "from": "n4",
+            "to": "n3",
+            "label": "nearest search"
           },
           {
-            "from": "vec",
-            "to": "sim",
-            "label": "nearest"
+            "from": "n5",
+            "to": "n3",
+            "label": "permission filter"
+          },
+          {
+            "from": "n3",
+            "to": "n6",
+            "label": "candidates"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain embeddings and semantic search: how text becomes vectors, why similar meanings land close together, how cosine similarity and nearest-neighbour search work, and how this differs from keyword search. It's the foundation for RAG, recommendations, dedup and clustering.\n\n## Requirements\n\n- What an embedding is (a dense vector of fixed dimension from a model) and what dimensions mean.\n- Cosine similarity vs. dot product vs. Euclidean distance.\n- Semantic vs. lexical search: strengths and failure modes of each.\n- Exact vs. approximate nearest neighbour (HNSW, IVF).\n- Practical concerns: model choice, normalisation, chunk size, re-embedding on model change.\n\n## Learn through a concrete example\n\nA user asks “How can I recover access?” while a document says “Reset your password.” Exact keyword matching may miss the connection. An **embedding** maps text into a numeric vector so related language can be nearby under the model's learned representation.\n\nSimilarity is useful for retrieving candidates; it is not a probability that the candidate is true, current or authorized. Start with a tiny labelled document set so you can inspect good and bad matches before adding an approximate index.\n\n## See retrieval and a misleading neighbour\n\n![Documents and queries must use a compatible embedding space.](lessons/ai-4-flow.svg)\n\n*Documents and queries must use a compatible embedding space.*\n\n![Tenant and document access filters constrain retrieval independently of the score.](lessons/ai-4-failure.svg)\n\n*Tenant and document access filters constrain retrieval independently of the score.*\n\n### Calculate similarity and storage\n\nFor vectors `(1,0)` and `(1,1)`, cosine similarity is `1/(1×sqrt(2)) ≈ 0.707`. A zero vector has no defined cosine direction; handle it explicitly. Mismatched dimensions are an input error, not a score of zero.\n\nTen million 768-dimensional float32 vectors require `10,000,000×768×4 = 30.72 GB` raw numeric storage, before metadata, text, index edges, replicas and headroom. Approximate nearest-neighbour search trades exact recall for speed/memory; measure retrieval quality on your corpus.\n\n## Design details and alternatives\n\n### Key concepts and learning objective\n\n**Question to answer:** Why should a search for \"password recovery\" find a document titled \"reset credentials\", and when should it not?\n\nAn embedding model maps text to vectors in its learned space. Compare query and document vectors produced by compatible model/preprocessing versions. Cosine similarity compares angle; dot product and Euclidean distance have different normalization assumptions. Nearest neighbors are candidates for relevance, not verified answers.\n\n### Architecture and contracts\n\n```text\nParse documents -> preserve metadata -> chunk -> embed -> index; query -> embed -> filtered candidate search -> rerank -> source-backed result\n\nApplication contracts (design outline):\nChunk(id,documentId,revision,text,tenant,acl); Embedding(modelVersion,dimensions,values); SearchHit(chunkId,score)\n```\n\nEmbeddingModel handles vectors; VectorStore stores Document objects with source and authorization metadata. Apply tenant/ACL restrictions during retrieval and again before use.\n\n### Worked reasoning and capacity example\n\nOne million vectors x 768 dimensions x 4 bytes = 3.072 GB raw vector storage. Doubling dimensions doubles this component, but index links, payloads, replicas and backup storage are additional.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord SearchHit(String chunkId, double score, String documentVersion) {}\ninterface AuthorizedSearch {\n  java.util.List<SearchHit> find(String tenant, String user, String query, int k);\n}\n// Identity comes from the application, never from a model-generated filter.\n```\n\n### Design decisions and alternatives\n\nUse lexical matching for exact identifiers, names and error codes; combine it with dense retrieval for paraphrases. Tune chunk size/overlap on labelled questions rather than assuming a universal 500-character optimum.\n\n### Failure scenario and safe recovery\n\nTwo different embedding model versions have the same dimensions but incompatible spaces. A mixed index can return plausible-looking irrelevant neighbors without throwing an error. Version collections and re-embed documents and queries together.\n\n### Security, privacy and provenance\n\nVector dimensions are learned coordinates, not human-readable slots for concepts such as vacation or happiness. A high similarity score is not a confidence percentage.\n\n### Hands-on lab and evaluation\n\n**Build:** Create ten paraphrase queries, ten exact-ID queries and ten out-of-domain queries. Compare lexical, dense and hybrid results, including cases where semantic similarity is misleading.\n\n**Measure:** Report recall@k and ranking quality on relevant chunk labels, filter correctness, latency and index memory. Use an exact-search sample as an ANN recall baseline.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n## Work through model changes\n\nEmbeddings from different model versions are not automatically comparable even if their dimensions match. Build a new versioned index, re-embed documents and evaluate before switching query traffic. Keep document revision and chunk identity so a retrieved neighbour can be traced to readable source text.\n\nPure semantic search can miss exact identifiers such as error code `E1042`. Hybrid lexical/vector retrieval combines different signals, but its scores need an explicit fusion/reranking strategy rather than adding unlike numbers blindly.\n\n## Practise, then check your reasoning\n\n1. **Does similarity 0.9 mean 90% correct?** No. Scores depend on representation, distance metric and corpus.\n2. **Can you delete only the source file?** Remove/tombstone its searchable chunks and cached evidence too.\n3. **Exercise:** make ten queries with known relevant chunks, including an exact error code and a paraphrase. Measure recall@k and cross-tenant exclusion separately; a search that finds relevant but forbidden content is not successful.\n"
+      "markdown": "## Problem\n\nExplain embeddings and semantic search: how text becomes vectors, why similar meanings land close together, how cosine similarity and nearest-neighbour search work, and how this differs from keyword search. It's the foundation for RAG, recommendations, dedup and clustering.\n\n## Requirements\n\n- What an embedding is (a dense vector of fixed dimension from a model) and what dimensions mean.\n- Cosine similarity vs. dot product vs. Euclidean distance.\n- Semantic vs. lexical search: strengths and failure modes of each.\n- Exact vs. approximate nearest neighbour (HNSW, IVF).\n- Practical concerns: model choice, normalisation, chunk size, re-embedding on model change.\n\n## 1. Complete embedding answer and selected design\n\nAn embedding maps text into a fixed-length vector learned by a model. Related meanings can be close under the configured metric, making paraphrases retrievable without exact keyword overlap. I choose one compatible embedding model for documents and queries, versioned chunks and authorization-filtered nearest-neighbour retrieval.\n\n## 2. Similarity and retrieval algorithm\n\n```text\ncosine(a,b) = dot(a,b)/(norm(a)*norm(b))\nFor (1,0) and (1,1): 1/sqrt(2) = approximately 0.707\nPipeline: authorized document -> chunks -> embed -> index\n          authorized query -> embed -> scoped top-k -> rerank -> evidence\n```\n\nZero norms and mismatched dimensions are rejected rather than silently scored. Ten million 768-dimensional float32 vectors occupy 30.72 GB raw; indexes, text, metadata and replicas add cost. Approximate search trades exact recall for resource efficiency, so I measure recall@k against known relevant chunk IDs.\n\nFor “recover access,” a password-reset passage can match semantically. For error code E1042, I also retrieve lexically and fuse/rerank candidates under a defined method; unlike raw scores are not blindly added. Model replacement builds a new index and switches query embedding plus index together. Current source permissions apply before forbidden content reaches a model. Deletion retires chunk IDs/cached evidence, and source revision IDs let the answer cite inspectable text rather than an opaque vector.\n\n## 3. Final design diagram\n\n[![Embeddings & Semantic Search: Source documents versioned text Chunker; Chunker embeds chunks Embedding model; Embedding model stores vectors Vector index; Query embedder nearest search Vector index; Scoped retriever permission filter Vector index; Vector index candidates Ranked evidence](designs/ai-4.svg)](designs/ai-4.svg)\n\nSimilarity is useful for retrieving candidates; it is not a probability that the candidate is true, current or authorized. I start with a tiny labelled document set so you can inspect good and bad matches before adding an approximate index.\n\n## 4. Critical operation: worked execution\n\n![Documents and queries must use a compatible embedding space.](lessons/ai-4-flow.svg)\n\n*Documents and queries must use a compatible embedding space.*\n\n![Tenant and document access filters constrain retrieval independently of the score.](lessons/ai-4-failure.svg)\n\n*Tenant and document access filters constrain retrieval independently of the score.*\n\n### Calculate similarity and storage\n\nFor vectors `(1,0)` and `(1,1)`, cosine similarity is `1/(1×sqrt(2)) ≈ 0.707`. A zero vector has no defined cosine direction; handle it explicitly. Mismatched dimensions are an input error, not a score of zero.\n\nTen million 768-dimensional float32 vectors require `10,000,000×768×4 = 30.72 GB` raw numeric storage, before metadata, text, index edges, replicas and headroom. Approximate nearest-neighbour search trades exact recall for speed/memory; measure retrieval quality on your corpus.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** Why should a search for \"password recovery\" find a document titled \"reset credentials\", and when should it not?\n\nAn embedding model maps text to vectors in its learned space. Compare query and document vectors produced by compatible model/preprocessing versions. Cosine similarity compares angle; dot product and Euclidean distance have different normalization assumptions. Nearest neighbors are candidates for relevance, not verified answers.\n\n### Architecture and contracts\n\n```text\nParse documents -> preserve metadata -> chunk -> embed -> index; query -> embed -> filtered candidate search -> rerank -> source-backed result\n\nApplication contracts (design outline):\nChunk(id,documentId,revision,text,tenant,acl); Embedding(modelVersion,dimensions,values); SearchHit(chunkId,score)\n```\n\nEmbeddingModel handles vectors; VectorStore stores Document objects with source and authorization metadata. Apply tenant/ACL restrictions during retrieval and again before use.\n\n### Worked reasoning and capacity example\n\nOne million vectors x 768 dimensions x 4 bytes = 3.072 GB raw vector storage. Doubling dimensions doubles this component, but index links, payloads, replicas and backup storage are additional.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord SearchHit(String chunkId, double score, String documentVersion) {}\ninterface AuthorizedSearch {\n  java.util.List<SearchHit> find(String tenant, String user, String query, int k);\n}\n// Identity comes from the application, never from a model-generated filter.\n```\n\n### Design decisions and alternatives\n\nUse lexical matching for exact identifiers, names and error codes; combine it with dense retrieval for paraphrases. Tune chunk size/overlap on labelled questions rather than assuming a universal 500-character optimum.\n\n### Failure scenario and safe recovery\n\nTwo different embedding model versions have the same dimensions but incompatible spaces. A mixed index can return plausible-looking irrelevant neighbors without throwing an error. Version collections and re-embed documents and queries together.\n\n### Security, privacy and provenance\n\nVector dimensions are learned coordinates, not human-readable slots for concepts such as vacation or happiness. A high similarity score is not a confidence percentage.\n\n\n**Verification criteria:** Report recall@k and ranking quality on relevant chunk labels, filter correctness, latency and index memory. Use an exact-search sample as an ANN recall baseline.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through model changes\n\nEmbeddings from different model versions are not automatically comparable even if their dimensions match. Build a new versioned index, re-embed documents and evaluate before switching query traffic. Keep document revision and chunk identity so a retrieved neighbour can be traced to readable source text.\n\nPure semantic search can miss exact identifiers such as error code `E1042`. Hybrid lexical/vector retrieval combines different signals, but its scores need an explicit fusion/reranking strategy rather than adding unlike numbers blindly.\n\n## 6. Interviewer follow-ups\n\n**Does similarity 0.9 mean 90% correct?** No. Scores depend on representation, distance metric and corpus.\n\n**Can you delete only the source file?** Remove/tombstone its searchable chunks and cached evidence too.\n\n## 7. Closing answer\n\nI use embeddings to retrieve semantic candidates, keep model/version and source identity together, and measure recall on labelled questions. Similarity is neither truth probability nor permission. Hybrid retrieval addresses exact identifiers that semantic proximity can miss.\n"
     }
   ]
 }

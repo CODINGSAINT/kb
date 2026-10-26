@@ -45,9 +45,16 @@ for(let day=1;day<=20;day++){
     // A padded manuscript passed the previous 1,500-word gate. Verify the authored
     // teaching contract and duplication instead; this still needs editorial review.
     assert(words>=600,`${key}: unexpectedly abbreviated reference (${words} words)`);
-    assert(headings.includes('Learn through a concrete example'),`${key}: missing learner introduction`);
-    assert(headings.includes('Design details and alternatives'),`${key}: missing technical second pass`);
-    assert(headings.includes('Practise, then check your reasoning'),`${key}: missing explained practice`);
+    assert(headings.some(h=>/^1\. /.test(h)),`${key}: missing chosen solution`);
+    assert(headings.some(h=>/^2\. /.test(h)),`${key}: missing concrete contracts`);
+    assert(headings.includes('6. Interviewer follow-ups'),`${key}: missing answered follow-ups`);
+    assert(headings.includes('7. Closing answer'),`${key}: missing final position`);
+    assert(!/Learn through a concrete example|Practise, then check your reasoning|\*\*Build:\*\*|\*\*Lab:\*\*/.test(reference),`${key}: tutorial assignment remains`);
+    const design=`designs/${t.category.toLowerCase()}-${t.number}.svg`;
+    assert(reference.includes(`](${design})`),`${key}: missing selected-design picture`);
+    const designSvg=read(`public/${design}`);
+    assert(designSvg.includes('<title')&&designSvg.includes('<desc'),`${key}: inaccessible selected-design SVG`);
+    assert(!/<script|foreignObject|onload=/i.test(designSvg),`${key}: active SVG`);
     const pictures=[...reference.matchAll(/!\[([^\]]+)\]\((lessons\/[^)]+\.svg)\)/g)];
     assert(pictures.length>=2,`${key}: needs operation and failure pictures`);
     for(const [,alt,url] of pictures){
@@ -58,7 +65,7 @@ for(let day=1;day<=20;day++){
     }
     assert(/```/.test(reference),`${key}: missing concrete code/data/flow example`);
     assert(/(failure|race|recovery)/i.test(reference),`${key}: no failure treatment`);
-    assert(/(lab|exercise|practice prompt|verification)/i.test(reference),`${key}: no practice`);
+    assert(/(contract|transaction|algorithm|execution)/i.test(reference),`${key}: no concrete operation`);
     assert(/https:\/\//.test(reference),`${key}: no source links`);
     assert.equal((t.markdown.match(/^```/gm)||[]).length%2,0,`${key}: unclosed code fence`);
     const nodes=t.diagram.nodes, ids=new Set(nodes.map(n=>n.id));
@@ -99,4 +106,4 @@ const dsa=JSON.parse(read('content/dsa.json'));
 assert.equal(dsa.topics.reduce((s,t)=>s+t.problems.length,0),304);
 for(const [track,words] of Object.entries(metrics))
   console.log(`${track}: ${words.length} references, ${Math.min(...words)}-${Math.max(...words)} reference words`);
-console.log('PASS: 60 source/generated guided lessons, accessible lesson figures, no widely repeated long prose, valid topic diagrams, 45 chapters, reciprocal prerequisites, 304 DSA problems, no personal fields');
+console.log('PASS: 60 source/generated model answers, selected-design and operation figures, answered follow-ups, no widely repeated long prose, valid topic diagrams, 45 chapters, reciprocal prerequisites, 304 DSA problems, no personal fields');

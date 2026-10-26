@@ -1,15 +1,15 @@
 === HLD 2 ===
-N|client|Clients|0|130|120
-N|gw|API Gateway + limiter|200|130|190
-N|redis|Redis Cluster (counters)|500|0|200|cylinder
-N|rules|Rules Config|500|250|160|cylinder
-N|svc|Backend Services|500|130|180
-N|local|Local cache fallback|200|270|190|ellipse
-E|client|gw|request
-E|gw|redis|Lua: check+incr
-E|gw|svc|allowed
-E|gw|rules|limits per key
-E|gw|local|Redis down?
+N|n0|Client and gateway|0|0|200|rect
+N|n1|Policy resolver|250|0|200|rect
+N|n2|Atomic quota store|500|0|200|rect
+N|n3|Backend service|0|110|200|rect
+N|n4|Config control plane|250|110|200|rect
+N|n5|Local emergency cap|500|110|200|rect
+E|n0|n1|resolves limits
+E|n1|n2|atomic decision
+E|n0|n3|only if allowed
+E|n4|n1|versioned policy
+E|n0|n5|degraded admission
 ---
 ## Problem
 
@@ -27,13 +27,28 @@ Design a distributed rate limiter that protects APIs across a fleet of gateway o
 
 **Scale:** 1M req/s peak across 200 gateway nodes, and 50M active keys at ~100 bytes of state each, which is 5 GB. This is raw state only; keys, allocator/index overhead, replicas and headroom must be measured before sizing a Redis deployment.
 
-## Learn through a concrete example
+## 1. Scope and selected policy
 
-A public API permits 100 requests/minute per customer but also needs a short burst limit. The question is not just which counter to use: where is the decision made, how is a customer identified, and what happens if the shared decision store is unavailable?
+I enforce per-customer/per-route burst and sustained limits across gateways. I choose a token bucket in Redis executed atomically per policy key. Configuration is versioned. For high-impact writes, loss of the quota authority fails closed; public read routes may use explicitly allocated local emergency budgets. Independent full-size local buckets are not a global limit.
+
+## 2. Admission contract and state
+
+```text
+key = tenant + authenticatedCustomer + route + policyVersion
+state = tokens, lastRefillTime; policy = capacity, refillRate, requestCost
+decision -> allowed, remaining, retryAfter, policyVersion, degraded
+Denied HTTP request -> 429; dependency outage -> documented 503/degraded policy
+```
+
+One short server-side script reads, refills to capacity, conditionally subtracts cost and writes expiry. Its clock policy prevents negative elapsed time. Independent limits use ordered admission; if combined rules require all-or-nothing consumption I colocate their state in one authoritative operation rather than claiming cross-slot atomicity. With 50 million keys at 100 bytes, raw state is 5 GB before Redis overhead and replicas. I benchmark the overhead target; it is not guaranteed merely by choosing Redis. Script latency, denied rate, degraded exposure and cardinality are operational signals.
+
+## 3. Final design diagram
+
+[![Rate Limiter: Client and gateway resolves limits Policy resolver; Policy resolver atomic decision Atomic quota store; Client and gateway only if allowed Backend service; Config control plane versioned policy Policy resolver; Client and gateway degraded admission Local emergency cap](designs/hld-2.svg)](designs/hld-2.svg)
 
 An **admission decision** allows or rejects work before expensive processing. A **quota key** identifies the policy subject, such as authenticated customer and route. A **fixed window**, **sliding window** and **token bucket** express different promises; they are not interchangeable implementations of one exact contract.
 
-## See shared authority and an outage
+## 4. Critical operation: worked execution
 
 ![All servers consult the same quota authority for the relevant key.](lessons/hld-2-flow.svg)
 
@@ -47,7 +62,7 @@ An **admission decision** allows or rejects work before expensive processing. A 
 
 A fixed window can allow 100 requests at 12:00:59 and another 100 at 12:01:00—200 in roughly a second. A sliding log enforces a rolling interval precisely but stores per-request timestamps. At one million active keys and 100 events each, that is 100 million timestamp entries before index/container overhead. A bucket keeps constant-sized state per key but promises a different burst/refill model.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -121,8 +136,6 @@ Redis timeout means the decision may have executed. Retrying can double-spend qu
 
 Global serialization gives a tighter quota but adds cross-region latency and partition dependence. Per-region token leases bound overshoot by outstanding lease budgets and reduce round trips. A distributed lock around each check adds unnecessary contention when the store supports atomic operations.
 
-### SLOs, failure drills and lab
-
 Measure decision p99, limiter error rate, false rejection rate, allowed overshoot and downstream saturation; do not confuse 429 with a failed infrastructure dependency.
 
 **Test matrix:** Race final tokens across gateways; cross a fixed-window boundary; inject a store timeout; skew clocks; change policy versions; flood unique keys to test bounded state.
@@ -145,30 +158,35 @@ Measure decision p99, limiter error rate, false rejection rate, allowed overshoo
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Make the distributed decision explicit
+### Make the distributed decision explicit
 
 Three gateways with independent 100-request counters permit up to 300 globally. A shared atomic script or partition owner avoids that multiplication. Redis pipelining alone does not make a read-refill-consume sequence atomic; its execution boundary must do so. Cluster keys participating in one script must meet the store's routing constraints.
 
 Do not key solely by a spoofable forwarding header. Apply policy to authenticated identity where available and trusted proxy metadata for network controls. Bound key cardinality, expiry and request cost so an attacker cannot exhaust the limiter itself.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does 429 mean the backend was already called?** Admission should happen first; test that denied requests perform no expensive backend operation.
-2. **Can an expired bucket always restart full?** Only when that matches the idle-time policy; premature eviction can mint allowance.
-3. **Exercise:** compare fixed-window and token-bucket results on 200 timestamped requests straddling a minute boundary. Then simulate shared-store loss and measure the exact additional traffic the fallback admits.
+**Does 429 mean the backend was already called?** Admission should happen first; test that denied requests perform no expensive backend operation.
+
+**Can an expired bucket always restart full?** Only when that matches the idle-time policy; premature eviction can mint allowance.
+
+## 7. Closing answer
+
+I choose shared atomic per-key token buckets at the gateway, versioned policy and bounded degraded admission. I distinguish exact decisions on a healthy owner from tolerated loss/failover behaviour. Quota keys, retry delay and outage policy are part of the API contract, not implementation afterthoughts.
 
 === HLD 3 ===
-N|client|App Servers|0|130|140
-N|lib|Client lib (hash ring)|200|130|190
-N|n1|Cache Node A|520|0|150|cylinder
-N|n2|Cache Node B|520|130|150|cylinder
-N|n3|Cache Node C|520|260|150|cylinder
-N|cfg|Membership (ZK/etcd)|200|270|190|ellipse
-E|client|lib|get/set
-E|lib|n1|hash(key)
-E|lib|n2
-E|n2|n3|replicate
-E|cfg|lib|ring updates
+N|n0|Application client|0|0|200|rect
+N|n1|Cache router|250|0|200|rect
+N|n2|Cache shards|500|0|200|rect
+N|n3|Authoritative database|0|110|200|rect
+N|n4|Invalidation stream|250|110|200|rect
+N|n5|Membership control plane|500|110|200|rect
+E|n0|n1|GET and PUT
+E|n1|n2|owns key routes
+E|n0|n3|miss and writes
+E|n3|n4|versioned changes
+E|n4|n2|invalidates
+E|n5|n1|publishes owners
 ---
 ## Problem
 
@@ -186,13 +204,28 @@ Design a distributed in-memory cache like Memcached or Redis Cluster: a key-valu
 
 **Scale:** 10 TB of hot data at 64 GB per node is roughly 160 nodes (plus replicas). At ~100k ops/s per node, 1M ops/s needs only about 10 nodes for throughput, so **memory drives the node count**.
 
-## Learn through a concrete example
+## 1. Scope and selected consistency
 
-A product page reads a price from PostgreSQL and puts it in Redis. The next request is faster, but after a price update, an old value may remain. A distributed cache accelerates reads by creating copies, and every copy creates a freshness question.
+I design a read cache for mutable product data with a declared bounded staleness target. I choose cache-aside, virtual-bucket ownership, replicated cache shards and versioned invalidation events. The cache is disposable; a successful database write remains durable when cache operations fail.
+
+## 2. Protocol and request paths
+
+```text
+GET(key) -> value, version, expiresAt | MISS
+PUT_IF_NEWER(key,value,version,expiresAt) -> stored | olderVersionRejected
+INVALIDATE(key,minVersion) -> tombstone/version watermark
+Entry: key, serializedValue, sourceVersion, absoluteExpiry
+```
+
+A miss enters per-key request coalescing, reads authoritative data and fills only if its version is not below the current watermark. A write commits at the source then emits invalidation through an outbox/change stream. Tombstone/watermark retention must cover delayed fills; otherwise only the stated staleness bound is defensible. Cache outages trigger a bounded database concurrency pool and load shedding. At 20,000 reads/s and 98% hits, source load is 400/s; full loss exposes 20,000/s, so an unbounded bypass would be unsafe. Shard migration switches virtual-bucket ownership after transfer/validation and retains a rollback path.
+
+## 3. Final design diagram
+
+[![Distributed Cache: Application client GET and PUT Cache router; Cache router owns key routes Cache shards; Application client miss and writes Authoritative database; Authoritative database versioned changes Invalidation stream; Invalidation stream invalidates Cache shards; Membership control plane publishes owners Cache router](designs/hld-3.svg)](designs/hld-3.svg)
 
 A **cache miss** fetches the authoritative value. **Eviction** removes entries to reclaim space; **expiry** removes them after a lifetime. **Invalidation** removes or supersedes stale data after change. These mechanisms solve different problems.
 
-## See cache-aside and stale fill
+## 4. Critical operation: worked execution
 
 ![The database stays authoritative when the cache is empty.](lessons/hld-3-flow.svg)
 
@@ -208,7 +241,7 @@ At 20,000 reads/s and 98% hit rate, database traffic is 400 reads/s. Losing the 
 
 For one million 1 KB values, raw payload is about 1 GB decimal. Keys, object overhead, allocator fragmentation, replication and headroom make provisioned memory larger. Estimate those separately instead of sizing a node to raw payload alone.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -275,8 +308,6 @@ Losing a node causes correlated misses. Bound concurrent origin fetches, shed lo
 
 LRU approximates recency; LFU protects popular long-lived values; admission policies prevent scans evicting the working set. Write-through simplifies population but creates a dual-write failure problem unless durable authority remains clear.
 
-### SLOs, failure drills and lab
-
 Observe hit ratio by namespace, eviction rate, origin concurrency, memory fragmentation, replication lag, stampede group size and stale-value rate.
 
 **Test matrix:** Cold start, hot key expiration, a failed shard, origin slowdown, stale refill after update, memory pressure and repeated rebalancing with old clients.
@@ -299,32 +330,36 @@ Observe hit ratio by namespace, eviction rate, origin concurrency, memory fragme
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through partitioning and hot keys
+### Work through partitioning and hot keys
 
 Hash partitioning spreads different keys. It does not split the load of a single viral key. Local short-lived caches, replication or edge caching may help that case, each adding another freshness boundary. Consistent hashing reduces remapping when nodes change; it does not eliminate migration or ownership coordination.
 
 Request coalescing lets one caller fetch a missing key while others wait within a bound. Jittered TTLs reduce synchronized expiry across keys. Negative caching must be short and invalidated on creation, or newly created products can appear missing.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does a cache replica guarantee fresh reads?** No. Replica lag is separate from key TTL.
-2. **Should a database write fail because cache population failed?** Usually the durable write remains successful; document read-after-write fallback and invalidation recovery.
-3. **Exercise:** use a slow authoritative reader, update the value during its delay, then allow its cache fill. Demonstrate the chosen version/tombstone or bounded-staleness policy instead of merely asserting eventual consistency.
+**Does a cache replica guarantee fresh reads?** No. Replica lag is separate from key TTL.
+
+**Should a database write fail because cache population failed?** Usually the durable write remains successful; document read-after-write fallback and invalidation recovery.
+
+## 7. Closing answer
+
+My cache design makes routing and eviction explicit but retains the database as authority. Version-aware fills and a documented freshness window address stale writes; coalescing and bounded fallback prevent cache loss from becoming a database outage. Hot-key load is treated separately from distributing different keys.
 
 === HLD 4 ===
-N|prod|Producers (services)|0|0|180
-N|api|Notification API|0|150|170
-N|kafka|Kafka topics|260|110|150|cylinder
-N|workers|Channel Workers|480|115|160
-N|vendors|APNs/FCM/SES/SMS|480|250|180|ellipse
-N|dlq|Retry + DLQ|260|258|150|cylinder
-N|prefs|Prefs/Template DB|480|0|170|cylinder
-E|prod|kafka|events
-E|api|kafka|enqueue
-E|kafka|workers|consume
-E|workers|prefs|lookup
-E|workers|vendors|send
-E|workers|dlq|fail
+N|n0|Business outbox|0|0|200|rect
+N|n1|Notification ingest|250|0|200|rect
+N|n2|Priority queues|500|0|200|rect
+N|n3|Channel workers|0|110|200|rect
+N|n4|Provider adapters|250|110|200|rect
+N|n5|Delivery records|500|110|200|rect
+N|n6|Preference store|0|220|200|rect
+E|n0|n1|durable events
+E|n1|n2|routes
+E|n2|n3|leased work
+E|n3|n4|sends
+E|n3|n5|records attempts
+E|n3|n6|checks consent
 ---
 ## Problem
 
@@ -343,13 +378,28 @@ Design a notification platform that many internal services use to send email, SM
 
 **Scale:** 1B notifications per day is ~12k/s average and 100k/s peak during campaigns. A campaign to a segment fans out 1 request into 50M messages.
 
-## Learn through a concrete example
+## 1. Scope and selected architecture
 
-A shop generates a million delivery updates. Email can wait a minute; an OTP expires quickly; marketing messages require consent. One universal queue and retry rule can let slow promotional traffic delay security messages.
+I deliver transactional and opted-in bulk notifications by email, SMS and push. I choose a business outbox, durable priority queues, independently scaled channel workers and a delivery database. Provider acceptance is distinct from delivery/read evidence. The default is at-least-once processing with provider deduplication when supported, not an unsupported exactly-once claim.
+
+## 2. API, records and delivery transaction
+
+```text
+POST /notifications {eventId,recipient,templateVersion,category,expiresAt} -> 202 id
+GET /notifications/{id} -> current intent/attempt/receipt states
+Intent UNIQUE(eventId,recipient,channel): template, consentScope, expiry
+Attempt PK(attemptId): intentId, providerKey, state, nextRetryAt
+```
+
+Ingest deduplicates, resolves allowed channels and queues work. A worker checks current consent/expiry, records an attempt, calls the provider with its stable key, and stores evidence before acknowledging queue work. If acceptance is uncertain, it queries or follows the stated duplicate-risk policy rather than assuming unsent. Permanent address errors terminate; throttling backs off within the deadline. At arrivals 5,000/s and completion 4,000/s, backlog grows 60,000/minute; priority isolation prevents bulk work from consuming OTP capacity. Related status events retain business sequence/version to suppress obsolete messages.
+
+## 3. Final design diagram
+
+[![Notification System: Business outbox durable events Notification ingest; Notification ingest routes Priority queues; Priority queues leased work Channel workers; Channel workers sends Provider adapters; Channel workers records attempts Delivery records; Channel workers checks consent Preference store](designs/hld-4.svg)](designs/hld-4.svg)
 
 A **notification intent** records what should be sent. **Fan-out** creates recipient/channel work. A **delivery receipt** records provider evidence. An **outbox** stores intent in the same transaction as the business fact so a crash cannot lose the fact-to-message handoff.
 
-## See durable intent and uncertain delivery
+## 4. Critical operation: worked execution
 
 ![Durable intent separates business correctness from slow delivery.](lessons/hld-4-flow.svg)
 
@@ -363,7 +413,7 @@ A **notification intent** records what should be sent. **Fan-out** creates recip
 
 If arrivals are 5,000/s and providers complete 4,000/s, backlog grows 1,000 every second: 60,000 messages in a minute. Adding workers helps only when worker capacity is the bottleneck; it does not change provider quota. Separate urgent and bulk traffic so an OTP's deadline is not hidden behind marketing work.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -429,8 +479,6 @@ Provider outage grows backlog and can make messages obsolete. Expire one-time co
 
 Push channels differ in delivery receipts and device availability; failover to SMS changes cost and consent requirements. Partitioning per recipient preserves useful order but requires fairness so one tenant cannot occupy every worker.
 
-### SLOs, failure drills and lab
-
 Track accepted-to-delivered latency by priority, delivery outcome, oldest queue age, retries, dead letters, provider quotas and duplicate reports.
 
 **Test matrix:** Duplicate queue delivery, out-of-order callbacks, provider timeout after acceptance, unsubscribe during backlog, expired OTP, campaign surge and a malformed template.
@@ -453,32 +501,36 @@ Track accepted-to-delivered latency by priority, delivery outcome, oldest queue 
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through ordering and lifecycle
+### Work through ordering and lifecycle
 
 “Order delivered” may overtake “out for delivery” if workers process them independently. Partition related updates by order/recipient when order matters, or suppress obsolete events using business sequence numbers. A recipient's opt-out must be checked near delivery as well as at enqueue time for messages where consent applies.
 
 Transient failures use bounded retries with jitter; invalid addresses and expired intents go to a final disposition. A dead-letter queue is not resolution by itself: include reason, retry history and a safe replay identity. Avoid storing raw message secrets such as OTP codes in broad-access logs.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Is provider accepted equal to user read?** No. Model acceptance, delivery and read evidence separately when available.
-2. **Does an outbox prevent duplicate email?** It prevents lost intent; duplicate publication and provider calls still need handling.
-3. **Exercise:** stop workers for two minutes, then restart with a known drain capacity. Calculate recovery time, expire obsolete OTPs and verify bulk traffic cannot starve urgent messages.
+**Is provider accepted equal to user read?** No. Model acceptance, delivery and read evidence separately when available.
+
+**Does an outbox prevent duplicate email?** It prevents lost intent; duplicate publication and provider calls still need handling.
+
+## 7. Closing answer
+
+I persist notification intent before asynchronous delivery, isolate urgent and bulk queues, and enforce provider quotas at channel workers. Stable identities and explicit acceptance uncertainty address redelivery. Delivery receipts, consent, expiry and ordering are first-class semantics rather than one sent boolean.
 
 === HLD 5 ===
-N|post|New Post|0|0|130
-N|fan|Fan-out Service|240|0|160
-N|feedc|Feed Cache (per user)|540|0|200|cylinder
-N|client|Client|0|200|120
-N|feed|Feed Service|240|200|150
-N|celeb|Celebrity posts (pull)|540|130|200|cylinder
-N|rank|Ranking|540|260|150|ellipse
-E|post|fan|on write
-E|fan|feedc|push ids to followers
-E|client|feed|GET /feed
-E|feed|feedc|read
-E|feed|celeb|merge at read
-E|feed|rank|score
+N|n0|Post service|0|0|200|rect
+N|n1|Post store|250|0|200|rect
+N|n2|Fanout queue|500|0|200|rect
+N|n3|Follower inbox|0|110|200|rect
+N|n4|Feed assembler|250|110|200|rect
+N|n5|Celebrity post index|500|110|200|rect
+N|n6|Visibility and ranker|0|220|200|rect
+E|n0|n1|commits
+E|n0|n2|outbox
+E|n2|n3|ordinary authors
+E|n3|n4|candidates
+E|n5|n4|pull candidates
+E|n4|n6|authorize then rank
 ---
 ## Problem
 
@@ -496,13 +548,29 @@ Design a social news feed (like Facebook, X or LinkedIn): users post, follow oth
 
 **Scale:** 300M DAU, each opening the feed 10 times a day, is 3B feed reads/day ≈ 35k/s (peak ~100k/s). 50M posts/day ≈ 600 writes/s. Average 200 followers per user means **fan-out ≈ 120k feed inserts/s**.
 
-## Learn through a concrete example
+## 1. Scope and selected architecture
 
-You follow 200 people and open a feed. One design fetches their posts at read time; another precomputes your inbox when each author posts. Both can be valid. The choice depends on follower distributions, read frequency and freshness, not on a rule that every social product needs the same architecture.
+I serve a follower feed with public/private posts, deletion and paginated reads. I choose hybrid fan-out because follower counts are skewed: precomputing one celebrity's 20 million references would monopolize write workers. Inbox records store post references, not copied bodies.
+
+## 2. APIs and assembly algorithm
+
+```text
+POST /posts {body,visibility} -> postId
+GET /feed?cursor=... -> items,nextCursor
+Post PK(postId): authorId,createdAt,version,visibility,deleted
+Inbox PK(userId,sortKey,postId): sourceEventId
+Follow PK(followerId,authorId): state,version
+```
+
+Post creation commits with an outbox event. Fan-out workers batch idempotent inbox inserts for ordinary authors. Feed assembly merges inbox candidates with recent celebrity posts, checks current follow/privacy/deletion state, ranks eligible candidates and returns a stable tie-breaker cursor. A ranking-session snapshot or stated approximate continuation policy handles changing scores. At 100,000 inbox insertions/s, a 20-million-follower post alone needs about 200 seconds, motivating the hybrid threshold. Deletion marks authority first; stale references are filtered before later cleanup. Read latency, oldest fan-out age, candidate shortfall and hot-author load are separate signals.
+
+## 3. Final design diagram
+
+[![News Feed: Post service commits Post store; Post service outbox Fanout queue; Fanout queue ordinary authors Follower inbox; Follower inbox candidates Feed assembler; Celebrity post index pull candidates Feed assembler; Feed assembler authorize then rank Visibility and ranker](designs/hld-5.svg)](designs/hld-5.svg)
 
 **Fan-out on write** distributes post references to follower inboxes. **Fan-out on read** gathers posts when the reader asks. **Ranking** orders candidates; it should not be confused with retrieving authorized candidates in the first place.
 
-## See a hybrid feed
+## 4. Critical operation: worked execution
 
 ![Ordinary authors and celebrity authors can use different fan-out policies.](lessons/hld-5-flow.svg)
 
@@ -516,7 +584,7 @@ You follow 200 people and open a feed. One design fetches their posts at read ti
 
 A post by someone with 500 followers creates roughly 500 inbox insertions. A celebrity with 20 million followers creates 20 million. At 100,000 insertions/s, that single fan-out takes about 200 seconds before other traffic. A hybrid avoids requiring every follower inbox to be updated before the celebrity post is visible.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -580,8 +648,6 @@ A post is deleted after fanout reaches some timelines. A canonical tombstone/ver
 
 Ranking by timestamp is predictable; learned ranking needs feature freshness, versioned models and offline/online evaluation. Cursor pagination on a changing ranked set needs snapshot/ranking epoch semantics; offset pagination causes duplicates and omissions.
 
-### SLOs, failure drills and lab
-
 Measure feed p99, fanout lag, stale visibility exposure, candidate coverage, queue backlog by author and timeline write amplification.
 
 **Test matrix:** Celebrity burst, inactive follower population, unfollow during fanout, deleted/private posts in stale cache, delayed queue and page continuation while new posts arrive.
@@ -604,32 +670,37 @@ Measure feed p99, fanout lag, stale visibility exposure, candidate coverage, que
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through pagination and consistency
+### Work through pagination and consistency
 
 Offset pagination can skip or duplicate posts when new items arrive. A cursor containing a stable sort key and tie-breaker gives a better continuation contract; ranking changes may require a session snapshot or an explicitly approximate feed policy.
 
 Unfollowing should affect authorization/candidate selection even when old inbox rows remain. Store references rather than copying full post bodies into every inbox; updates and deletions then have a smaller invalidation surface. Track oldest fan-out age so an apparently healthy API does not hide stale feeds.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does ranking decide whether private content is visible?** No. Authorization filters candidates before exposure and may need a final check.
-2. **Must every user receive every post synchronously?** No. State the freshness promise and support delayed materialization.
-3. **Exercise:** insert a new post between page one and page two, delete a previously indexed post and unfollow an author. Show the cursor and visibility rules that prevent accidental disclosure and explain any accepted duplicates or omissions.
+**Does ranking decide whether private content is visible?** No. Authorization filters candidates before exposure and may need a final check.
+
+**Must every user receive every post synchronously?** No. State the freshness promise and support delayed materialization.
+
+## 7. Closing answer
+
+I choose hybrid fan-out: precompute ordinary-author inbox references and fetch high-fanout authors on read. A read-time visibility check prevents stale inbox entries from leaking deleted or restricted content. Stable cursor ordering and lag metrics make freshness and pagination limitations explicit.
 
 === HLD 6 ===
-N|a|Sender app|0|0|130
-N|ws|WebSocket Gateway|230|0|180
-N|chat|Chat Service|230|140|150
-N|store|Message Store (Cassandra)|500|140|220|cylinder
-N|presence|Presence (Redis)|500|0|170|cylinder
-N|push|Push (APNs/FCM)|500|270|170|ellipse
-N|b|Receiver app|0|140|130
-E|a|ws|send(msg)
-E|ws|chat|route
-E|chat|store|persist seq
-E|chat|presence|online?
-E|chat|ws|deliver
-E|chat|push|if offline
+N|n0|Client connections|0|0|200|rect
+N|n1|Conversation service|250|0|200|rect
+N|n2|Message store|500|0|200|rect
+N|n3|Delivery queue|0|110|200|rect
+N|n4|Device cursors|250|110|200|rect
+N|n5|Media object store|500|110|200|rect
+N|n6|Presence cache|0|220|200|rect
+E|n0|n1|send and resume
+E|n1|n2|ordered commit
+E|n1|n3|fanout
+E|n3|n0|online push
+E|n0|n4|acknowledges
+E|n1|n5|media references
+E|n0|n6|heartbeats
 ---
 ## Problem
 
@@ -647,13 +718,29 @@ Design a chat system like WhatsApp: 1:1 and group messaging, real-time delivery,
 
 **Scale:** 500M DAU and 50B messages/day ≈ 600k msgs/s average, more at peak. Around 100M concurrent connections; at ~100k per gateway box, that's ~1,000+ gateway servers.
 
-## Learn through a concrete example
+## 1. Scope and selected guarantees
 
-Alice sends “hello” to Bob while Bob's phone is offline. A socket alone cannot deliver it later; the server needs a durable message and a way for Bob's devices to resume. Distinguish **accepted by server**, **delivered to device** and **read by person**. They are three different acknowledgements.
+I support direct/group chat, offline replay, device delivery and read receipts. I choose one logical conversation owner for sequence allocation; independent conversations scale across partitions. Payload media lives in object storage. End-to-end encryption is a separate key-management requirement and is not implied by TLS.
+
+## 2. Message protocol and persistence
+
+```text
+SEND(conversationId,clientMessageId,body) -> ACCEPTED(serverSeq,messageId)
+RESUME(conversationId,afterSeq,deviceId) -> ordered messages
+ACK_DELIVERED(deviceId,conversationId,seq); ACK_READ(userId,conversationId,seq)
+Message PK(conversationId,seq), UNIQUE(senderId,clientMessageId)
+DeviceCursor PK(deviceId,conversationId): deliveredSeq
+```
+
+The owner validates membership, returns a matching prior send on retry, allocates sequence and commits before ACCEPTED. Outbox/delivery fan-out pushes to live connections; reconnect fetches durable gaps. Concurrent senders receive one committed order independent of device clocks. At 100,000 envelopes/s and 500 bytes, raw history grows 4.32 TB/day before indexes/replication. Cursor updates are monotonic and scoped to device; a laptop cannot inherit proof of delivery from a phone. Presence expiry changes routing efficiency, not durability. Membership changes are checked before replay to avoid exposing removed-group history beyond the chosen policy.
+
+## 3. Final design diagram
+
+[![Chat / WhatsApp: Client connections send and resume Conversation service; Conversation service ordered commit Message store; Conversation service fanout Delivery queue; Delivery queue online push Client connections; Client connections acknowledges Device cursors; Conversation service media references Media object store; Client connections heartbeats Presence cache](designs/hld-6.svg)](designs/hld-6.svg)
 
 A **conversation sequence** orders messages within one conversation. A **client message ID** deduplicates retries from the sender. A **delivery cursor** records what a particular device has received; multiple devices can have different cursors.
 
-## See durable delivery and sender retries
+## 4. Critical operation: worked execution
 
 ![Persist before acknowledging acceptance to the sender.](lessons/hld-6-flow.svg)
 
@@ -667,7 +754,7 @@ A **conversation sequence** orders messages within one conversation. A **client 
 
 At 100,000 messages/s and 500 bytes per stored envelope, raw message data grows about 50 MB/s or 4.32 TB/day before media, indexes and replicas. Store media objects separately and send authorized references. Partition message ownership by conversation to make ordering local rather than inventing one global sequence for every user.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -733,8 +820,6 @@ A gateway dies after persistence but before client acknowledgement. Retrying the
 
 Small groups can fanout on write; very large channels favor shared logs and read cursors. Ordering across two independent conversations is usually unnecessary. Push notification delivery is not a read receipt.
 
-### SLOs, failure drills and lab
-
 Track durable-ack latency, end-to-end delivery latency, reconnect success, missing-message repair, fanout lag and receipt consistency.
 
 **Test matrix:** Reconnect after a lost acknowledgement, duplicate send, device clock skew, group membership change during delivery, gaps in sequence and offline device catch-up.
@@ -757,32 +842,36 @@ Track durable-ack latency, end-to-end delivery latency, reconnect success, missi
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through ordering and presence
+### Work through ordering and presence
 
 Two concurrent senders can each show optimistic local messages, but the server must choose the conversation's committed order. Device clocks are not a reliable total-order authority. Gaps in a receiver's sequence should trigger replay rather than an assumption that missing messages were deleted.
 
 Presence is soft state with expiry: a disconnected mobile app can appear online briefly. Do not make durable delivery depend on a perfectly accurate online flag. End-to-end encryption changes what servers can inspect and index; explain its key/device model separately from transport TLS.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does a WebSocket write prove delivery?** No. It may only enqueue bytes locally; require protocol-level evidence for stronger claims.
-2. **Can Bob's laptop reuse his phone's cursor?** Not blindly. Device delivery state differs even if read state is shared by policy.
-3. **Exercise:** disconnect Bob, drop Alice's acknowledgement, retry the send and reconnect Bob. Assert one durable message and an ordered replay without conflating read and delivery receipts.
+**Does a WebSocket write prove delivery?** No. It may only enqueue bytes locally; require protocol-level evidence for stronger claims.
+
+**Can Bob's laptop reuse his phone's cursor?** Not blindly. Device delivery state differs even if read state is shared by policy.
+
+## 7. Closing answer
+
+I acknowledge a message after durable conversation-ordered storage, deduplicate by sender message identity and replay from per-device cursors. Persistent messages survive offline recipients; presence is only a soft hint. Accepted, delivered and read acknowledgements remain separate.
 
 === HLD 7 ===
-N|creator|Uploader|0|0|130
-N|upload|Upload Svc (resumable)|200|0|200
-N|raw|Raw Object Store|520|0|180|cylinder
-N|queue|Transcode Queue|520|130|170|cylinder
-N|trans|Transcoder Workers|200|130|190
-N|cdn|CDN (HLS/DASH)|200|270|170|ellipse
-N|meta|Metadata DB|520|270|160|cylinder
-E|creator|upload|chunks
-E|upload|raw|store
-E|raw|queue|job
-E|queue|trans|consume
-E|trans|cdn|renditions
-E|trans|meta|ready
+N|n0|Upload service|0|0|200|rect
+N|n1|Original object store|250|0|200|rect
+N|n2|Processing queue|500|0|200|rect
+N|n3|Transcode workers|0|110|200|rect
+N|n4|Asset metadata|250|110|200|rect
+N|n5|CDN|500|110|200|rect
+N|n6|Player|0|220|200|rect
+E|n0|n1|resumable chunks
+E|n0|n2|verified finalize
+E|n2|n3|profile tasks
+E|n3|n4|validated renditions
+E|n4|n5|published manifest
+E|n5|n6|segments
 ---
 ## Problem
 
@@ -801,13 +890,28 @@ Design YouTube: creators upload videos, which get transcoded into multiple resol
 
 **Scale:** 500 hours uploaded per minute ≈ 30k hours/hour. At ~1 GB per hour of raw video × ~3 for renditions, that's **≈ 2–3 PB of new storage per day**. Views of billions per day are served mostly by the CDN.
 
-## Learn through a concrete example
+## 1. Scope and chosen pipeline
 
-A creator uploads a 2 GB video. Viewers on slow phones and fast televisions need different resolutions and bitrates. Upload storage, transcoding and playback are different workloads: a successful upload does not mean every playable rendition is ready.
+I support creator upload, asynchronous multi-bitrate preparation, public/private publication and adaptive playback. I choose direct resumable object uploads, a durable processing queue and independently retryable transcode tasks keyed by asset version/profile. Search/recommendation are downstream consumers, not prerequisites for serving a known video.
 
-An **original asset** is the uploaded source. A **rendition** is an encoded version. A **manifest** lists segments and available variants. A **CDN** keeps content near viewers. Begin with one durable original and an asynchronous preparation pipeline.
+## 2. API and asset model
 
-## See publishing and partial preparation
+```text
+POST /uploads -> uploadId, authorized chunk destinations
+POST /uploads/{id}/finalize {size,checksum} -> assetId,PROCESSING
+GET /videos/{id}/playback -> authorized manifest and status
+Asset: id,owner,sourceVersion,state; Rendition UNIQUE(asset,version,profile)
+```
+
+Finalize verifies chunks/checksum and records processing intent once. Workers write temporary outputs, validate segments, then mark their rendition complete. Manifest publication is an atomic metadata/version switch referencing completed outputs. I may publish 720p while 1080p retries if the readiness policy allows it. A million viewers at 3 Mb/s imply 3 Tb/s, so media bypasses application servers via CDN. Failed uploads expire; deletion revokes metadata access and schedules source/rendition/cache lifecycle cleanup. Upload throughput, processing age, playback startup and rebuffer rate cover different failure stages.
+
+## 3. Final design diagram
+
+[![YouTube: Upload service resumable chunks Original object store; Upload service verified finalize Processing queue; Processing queue profile tasks Transcode workers; Transcode workers validated renditions Asset metadata; Asset metadata published manifest CDN; CDN segments Player](designs/hld-7.svg)](designs/hld-7.svg)
+
+An **original asset** is the uploaded source. A **rendition** is an encoded version. A **manifest** lists segments and available variants. A **CDN** keeps content near viewers. I begin with one durable original and an asynchronous preparation pipeline.
+
+## 4. Critical operation: worked execution
 
 ![Publication follows verified processing rather than mere upload completion.](lessons/hld-7-flow.svg)
 
@@ -821,7 +925,7 @@ An **original asset** is the uploaded source. A **rendition** is an encoded vers
 
 One million concurrent viewers averaging 3 Mb/s require 3 Tb/s of delivery bandwidth before overhead. That belongs on object/CDN delivery infrastructure rather than application servers proxying every segment. Ten minutes at 3 Mb/s is approximately 225 MB decimal, illustrating why watch time dominates storage/control-plane API payloads.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -888,8 +992,6 @@ An encoder crashes after writing half a rendition. Its lease can expire and anot
 
 Precompute popular bitrates for predictable playback; just-in-time encoding saves unused storage but risks startup stalls. Content moderation and copyright handling are separate workflows with appeal/audit boundaries.
 
-### SLOs, failure drills and lab
-
 Upload completion rate, time-to-playable, playback start time, rebuffer ratio, CDN hit ratio, encoding backlog and cost per viewing minute.
 
 **Test matrix:** Resume interrupted multipart upload, retry an encoder job, corrupt a segment checksum, simulate CDN miss storms, remove a video while manifests are cached.
@@ -912,32 +1014,36 @@ Upload completion rate, time-to-playable, playback start time, rebuffer ratio, C
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through retries and access
+### Work through retries and access
 
 Transcode job identity should include original asset version and encoding profile. Retrying a task may rewrite deterministic output paths or produce a new version, but must not publish partial files as completed segments. Upload finalization is idempotent and verifies all chunks; abandoned sessions need lifecycle cleanup.
 
 Private video access requires checking entitlements when issuing short-lived playback access, not merely hiding the video in search. CDN caching keys and signed URLs must preserve the chosen authorization boundary. Deletion requires original, renditions, manifests and CDN policy to be considered together.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Does adaptive bitrate mean changing the original video?** No. The player selects among prepared variants as conditions change.
-2. **Can a task acknowledgement prove playable output?** Only after validating its expected artifacts.
-3. **Exercise:** interrupt upload, duplicate finalization and crash one transcode. Show which asset states are visible to the creator and viewer, and verify the manifest never references an incomplete segment.
+**Does adaptive bitrate mean changing the original video?** No. The player selects among prepared variants as conditions change.
+
+**Can a task acknowledgement prove playable output?** Only after validating its expected artifacts.
+
+## 7. Closing answer
+
+I separate resumable ingestion, idempotent media preparation and CDN playback. Publication references only verified versioned artifacts; incomplete transcodes never become playable output. Application APIs handle metadata and permissions while object/CDN infrastructure carries the video bandwidth.
 
 === HLD 8 ===
-N|client|Netflix Client|0|130|150
-N|api|API / Playback Svc|230|0|180
-N|steer|Steering (best OCA)|230|130|180|ellipse
-N|oca|Open Connect (ISP edge)|520|130|210|cylinder
-N|origin|Origin + Encoding|520|0|180|cylinder
-N|reco|Recommendations|230|270|170
-N|events|Viewing events|520|270|160|cylinder
-E|client|api|play(title)
-E|api|steer|pick CDN
-E|client|oca|stream segments
-E|origin|oca|pre-position nightly
-E|client|events|heartbeats
-E|events|reco|train
+N|n0|Playback API|0|0|200|rect
+N|n1|Entitlement service|250|0|200|rect
+N|n2|Session leases|500|0|200|rect
+N|n3|Manifest service|0|110|200|rect
+N|n4|License boundary|250|110|200|rect
+N|n5|CDN and origins|500|110|200|rect
+N|n6|Player|0|220|200|rect
+E|n0|n1|authorizes
+E|n0|n2|claims stream
+E|n0|n3|resolves variant
+E|n0|n4|grants scoped access
+E|n3|n5|media paths
+E|n5|n6|segments
 ---
 ## Problem
 
@@ -955,13 +1061,28 @@ Design Netflix: a subscription streaming service with a fixed, curated catalogue
 
 **Scale:** 250M members and ~100M concurrent streams at peak. At ~5 Mbps average that's on the order of **hundreds of Tbps** at the edge. It can't be served from a few datacentres.
 
-## Learn through a concrete example
+## 1. Scope and chosen architecture
 
-A subscriber presses Play. Before streaming begins, the service checks whether this account can watch that title in this region and whether concurrent-stream limits permit another session. The media delivery path is different from catalogue search, billing and recommendation APIs.
+I design subscription playback, regional title rights, stream limits and adaptive streaming. Catalogue, recommendation and progress tracking can be eventually consistent; starting/renewing playback requires current entitlement under a documented grant lifetime. DRM license delivery, when required, is separate from subscription authorization.
+
+## 2. Playback contract
+
+```text
+POST /playback-sessions {titleId,deviceId} -> sessionId,manifest,accessExpiry
+POST /playback-sessions/{id}/heartbeat -> renewed | revoked
+DELETE /playback-sessions/{id} -> ended
+Session: accountId,deviceId,titleId,leaseExpiry,rightsVersion,state
+```
+
+The service authenticates, checks subscription/region, atomically claims a session lease within account limits and issues short-lived scoped access. Player fetches segments from CDN, selects bitrate and reports quality/progress asynchronously. A crashed device retains its slot only until lease expiry; renewal rechecks policy. Two million 5 Mb/s streams require about 10 Tb/s delivery, so origin shielding/pre-positioning matter independently of API scaling. Rights revocation cannot retract already downloaded bytes; the grant/license lifetime bounds future access. I track startup delay, rebuffering, playback errors, origin saturation and lease leakage by region/device.
+
+## 3. Final design diagram
+
+[![Netflix: Playback API authorizes Entitlement service; Playback API claims stream Session leases; Playback API resolves variant Manifest service; Playback API grants scoped access License boundary; Manifest service media paths CDN and origins; CDN and origins segments Player](designs/hld-8.svg)](designs/hld-8.svg)
 
 A **playback session** is an authorized attempt to watch a title. A **manifest** describes playable variants. **DRM** adds a license/key-delivery boundary; it does not replace subscription authorization. Start by tracing play authorization and segment delivery separately.
 
-## See entitlement and CDN delivery
+## 4. Critical operation: worked execution
 
 ![Control APIs grant bounded playback access; CDN serves the bytes.](lessons/hld-8-flow.svg)
 
@@ -975,7 +1096,7 @@ A **playback session** is an authorized attempt to watch a title. A **manifest**
 
 With two million simultaneous streams at 5 Mb/s, media delivery is about 10 Tb/s. Even a modest cache miss percentage can generate enormous origin egress. Popularity-aware pre-positioning and origin shielding are capacity choices; the account API does not need to carry the media bytes.
 
-## Design details and alternatives
+## 5. Detailed decisions, algorithms and failure behaviour
 
 ### Architecture
 
@@ -1040,8 +1161,6 @@ A control-plane region fails while streams are already playing. Existing signed 
 
 Pre-position popular titles near demand; origin fetch reduces storage but increases first-view latency and egress. Availability and consistency goals differ between catalogue browsing, licence grants and progress updates.
 
-### SLOs, failure drills and lab
-
 Start-up latency, rebuffering, error-free playback, licence p99, origin egress and entitlement decision errors.
 
 **Test matrix:** Playback under bandwidth changes, CDN origin loss, expired entitlement, concurrent device limit, regional rights change and licence-service degradation.
@@ -1064,14 +1183,18 @@ Start-up latency, rebuffering, error-free playback, licence p99, origin egress a
 - [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
 - [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
 
-## Work through resilience
+### Work through resilience
 
 Playback-session heartbeats approximate active viewing. A crashed TV may leave a lease until expiry, so stream-limit enforcement needs a documented grace/lease policy. Revoking a subscription cannot instantly retract segments already downloaded; define what must be checked at session renewal or license expiry.
 
 Keep continue-watching progress separate from billing and entitlement. A delayed progress update can be accepted eventually, whereas granting a restricted title needs a stronger decision. Track startup delay, rebuffer ratio and playback failure by device/region; a fast catalogue API can coexist with terrible viewing quality.
 
-## Practise, then check your reasoning
+## 6. Interviewer follow-ups
 
-1. **Must every segment call the account database?** Usually no. Short-lived scoped playback access amortizes authorization while bounding its staleness.
-2. **Is CDN hit ratio alone enough?** No. Playback startup, rebuffering and origin overload reveal different problems.
-3. **Exercise:** simulate expired entitlement, a dead session heartbeat and a regional CDN failure. Explain what the player sees and which existing sessions may continue under the stated policy.
+**Must every segment call the account database?** Usually no. Short-lived scoped playback access amortizes authorization while bounding its staleness.
+
+**Is CDN hit ratio alone enough?** No. Playback startup, rebuffering and origin overload reveal different problems.
+
+## 7. Closing answer
+
+I keep entitlement and concurrent-session decisions in the playback control path and distribute media through CDN/origin infrastructure. Bounded playback grants, lease expiry and explicit regional rights preserve access policy without a billing-database lookup for every segment. User experience is measured at the player.
