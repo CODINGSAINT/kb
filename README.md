@@ -43,7 +43,7 @@ KB makes you **commit to your own design before you see any answer**, then gives
 | ✅ **A real verdict** | One click grades your answer: **Strong / Solid / Partial / Needs work**, what you got right, the gaps, and what to study next. It reads your diagrams too. |
 | 💬 **A tutor that pushes back** | Chat about your answer with an AI that knows the topic, your attempt and its verdict. *"Quiz me like an interviewer"* is one click away, and it won't spoil the design before you've tried. |
 | 🎙️ **Talk instead of type** | Ask the tutor out loud and hear its answers. *Talk mode* is a hands-free spoken conversation, and you can dictate your answer too. Works with Ollama, Claude and OpenAI, and can run fully offline. |
-| 📚 **Fundamentals, done properly** | 37 chapters (caching, sharding, consensus, SOLID, design patterns, concurrency…) written simply: definition, the problem, a better way, key takeaway. Each is linked from the problems that need it. |
+| 📚 **Fundamentals, done properly** | 45 chapters (caching, sharding, consensus, SOLID, design patterns, concurrency…) written simply: definition, the problem, a better way, key takeaway. Each is linked from the problems that need it. |
 | 📖 **Learn anything** | `kb add "core java"`, `kb add "operating systems"`, even `kb add "calculus"`: your AI plans a short course and writes every chapter in the same clear style, into your private library. |
 | 🧩 **DSA by pattern** | 304 problems in 32 patterns, each with a guide and a Java template. The grader checks whether you used the pattern, not just whether the code works. |
 | 🔒 **Private and yours** | Plain JSON files on your machine. No account, no tracking. Bring your own Claude or OpenAI key, or run **free and offline** with Ollama. |
@@ -58,7 +58,7 @@ KB makes you **commit to your own design before you see any answer**, then gives
 | **Low-level design** | 20 | Chess, Parking Lot, Elevator, BookMyShow, Splitwise, Rate Limiter, Wallet, Calendar |
 | **High-level design** | 20 | URL Shortener, Chat/WhatsApp, YouTube, Netflix, Uber, Dropbox, Payments, API Gateway |
 | **AI / Spring AI** | 20 | RAG, embeddings, ChatClient, tool calling, agents, MCP, multi-agent, AI security, evaluation |
-| **Read-first chapters** | 37 | Approach & estimation, caching, sharding, replication, CAP, consensus, messaging, SOLID, design patterns, concurrency |
+| **Read-first chapters** | 45 | Approach & estimation, caching, sharding, replication, CAP, consensus, messaging, SOLID, design patterns, concurrency |
 | **DSA problems** | 304 | 32 patterns: two pointers, sliding window, binary search, trees, graphs, DP, tries, design… |
 
 Every design topic comes with a reference write-up and a diagram, revealed only when you ask.
@@ -351,7 +351,7 @@ kb chat lld 1                      # back-and-forth; /exit to leave
 
 ## Using the `kb` command
 
-Topics are addressed by track and number: `lld 1`–`lld 20`, `hld 1`–`hld 20`, `ai 1`–`ai 20`, `dsa 1`–`dsa 304`, and `read 1`–`read 37` for the fundamentals.
+Topics are addressed by track and number: `lld 1`–`lld 20`, `hld 1`–`hld 20`, `ai 1`–`ai 20`, `dsa 1`–`dsa 304`, and `read 1`–`read 45` for the fundamentals.
 `lld1` and `LLD-1` also work. Run `kb list` to see every number.
 
 | Command | What it does |
@@ -558,7 +558,7 @@ If you explicitly ask for the solution, it gives it.
 
 ## Read-first fundamentals
 
-37 in-depth chapters (roughly 2,500–4,000 words each) to read before attempting topics, written for this site. Each covers the concepts, how it works, trade-off tables, Java/Spring or config examples, real systems, where it shows up in the interview topics, pitfalls, interview questions and a cheat sheet. Long chapters open with an *On this page* contents list.
+45 prerequisite chapters, including extended LLD/HLD material and a progressive Java-focused AI foundations path, written for this site. Each covers the concepts, how it works, trade-off tables, Java/Spring or config examples, real systems, where it shows up in the interview topics, pitfalls, interview questions and a cheat sheet. Long chapters open with an *On this page* contents list.
 - **LLD (10):** approach, OOP, UML relationships, SOLID, creational, structural and behavioral patterns, concurrency, modelling details (money, time, IDs).
 - **HLD (25):** approach, estimation, scalability, networking (DNS, TCP/UDP, HTTP, TLS, proxies), load balancing, caching, CDN and object storage, SQL vs NoSQL, indexes, replication, sharding,
   consistent hashing, CAP/PACELC, consensus, messaging, batch and stream processing, idempotency, distributed transactions, API design, real-time, rate limiting, IDs and probabilistic structures, geospatial indexing, observability and resilience, security (authn/authz, OAuth2/JWT, TLS/mTLS, secrets).
@@ -615,7 +615,7 @@ Bits → Trie → Strings → Matrix & Math → Design.
 
 **[codingsaint.github.io/kb](https://codingsaint.github.io/kb/)** runs KB in your browser, with nothing to install.
 
-- **Browse it read-only:** every design topic (and its reference design), all 37 read-first chapters, and the 304 DSA problems with their pattern guides.
+- **Browse it read-only:** every design topic (and its reference design), all 45 read-first chapters, and the 304 DSA problems with their pattern guides.
 - **Or use it for real: Continue with Google.** Your answers, notes, read status, tutor chats and answer images are saved in KB's private
   app folder in **your own Google Drive**, and follow you to every device you sign in on: any browser, phones included, and the Android app.
   KB can't see anything else in your Drive, and there is no KB server.
@@ -781,3 +781,8 @@ If KB helped you prepare:
 - 📺 For Java, Spring Boot, microservices and Spring AI, see **[Coding Saint on YouTube](https://www.youtube.com/@codingsaint)**.
 
 <p align="center">Built by <b>Pallav</b> · Java &amp; AI architect · <a href="https://www.youtube.com/@codingsaint">Coding Saint</a></p>
+
+
+## Detailed reference manuscripts
+
+All 60 design topics have extended references with failure scenarios, verification exercises and explained trade-offs. AI has ten prerequisite chapters, from context/token fundamentals to a Java/Spring learning path. See [the content revamp and source notes](docs/REFERENCE-REVAMP.md) for the authoring/build workflow and checks.

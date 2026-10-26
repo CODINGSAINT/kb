@@ -785,15 +785,29 @@ cd kb && npm install && npm start</code></pre>
 
     // Reference design: below everything, hidden until confirmed.
     root.insertAdjacentHTML("beforeend", '<div id="refZone"></div><div id="dayExtra"></div>');
-    const refNames = [...(t.diagram?.nodes?.length ? ["diagram"] : []), ...ref.map((x) => x.title.toLowerCase())];
     const renderRef = (asking) => {
       const zone = $("#refZone");
       if (!ref.length && !t.diagram?.nodes?.length) { zone.innerHTML = ""; return; }
       if (revealed.has(key)) {
         zone.innerHTML = `<section class="card"><h2>Reference design <span class="spacer"></span><button class="btn small" id="refHide">Hide again</button></h2>
-            ${t.diagram?.nodes?.length ? `<div class="diagram" id="diagram" data-diagram="${dkey}"></div>` : ""}<div id="writeup"></div></section>`;
+            ${t.diagram?.nodes?.length ? `<div class="diagram" id="diagram" data-diagram="${dkey}"></div>` : ""}<nav class="toc" id="refToc" aria-label="Reference design contents" hidden><div class="toc-title">In this reference</div><ol id="refTocList"></ol></nav><div id="writeup"></div></section>`;
         if (t.diagram?.nodes?.length) { const dg = $("#diagram"); dg._spec = t.diagram; KBDiagram.render(dg, t.diagram, dkey); }
         viewer($("#writeup"), ref.map((x) => x.md).join("\n\n"));
+        const referenceHeads = [...$("#writeup").querySelectorAll("h2")];
+        if (referenceHeads.length > 2) {
+          const list = $("#refTocList");
+          list.classList.toggle("plain", referenceHeads.filter((h) => /^\s*\d+[.)]\s/.test(h.textContent)).length >= referenceHeads.length / 2);
+          list.innerHTML = referenceHeads.map((h, i) => `<li><button type="button" data-reference-section="${i}">${esc(h.textContent)}</button></li>`).join("");
+          list.addEventListener("click", (e) => {
+            const button = e.target.closest("button[data-reference-section]");
+            if (!button) return;
+            const heading = referenceHeads[Number(button.dataset.referenceSection)];
+            heading.tabIndex = -1;
+            heading.focus({ preventScroll: true });
+            heading.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+          });
+          $("#refToc").hidden = false;
+        }
         $("#refHide").addEventListener("click", () => { revealed.set(key, false); renderRef(); });
         return;
       }
@@ -805,7 +819,7 @@ cd kb && npm install && npm start</code></pre>
           : "You haven't saved an answer yet. Seeing the reference first turns the exercise into reading. Try writing your own design first, even a rough one.";
       zone.innerHTML = `<section class="card gate">
         <h2>Reference design <span class="spacer"></span><span class="muted small">hidden</span></h2>
-        <p class="muted" style="margin-top:0">Contains the ${esc(refNames.join(", "))}. These are hints towards the design, so attempt it yourself first.</p>
+        <p class="muted" style="margin-top:0">Contains the diagram, detailed walkthrough, implementation notes, trade-offs and exercises. Attempt your own design first, then compare it with the reference.</p>
         ${asking
           ? `<div class="confirm"><p><b>Are you sure you want to see it?</b> ${esc(warn)}</p>
                <div class="row"><button class="btn ${answered ? "primary" : ""}" id="refYes">${answered ? "Yes, show the reference" : "Show it anyway"}</button>
