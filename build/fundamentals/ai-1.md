@@ -11,7 +11,7 @@ AI design rounds mix classic system design with model-specific concerns: groundi
 7. **Safety and security.** Prompt injection, data leakage, PII handling, authorisation on retrieved documents and tool calls, output filtering, human-in-the-loop for high-impact actions.
 
 ## Numbers to keep in mind
-- Tokens ≈ ¾ of an English word. Latency splits into time-to-first-token (prefill) and per-output-token generation, and output tokens dominate.
+- Token counts depend on tokenizer, language and payload. Latency includes queueing, prefill, decoding and any tools; measure first-token and full-response times separately.
 - Cost scales with input + output tokens. Long contexts and agent loops multiply it.
 - Retrieval: top-k of 3–10 chunks of ~300–800 tokens each is a common starting point.
 

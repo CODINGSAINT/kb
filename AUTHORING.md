@@ -8,11 +8,8 @@ so a reload shows changes immediately. Keep JSON valid: 2-space indent, and touc
 `node scripts/new-day.js N` scaffolds `content/day-NN.json` from row N of all three
 `study.md` tables (LLD, HLD, AI). Then, for each of the 3 topics:
 
-- **`markdown`** is an interview-style write-up with exactly these `##` sections, in order:
-  `Problem`, `Requirements`, `Key abstractions` (HLD may use `Architecture`, AI may use
-  `Key concepts`), `Design decisions & trade-offs`, `Follow-up questions` (5–7 numbered questions).
-  Aim for 600–900 words. LLD examples are in Java. HLD includes back-of-envelope numbers.
-  AI topics connect to Spring AI where relevant.
+- **`markdown`** begins with `## Problem` and `## Requirements` (optional explanatory suffixes are allowed). These are the visible exercise brief. All subsequent `##` sections are the gated reference, so never put solution material inside the brief. Expand references to the depth needed for the domain: ownership/architecture, worked model or capacity assumptions, APIs/data/state, Java or Spring outlines, request/command flows, concurrency and failure races, trade-offs, security/lifecycle, verification exercises and explained follow-ups. The existing references are roughly 1,700–3,700 words of reference material; do not pad to a count or substitute repeated generic advice for topic-specific reasoning. Keep assumptions labelled and distinguish executable examples from incomplete design sketches. Use `node scripts/check-reference-content.js` for integrity checks, then review technical correctness separately.
+- Author diagram+Markdown source in `build/topics/*.txt` using the block contract in `build/assemble.js`, then run `node build/assemble.js`. Every topic, including day 1, needs an authored block. Update `build/fundamentals/*.md` and `build/make-fundamentals.js` together when adding prerequisites, then run `node build/make-fundamentals.js`. Generated JSON must match authored source.
 - **`diagram`** is `{nodes, edges}` with **4–7 nodes**. Coordinates are hand-placed within
   `x: 0–768, y: 0–320`. Default node size is `w:140, h:50`; widen `w` for long labels.
   `shape` is `rect` | `ellipse` | `diamond` | `cylinder` (cylinder = datastore).
