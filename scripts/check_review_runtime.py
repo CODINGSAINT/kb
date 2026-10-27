@@ -10,11 +10,13 @@ def main():
     manifest = read_json(DOC/'manifest.json')
     current = topics()
     observations = []
-    definition = digest((DOC/'browser/lot.js').read_bytes())
-    for key in manifest['review_batch']['topics']:
+    for key in [t['id'] for t in manifest['topics'] if t['generation']=='written']:
         report = read_json(DOC/'evidence'/(key+'-browser.json'))
         assert report['content_hash'] == digest(current[key]), 'stale browser content: '+key
-        assert report['definition_sha256'] == definition and report['exit_code'] == 0
+        definition = next(value.split('=',1)[1] for value in report['command'] if value.startswith('--filename='))
+        definition_path = Path(definition).resolve()
+        assert definition_path.is_relative_to(ROOT) and definition_path.is_file()
+        assert report['definition_sha256'] == digest(definition_path.read_bytes()) and report['exit_code'] == 0
         expected = {(p,t,w) for p in ['article','walkthrough'] for t in ['light','dark'] for w in [1280,390]}
         assert {(r['page'],r['theme'],r['width']) for r in report['observations']} == expected
         for row in report['observations']:

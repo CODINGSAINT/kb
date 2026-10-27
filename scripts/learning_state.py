@@ -104,14 +104,19 @@ def checkpoint(manifest):
     done=[t['id'] for t in required if t['completion']=='complete' and t['id'] not in stale]
     pending=[t['id'] for t in sorted(required,key=lambda t:t['priority']) if t['completion']!='complete' or t['id'] in stale]
     content='# Learning campaign checkpoint\n\nUpdated: '+now()+'\n\n'
-    content+='Objective: finish the authorized review lot, then stop for owner review. Fundamentals remain unchanged.\n\n'
+    content+='Objective: complete the owner-authorized KB reference scope. Fundamentals remain unchanged.\n\n'
     content+=f"Written: {sum(t['generation']=='written' for t in required)}/{len(required)}. Validated: {sum(t['validation']=='passed' and t['id'] not in stale for t in required)}/{len(required)}. Reviewed complete: {len(done)}/{len(required)}.\n\n"
     if stale:content+='Checks requiring refresh after an input change: '+', '.join(stale)+'\n\n'
     content+='Completed: '+(', '.join(done) or 'none')+'\n\nNext: '+manifest.get('next_action',(', '.join(pending[:8]) or 'final cross-topic review and owner handoff'))+'\n\n'
     if manifest.get('review_batch'):
         batch=manifest['review_batch'];selected=[t for t in required if t['id'] in batch['topics']]
-        content+=f"Current owner review lot: {sum(t['generation']=='written' for t in selected)}/{len(selected)} written; {sum(t['completion']=='complete' and t['id'] not in stale for t in selected)}/{len(selected)} reviewed. Remaining topics deferred by owner. See OWNER-SCOPE.md.\n\n"
-    content+='Policy: local review commit authorized for the current lot; no push, PR, merge or publishing. Stop expansion for owner review.\n\n' if manifest['policy'].get('allow_local_review_commit') else 'Policy: no commits, pushes, PRs, merges or publishing. Code and text stay local for owner verification.\n\n'
+        content+=f"Current authorized scope: {sum(t['generation']=='written' for t in selected)}/{len(selected)} written; {sum(t['completion']=='complete' and t['id'] not in stale for t in selected)}/{len(selected)} reviewed. See OWNER-SCOPE.md for the current instruction.\n\n"
+    if manifest['policy'].get('push_authorized'):
+        content+='Policy: current seven-article batch commit/push authorized; no PR, merge or publication. Remaining articles paused for 2 November.\n\n'
+    elif manifest.get('owner_resume'):
+        content+='Policy: owner resumed all remaining KB references after reviewing local commit ed62f0d. New changes stay local/uncommitted; no push, PR, merge or publishing.\n\n'
+    else:
+        content+='Policy: local review commit authorized for the current lot; no push, PR, merge or publishing. Stop expansion for owner review.\n\n' if manifest['policy'].get('allow_local_review_commit') else 'Policy: no commits, pushes, PRs, merges or publishing. Code and text stay local for owner verification.\n\n'
     content+='Decisions and benchmark: BENCHMARK.md, RUBRIC.md and PLAN.md. Resume: CONTINUE.md.\n\n'
     content+='Known issues: '+('; '.join(manifest.get('known_issues',[])) or 'none recorded')+'\n'
     atomic(DOC/'CHECKPOINT.md',content)

@@ -1,0 +1,15 @@
+# HLD-6 Chat checkpoint
+
+Current shared-brain startup/Decisions/adoption pages and current HLD-6 read. Parent owns shared source, manifest/lease/Logseq, integration and review gates. Staging only; no commits, real messages or paid calls. Assigned queue: finish HLD-6, hand off, then HLD-7.
+
+Chosen scope: text direct/moderate groups up to500 members; immutable accepted messages, one committed per-conversation sequence and sender/client-ID dedup. Server durable acceptance is distinct from device contiguous receipt and user-read signals. Membership is authoritative at send/history/fanout authorization; new/rejoining members start after joining, removed members lose subsequent API access. Already authorized/in-flight content cannot be recalled. TLS/at-rest encryption chosen; no false E2E claim.
+
+Reconnect afterSeq returns ordered retained history or an explicit JOIN_BOUNDARY/RETENTION gap and earliest available sequence. Client must acknowledge a history boundary, buffer bounded out-of-order messages and not advance contiguous delivery over a missing sequence. Retention30 days in the design; local mechanism uses explicit pruning. Idempotency metadata remains separate from removed payloads.
+
+Primary research: RFC6455 transport/reconnect, PostgreSQL17 sequence gaps and TLS1.3 RFC8446. RFC9001 was opened accidentally and is not used/cited. Saved complete article.md/header.txt and ConversationLog.java/ClientCursor.java/ChatChecks.java. No checks run yet.
+
+Saved since that checkpoint: ChatTrace.java; ConversationLog.LogView synthetic diagnostics; both hld-6-accept.svg and hld-6-gap.svg; standalone chat.html/chat.js and a copied topic-owned chat.css; numeric-spacing cleanup in article.md. All four Java files, article/header and authored visual sources are preserved. No Java compilation, ChatChecks execution, trace-fixture generation, browser gate or integration note has been completed for HLD-6.
+
+OWNER STOP — 27 October 2026: stop expansion and preserve this current turn. HLD-6 is PARTIAL/UNCHECKED, not ready for the seven-topic integrated batch. Do not start HLD-7; no HLD-7 files were created by this worker. Parent owns validation of the already integrated seven topics, the Feed fan-in cap fix, commit/push and guarded Logseq/pause. This worker did not touch shared source/manifest/lease/Logseq or make a commit/push.
+
+Exact resumption action: read current owner/shared-brain scope, then compile the four staged kb/chat Java sources with Java21, run ChatChecks once and ChatTrace to produce public/learning-labs/chat-traces.json, inspect any failure and fix only demonstrated defects. Check/finalize topic CSS/layout (chat.css currently copies the two-card News Feed base although Chat has three cards), write integration.md with actual evidence/limits, then hand off for parent's independent source/generated/browser review. Local receipt baseline always names its available history window, not proof of unavailable history. Do not resume HLD-7 without the next owner scope.

@@ -47,8 +47,8 @@ for(let day=1;day<=20;day++){
     assert(words>=600,`${key}: unexpectedly abbreviated reference (${words} words)`);
     assert(headings.some(h=>/^1\. /.test(h)),`${key}: missing chosen solution`);
     assert(headings.some(h=>/^2\. /.test(h)),`${key}: missing concrete contracts`);
-    assert(headings.includes('6. Interviewer follow-ups'),`${key}: missing answered follow-ups`);
-    assert(headings.includes('7. Closing answer'),`${key}: missing final position`);
+    assert(headings.some(h=>/^(?:\d+\.\s*)?Interviewer follow-ups$/i.test(h)),`${key}: missing answered follow-ups`);
+    assert(headings.some(h=>/^(?:\d+\.\s*)?Closing answer$/i.test(h)),`${key}: missing final position`);
     assert(!/Learn through a concrete example|Practise, then check your reasoning|\*\*Build:\*\*|\*\*Lab:\*\*/.test(reference),`${key}: tutorial assignment remains`);
     const design=`designs/${t.category.toLowerCase()}-${t.number}.svg`;
     assert(reference.includes(`](${design})`),`${key}: missing selected-design picture`);

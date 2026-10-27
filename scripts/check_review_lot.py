@@ -2,7 +2,7 @@
 from pathlib import Path
 import re,json,textwrap,xml.etree.ElementTree as ET,zipfile
 from learning_state import ROOT,MANIFEST,read_json,topics,protected,digest
-m=read_json(MANIFEST);protected(m);all_topics=topics();lot=m['review_batch']['topics'];assets=set();excerpts=0
+m=read_json(MANIFEST);protected(m);all_topics=topics();lot=[t['id'] for t in m['topics'] if t['generation']=='written'];assets=set();excerpts=0
 for row in m['topics']:
     if row['id'] not in lot:assert digest(all_topics[row['id']])==row['initial_hash'],'out-of-scope reference changed: '+row['id']
 for key in lot:

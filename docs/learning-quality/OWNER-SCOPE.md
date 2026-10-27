@@ -1,15 +1,9 @@
-# Owner review checkpoint — 2026-10-26
+# Current owner scope - 27 October 2026
 
-Latest direct instruction: finish the current lot, stop expansion for owner review, update Logseq, commit the local changes and create no pull request. A push is not authorized.
+Latest owner instruction: finish the current turn, commit and push; weekly limits are approaching and other articles will be picked up on 2 November. This supersedes the resumed all-57 execution for now.
 
-The review lot is the nine integrated references plus the three articles already in progress:
+Finish only seven newly integrated topics: LLD-6 Car Rental, LLD-7 Cab Booking, LLD-10 Splitwise, HLD-5 News Feed, AI-2 Prompt Engineering, AI-3 Parameters/APIs and AI-4 Embeddings/Semantic Search. Preserve the twelve already reviewed at local ed62f0d. Complete concrete review fixes and code/link/rendering gates, then create a local commit and push the existing codex/kb-learning-quality-review branch. No pull request, merge or site publication.
 
-- LLD-4 Movie Booking, LLD-5 ATM, LLD-9 Library, LLD-16 Tic-Tac-Toe.
-- HLD-1 URL Shortener, HLD-2 Rate Limiter, HLD-3 Distributed Cache, HLD-4 Notification System.
-- AI-1 AI/LLM Fundamentals, AI-6 Spring AI Fundamentals, AI-7 ChatClient, AI-8 Structured Output.
+All workers stopped. LLD-8 and HLD-6 are partial/unchecked and are not included as completed customer content; archive their saved drafts and exact next actions for 2 November. HLD-7 was not started. After these seven pass, the first pass has 19/57 complete and 38 paused, not a complete website campaign. Fundamentals and accepted Chess/Parking/Elevator stay unchanged.
 
-Finish and check these twelve. Do not start queued Car Rental/Uber/Food Delivery, News Feed/Chat/YouTube or Prompt Engineering/Parameters/Embeddings work. The three writers confirmed those queued topics were not started. Remaining 45 first-pass topics are deferred for owner review, not complete.
-
-Make one local review branch/commit after checking the lot. Do not push, open a PR, merge or publish. Preserve Fundamentals and the three accepted LLD examples. Save the actual commit, checks, limitations, review URL and next action in Logseq. Disable the continuation once this lot is handed over; do not automatically resume the broader campaign without a new owner request.
-
-Status at handoff: all twelve are integrated, validated and rubric-reviewed; evidence is current. The native continuation was deleted. Delivery is one local review commit plus the guarded Logseq handoff. Wait for owner review before further work.
+The ten-minute continuation is PAUSED through the native tool. Do not restart writing or resume background work without owner authorization. Record actual pushed branch/commit and checks in shared Logseq using its guarded protocol. Preserve human edits, source ownership and the fenced KB writer until the current handoff is finished, then release it. Do not mark the broader goal complete.

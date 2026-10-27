@@ -1,4 +1,4 @@
-# Run the twelve-article review copy
+# Run the nineteen-article review copy
 
 Canonical folder: `C:/Users/07pal/OneDrive/Documents/New project/kb-learning-quality/`.
 
@@ -25,4 +25,6 @@ The built review preview, while its current local server is running, is http://1
 
 The walkthroughs use offline recorded executions or explicitly labelled explanatory cases. Tic-Tac-Toe also has a browser rules mode. They do not send payments, messages or provider calls. Text fallbacks, manual stepping, theme controls and narrow layouts are included.
 
-REPORT.md describes validation and limits. Manifest counts distinguish generation from validation/review. The remaining 45 first-pass articles are deferred; Fundamentals and the three accepted LLD references remain unchanged. Owner review is the next step; no additional topics will be started automatically.
+REPORT.md describes validation and limits. Manifest counts distinguish generation from validation/review. The remaining 38 first-pass articles are paused for 2 November; Fundamentals and the three accepted LLD references remain unchanged. Owner review is the next step; no additional topics will be started automatically.
+
+Seven new routes and walkthroughs are listed in [PUSH-REPORT-20261027.md](PUSH-REPORT-20261027.md).

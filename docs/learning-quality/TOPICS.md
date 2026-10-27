@@ -3,9 +3,9 @@
 | Topic | Generation | Validation | Review | Completion |
 | --- | --- | --- | --- | --- |
 | AI-1 · AI/LLM Fundamentals | written | passed | passed | complete |
-| AI-2 · Prompt Engineering | pending | not_run | not_started | pending |
-| AI-3 · LLM Parameters & APIs | pending | not_run | not_started | pending |
-| AI-4 · Embeddings & Semantic Search | pending | not_run | not_started | pending |
+| AI-2 · Prompt Engineering | written | passed | passed | complete |
+| AI-3 · LLM Parameters & APIs | written | passed | passed | complete |
+| AI-4 · Embeddings & Semantic Search | written | passed | passed | complete |
 | AI-5 · RAG Fundamentals | pending | not_run | not_started | pending |
 | AI-6 · Spring AI Fundamentals | written | passed | passed | complete |
 | AI-7 · ChatClient Mastery | written | passed | passed | complete |
@@ -26,7 +26,7 @@
 | HLD-2 · Rate Limiter | written | passed | passed | complete |
 | HLD-3 · Distributed Cache | written | passed | passed | complete |
 | HLD-4 · Notification System | written | passed | passed | complete |
-| HLD-5 · News Feed | pending | not_run | not_started | pending |
+| HLD-5 · News Feed | written | passed | passed | complete |
 | HLD-6 · Chat / WhatsApp | pending | not_run | not_started | pending |
 | HLD-7 · YouTube | pending | not_run | not_started | pending |
 | HLD-8 · Netflix | pending | not_run | not_started | pending |
@@ -47,11 +47,11 @@
 | LLD-3 · Design Elevator System | baseline_preserved | not_run | not_started | baseline_preserved |
 | LLD-4 · Design BookMyShow / Movie Booking | written | passed | passed | complete |
 | LLD-5 · Design ATM | written | passed | passed | complete |
-| LLD-6 · Design Car Rental System | pending | not_run | not_started | pending |
-| LLD-7 · Design Uber / Cab Booking | pending | not_run | not_started | pending |
+| LLD-6 · Design Car Rental System | written | passed | passed | complete |
+| LLD-7 · Design Uber / Cab Booking | written | passed | passed | complete |
 | LLD-8 · Design Food Delivery System | pending | not_run | not_started | pending |
 | LLD-9 · Design Library Management System | written | passed | passed | complete |
-| LLD-10 · Design Splitwise | pending | not_run | not_started | pending |
+| LLD-10 · Design Splitwise | written | passed | passed | complete |
 | LLD-11 · Design Coffee Vending Machine | pending | not_run | not_started | pending |
 | LLD-12 · Design Shopping Cart | pending | not_run | not_started | pending |
 | LLD-13 · Design Notification System | pending | not_run | not_started | pending |

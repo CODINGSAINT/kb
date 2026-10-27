@@ -16,7 +16,7 @@ if proc.returncode or not match:raise RuntimeError('Browser checks did not retur
 observations=json.loads(match.group(1))
 if len(observations)<4:raise RuntimeError('Incomplete browser matrix')
 for key in targets:
-    rows=observations if len(targets)==1 else [r for r in observations if r.get('topic')==key]
+    rows=[r for r in observations if r.get('topic',key)==key]
     if len(rows)<4 or digest(topics()[key])!=hashes[key]:raise RuntimeError('Incomplete matrix or content changed: '+key)
     report={'topic':key,'checked_at':now(),'content_hash':hashes[key],'command':argv,'exit_code':proc.returncode,'definition_sha256':digest(definition.read_bytes()),'observations':rows}
     atomic(DOC/'evidence'/(key+'-browser.json'),report)

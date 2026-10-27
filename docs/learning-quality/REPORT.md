@@ -1,3 +1,5 @@
+> Historical twelve-article delivery. Current 27 October batch/push and pause state: [PUSH-REPORT-20261027.md](PUSH-REPORT-20261027.md).
+
 # Twelve-article local review delivery
 
 The owner narrowed the broader campaign to twelve articles and requested a local commit, Logseq handoff and stop. This report covers that lot. The other 45 first-pass references are deferred; this is not completion of the original 57-topic campaign. Fundamentals and the accepted Chess, Parking Lot and Elevator answers remain unchanged by hash.
