@@ -12,103 +12,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "req",
+            "label": "Schedule request",
+            "x": 0,
+            "y": 0,
+            "w": 160,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "svc",
             "label": "CalendarService",
-            "x": 0,
+            "x": 210,
             "y": 0,
-            "w": 200,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Event",
-            "x": 250,
+            "id": "room",
+            "label": "Room bookings",
+            "x": 420,
             "y": 0,
-            "w": 200,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "people",
+            "label": "Events by person",
+            "x": 420,
+            "y": 130,
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "free",
+            "label": "Free-slot sweep",
+            "x": 210,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Occurrence",
-            "x": 500,
-            "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n3",
-            "label": "RoomReservation",
+            "id": "rule",
+            "label": "Weekly rule + zone",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "RecurrenceRule",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Invitation",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "ConflictPolicy",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "owns edits"
+            "from": "req",
+            "to": "svc",
+            "label": "attendees, slot, room"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "expands into"
+            "from": "svc",
+            "to": "room",
+            "label": "no overlap?"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "claims"
+            "from": "svc",
+            "to": "people",
+            "label": "add to calendars"
           },
           {
-            "from": "n1",
-            "to": "n4",
-            "label": "defined by"
+            "from": "free",
+            "to": "people",
+            "label": "busy slots"
           },
           {
-            "from": "n1",
-            "to": "n5",
-            "label": "versions"
-          },
-          {
-            "from": "n3",
-            "to": "n6",
-            "label": "checks intervals"
+            "from": "rule",
+            "to": "svc",
+            "label": "expand to instants"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a calendar and meeting scheduler like Google Calendar: create events, invite attendees, detect conflicts, find free slots common to all attendees, book rooms, and handle recurring meetings and RSVPs. The core is **interval algorithms** (overlap detection and free-slot search) plus **concurrency** when two people book the same room.\n\n## Requirements\n\n**Functional**\n- Create, update and cancel meetings with attendees, a time range, a room and an optional recurrence.\n- Detect conflicts for attendees and rooms. Suggest the earliest common free slot of length D.\n- RSVP (accept, decline, tentative). Notifications and reminders.\n\n**Non-functional**\n- A room can never be double-booked. Searching across many attendees must be fast.\n\n## 1. Scope and chosen solution\n\nI schedule meetings with rooms, attendees and recurring local-time rules. Concrete occurrences store instants; recurring definitions store local time, ZoneId and an explicit gap/overlap policy. I materialize a bounded future horizon and extend it, avoiding an impossible infinite expansion.\n\n## 2. Reservation and edit transaction\n\n```text\ncreate(eventId,organizer,start,end,room,attendees) -> EventVersion\nreschedule(eventId,expectedVersion,newInterval,newRoom) -> Version | Conflict\nrespond(invitationId,eventVersion,attendee,answer) -> AttendanceState\nconflict(a,b) = a.start < b.end && b.start < a.end\n```\n\nThe room transaction serializes interval allocation and the event version change. A failed reschedule keeps the original reservation intact. 10:00–11:00 and 11:00–12:00 coexist; 10:30–11:30 conflicts. Editing one recurrence creates an exception; “this and future” splits the series under explicit identity/version rules. Responses to an old invitation version do not overwrite the new version's attendance. A 09:00 Europe/London weekly rule is re-expanded using timezone rules, not by adding a fixed UTC offset forever. Late notifications refer to event versions and cannot resurrect cancelled occurrences.\n\n## 3. Final design diagram\n\n[![Design Calendar / Meeting Scheduler: CalendarService owns edits Event; Event expands into Occurrence; Occurrence claims RoomReservation; Event defined by RecurrenceRule; Event versions Invitation; RoomReservation checks intervals ConflictPolicy](designs/lld-20.svg)](designs/lld-20.svg)\n\nAn **event** is a user's scheduling intent; an **occurrence** is one dated instance of a recurring event; a **resource reservation** claims a room over an interval. Separate personal invitations from the room's exclusive allocation.\n\n## 4. Critical operation: worked execution\n\n![Room ownership is decided independently of email invitations.](lessons/lld-20-flow.svg)\n\n*Room ownership is decided independently of email invitations.*\n\n![Expand recurring occurrences using a timezone identifier and policy.](lessons/lld-20-failure.svg)\n\n*Expand recurring occurrences using a timezone identifier and policy.*\n\n### Selected algorithm\n\n```text\nOverlap(a,b) = a.start < b.end AND b.start < a.end\n10:00-11:00 vs 11:00-12:00: no overlap\n10:00-11:00 vs 10:30-11:30: overlap\n```\n\nStore instants for concrete occurrences and a `ZoneId` plus local rule for recurrence. Some local times are missing or duplicated during clock changes; choose a policy and show it to the organizer rather than silently shifting an important meeting.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Interval` (record) | start, end (half-open `[s, e)`), `overlaps(other)` |\n| `Meeting` | id, organiser, attendees, interval, room, recurrence rule |\n| `Calendar` | Per user: `TreeMap<Instant, Meeting>` keyed by start |\n| `Room` + `RoomCalendar` | Same structure, plus capacity and features |\n| `ConflictChecker` | `hasConflict(calendar, interval)` in O(log n) |\n| `SlotFinder` | Merge busy intervals across attendees, scan the gaps |\n| `RecurrenceRule` | RRULE-like; expands occurrences lazily within a window |\n| `Invitation` | attendee, RSVP status |\n\n### Design decisions & trade-offs\n\n**1. Overlap in O(log n).** With a calendar sorted by start and no internal overlaps (true for rooms), check `floorEntry(newStart)` (does it end after `newStart`?) and `ceilingEntry(newStart)` (does it start before `newEnd`?). People *can* have overlapping events, so use an interval tree, or accept the O(log n + k) scan for a person.\n\n**2. Common free slot.** Gather all attendees' busy intervals in `[from, to]`, sort by start, merge the overlapping ones, then walk the gaps and return the first gap ≥ D (respecting working hours). That's O(M log M) for M intervals. It's the classic \"merge intervals\" pattern from DSA.\n\n**3. Room booking atomicity.** Lock per room (`ConcurrentHashMap<RoomId, ReentrantLock>`), re-check the conflict and insert. In a database: a range-exclusion constraint, or `INSERT … WHERE NOT EXISTS (overlapping)` under serializable isolation.\n\n**4. Recurring meetings.** Store the rule plus exceptions, not 520 copies. Expand on read within the query window. Editing \"this and following\" splits the rule into two series.\n\n**5. Time zones.** Store instants in UTC and the organiser's zone with the rule. \"9am every Monday\" must survive DST shifts, so expand recurrence in the event's zone.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Meeting time is an interval plus a time-zone interpretation; recurrence is a rule, not an infinite row list.\n\nCalendar owns Events and access rules. Event contains organizer, attendees, start/end instants and display zone. RecurrenceRule defines repeated local times; OccurrenceOverride changes or cancels a single instance. AvailabilityService merges busy intervals; Invitation tracks response independently.\n\n**Correctness rule:** End is after start, resource calendars cannot contain overlapping confirmed reservations, and an occurrence identity remains stable when one instance is edited. Personal calendars may intentionally allow overlaps.\n\n```text\nevent(id,start_instant,end_instant,zone,recurrence_rule,version); occurrence_override(event_id,original_start,status); invitation(event_id,attendee,response)\n```\n\n### End-to-end execution trace\n\nValidate organizer permissions and interval; expand only the requested recurrence horizon; check resource conflicts; save event and invitation intent atomically; notify after commit; track accept/decline responses with versions; apply single-occurrence overrides separately.\n\n### Concurrency and recovery walkthrough\n\nTwo organizers reserve one room for overlapping intervals. An authoritative room-schedule lock or range exclusion constraint decides the winner. Availability lookup alone is advisory.\n\n### Policy choices and extension seams\n\nPersisting local recurrence rule plus zone preserves a recurring 09:00 meeting across daylight-saving changes. Persisting only UTC repetitions can shift local time. Strategy can rank suggested slots; it must not bypass room constraints.\n\n### Edge cases that change the design\n\nA daylight-saving gap may make a local time nonexistent, while an overlap makes it ambiguous. Choose and display a resolution policy. Half-open intervals allow back-to-back meetings. All-day events should use dates rather than pretending every day is exactly 24 hours.\n\n**Topic-specific cases:** Adjacent slots; room conflict; personal overlap policy; daylight-saving gap/overlap; single-occurrence edit; duplicate invitation; unauthorized calendar access.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through edits and concurrency\n\nTwo organizers can race for an empty room. A preflight availability search is useful but cannot establish the reservation. The room's transaction/interval constraint decides. Changing room or time should release the old reservation only if acquiring the new one succeeds atomically under the chosen storage design.\n\nEditing one occurrence creates an exception; editing “this and future” may split the recurring series. Expanding an infinite series into database rows is impossible, so use a bounded scheduling horizon and extend it with conflict handling. Version invitations so late responses to an old time do not overwrite responses to the replacement event.\n\n## 6. Interviewer follow-ups\n\n**Does a declined attendee response free the room?** No. The organizer's event owns it until cancellation or modification.\n\n**Does storing UTC solve recurrence?** It solves concrete instants, not recurring local-time intent.\n\n## 7. Closing answer\n\nI separate event intent, dated occurrences and exclusive room allocation. Half-open intervals define conflicts, timezone-aware recurrence preserves local intent, and versioned edits acquire replacement reservations before releasing old ones. Invitation responses cannot silently alter room ownership.\n"
+      "markdown": "## Problem\n\nDesign a calendar and meeting scheduler like Google Calendar. Asha wants a 45-minute meeting with Bilal and Chetan tomorrow in the Kaveri room. The system should show conflicts, never double-book the room, and suggest the first time all three are free.\n\nBilal's weekly standup is \"every Monday 9:00 New York time\" – which is 18:30 in Bengaluru one week and 19:30 the next, when US clocks change. Time zones are where calendar designs usually break.\n\n## Requirements\n\n- Create events with an organiser, attendees, a time slot and optionally a room.\n- A room can never be booked for two overlapping events.\n- Show a person's conflicts for a proposed time.\n- Find the earliest slot of a given length when all attendees are free.\n- Support weekly recurring events in the organiser's time zone.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Can people be double-booked?\n\n**Interviewer:** Yes – show a warning, but let them decide. Rooms can't be.\n\n**Candidate:** Do we need free-slot suggestions?\n\n**Interviewer:** Yes: \"first 45 minutes when everyone's free between 9:30 and 18:00\".\n\n**Candidate:** Recurring events?\n\n**Interviewer:** Weekly is enough for now.\n\n**Candidate:** Attendees in different time zones?\n\n**Interviewer:** Yes – the team is in Bengaluru and New York.\n\n**Candidate:** Is a meeting ending at 11:00 a conflict with one starting at 11:00?\n\n**Interviewer:** No, back-to-back is fine.\n\n> **🎯 In the interview**\n> Settle three rules early: are slots half-open (end exclusive), can people be double-booked, and in which time zone does a recurring event repeat.\n\n| Functional | Non-functional |\n| --- | --- |\n| Create events, rooms, attendees | Rooms never double-booked |\n| Conflicts and free-slot search | Correct across time zones and DST |\n| Weekly recurrence | Fast enough for a day's view |\n\n## Step 2: Identify the core objects\n\n- **Slot** – a time range `[start, end)` stored as `Instant`s.\n- **Event** – title, organiser, attendees, slot, optional room.\n- **WeeklyRule** – day of week, local start time, length and **time zone**; expands into slots.\n- **CalendarService** – schedules events, checks room clashes, finds conflicts and free slots.\n\n[![Selected design: a scheduling request goes to the calendar service, which checks the room's events for overlaps, stores the event on every attendee's calendar, reports personal conflicts, searches merged busy times for the first common free slot, and expands weekly rules using a time zone.](designs/lld-20.svg)](designs/lld-20.svg)\n\n> **⚖️ Design choice**\n> Store every slot as an **`Instant`** (a point on the global timeline) and keep the **time zone with the rule**, not with the stored times. Comparisons are then always correct; local times appear only when displaying or expanding a rule.\n\n## Step 3: Design the classes\n\n### Slot\n\nTwo instants with `overlaps(other)`: `start < other.end && other.start < end`. Because the end is exclusive, 10:00–11:00 and 11:00–11:30 don't overlap.\n\n### Event\n\nAn immutable record with the attendees and the optional room.\n\n### WeeklyRule\n\nTurns \"every Monday 09:00 in America/New_York\" into real instants week by week, letting Java's time zone rules handle daylight saving.\n\n### CalendarService\n\nKeeps events by person and by room. `schedule` refuses room overlaps; `conflictsFor` lists a person's overlapping events; `firstCommonFree` finds the earliest gap.\n\n[![Class diagram: CalendarService keeps Events by person and by room; each Event has a Slot of two Instants, an organiser, attendees and an optional room; WeeklyRule has a day, a local start time, a length and a ZoneId and produces Slots.](learning-figures/lld-20-classes.svg)](learning-figures/lld-20-classes.svg)\n\n## Step 4: Write the code\n\n### Slot and Event\n\n```java\n/** A time range [start, end). Stored as Instants so time zones can't confuse comparisons. */\nrecord Slot(Instant start, Instant end) {\n    Slot {\n        if (!start.isBefore(end)) throw new IllegalArgumentException(\"End before start\");\n    }\n    boolean overlaps(Slot o) { return start.isBefore(o.end) && o.start.isBefore(end); }\n}\n\nrecord Event(String id, String title, String organizer, Set<String> attendees,\n             Slot slot, String room) {}\n```\n\n### Weekly recurrence\n\n```java\n/** \"Every Monday 10:00–10:30 in Asia/Kolkata\", expanded into concrete slots. */\nrecord WeeklyRule(DayOfWeek day, LocalTime start, Duration length, ZoneId zone) {\n    List<Slot> occurrences(LocalDate from, int count) {\n        List<Slot> out = new ArrayList<>();\n        LocalDate d = from;\n        while (d.getDayOfWeek() != day) d = d.plusDays(1);\n        for (int i = 0; i < count; i++, d = d.plusWeeks(1)) {\n            Instant s = ZonedDateTime.of(d, start, zone).toInstant();  // local → instant\n            out.add(new Slot(s, s.plus(length)));\n        }\n        return out;\n    }\n}\n```\n\n### CalendarService\n\n```java\nclass CalendarService {\n    private final Map<String, List<Event>> byPerson = new HashMap<>();\n    private final Map<String, List<Event>> byRoom = new HashMap<>();\n    private int nextId = 1;\n\n    /** Rooms can't be double-booked; people get a warning-free invite (they decide). */\n    synchronized Event schedule(String title, String organizer, Set<String> attendees,\n                                Slot slot, String room) {\n        if (room != null && byRoom.getOrDefault(room, List.of()).stream()\n                .anyMatch(e -> e.slot().overlaps(slot)))\n            throw new IllegalStateException(room + \" is already booked then\");\n        Event e = new Event(\"EV-\" + nextId++, title, organizer, Set.copyOf(attendees),\n                slot, room);\n        Set<String> everyone = new HashSet<>(attendees);\n        everyone.add(organizer);\n        everyone.forEach(p -> byPerson.computeIfAbsent(p, k -> new ArrayList<>()).add(e));\n        if (room != null) byRoom.computeIfAbsent(room, k -> new ArrayList<>()).add(e);\n        return e;\n    }\n\n    List<Event> conflictsFor(String person, Slot slot) {\n        return byPerson.getOrDefault(person, List.of()).stream()\n                .filter(e -> e.slot().overlaps(slot)).toList();\n    }\n\n    /** Earliest gap of `length` inside `window` when everyone is free. */\n    Optional<Slot> firstCommonFree(Set<String> people, Slot window, Duration length) {\n        List<Slot> busy = people.stream()\n                .flatMap(p -> byPerson.getOrDefault(p, List.of()).stream())\n                .map(Event::slot)\n                .filter(s -> s.overlaps(window))\n                .sorted(Comparator.comparing(Slot::start))\n                .toList();\n        Instant cursor = window.start();\n        for (Slot b : busy) {\n            if (!cursor.plus(length).isAfter(b.start()))            // gap before this meeting\n                return Optional.of(new Slot(cursor, cursor.plus(length)));\n            if (b.end().isAfter(cursor)) cursor = b.end();          // skip past this meeting\n        }\n        Instant end = cursor.plus(length);\n        if (end.isAfter(window.end())) return Optional.empty();\n        return Optional.of(new Slot(cursor, end));\n    }\n}\n```\n\n### Worked example\n\nWednesday 28 Oct 2026, times in IST.\n\n| Step | Request | Result |\n| --- | --- | --- |\n| 1 | Asha: Design review 10:00–11:00 with Bilal, room Kaveri | Booked |\n| 2 | Bilal: 1:1 with Chetan 11:30–12:00, no room | Booked |\n| 3 | Chetan: Standup 10:30–10:45 in Kaveri | **Refused** – Kaveri busy |\n| 4 | Bilal's conflicts for 10:30–11:45 | 2 (design review, 1:1) |\n| 5 | Bilal's conflicts for 11:00–11:30 | none – back-to-back is fine |\n| 6 | First common 45 min, 09:30–18:00 | **12:00–12:45** (09:30–10:00 is only 30 min) |\n| 7 | First common 30 min | **09:30–10:00** |\n| 8 | Weekly standup, Mon 09:00 New York | 26 Oct → 18:30 IST; 2 Nov → **19:30 IST** (US clocks changed) |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| End before start | Rejected |\n| Meeting spanning midnight | Fine – instants don't care about dates |\n| No common gap in the window | `Optional.empty()` |\n| Organiser not in attendees | Added to the organiser's calendar anyway |\n\n## Step 5: The free-slot algorithm\n\nTo find the first gap of 45 minutes for Asha, Bilal and Chetan:\n\n1. Collect everyone's busy slots inside the window and **sort them by start**: 10:00–11:00, 10:00–11:00, 11:30–12:00, 11:30–12:00.\n2. Start a cursor at the window start, 09:30.\n3. For each busy slot: if `cursor + 45 min` fits before it starts, that's the answer. Otherwise move the cursor to the end of that busy slot (if later).\n4. 09:30 + 45 = 10:15 > 10:00 → no; cursor → 11:00. 11:45 > 11:30 → no; cursor → 12:00.\n5. No more meetings: 12:00–12:45 fits inside the window → answer.\n\nThis is the classic \"merge intervals\" idea: sort once, sweep once – O(n log n).\n\n![Animation: busy meetings for three people are sorted on a timeline; a cursor starts at 9:30 and needs 45 minutes; the gap before 10:00 is too short so the cursor jumps to 11:00; the gap before 11:30 is too short so it jumps to 12:00; there the 45-minute slot from 12:00 to 12:45 fits.](learning-figures/lld-20-freeslot.gif)\n\n> **⚠️ Common mistake**\n> Storing recurring events as \"UTC 13:00 every Monday\". When the organiser's country changes its clocks, the meeting silently moves by an hour in their own time. Store the local time **and** the zone ID, and expand with time-zone rules.\n\n> **🎯 In the interview**\n> Room booking across servers needs the same atomic check as any booking: a database exclusion constraint (PostgreSQL `EXCLUDE USING gist` on room + time range) makes overlapping room bookings impossible.\n\n## Step 6: Deep dives\n\n### Invitations and responses\n\nAdd an `Invitation` per attendee with status (pending, accepted, declined, tentative). Free-slot search can ignore events the person declined.\n\n### Full recurrence rules\n\nReal calendars use iCalendar RRULEs (\"every 2nd Tuesday\", \"last weekday of the month\") and exceptions (\"skip 25 Dec\", \"move this one to 11:00\"). Store the rule plus a list of exceptions, and expand only the range being viewed.\n\n### Fast day and week views\n\nKeep each person's events in a sorted structure (a `TreeMap` by start, or a database index on (person, start)), so \"events this week\" is a range query.\n\n### Working hours and time zones per person\n\nEach user has a zone and working hours; the free-slot search intersects the window with every attendee's working hours, converted to instants.\n\n## Interviewer follow-ups\n\n**Why half-open intervals?** So back-to-back meetings don't conflict and adjacent slots tile perfectly with no gaps or overlaps.\n\n**Why not store local date-times?** \"10:00\" means different moments in Bengaluru and New York. Instants are unambiguous; local times are for display and for rules.\n\n**How do you handle a 500-person all-hands?** Store the event once and reference it from attendees, rather than copying it 500 times; free-slot search for 500 people is rarely needed.\n\n**How would you suggest several options, not just the first?** Keep sweeping after the first match and collect up to N gaps, maybe preferring mid-morning.\n\n## Wrap up\n\nSlots are half-open ranges of instants; rooms are protected by an overlap check; free slots come from sorting busy times and sweeping; recurring events keep their local time and zone and are expanded with time-zone rules.\n\n> **📝 Key takeaways**\n> - Store instants; keep the zone with the recurrence rule.\n> - Half-open intervals: back-to-back is not a conflict.\n> - Rooms are booked atomically; people may be double-booked with a warning.\n> - Free-slot search = sort busy slots, sweep with a cursor.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [CalendarDemo.java](reference-code/learning/kb/calendar/CalendarDemo.java). It replays the worked example, including the New York daylight-saving change, and checks every result.\n\n[![Expand recurring occurrences using a timezone identifier and policy.](lessons/lld-20-failure.svg)](lessons/lld-20-failure.svg)\n\n## Closing answer\n\n\"A Slot is a half-open range of two Instants, so comparisons are time-zone-proof and back-to-back meetings don't conflict. An Event has an organiser, attendees, a slot and an optional room. The CalendarService indexes events by person and by room: scheduling refuses any overlap in the room – across servers that's a database exclusion constraint – while personal overlaps are shown as conflicts. To find a common free slot I collect everyone's busy slots in the window, sort them by start and sweep a cursor until a gap of the required length fits. Recurring events store the local time and the zone ID and are expanded with Java's time-zone rules, so a 9:00 New York standup correctly moves from 18:30 to 19:30 in India when US clocks change.\"\n"
     },
     {
       "category": "HLD",

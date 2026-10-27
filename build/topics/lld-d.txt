@@ -565,303 +565,554 @@ The complete, runnable code is [TrainBookingDemo.java](reference-code/learning/k
 "A TrainRun is one train on one date with a route of stops; segment i runs from stop i to stop i+1, so a journey is a range of segments. Each Seat records which booking holds each segment, so the same seat can be sold Bengaluru–Jolarpettai to Asha and Jolarpettai–Chennai to Bilal. Booking finds seats free on every segment of the journey for every passenger; if there aren't enough, nothing is held and the booking joins a first-come waitlist. Cancelling releases that booking's segments and re-checks the waitlist in order. Booking and cancelling are atomic per train run – in a database, one conditional transaction on the seat-segment rows."
 
 === LLD 19 ===
-N|n0|Order|0|0|200|rect
-N|n1|OrderLine|250|0|200|rect
-N|n2|InventoryReservation|500|0|200|rect
-N|n3|Shipment|0|110|200|rect
-N|n4|PaymentIntent|250|110|200|rect
-N|n5|Return|500|110|200|rect
-N|n6|Outbox|0|220|200|rect
-E|n0|n1|owns
-E|n1|n2|reserves
-E|n1|n3|fulfilled by
-E|n0|n4|collects through
-E|n3|n5|can produce
-E|n0|n6|publishes events
+N|order|Order|0|0|110|rect
+N|lines|Order lines (units)|170|0|180|rect
+N|ship|Shipment per seller|400|0|180|rect
+N|cancel|Cancel pending units|170|130|190|rect
+N|refund|Refunds|400|130|120|cylinder
+N|status|Derived status|0|130|150|rect
+E|order|lines|has
+E|lines|ship|pack pending units
+E|cancel|lines|only pending
+E|cancel|refund|units × price
+E|lines|status|count units
+E|ship|status|delivered?|dashed
 ---
 ## Problem
 
-Design Amazon's order management: from a cart, create an order that may hold items from several sellers and warehouses; reserve inventory, take payment, split into shipments, track each shipment, and support cancellation and returns. It brings together a **State machine**, **Observer** and **Strategy** (fulfilment and payment), plus consistency across inventory and payment.
+Design order management for a marketplace like Amazon. Asha orders headphones and 3 USB-C cables from the seller SoundHub, and 4 notebooks from PaperCo, in one checkout. Before anything ships she cancels one cable. SoundHub and PaperCo then send separate parcels, and later she returns one notebook.
+
+One "order" is really several things moving at different speeds. The design must track every unit – ordered, cancelled, shipped, returned – and show an order status that is always consistent with them.
 
 ## Requirements
 
-**Functional**
-- Place an order: validate the cart, reserve inventory, charge, confirm.
-- Split into shipments by warehouse and seller, each with its own lifecycle.
-- Cancel (fully or one item) before shipping. Return and refund after delivery.
-- Notify the customer on every change.
+- An order has lines (product, seller, quantity, price) from one or more sellers.
+- Each seller ships its own parcel (shipment); an order can be partly shipped.
+- Customers can cancel units that haven't shipped, and return units that have.
+- Refunds match exactly the units cancelled or returned.
+- The order's status is always consistent with its lines and shipments.
 
-**Non-functional**
-- No overselling and no double charging: inventory reservation and payment stay consistent, and order placement is idempotent.
-- State changes follow the order lifecycle only, with a full audit history.
-- Handles sale-day peaks: high write throughput, with notifications sent asynchronously.
-- New payment methods and fulfilment types plug in without rewriting order flow.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Can one order contain items from several sellers?
 
-I support multi-line orders with split shipments, cancellation before dispatch and returns after delivery. An Order owns accepted terms; each line tracks quantities; warehouse and payment integrations have stable operation references. I choose quantity accounting rather than a single SHIPPED flag.
+**Interviewer:** Yes. Each seller ships separately.
 
-## 2. Commands and conservation
+**Candidate:** Can a customer cancel part of a line – one of three cables?
 
-```text
-submit(checkoutId,acceptedQuote) -> Order
-reserve(lineId,reservationId,quantity)
-ship(eventId,lineId,shipmentId,quantity)
-cancel(commandId,lineId,quantity)
-returnItem(returnId,lineId,quantity,evidence)
-Invariant: cancelled + shipped <= ordered; returned <= shipped
+**Interviewer:** Yes, as long as those units haven't shipped.
+
+**Candidate:** After shipping?
+
+**Interviewer:** Then it's a return, not a cancellation.
+
+**Candidate:** What statuses does the customer see?
+
+**Interviewer:** Placed, partly shipped, shipped, delivered, cancelled.
+
+**Candidate:** Do we design payment and warehouses too?
+
+**Interviewer:** No – assume payment is done; focus on lines, shipments and statuses.
+
+> **🎯 In the interview**
+> Ask about partial cancellation early. It tells you that status belongs to **units**, not just to the whole order.
+
+| Functional | Non-functional |
+| --- | --- |
+| Lines from many sellers | Units never double-counted (cancelled *and* shipped) |
+| Shipments per seller | Refund = exactly the units cancelled or returned |
+| Cancel, return, track | Status never contradicts the details |
+
+## Step 2: Identify the core objects
+
+- **Order** – a customer, its lines, its shipments and refunds.
+- **OrderLine** – a product from one seller: ordered quantity, unit price, and how many units are shipped, cancelled and returned.
+- **Shipment** – one seller's parcel: which lines and how many units, plus its status.
+- **ShipmentStatus** – created, dispatched, delivered.
+- **OrderStatus** – placed, partly shipped, shipped, delivered, cancelled – **calculated**, not stored.
+
+[![Selected design: an order holds lines from several sellers; each line splits its units into pending, shipped and cancelled; pending units are packed into one shipment per seller; cancellations and returns produce refunds per unit; the order status is calculated from the lines and shipments.](designs/lld-19.svg)](designs/lld-19.svg)
+
+> **⚖️ Design choice**
+> **Derive the order status** from lines and shipments instead of storing it. A stored status can drift ("SHIPPED" while a cable is still pending); a calculated one can't.
+
+## Step 3: Design the classes
+
+### OrderLine
+
+Keeps the invariant: `ordered = pending + shipped + cancelled`. You can cancel only pending units and return only shipped (not yet returned) units.
+
+### Shipment
+
+One per seller per dispatch. It records how many units of each line it carries and its delivery status.
+
+### Order
+
+`planShipments` groups pending units by seller into new shipments. `cancel(sku, qty)` cancels units and adds to the refund. `status()` computes the customer-facing status.
+
+[![Class diagram: an Order has OrderLines and Shipments; each Shipment carries units of OrderLines and has a ShipmentStatus; the Order calculates an OrderStatus; each OrderLine tracks ordered, shipped, cancelled and returned units.](learning-figures/lld-19-classes.svg)](learning-figures/lld-19-classes.svg)
+
+## Step 4: Write the code
+
+### OrderLine
+
+```java
+/** One product in an order. Its units are split across pending, shipped and cancelled. */
+class OrderLine {
+    final String sku, seller;
+    final int ordered;
+    final long unitPricePaise;
+    private int shipped, cancelled, returned;
+
+    OrderLine(String sku, String seller, int qty, long unitPricePaise) {
+        this.sku = sku; this.seller = seller; this.ordered = qty;
+        this.unitPricePaise = unitPricePaise;
+    }
+    int pending()   { return ordered - shipped - cancelled; }   // always >= 0
+    int shipped()   { return shipped; }
+    int cancelled() { return cancelled; }
+
+    void ship(int n) {
+        if (n > pending()) throw new IllegalStateException("Only " + pending() + " to ship");
+        shipped += n;
+    }
+    long cancel(int n) {
+        if (n > pending()) throw new IllegalStateException("Only " + pending() + " left");
+        cancelled += n;
+        return n * unitPricePaise;                                // refund
+    }
+    long returnUnits(int n) {
+        if (n > shipped - returned) throw new IllegalStateException("Nothing to return");
+        returned += n;
+        return n * unitPricePaise;
+    }
+}
 ```
 
-Every line transition locks its current version, checks remaining eligible quantity, deduplicates the operation/event and commits quantity plus outbox fact. For ordered 3, cancelled 1 and shipped 2, remaining-to-fulfil is zero. A repeated shipment event cannot increment shipped again. Cancellation racing dispatch competes for the same remaining units; the loser becomes a rejection or a return workflow. Capture-per-shipment and refunds reference actual captured amounts; a never-captured authorization is released instead of refunded. Returns append evidence without deleting original shipment history.
+### Shipment
 
-## 3. Final design diagram
+```java
+enum ShipmentStatus { CREATED, DISPATCHED, DELIVERED }
 
-[![Design Amazon Order Management: Order owns OrderLine; OrderLine reserves InventoryReservation; OrderLine fulfilled by Shipment; Order collects through PaymentIntent; Shipment can produce Return; Order publishes events Outbox](designs/lld-19.svg)](designs/lld-19.svg)
+/** What one seller sends in one parcel. */
+class Shipment {
+    final String id, seller;
+    final Map<OrderLine, Integer> units = new LinkedHashMap<>();
+    ShipmentStatus status = ShipmentStatus.CREATED;
 
-Separate the **order** from its **lines**, **inventory reservations**, **shipments** and **payment operations**. An order summarizes the commercial agreement; fulfilment facts belong at the line/quantity level. I start with one transactional order store and explicit integrations.
-
-## 4. Critical operation: worked execution
-
-![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)
-
-*Ordered quantities are partitioned across fulfilment outcomes.*
-
-![A line cannot be both newly cancelled and dispatched for the same units.](lessons/lld-19-failure.svg)
-
-*A line cannot be both newly cancelled and dispatched for the same units.*
-
-### Worked calculation and implementation
-
-For an order line with quantity 3, track ordered, cancelled, shipped and returned quantities explicitly. If one unit is cancelled and two ship, fulfilment is complete even though shipped quantity is less than the original three. Returns refer to shipped units and do not rewrite the original order quantity.
-
-```text
-OrderLine: ordered=3, cancelled=1, shipped=2, returned=0
-Constraints: cancelled + shipped <= ordered
-             returned <= shipped
-Remaining to fulfil = ordered - cancelled - shipped = 0
+    Shipment(String id, String seller) { this.id = id; this.seller = seller; }
+}
 ```
 
-## 5. Detailed decisions, algorithms and failure behaviour
+### Order
 
-### Key abstractions
+```java
+enum OrderStatus { PLACED, PARTLY_SHIPPED, SHIPPED, DELIVERED, CANCELLED }
 
-| Type | Responsibility |
-|---|---|
-| `Order` | id, customer, `List<OrderLine>`, payment, status, address snapshot |
-| `OrderLine` | product, seller, qty, price snapshot, line status |
-| `OrderState` | `CREATED → PAYMENT_PENDING → CONFIRMED → PARTIALLY_SHIPPED → SHIPPED → DELIVERED`; `CANCELLED`, `RETURN_REQUESTED → RETURNED` |
-| `Shipment` | lines, warehouse, carrier, tracking; `PACKED → SHIPPED → OUT_FOR_DELIVERY → DELIVERED` |
-| `FulfilmentStrategy` | Nearest warehouse, fewest shipments, cheapest |
-| `InventoryService` | `reserve(lines, ttl)`, `commit`, `release` |
-| `OrderEventPublisher` | Observer hub: `OrderConfirmed`, `ShipmentDelivered`, … |
+class Order {
+    final String id, customer;
+    final List<OrderLine> lines;
+    final List<Shipment> shipments = new ArrayList<>();
+    private long refundedPaise;
 
-### Design decisions & trade-offs
+    Order(String id, String customer, List<OrderLine> lines) {
+        this.id = id; this.customer = customer; this.lines = List.copyOf(lines);
+    }
 
-**1. Order status is derived from shipments and lines.** With partial shipping, an order is "shipped" only when all shipments are. Derive aggregate status from children rather than setting it independently. That prevents contradictions like "order DELIVERED, shipment still in transit".
+    /** One shipment per seller for everything not yet shipped or cancelled. */
+    List<Shipment> planShipments() {
+        Map<String, List<OrderLine>> bySeller = lines.stream().filter(l -> l.pending() > 0)
+                .collect(Collectors.groupingBy(l -> l.seller, LinkedHashMap::new,
+                        Collectors.toList()));
+        List<Shipment> created = new ArrayList<>();
+        bySeller.forEach((seller, ls) -> {
+            Shipment s = new Shipment(id + "-S" + (shipments.size() + 1), seller);
+            ls.forEach(l -> { s.units.put(l, l.pending()); l.ship(l.pending()); });
+            shipments.add(s);
+            created.add(s);
+        });
+        return created;
+    }
 
-**2. Transactional flow as a saga.** Reserve inventory (with a TTL), then charge payment, then commit inventory and confirm. On payment failure, release the inventory. Each step has a compensating action, so you can explain it without a distributed transaction.
+    long cancel(String sku, int qty) {
+        long refund = line(sku).cancel(qty);
+        refundedPaise += refund;
+        return refund;
+    }
 
-**3. Observer for side effects.** The state machine publishes events. Email, SMS, loyalty points and analytics subscribe. Adding "notify the seller" doesn't touch `Order`.
+    /** The status is derived from the lines and shipments, never set by hand. */
+    OrderStatus status() {
+        int pending = lines.stream().mapToInt(OrderLine::pending).sum();
+        int shipped = lines.stream().mapToInt(OrderLine::shipped).sum();
+        if (shipped == 0) return pending == 0 ? OrderStatus.CANCELLED : OrderStatus.PLACED;
+        if (pending > 0) return OrderStatus.PARTLY_SHIPPED;
+        boolean allDelivered = shipments.stream()
+                .allMatch(s -> s.status == ShipmentStatus.DELIVERED);
+        return allDelivered ? OrderStatus.DELIVERED : OrderStatus.SHIPPED;
+    }
 
-**4. Snapshots.** Copy price, title and address into the order. Later catalogue or address edits must not rewrite history.
-
-**5. Guarded transitions.** `cancel()` is legal only before `SHIPPED` (per line). A transition table plus `canTransition(from, to)` stops illegal moves, and an optimistic version field handles concurrent updates such as a warehouse "packed" racing a customer "cancel".
-
-### Ownership, boundaries and invariants
-
-**Central design question:** An order is a durable commercial record whose fulfillment and payment can progress independently.
-
-Order snapshots buyer, lines, address, currency and totals. OrderLine references a purchased SKU snapshot. InventoryReservation, PaymentAttempt and Shipment carry separate lifecycle state. OrderCoordinator applies business policy; TaxPolicy and ShippingPolicy return deterministic quotes.
-
-**Correctness rule:** The total equals the sum of immutable line amounts, tax, discounts and delivery under a defined rounding policy. A shipment cannot exceed purchased quantities, and retries cannot create a second paid order.
-
-```text
-orders(id,request_key,total_minor,status,version); line(id,qty,shipped_qty,cancelled_qty); shipment; payment_attempt; refund
+    OrderLine line(String sku) {
+        return lines.stream().filter(l -> l.sku.equals(sku)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("No line " + sku));
+    }
+    long refunded() { return refundedPaise; }
+}
 ```
 
-### End-to-end execution trace
+### Worked example
 
-Validate quote; reserve inventory; create a pending order; authorize payment; confirm or compensate stock; capture according to fulfillment policy; split into shipments; record delivery; process partial refunds as separate auditable records.
+Prices in paise: headphones ₹2,499, cable ₹399, notebook ₹120.
 
-### Concurrency and recovery walkthrough
+| Step | Action | Effect | Order status |
+| --- | --- | --- | --- |
+| 1 | Asha places the order | 1 headphones + 3 cables (SoundHub), 4 notebooks (PaperCo) | PLACED |
+| 2 | Cancel 1 cable | Refund ₹399; 2 cables pending | PLACED |
+| 3 | Plan shipments | SoundHub parcel: headphones + 2 cables; PaperCo parcel: 4 notebooks | SHIPPED |
+| 4 | Cancel 1 notebook | Refused – it's in a parcel | SHIPPED |
+| 5 | Return 1 notebook | Refund ₹120 | SHIPPED |
+| 6 | SoundHub parcel delivered | PaperCo still on the way | SHIPPED |
+| 7 | PaperCo parcel delivered | All parcels delivered | DELIVERED |
+| – | Bilal cancels both notebooks of his order | Refund ₹240, nothing to ship | CANCELLED |
 
-Cancellation crosses shipment handoff. Compare order-line fulfillment quantities and cancel only unshipped units; compensation may become return/refund after the boundary. Late payment callbacks are deduplicated and reconciled.
+### Edge cases
 
-### Policy choices and extension seams
+| Case | Behaviour |
+| --- | --- |
+| Cancel more units than are pending | Refused |
+| Return more than shipped | Refused |
+| Unknown SKU | Refused |
+| Everything cancelled | Status CANCELLED, full refund |
 
-One giant enum for every shipment/payment combination becomes unmaintainable. Separate state axes plus invariants give clearer composition. Saga coordination belongs in application logic, not in every OrderLine getter.
+## Step 5: The status algorithm: count units, then decide
 
-### Edge cases that change the design
+`status()` follows a small decision list:
 
-Two warehouses can partially fulfill one order. Refund arithmetic must account for prorated discounts and taxes. A retry with a reused idempotency key and changed cart payload is a conflict.
+1. Nothing shipped and nothing pending → **CANCELLED**.
+2. Nothing shipped, something pending → **PLACED**.
+3. Something shipped, something still pending → **PARTLY_SHIPPED**.
+4. All non-cancelled units shipped: all parcels delivered → **DELIVERED**, otherwise **SHIPPED**.
 
-**Topic-specific cases:** Duplicate checkout; inventory compensation; partial shipment; cancellation boundary; duplicate webhook; partial refund conservation; immutable price snapshots.
+Because each unit is in exactly one bucket (pending, shipped or cancelled), the status can't contradict the lines.
 
-### Further reading
+![Animation: Asha's order starts with headphones, three cables and four notebooks; one cable is cancelled and refunded; the remaining units are packed into a SoundHub parcel and a PaperCo parcel; a notebook cancellation is refused because it is already in a parcel and becomes a return; when both parcels are delivered the order status becomes delivered.](learning-figures/lld-19-units.gif)
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+> **⚠️ Common mistake**
+> One status field on the order, updated by whoever touched it last. A seller dispatch and a customer cancellation arriving together can leave the order saying "CANCELLED" while a parcel is on its way. Track units per line and derive the status.
 
-### Work through integration failures
+> **🎯 In the interview**
+> With many services, the cancel and the warehouse pick can race. Make "cancel pending units" a conditional update (`pending >= qty`) on the line, the same row the warehouse updates when it packs units – only one can take the last unit.
 
-A duplicate warehouse event must not increment `shipped` twice. Use event identity and the line's legal remaining quantity. A reservation timeout that later succeeds needs reconciliation by reservation reference, especially if another warehouse was already asked to fulfil the same item.
+## Step 6: Deep dives
 
-Payments follow capture policy: authorize at order placement, perhaps capture per shipment. Refunds must reference captured amounts; a cancelled, never-captured line may need authorization release rather than a refund. Store the financial evidence instead of inferring it from shipping status.
+### Several warehouses per seller
 
-## 6. Interviewer follow-ups
+Group pending units by **(seller, warehouse)** instead of seller. One seller can then send two parcels from Bengaluru and Delhi.
 
-**Can an order be completed with a cancelled line?** Yes, if every unit has a final documented fulfilment disposition.
+### Payments and refunds
 
-**Should a return delete a shipment?** No. The shipment happened; the return is a later event.
+Store each refund as its own record (order, line, units, amount, reason). Refunds are always calculated from units × unit price, so partial refunds are exact.
 
-## 7. Closing answer
+### Return pickup and inspection
 
-I make fulfilment quantitative at order-line level and derive the order summary. Immutable commercial snapshots, versioned quantity transitions and idempotent warehouse events preserve partial shipments, cancellations and returns. Financial capture/refund follows actual recorded fulfilment policy rather than one overloaded status.
+A return has its own small state machine: requested → picked up → inspected → refunded (or rejected). Refund only after inspection if the policy says so.
+
+### Notifications and tracking
+
+Each shipment status change publishes an event; the customer sees per-parcel tracking, while the order status summarises them.
+
+## Interviewer follow-ups
+
+**Why not split the order into one order per seller at checkout?** The customer thinks of one order and one payment. Keep one order; split into shipments underneath.
+
+**Why derive status instead of storing it?** It can't get out of sync. If reading it is expensive, store a cached copy updated in the same transaction as the lines.
+
+**How do you handle a seller who can't fulfil?** Cancel those units on the seller's side – same `cancel` on pending units, with reason "seller unavailable" and an automatic refund.
+
+**How would you scale it?** Orders partitioned by customer; shipments also indexed by seller for seller dashboards; events to analytics and notifications.
+
+## Wrap up
+
+An order is lines of units from many sellers; units are pending, shipped or cancelled; pending units become per-seller shipments; refunds follow units; and the order status is calculated from all of that.
+
+> **📝 Key takeaways**
+> - Track units per line: ordered = pending + shipped + cancelled.
+> - Cancel only pending units; after shipping it's a return.
+> - One shipment per seller (or warehouse).
+> - Derive the order status so it can't contradict the details.
+
+## Going deeper (optional)
+
+The complete, runnable code is [OrderManagementDemo.java](reference-code/learning/kb/ordermgmt/OrderManagementDemo.java). It replays the worked example and checks every result.
+
+[![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)](lessons/lld-19-flow.svg)
+
+## Closing answer
+
+"An Order holds OrderLines – product, seller, quantity and unit price – and each line splits its units into pending, shipped and cancelled, with returns tracked against shipped units, so a unit is never counted twice. Customers can cancel only pending units, and the refund is units times price. Pending units are grouped by seller into Shipments, each with its own delivery status. The order's status – placed, partly shipped, shipped, delivered or cancelled – is calculated from the lines and shipments rather than stored, so it can't contradict them. Across services, cancelling and packing use a conditional update on the line so only one can take the last unit."
 
 === LLD 20 ===
-N|n0|CalendarService|0|0|200|rect
-N|n1|Event|250|0|200|rect
-N|n2|Occurrence|500|0|200|rect
-N|n3|RoomReservation|0|110|200|rect
-N|n4|RecurrenceRule|250|110|200|rect
-N|n5|Invitation|500|110|200|rect
-N|n6|ConflictPolicy|0|220|200|rect
-E|n0|n1|owns edits
-E|n1|n2|expands into
-E|n2|n3|claims
-E|n1|n4|defined by
-E|n1|n5|versions
-E|n3|n6|checks intervals
+N|req|Schedule request|0|0|160|rect
+N|svc|CalendarService|210|0|160|rect
+N|room|Room bookings|420|0|150|cylinder
+N|people|Events by person|420|130|160|cylinder
+N|free|Free-slot sweep|210|130|150|rect
+N|rule|Weekly rule + zone|0|130|170|rect
+E|req|svc|attendees, slot, room
+E|svc|room|no overlap?
+E|svc|people|add to calendars
+E|free|people|busy slots
+E|rule|svc|expand to instants
 ---
 ## Problem
 
-Design a calendar and meeting scheduler like Google Calendar: create events, invite attendees, detect conflicts, find free slots common to all attendees, book rooms, and handle recurring meetings and RSVPs. The core is **interval algorithms** (overlap detection and free-slot search) plus **concurrency** when two people book the same room.
+Design a calendar and meeting scheduler like Google Calendar. Asha wants a 45-minute meeting with Bilal and Chetan tomorrow in the Kaveri room. The system should show conflicts, never double-book the room, and suggest the first time all three are free.
+
+Bilal's weekly standup is "every Monday 9:00 New York time" – which is 18:30 in Bengaluru one week and 19:30 the next, when US clocks change. Time zones are where calendar designs usually break.
 
 ## Requirements
 
-**Functional**
-- Create, update and cancel meetings with attendees, a time range, a room and an optional recurrence.
-- Detect conflicts for attendees and rooms. Suggest the earliest common free slot of length D.
-- RSVP (accept, decline, tentative). Notifications and reminders.
+- Create events with an organiser, attendees, a time slot and optionally a room.
+- A room can never be booked for two overlapping events.
+- Show a person's conflicts for a proposed time.
+- Find the earliest slot of a given length when all attendees are free.
+- Support weekly recurring events in the organiser's time zone.
 
-**Non-functional**
-- A room can never be double-booked. Searching across many attendees must be fast.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Can people be double-booked?
 
-I schedule meetings with rooms, attendees and recurring local-time rules. Concrete occurrences store instants; recurring definitions store local time, ZoneId and an explicit gap/overlap policy. I materialize a bounded future horizon and extend it, avoiding an impossible infinite expansion.
+**Interviewer:** Yes – show a warning, but let them decide. Rooms can't be.
 
-## 2. Reservation and edit transaction
+**Candidate:** Do we need free-slot suggestions?
 
-```text
-create(eventId,organizer,start,end,room,attendees) -> EventVersion
-reschedule(eventId,expectedVersion,newInterval,newRoom) -> Version | Conflict
-respond(invitationId,eventVersion,attendee,answer) -> AttendanceState
-conflict(a,b) = a.start < b.end && b.start < a.end
+**Interviewer:** Yes: "first 45 minutes when everyone's free between 9:30 and 18:00".
+
+**Candidate:** Recurring events?
+
+**Interviewer:** Weekly is enough for now.
+
+**Candidate:** Attendees in different time zones?
+
+**Interviewer:** Yes – the team is in Bengaluru and New York.
+
+**Candidate:** Is a meeting ending at 11:00 a conflict with one starting at 11:00?
+
+**Interviewer:** No, back-to-back is fine.
+
+> **🎯 In the interview**
+> Settle three rules early: are slots half-open (end exclusive), can people be double-booked, and in which time zone does a recurring event repeat.
+
+| Functional | Non-functional |
+| --- | --- |
+| Create events, rooms, attendees | Rooms never double-booked |
+| Conflicts and free-slot search | Correct across time zones and DST |
+| Weekly recurrence | Fast enough for a day's view |
+
+## Step 2: Identify the core objects
+
+- **Slot** – a time range `[start, end)` stored as `Instant`s.
+- **Event** – title, organiser, attendees, slot, optional room.
+- **WeeklyRule** – day of week, local start time, length and **time zone**; expands into slots.
+- **CalendarService** – schedules events, checks room clashes, finds conflicts and free slots.
+
+[![Selected design: a scheduling request goes to the calendar service, which checks the room's events for overlaps, stores the event on every attendee's calendar, reports personal conflicts, searches merged busy times for the first common free slot, and expands weekly rules using a time zone.](designs/lld-20.svg)](designs/lld-20.svg)
+
+> **⚖️ Design choice**
+> Store every slot as an **`Instant`** (a point on the global timeline) and keep the **time zone with the rule**, not with the stored times. Comparisons are then always correct; local times appear only when displaying or expanding a rule.
+
+## Step 3: Design the classes
+
+### Slot
+
+Two instants with `overlaps(other)`: `start < other.end && other.start < end`. Because the end is exclusive, 10:00–11:00 and 11:00–11:30 don't overlap.
+
+### Event
+
+An immutable record with the attendees and the optional room.
+
+### WeeklyRule
+
+Turns "every Monday 09:00 in America/New_York" into real instants week by week, letting Java's time zone rules handle daylight saving.
+
+### CalendarService
+
+Keeps events by person and by room. `schedule` refuses room overlaps; `conflictsFor` lists a person's overlapping events; `firstCommonFree` finds the earliest gap.
+
+[![Class diagram: CalendarService keeps Events by person and by room; each Event has a Slot of two Instants, an organiser, attendees and an optional room; WeeklyRule has a day, a local start time, a length and a ZoneId and produces Slots.](learning-figures/lld-20-classes.svg)](learning-figures/lld-20-classes.svg)
+
+## Step 4: Write the code
+
+### Slot and Event
+
+```java
+/** A time range [start, end). Stored as Instants so time zones can't confuse comparisons. */
+record Slot(Instant start, Instant end) {
+    Slot {
+        if (!start.isBefore(end)) throw new IllegalArgumentException("End before start");
+    }
+    boolean overlaps(Slot o) { return start.isBefore(o.end) && o.start.isBefore(end); }
+}
+
+record Event(String id, String title, String organizer, Set<String> attendees,
+             Slot slot, String room) {}
 ```
 
-The room transaction serializes interval allocation and the event version change. A failed reschedule keeps the original reservation intact. 10:00–11:00 and 11:00–12:00 coexist; 10:30–11:30 conflicts. Editing one recurrence creates an exception; “this and future” splits the series under explicit identity/version rules. Responses to an old invitation version do not overwrite the new version's attendance. A 09:00 Europe/London weekly rule is re-expanded using timezone rules, not by adding a fixed UTC offset forever. Late notifications refer to event versions and cannot resurrect cancelled occurrences.
+### Weekly recurrence
 
-## 3. Final design diagram
-
-[![Design Calendar / Meeting Scheduler: CalendarService owns edits Event; Event expands into Occurrence; Occurrence claims RoomReservation; Event defined by RecurrenceRule; Event versions Invitation; RoomReservation checks intervals ConflictPolicy](designs/lld-20.svg)](designs/lld-20.svg)
-
-An **event** is a user's scheduling intent; an **occurrence** is one dated instance of a recurring event; a **resource reservation** claims a room over an interval. Separate personal invitations from the room's exclusive allocation.
-
-## 4. Critical operation: worked execution
-
-![Room ownership is decided independently of email invitations.](lessons/lld-20-flow.svg)
-
-*Room ownership is decided independently of email invitations.*
-
-![Expand recurring occurrences using a timezone identifier and policy.](lessons/lld-20-failure.svg)
-
-*Expand recurring occurrences using a timezone identifier and policy.*
-
-### Selected algorithm
-
-```text
-Overlap(a,b) = a.start < b.end AND b.start < a.end
-10:00-11:00 vs 11:00-12:00: no overlap
-10:00-11:00 vs 10:30-11:30: overlap
+```java
+/** "Every Monday 10:00–10:30 in Asia/Kolkata", expanded into concrete slots. */
+record WeeklyRule(DayOfWeek day, LocalTime start, Duration length, ZoneId zone) {
+    List<Slot> occurrences(LocalDate from, int count) {
+        List<Slot> out = new ArrayList<>();
+        LocalDate d = from;
+        while (d.getDayOfWeek() != day) d = d.plusDays(1);
+        for (int i = 0; i < count; i++, d = d.plusWeeks(1)) {
+            Instant s = ZonedDateTime.of(d, start, zone).toInstant();  // local → instant
+            out.add(new Slot(s, s.plus(length)));
+        }
+        return out;
+    }
+}
 ```
 
-Store instants for concrete occurrences and a `ZoneId` plus local rule for recurrence. Some local times are missing or duplicated during clock changes; choose a policy and show it to the organizer rather than silently shifting an important meeting.
+### CalendarService
 
-## 5. Detailed decisions, algorithms and failure behaviour
+```java
+class CalendarService {
+    private final Map<String, List<Event>> byPerson = new HashMap<>();
+    private final Map<String, List<Event>> byRoom = new HashMap<>();
+    private int nextId = 1;
 
-### Key abstractions
+    /** Rooms can't be double-booked; people get a warning-free invite (they decide). */
+    synchronized Event schedule(String title, String organizer, Set<String> attendees,
+                                Slot slot, String room) {
+        if (room != null && byRoom.getOrDefault(room, List.of()).stream()
+                .anyMatch(e -> e.slot().overlaps(slot)))
+            throw new IllegalStateException(room + " is already booked then");
+        Event e = new Event("EV-" + nextId++, title, organizer, Set.copyOf(attendees),
+                slot, room);
+        Set<String> everyone = new HashSet<>(attendees);
+        everyone.add(organizer);
+        everyone.forEach(p -> byPerson.computeIfAbsent(p, k -> new ArrayList<>()).add(e));
+        if (room != null) byRoom.computeIfAbsent(room, k -> new ArrayList<>()).add(e);
+        return e;
+    }
 
-| Type | Responsibility |
-|---|---|
-| `Interval` (record) | start, end (half-open `[s, e)`), `overlaps(other)` |
-| `Meeting` | id, organiser, attendees, interval, room, recurrence rule |
-| `Calendar` | Per user: `TreeMap<Instant, Meeting>` keyed by start |
-| `Room` + `RoomCalendar` | Same structure, plus capacity and features |
-| `ConflictChecker` | `hasConflict(calendar, interval)` in O(log n) |
-| `SlotFinder` | Merge busy intervals across attendees, scan the gaps |
-| `RecurrenceRule` | RRULE-like; expands occurrences lazily within a window |
-| `Invitation` | attendee, RSVP status |
+    List<Event> conflictsFor(String person, Slot slot) {
+        return byPerson.getOrDefault(person, List.of()).stream()
+                .filter(e -> e.slot().overlaps(slot)).toList();
+    }
 
-### Design decisions & trade-offs
-
-**1. Overlap in O(log n).** With a calendar sorted by start and no internal overlaps (true for rooms), check `floorEntry(newStart)` (does it end after `newStart`?) and `ceilingEntry(newStart)` (does it start before `newEnd`?). People *can* have overlapping events, so use an interval tree, or accept the O(log n + k) scan for a person.
-
-**2. Common free slot.** Gather all attendees' busy intervals in `[from, to]`, sort by start, merge the overlapping ones, then walk the gaps and return the first gap ≥ D (respecting working hours). That's O(M log M) for M intervals. It's the classic "merge intervals" pattern from DSA.
-
-**3. Room booking atomicity.** Lock per room (`ConcurrentHashMap<RoomId, ReentrantLock>`), re-check the conflict and insert. In a database: a range-exclusion constraint, or `INSERT … WHERE NOT EXISTS (overlapping)` under serializable isolation.
-
-**4. Recurring meetings.** Store the rule plus exceptions, not 520 copies. Expand on read within the query window. Editing "this and following" splits the rule into two series.
-
-**5. Time zones.** Store instants in UTC and the organiser's zone with the rule. "9am every Monday" must survive DST shifts, so expand recurrence in the event's zone.
-
-### Ownership, boundaries and invariants
-
-**Central design question:** Meeting time is an interval plus a time-zone interpretation; recurrence is a rule, not an infinite row list.
-
-Calendar owns Events and access rules. Event contains organizer, attendees, start/end instants and display zone. RecurrenceRule defines repeated local times; OccurrenceOverride changes or cancels a single instance. AvailabilityService merges busy intervals; Invitation tracks response independently.
-
-**Correctness rule:** End is after start, resource calendars cannot contain overlapping confirmed reservations, and an occurrence identity remains stable when one instance is edited. Personal calendars may intentionally allow overlaps.
-
-```text
-event(id,start_instant,end_instant,zone,recurrence_rule,version); occurrence_override(event_id,original_start,status); invitation(event_id,attendee,response)
+    /** Earliest gap of `length` inside `window` when everyone is free. */
+    Optional<Slot> firstCommonFree(Set<String> people, Slot window, Duration length) {
+        List<Slot> busy = people.stream()
+                .flatMap(p -> byPerson.getOrDefault(p, List.of()).stream())
+                .map(Event::slot)
+                .filter(s -> s.overlaps(window))
+                .sorted(Comparator.comparing(Slot::start))
+                .toList();
+        Instant cursor = window.start();
+        for (Slot b : busy) {
+            if (!cursor.plus(length).isAfter(b.start()))            // gap before this meeting
+                return Optional.of(new Slot(cursor, cursor.plus(length)));
+            if (b.end().isAfter(cursor)) cursor = b.end();          // skip past this meeting
+        }
+        Instant end = cursor.plus(length);
+        if (end.isAfter(window.end())) return Optional.empty();
+        return Optional.of(new Slot(cursor, end));
+    }
+}
 ```
 
-### End-to-end execution trace
+### Worked example
 
-Validate organizer permissions and interval; expand only the requested recurrence horizon; check resource conflicts; save event and invitation intent atomically; notify after commit; track accept/decline responses with versions; apply single-occurrence overrides separately.
+Wednesday 28 Oct 2026, times in IST.
 
-### Concurrency and recovery walkthrough
+| Step | Request | Result |
+| --- | --- | --- |
+| 1 | Asha: Design review 10:00–11:00 with Bilal, room Kaveri | Booked |
+| 2 | Bilal: 1:1 with Chetan 11:30–12:00, no room | Booked |
+| 3 | Chetan: Standup 10:30–10:45 in Kaveri | **Refused** – Kaveri busy |
+| 4 | Bilal's conflicts for 10:30–11:45 | 2 (design review, 1:1) |
+| 5 | Bilal's conflicts for 11:00–11:30 | none – back-to-back is fine |
+| 6 | First common 45 min, 09:30–18:00 | **12:00–12:45** (09:30–10:00 is only 30 min) |
+| 7 | First common 30 min | **09:30–10:00** |
+| 8 | Weekly standup, Mon 09:00 New York | 26 Oct → 18:30 IST; 2 Nov → **19:30 IST** (US clocks changed) |
 
-Two organizers reserve one room for overlapping intervals. An authoritative room-schedule lock or range exclusion constraint decides the winner. Availability lookup alone is advisory.
+### Edge cases
 
-### Policy choices and extension seams
+| Case | Behaviour |
+| --- | --- |
+| End before start | Rejected |
+| Meeting spanning midnight | Fine – instants don't care about dates |
+| No common gap in the window | `Optional.empty()` |
+| Organiser not in attendees | Added to the organiser's calendar anyway |
 
-Persisting local recurrence rule plus zone preserves a recurring 09:00 meeting across daylight-saving changes. Persisting only UTC repetitions can shift local time. Strategy can rank suggested slots; it must not bypass room constraints.
+## Step 5: The free-slot algorithm
 
-### Edge cases that change the design
+To find the first gap of 45 minutes for Asha, Bilal and Chetan:
 
-A daylight-saving gap may make a local time nonexistent, while an overlap makes it ambiguous. Choose and display a resolution policy. Half-open intervals allow back-to-back meetings. All-day events should use dates rather than pretending every day is exactly 24 hours.
+1. Collect everyone's busy slots inside the window and **sort them by start**: 10:00–11:00, 10:00–11:00, 11:30–12:00, 11:30–12:00.
+2. Start a cursor at the window start, 09:30.
+3. For each busy slot: if `cursor + 45 min` fits before it starts, that's the answer. Otherwise move the cursor to the end of that busy slot (if later).
+4. 09:30 + 45 = 10:15 > 10:00 → no; cursor → 11:00. 11:45 > 11:30 → no; cursor → 12:00.
+5. No more meetings: 12:00–12:45 fits inside the window → answer.
 
-**Topic-specific cases:** Adjacent slots; room conflict; personal overlap policy; daylight-saving gap/overlap; single-occurrence edit; duplicate invitation; unauthorized calendar access.
+This is the classic "merge intervals" idea: sort once, sweep once – O(n log n).
 
-### Further reading
+![Animation: busy meetings for three people are sorted on a timeline; a cursor starts at 9:30 and needs 45 minutes; the gap before 10:00 is too short so the cursor jumps to 11:00; the gap before 11:30 is too short so it jumps to 12:00; there the 45-minute slot from 12:00 to 12:45 fits.](learning-figures/lld-20-freeslot.gif)
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+> **⚠️ Common mistake**
+> Storing recurring events as "UTC 13:00 every Monday". When the organiser's country changes its clocks, the meeting silently moves by an hour in their own time. Store the local time **and** the zone ID, and expand with time-zone rules.
 
-### Work through edits and concurrency
+> **🎯 In the interview**
+> Room booking across servers needs the same atomic check as any booking: a database exclusion constraint (PostgreSQL `EXCLUDE USING gist` on room + time range) makes overlapping room bookings impossible.
 
-Two organizers can race for an empty room. A preflight availability search is useful but cannot establish the reservation. The room's transaction/interval constraint decides. Changing room or time should release the old reservation only if acquiring the new one succeeds atomically under the chosen storage design.
+## Step 6: Deep dives
 
-Editing one occurrence creates an exception; editing “this and future” may split the recurring series. Expanding an infinite series into database rows is impossible, so use a bounded scheduling horizon and extend it with conflict handling. Version invitations so late responses to an old time do not overwrite responses to the replacement event.
+### Invitations and responses
 
-## 6. Interviewer follow-ups
+Add an `Invitation` per attendee with status (pending, accepted, declined, tentative). Free-slot search can ignore events the person declined.
 
-**Does a declined attendee response free the room?** No. The organizer's event owns it until cancellation or modification.
+### Full recurrence rules
 
-**Does storing UTC solve recurrence?** It solves concrete instants, not recurring local-time intent.
+Real calendars use iCalendar RRULEs ("every 2nd Tuesday", "last weekday of the month") and exceptions ("skip 25 Dec", "move this one to 11:00"). Store the rule plus a list of exceptions, and expand only the range being viewed.
 
-## 7. Closing answer
+### Fast day and week views
 
-I separate event intent, dated occurrences and exclusive room allocation. Half-open intervals define conflicts, timezone-aware recurrence preserves local intent, and versioned edits acquire replacement reservations before releasing old ones. Invitation responses cannot silently alter room ownership.
+Keep each person's events in a sorted structure (a `TreeMap` by start, or a database index on (person, start)), so "events this week" is a range query.
+
+### Working hours and time zones per person
+
+Each user has a zone and working hours; the free-slot search intersects the window with every attendee's working hours, converted to instants.
+
+## Interviewer follow-ups
+
+**Why half-open intervals?** So back-to-back meetings don't conflict and adjacent slots tile perfectly with no gaps or overlaps.
+
+**Why not store local date-times?** "10:00" means different moments in Bengaluru and New York. Instants are unambiguous; local times are for display and for rules.
+
+**How do you handle a 500-person all-hands?** Store the event once and reference it from attendees, rather than copying it 500 times; free-slot search for 500 people is rarely needed.
+
+**How would you suggest several options, not just the first?** Keep sweeping after the first match and collect up to N gaps, maybe preferring mid-morning.
+
+## Wrap up
+
+Slots are half-open ranges of instants; rooms are protected by an overlap check; free slots come from sorting busy times and sweeping; recurring events keep their local time and zone and are expanded with time-zone rules.
+
+> **📝 Key takeaways**
+> - Store instants; keep the zone with the recurrence rule.
+> - Half-open intervals: back-to-back is not a conflict.
+> - Rooms are booked atomically; people may be double-booked with a warning.
+> - Free-slot search = sort busy slots, sweep with a cursor.
+
+## Going deeper (optional)
+
+The complete, runnable code is [CalendarDemo.java](reference-code/learning/kb/calendar/CalendarDemo.java). It replays the worked example, including the New York daylight-saving change, and checks every result.
+
+[![Expand recurring occurrences using a timezone identifier and policy.](lessons/lld-20-failure.svg)](lessons/lld-20-failure.svg)
+
+## Closing answer
+
+"A Slot is a half-open range of two Instants, so comparisons are time-zone-proof and back-to-back meetings don't conflict. An Event has an organiser, attendees, a slot and an optional room. The CalendarService indexes events by person and by room: scheduling refuses any overlap in the room – across servers that's a database exclusion constraint – while personal overlaps are shown as conflicts. To find a common free slot I collect everyone's busy slots in the window, sort them by start and sweep a cursor until a gap of the required length fits. Recurring events store the local time and the zone ID and are expanded with Java's time-zone rules, so a 9:00 New York standup correctly moves from 18:30 to 19:30 in India when US clocks change."
+

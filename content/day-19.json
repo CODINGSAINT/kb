@@ -12,103 +12,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "order",
             "label": "Order",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 110,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "OrderLine",
-            "x": 250,
+            "id": "lines",
+            "label": "Order lines (units)",
+            "x": 170,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "InventoryReservation",
-            "x": 500,
+            "id": "ship",
+            "label": "Shipment per seller",
+            "x": 400,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Shipment",
+            "id": "cancel",
+            "label": "Cancel pending units",
+            "x": 170,
+            "y": 130,
+            "w": 190,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "refund",
+            "label": "Refunds",
+            "x": 400,
+            "y": 130,
+            "w": 120,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "status",
+            "label": "Derived status",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "PaymentIntent",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Return",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Outbox",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "owns"
+            "from": "order",
+            "to": "lines",
+            "label": "has"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "reserves"
+            "from": "lines",
+            "to": "ship",
+            "label": "pack pending units"
           },
           {
-            "from": "n1",
-            "to": "n3",
-            "label": "fulfilled by"
+            "from": "cancel",
+            "to": "lines",
+            "label": "only pending"
           },
           {
-            "from": "n0",
-            "to": "n4",
-            "label": "collects through"
+            "from": "cancel",
+            "to": "refund",
+            "label": "units × price"
           },
           {
-            "from": "n3",
-            "to": "n5",
-            "label": "can produce"
+            "from": "lines",
+            "to": "status",
+            "label": "count units"
           },
           {
-            "from": "n0",
-            "to": "n6",
-            "label": "publishes events"
+            "from": "ship",
+            "to": "status",
+            "label": "delivered?",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign Amazon's order management: from a cart, create an order that may hold items from several sellers and warehouses; reserve inventory, take payment, split into shipments, track each shipment, and support cancellation and returns. It brings together a **State machine**, **Observer** and **Strategy** (fulfilment and payment), plus consistency across inventory and payment.\n\n## Requirements\n\n**Functional**\n- Place an order: validate the cart, reserve inventory, charge, confirm.\n- Split into shipments by warehouse and seller, each with its own lifecycle.\n- Cancel (fully or one item) before shipping. Return and refund after delivery.\n- Notify the customer on every change.\n\n**Non-functional**\n- No overselling and no double charging: inventory reservation and payment stay consistent, and order placement is idempotent.\n- State changes follow the order lifecycle only, with a full audit history.\n- Handles sale-day peaks: high write throughput, with notifications sent asynchronously.\n- New payment methods and fulfilment types plug in without rewriting order flow.\n\n## 1. Scope and chosen solution\n\nI support multi-line orders with split shipments, cancellation before dispatch and returns after delivery. An Order owns accepted terms; each line tracks quantities; warehouse and payment integrations have stable operation references. I choose quantity accounting rather than a single SHIPPED flag.\n\n## 2. Commands and conservation\n\n```text\nsubmit(checkoutId,acceptedQuote) -> Order\nreserve(lineId,reservationId,quantity)\nship(eventId,lineId,shipmentId,quantity)\ncancel(commandId,lineId,quantity)\nreturnItem(returnId,lineId,quantity,evidence)\nInvariant: cancelled + shipped <= ordered; returned <= shipped\n```\n\nEvery line transition locks its current version, checks remaining eligible quantity, deduplicates the operation/event and commits quantity plus outbox fact. For ordered 3, cancelled 1 and shipped 2, remaining-to-fulfil is zero. A repeated shipment event cannot increment shipped again. Cancellation racing dispatch competes for the same remaining units; the loser becomes a rejection or a return workflow. Capture-per-shipment and refunds reference actual captured amounts; a never-captured authorization is released instead of refunded. Returns append evidence without deleting original shipment history.\n\n## 3. Final design diagram\n\n[![Design Amazon Order Management: Order owns OrderLine; OrderLine reserves InventoryReservation; OrderLine fulfilled by Shipment; Order collects through PaymentIntent; Shipment can produce Return; Order publishes events Outbox](designs/lld-19.svg)](designs/lld-19.svg)\n\nSeparate the **order** from its **lines**, **inventory reservations**, **shipments** and **payment operations**. An order summarizes the commercial agreement; fulfilment facts belong at the line/quantity level. I start with one transactional order store and explicit integrations.\n\n## 4. Critical operation: worked execution\n\n![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)\n\n*Ordered quantities are partitioned across fulfilment outcomes.*\n\n![A line cannot be both newly cancelled and dispatched for the same units.](lessons/lld-19-failure.svg)\n\n*A line cannot be both newly cancelled and dispatched for the same units.*\n\n### Worked calculation and implementation\n\nFor an order line with quantity 3, track ordered, cancelled, shipped and returned quantities explicitly. If one unit is cancelled and two ship, fulfilment is complete even though shipped quantity is less than the original three. Returns refer to shipped units and do not rewrite the original order quantity.\n\n```text\nOrderLine: ordered=3, cancelled=1, shipped=2, returned=0\nConstraints: cancelled + shipped <= ordered\n             returned <= shipped\nRemaining to fulfil = ordered - cancelled - shipped = 0\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Order` | id, customer, `List<OrderLine>`, payment, status, address snapshot |\n| `OrderLine` | product, seller, qty, price snapshot, line status |\n| `OrderState` | `CREATED → PAYMENT_PENDING → CONFIRMED → PARTIALLY_SHIPPED → SHIPPED → DELIVERED`; `CANCELLED`, `RETURN_REQUESTED → RETURNED` |\n| `Shipment` | lines, warehouse, carrier, tracking; `PACKED → SHIPPED → OUT_FOR_DELIVERY → DELIVERED` |\n| `FulfilmentStrategy` | Nearest warehouse, fewest shipments, cheapest |\n| `InventoryService` | `reserve(lines, ttl)`, `commit`, `release` |\n| `OrderEventPublisher` | Observer hub: `OrderConfirmed`, `ShipmentDelivered`, … |\n\n### Design decisions & trade-offs\n\n**1. Order status is derived from shipments and lines.** With partial shipping, an order is \"shipped\" only when all shipments are. Derive aggregate status from children rather than setting it independently. That prevents contradictions like \"order DELIVERED, shipment still in transit\".\n\n**2. Transactional flow as a saga.** Reserve inventory (with a TTL), then charge payment, then commit inventory and confirm. On payment failure, release the inventory. Each step has a compensating action, so you can explain it without a distributed transaction.\n\n**3. Observer for side effects.** The state machine publishes events. Email, SMS, loyalty points and analytics subscribe. Adding \"notify the seller\" doesn't touch `Order`.\n\n**4. Snapshots.** Copy price, title and address into the order. Later catalogue or address edits must not rewrite history.\n\n**5. Guarded transitions.** `cancel()` is legal only before `SHIPPED` (per line). A transition table plus `canTransition(from, to)` stops illegal moves, and an optimistic version field handles concurrent updates such as a warehouse \"packed\" racing a customer \"cancel\".\n\n### Ownership, boundaries and invariants\n\n**Central design question:** An order is a durable commercial record whose fulfillment and payment can progress independently.\n\nOrder snapshots buyer, lines, address, currency and totals. OrderLine references a purchased SKU snapshot. InventoryReservation, PaymentAttempt and Shipment carry separate lifecycle state. OrderCoordinator applies business policy; TaxPolicy and ShippingPolicy return deterministic quotes.\n\n**Correctness rule:** The total equals the sum of immutable line amounts, tax, discounts and delivery under a defined rounding policy. A shipment cannot exceed purchased quantities, and retries cannot create a second paid order.\n\n```text\norders(id,request_key,total_minor,status,version); line(id,qty,shipped_qty,cancelled_qty); shipment; payment_attempt; refund\n```\n\n### End-to-end execution trace\n\nValidate quote; reserve inventory; create a pending order; authorize payment; confirm or compensate stock; capture according to fulfillment policy; split into shipments; record delivery; process partial refunds as separate auditable records.\n\n### Concurrency and recovery walkthrough\n\nCancellation crosses shipment handoff. Compare order-line fulfillment quantities and cancel only unshipped units; compensation may become return/refund after the boundary. Late payment callbacks are deduplicated and reconciled.\n\n### Policy choices and extension seams\n\nOne giant enum for every shipment/payment combination becomes unmaintainable. Separate state axes plus invariants give clearer composition. Saga coordination belongs in application logic, not in every OrderLine getter.\n\n### Edge cases that change the design\n\nTwo warehouses can partially fulfill one order. Refund arithmetic must account for prorated discounts and taxes. A retry with a reused idempotency key and changed cart payload is a conflict.\n\n**Topic-specific cases:** Duplicate checkout; inventory compensation; partial shipment; cancellation boundary; duplicate webhook; partial refund conservation; immutable price snapshots.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through integration failures\n\nA duplicate warehouse event must not increment `shipped` twice. Use event identity and the line's legal remaining quantity. A reservation timeout that later succeeds needs reconciliation by reservation reference, especially if another warehouse was already asked to fulfil the same item.\n\nPayments follow capture policy: authorize at order placement, perhaps capture per shipment. Refunds must reference captured amounts; a cancelled, never-captured line may need authorization release rather than a refund. Store the financial evidence instead of inferring it from shipping status.\n\n## 6. Interviewer follow-ups\n\n**Can an order be completed with a cancelled line?** Yes, if every unit has a final documented fulfilment disposition.\n\n**Should a return delete a shipment?** No. The shipment happened; the return is a later event.\n\n## 7. Closing answer\n\nI make fulfilment quantitative at order-line level and derive the order summary. Immutable commercial snapshots, versioned quantity transitions and idempotent warehouse events preserve partial shipments, cancellations and returns. Financial capture/refund follows actual recorded fulfilment policy rather than one overloaded status.\n"
+      "markdown": "## Problem\n\nDesign order management for a marketplace like Amazon. Asha orders headphones and 3 USB-C cables from the seller SoundHub, and 4 notebooks from PaperCo, in one checkout. Before anything ships she cancels one cable. SoundHub and PaperCo then send separate parcels, and later she returns one notebook.\n\nOne \"order\" is really several things moving at different speeds. The design must track every unit – ordered, cancelled, shipped, returned – and show an order status that is always consistent with them.\n\n## Requirements\n\n- An order has lines (product, seller, quantity, price) from one or more sellers.\n- Each seller ships its own parcel (shipment); an order can be partly shipped.\n- Customers can cancel units that haven't shipped, and return units that have.\n- Refunds match exactly the units cancelled or returned.\n- The order's status is always consistent with its lines and shipments.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Can one order contain items from several sellers?\n\n**Interviewer:** Yes. Each seller ships separately.\n\n**Candidate:** Can a customer cancel part of a line – one of three cables?\n\n**Interviewer:** Yes, as long as those units haven't shipped.\n\n**Candidate:** After shipping?\n\n**Interviewer:** Then it's a return, not a cancellation.\n\n**Candidate:** What statuses does the customer see?\n\n**Interviewer:** Placed, partly shipped, shipped, delivered, cancelled.\n\n**Candidate:** Do we design payment and warehouses too?\n\n**Interviewer:** No – assume payment is done; focus on lines, shipments and statuses.\n\n> **🎯 In the interview**\n> Ask about partial cancellation early. It tells you that status belongs to **units**, not just to the whole order.\n\n| Functional | Non-functional |\n| --- | --- |\n| Lines from many sellers | Units never double-counted (cancelled *and* shipped) |\n| Shipments per seller | Refund = exactly the units cancelled or returned |\n| Cancel, return, track | Status never contradicts the details |\n\n## Step 2: Identify the core objects\n\n- **Order** – a customer, its lines, its shipments and refunds.\n- **OrderLine** – a product from one seller: ordered quantity, unit price, and how many units are shipped, cancelled and returned.\n- **Shipment** – one seller's parcel: which lines and how many units, plus its status.\n- **ShipmentStatus** – created, dispatched, delivered.\n- **OrderStatus** – placed, partly shipped, shipped, delivered, cancelled – **calculated**, not stored.\n\n[![Selected design: an order holds lines from several sellers; each line splits its units into pending, shipped and cancelled; pending units are packed into one shipment per seller; cancellations and returns produce refunds per unit; the order status is calculated from the lines and shipments.](designs/lld-19.svg)](designs/lld-19.svg)\n\n> **⚖️ Design choice**\n> **Derive the order status** from lines and shipments instead of storing it. A stored status can drift (\"SHIPPED\" while a cable is still pending); a calculated one can't.\n\n## Step 3: Design the classes\n\n### OrderLine\n\nKeeps the invariant: `ordered = pending + shipped + cancelled`. You can cancel only pending units and return only shipped (not yet returned) units.\n\n### Shipment\n\nOne per seller per dispatch. It records how many units of each line it carries and its delivery status.\n\n### Order\n\n`planShipments` groups pending units by seller into new shipments. `cancel(sku, qty)` cancels units and adds to the refund. `status()` computes the customer-facing status.\n\n[![Class diagram: an Order has OrderLines and Shipments; each Shipment carries units of OrderLines and has a ShipmentStatus; the Order calculates an OrderStatus; each OrderLine tracks ordered, shipped, cancelled and returned units.](learning-figures/lld-19-classes.svg)](learning-figures/lld-19-classes.svg)\n\n## Step 4: Write the code\n\n### OrderLine\n\n```java\n/** One product in an order. Its units are split across pending, shipped and cancelled. */\nclass OrderLine {\n    final String sku, seller;\n    final int ordered;\n    final long unitPricePaise;\n    private int shipped, cancelled, returned;\n\n    OrderLine(String sku, String seller, int qty, long unitPricePaise) {\n        this.sku = sku; this.seller = seller; this.ordered = qty;\n        this.unitPricePaise = unitPricePaise;\n    }\n    int pending()   { return ordered - shipped - cancelled; }   // always >= 0\n    int shipped()   { return shipped; }\n    int cancelled() { return cancelled; }\n\n    void ship(int n) {\n        if (n > pending()) throw new IllegalStateException(\"Only \" + pending() + \" to ship\");\n        shipped += n;\n    }\n    long cancel(int n) {\n        if (n > pending()) throw new IllegalStateException(\"Only \" + pending() + \" left\");\n        cancelled += n;\n        return n * unitPricePaise;                                // refund\n    }\n    long returnUnits(int n) {\n        if (n > shipped - returned) throw new IllegalStateException(\"Nothing to return\");\n        returned += n;\n        return n * unitPricePaise;\n    }\n}\n```\n\n### Shipment\n\n```java\nenum ShipmentStatus { CREATED, DISPATCHED, DELIVERED }\n\n/** What one seller sends in one parcel. */\nclass Shipment {\n    final String id, seller;\n    final Map<OrderLine, Integer> units = new LinkedHashMap<>();\n    ShipmentStatus status = ShipmentStatus.CREATED;\n\n    Shipment(String id, String seller) { this.id = id; this.seller = seller; }\n}\n```\n\n### Order\n\n```java\nenum OrderStatus { PLACED, PARTLY_SHIPPED, SHIPPED, DELIVERED, CANCELLED }\n\nclass Order {\n    final String id, customer;\n    final List<OrderLine> lines;\n    final List<Shipment> shipments = new ArrayList<>();\n    private long refundedPaise;\n\n    Order(String id, String customer, List<OrderLine> lines) {\n        this.id = id; this.customer = customer; this.lines = List.copyOf(lines);\n    }\n\n    /** One shipment per seller for everything not yet shipped or cancelled. */\n    List<Shipment> planShipments() {\n        Map<String, List<OrderLine>> bySeller = lines.stream().filter(l -> l.pending() > 0)\n                .collect(Collectors.groupingBy(l -> l.seller, LinkedHashMap::new,\n                        Collectors.toList()));\n        List<Shipment> created = new ArrayList<>();\n        bySeller.forEach((seller, ls) -> {\n            Shipment s = new Shipment(id + \"-S\" + (shipments.size() + 1), seller);\n            ls.forEach(l -> { s.units.put(l, l.pending()); l.ship(l.pending()); });\n            shipments.add(s);\n            created.add(s);\n        });\n        return created;\n    }\n\n    long cancel(String sku, int qty) {\n        long refund = line(sku).cancel(qty);\n        refundedPaise += refund;\n        return refund;\n    }\n\n    /** The status is derived from the lines and shipments, never set by hand. */\n    OrderStatus status() {\n        int pending = lines.stream().mapToInt(OrderLine::pending).sum();\n        int shipped = lines.stream().mapToInt(OrderLine::shipped).sum();\n        if (shipped == 0) return pending == 0 ? OrderStatus.CANCELLED : OrderStatus.PLACED;\n        if (pending > 0) return OrderStatus.PARTLY_SHIPPED;\n        boolean allDelivered = shipments.stream()\n                .allMatch(s -> s.status == ShipmentStatus.DELIVERED);\n        return allDelivered ? OrderStatus.DELIVERED : OrderStatus.SHIPPED;\n    }\n\n    OrderLine line(String sku) {\n        return lines.stream().filter(l -> l.sku.equals(sku)).findFirst()\n                .orElseThrow(() -> new IllegalArgumentException(\"No line \" + sku));\n    }\n    long refunded() { return refundedPaise; }\n}\n```\n\n### Worked example\n\nPrices in paise: headphones ₹2,499, cable ₹399, notebook ₹120.\n\n| Step | Action | Effect | Order status |\n| --- | --- | --- | --- |\n| 1 | Asha places the order | 1 headphones + 3 cables (SoundHub), 4 notebooks (PaperCo) | PLACED |\n| 2 | Cancel 1 cable | Refund ₹399; 2 cables pending | PLACED |\n| 3 | Plan shipments | SoundHub parcel: headphones + 2 cables; PaperCo parcel: 4 notebooks | SHIPPED |\n| 4 | Cancel 1 notebook | Refused – it's in a parcel | SHIPPED |\n| 5 | Return 1 notebook | Refund ₹120 | SHIPPED |\n| 6 | SoundHub parcel delivered | PaperCo still on the way | SHIPPED |\n| 7 | PaperCo parcel delivered | All parcels delivered | DELIVERED |\n| – | Bilal cancels both notebooks of his order | Refund ₹240, nothing to ship | CANCELLED |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Cancel more units than are pending | Refused |\n| Return more than shipped | Refused |\n| Unknown SKU | Refused |\n| Everything cancelled | Status CANCELLED, full refund |\n\n## Step 5: The status algorithm: count units, then decide\n\n`status()` follows a small decision list:\n\n1. Nothing shipped and nothing pending → **CANCELLED**.\n2. Nothing shipped, something pending → **PLACED**.\n3. Something shipped, something still pending → **PARTLY_SHIPPED**.\n4. All non-cancelled units shipped: all parcels delivered → **DELIVERED**, otherwise **SHIPPED**.\n\nBecause each unit is in exactly one bucket (pending, shipped or cancelled), the status can't contradict the lines.\n\n![Animation: Asha's order starts with headphones, three cables and four notebooks; one cable is cancelled and refunded; the remaining units are packed into a SoundHub parcel and a PaperCo parcel; a notebook cancellation is refused because it is already in a parcel and becomes a return; when both parcels are delivered the order status becomes delivered.](learning-figures/lld-19-units.gif)\n\n> **⚠️ Common mistake**\n> One status field on the order, updated by whoever touched it last. A seller dispatch and a customer cancellation arriving together can leave the order saying \"CANCELLED\" while a parcel is on its way. Track units per line and derive the status.\n\n> **🎯 In the interview**\n> With many services, the cancel and the warehouse pick can race. Make \"cancel pending units\" a conditional update (`pending >= qty`) on the line, the same row the warehouse updates when it packs units – only one can take the last unit.\n\n## Step 6: Deep dives\n\n### Several warehouses per seller\n\nGroup pending units by **(seller, warehouse)** instead of seller. One seller can then send two parcels from Bengaluru and Delhi.\n\n### Payments and refunds\n\nStore each refund as its own record (order, line, units, amount, reason). Refunds are always calculated from units × unit price, so partial refunds are exact.\n\n### Return pickup and inspection\n\nA return has its own small state machine: requested → picked up → inspected → refunded (or rejected). Refund only after inspection if the policy says so.\n\n### Notifications and tracking\n\nEach shipment status change publishes an event; the customer sees per-parcel tracking, while the order status summarises them.\n\n## Interviewer follow-ups\n\n**Why not split the order into one order per seller at checkout?** The customer thinks of one order and one payment. Keep one order; split into shipments underneath.\n\n**Why derive status instead of storing it?** It can't get out of sync. If reading it is expensive, store a cached copy updated in the same transaction as the lines.\n\n**How do you handle a seller who can't fulfil?** Cancel those units on the seller's side – same `cancel` on pending units, with reason \"seller unavailable\" and an automatic refund.\n\n**How would you scale it?** Orders partitioned by customer; shipments also indexed by seller for seller dashboards; events to analytics and notifications.\n\n## Wrap up\n\nAn order is lines of units from many sellers; units are pending, shipped or cancelled; pending units become per-seller shipments; refunds follow units; and the order status is calculated from all of that.\n\n> **📝 Key takeaways**\n> - Track units per line: ordered = pending + shipped + cancelled.\n> - Cancel only pending units; after shipping it's a return.\n> - One shipment per seller (or warehouse).\n> - Derive the order status so it can't contradict the details.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [OrderManagementDemo.java](reference-code/learning/kb/ordermgmt/OrderManagementDemo.java). It replays the worked example and checks every result.\n\n[![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)](lessons/lld-19-flow.svg)\n\n## Closing answer\n\n\"An Order holds OrderLines – product, seller, quantity and unit price – and each line splits its units into pending, shipped and cancelled, with returns tracked against shipped units, so a unit is never counted twice. Customers can cancel only pending units, and the refund is units times price. Pending units are grouped by seller into Shipments, each with its own delivery status. The order's status – placed, partly shipped, shipped, delivered or cancelled – is calculated from the lines and shipments rather than stored, so it can't contradict them. Across services, cancelling and packing use a conditional update on the line so only one can take the last unit.\"\n"
     },
     {
       "category": "HLD",
