@@ -720,916 +720,839 @@ A production system needs saved calls/assignments and must compare them with cur
 The [complete Java implementation](reference-code/lld-three/Elevators.java) includes car selection, request handling and the helpers used by these excerpts.
 
 === LLD 4 ===
-N|customer|Customer|20|20|150|rect
-N|service|BookingService|220|20|180|rect
-N|hold|Internal Hold|440|20|170|rect
-N|seat|Show-seat allocation|220|160|200|rect
-N|provider|Payment provider|20|300|180|rect
-N|refund|Refund intent|440|300|170|rect
-E|customer|service|hold / pay / cancel
-E|service|hold|owns state and quote
-E|service|seat|claims whole cart
-E|service|provider|stable attempt key|dashed
-E|provider|service|verified receipt|dashed
-E|service|refund|late capture
+N|user|User|0|0|140|rect
+N|booking|BookingService|220|0|180|rect
+N|show|Show|460|0|140|rect
+N|seat|ShowSeat|460|130|160|rect
+N|bk|Booking|220|130|160|rect
+N|pay|PaymentService|0|130|160|rect
+E|user|booking|hold / confirm
+E|booking|show|lock one show
+E|show|seat|has many
+E|booking|bk|creates
+E|bk|seat|holds seats
+E|booking|pay|charge
 ---
 ## Problem
-Design the booking part of a movie-ticket application. Two customers can choose the same seats on their screens. Only one may own them, a customer must get the whole chosen set or none, and a slow payment must never sell the same seat twice.
+
+Design the booking part of a movie-ticket app such as BookMyShow. Users browse movies and shows in their city, pick seats on a seat map, pay, and receive a ticket.
+
+The interesting part is not the catalogue. It is this: two people select the same seats at the same moment. Only one of them may get those seats, and nobody should be charged for seats they did not get.
 
 ## Requirements
-- Browse movies, cinemas, screens and shows; view a show's seats and prices.
-- Hold up to eight seats together, pay for the hold, retrieve the booking and cancel under a stated policy.
-- Preserve seat ownership under concurrent requests, repeated requests, expiry and late payment callbacks.
-- Start with a complete Java design for one process, then explain the transaction needed when several application servers share inventory.
 
-## 1. Start with two customers and two seats
+- Browse movies by city, then see cinemas and show times for a movie.
+- Show the seat map for one show with each seat's type (silver, gold, recliner), price and status.
+- Let a user select up to 8 seats and hold them for a few minutes while they pay.
+- Confirm the booking after a successful payment. Release the seats if payment fails or the hold expires.
+- Never sell the same seat for the same show twice.
+- Let a user cancel a confirmed booking before the show starts.
 
-Asha and Bilal both select **A7 and A8 for the 7 pm show**. Each seat costs ₹250. Both screens may say “available”, because neither customer has reserved anything yet. Asha presses Continue first. The server holds both seats for her for two minutes and freezes the price at **₹500**. Bilal's request then receives a conflict. He gets neither seat and is not sent to payment for this cart.
+Out of scope: food add-ons, offers and coupons, reviews, admin screens for adding cinemas.
 
-That is the central design decision: **the server changes ownership when it creates a hold, not when it draws the seat map**. Availability on a screen is advice. A successful hold is a promise with an expiry time.
+## 1. Clarify the scope
 
-In an interview, I would clarify four points before drawing classes:
+Spend the first few minutes agreeing on the rules. These are the answers we will design for:
 
-| Question | Chosen answer | What it changes |
+| Question to ask | Answer we choose | Why it matters |
 | --- | --- | --- |
-| Are seats assigned? | Yes, for a particular show | A7 in the matinee is different inventory from A7 at 7 pm |
-| Can a cart partially succeed? | No | Claim every chosen seat in one operation |
-| How long is a hold? | Two minutes for this example | At the exact deadline it is expired; this is a product policy, not a universal duration |
-| What if payment finishes late? | Release at the deadline; refund a capture received afterwards | A payment success alone cannot resurrect released inventory |
+| Is a seat the same thing in every show? | No. Seat A7 in the 7 pm show and A7 in the 10 pm show are different things to sell. | We need a `ShowSeat` per show, not just a `Seat`. |
+| Can a booking partly succeed? | No. You get all the selected seats or none. | Seat checks must be all-or-nothing. |
+| How long is a seat held during payment? | 5 minutes. | We need an expiry time on a hold. |
+| Does every seat cost the same? | No, price depends on seat type and show. | Pricing is a rule that may change; keep it replaceable. |
+| One server or many? | Design for one service first, then explain the database version. | Interviewers usually start in memory, then ask "what about many servers?" |
 
-For this answer, cancellation is allowed before the show starts and refunds the full captured amount. The Java mechanism models eligible cancellations; a real endpoint must check the show's start time and refund policy before calling it. Refund settlement, tax rules, search ranking and cinema onboarding are outside this object's scope. I would state those boundaries rather than hide them behind unfinished methods.
+A good 45-minute plan for this problem:
 
-**The rules we must preserve:** one owner per `(showId, seatNumber)`; a cart owns all its seats or none; a quote does not change during a hold; expired and cancelled reservations never become confirmed; repeating an operation does not create another charge, ticket or refund intent.
-
-[Step through both arrival orders and a late payment](learning-labs/index.html?topic=booking). The seats visibly change owner as the tested Java service runs. This is a recorded execution with Previous/Next controls, not a live payment integration. A complete text trace is available on the same page.
-
-## 2. Give each object one clear job
-
-[![A customer calls BookingService, which owns holds and show-seat allocations; payment runs outside its lock and late captures create refund intents.](learning-figures/booking-ownership.svg)](learning-figures/booking-ownership.svg)
-
-Open the diagram at full size by selecting it.
-
-The important relationship in this picture is between the hold and the show-seat allocation. They must change together. The payment provider is outside that operation because a network call may be slow or return no definite answer.
-
-| Type | Responsibility and important data |
+| Minutes | What you do |
 | --- | --- |
-| `Movie`, `Cinema`, `Screen`, `Show` | Catalogue. A show connects one movie, one screen and one start time. A screen's physical seat layout is reused by many shows. |
-| `Seat(show, number)` | Identity of one sellable seat for one show. It is a Java record, so equality includes both values. |
-| Internal `Hold` | The mutable reservation: owner, sorted seat list, frozen price, deadline, reservation state and payment state. Only `BookingService` mutates it. |
-| `Reservation` | An immutable owner-facing snapshot, including `refundState` and `refundAmountPaise`. The caller cannot change the service's state by editing it. |
-| `Attempt` | The stable payment key and amount for one reservation. Repeated attempts to send the same intent reuse this key. |
-| `Receipt` | An authenticated provider outcome bound to that attempt. Request parameters from a browser are never trusted as proof of payment. |
-| `Refund` | A request to return a particular captured charge. Its existence means “refund needed”, not “money has reached the bank account”. |
-| `Reconciliation` | Contradictory provider evidence, with reservation, attempt, charge and amount, for a worker to investigate before taking a financial action. |
+| 0–5 | Requirements and the questions above |
+| 5–15 | Core classes and their relationships |
+| 15–30 | Code for `holdSeats` and `confirmBooking` |
+| 30–40 | Concurrency: how two users cannot get the same seat |
+| 40–45 | Patterns, extensions and follow-ups |
 
-The service stores two related maps: reservation ID to internal hold, and show-seat to owning reservation ID. It also remembers successful request keys and refund intents. An owner's snapshot says `PENDING` with the actual captured refund amount once that work is recorded; `NOT_REQUIRED` means no refund intent exists. It never reports settlement as completed. Public seat browsing uses `availability(show)`, which omits customer identities; `seats(show)` is an internal diagnostic view for the trace. The catalogue can use a separate read-only repository because it does not decide who owns inventory.
+## 2. Core classes
 
-I would expose these application operations:
+Start from the nouns in the problem and keep only the ones that hold state or enforce a rule.
 
-```text
-POST /shows/{showId}/holds
-  authenticated customer; Idempotency-Key; body { seatNumbers: ["A7", "A8"] }
-  -> reservation ID, frozen amount, expiry, state; conflict if any seat is unavailable
+| Class | What it represents | Key fields |
+| --- | --- | --- |
+| `Movie` | A film | id, title, durationMinutes, language |
+| `Cinema` | A building in a city | id, name, city, list of screens |
+| `Screen` | One hall inside a cinema | id, name, physical seats |
+| `Seat` | A physical seat in a screen | id ("A7"), row, number, `SeatType` |
+| `Show` | One movie on one screen at one time | id, movie, screen, startTime, its show seats |
+| `ShowSeat` | A seat **for one show** – the thing we sell | seat, price, `SeatStatus`, heldBy, holdExpiresAt |
+| `Booking` | One user's purchase for one show | id, user, show, seats, amount, `BookingStatus` |
+| `Payment` | One payment attempt for a booking | id, bookingId, amount, status |
+| `User` | The customer | id, name, email |
 
-POST /reservations/{id}/payment
-  authenticated owner -> one stable payment intent, not a new charge for each retry
-
-GET /reservations/{id}
-  authenticated owner -> current reservation and payment states
-
-POST /reservations/{id}/cancellation
-  authenticated owner + checked cancellation policy -> terminal reservation + refund status
-
-POST /payments/provider-callback
-  verified provider signature + server-side receipt binding -> apply provider outcome
-```
-
-An **idempotency key** identifies one logical request despite retries. It is scoped to the customer. If Asha retries the same key with the same seats in a different order, she gets the same reservation. Reusing it for a different cart is an error. If that reservation has expired, the retry returns its expired state; a fresh cart needs a fresh key. Silently making a new hold would change the meaning of her original request.
-
-## 3. Reserve the whole cart before talking to payment
-
-Here is the actual reservation method from the runnable implementation. All service mutations use the same monitor (`synchronized`), so another thread cannot observe a half-written cart.
+Enums keep the states explicit:
 
 ```java
-public synchronized Reservation hold(String customer, String requestKey, String show, List<String> requested) {
-    text(customer); text(requestKey); text(show); Objects.requireNonNull(requested);
-    if (requested.isEmpty() || requested.size()>8 || new HashSet<>(requested).size()!=requested.size())
-        throw new IllegalArgumentException("choose 1..8 distinct seats");
-    requested.forEach(BookingService::text);
-    List<String> seats=requested.stream().sorted().toList();
-    Request request=new Request(customer,requestKey);
-    Fingerprint fingerprint=new Fingerprint(show,seats);
-    if (requests.containsKey(request)) {
-        if (!fingerprints.get(request).equals(fingerprint)) throw new IllegalArgumentException("key reused with another cart");
-        Hold old=holds.get(requests.get(request)); expire(old,clock.instant()); return old.view();
+enum SeatType { SILVER, GOLD, RECLINER }
+enum SeatStatus { AVAILABLE, HELD, BOOKED }
+enum BookingStatus { PENDING, CONFIRMED, CANCELLED, EXPIRED }
+```
+
+The most important modelling decision is **`ShowSeat`**. A `Seat` is furniture: it belongs to a screen forever. A `ShowSeat` is inventory: A7 for the 7 pm show on 12 May. Status lives on the show seat, because A7 can be booked for one show and free for the next.
+
+[![Class diagram: Cinema has Screens, Screen has Seats, Show links a Movie and a Screen and owns ShowSeats; Booking holds ShowSeats for a User; BookingService coordinates holds, payment and confirmation.](learning-figures/lld-4-classes.svg)](learning-figures/lld-4-classes.svg)
+
+Two services do the work:
+
+- `CatalogService` answers browse questions: movies in a city, shows for a movie, the seat map for a show. It only reads.
+- `BookingService` changes seat ownership: hold, confirm, cancel. All changes to show seats go through it.
+
+Keeping writes in one place matters. If the seat-map screen could change a seat's status directly, two screens could each believe they own A7.
+
+[![Selected design: User calls BookingService, which locks one Show, holds its ShowSeats in a Booking and charges through PaymentService.](designs/lld-4.svg)](designs/lld-4.svg)
+
+## 3. The booking flow
+
+Follow one user, Asha, booking two gold seats, A7 and A8, for the 7 pm show. Each costs ₹250.
+
+1. Asha opens the seat map. `CatalogService` returns every show seat with its status. A7 and A8 show as AVAILABLE.
+2. She taps Continue. `BookingService.holdSeats` checks both seats and marks both HELD for her booking for the next 5 minutes. It creates booking B1 with amount ₹500 and status PENDING.
+3. She pays. `confirmBooking` charges ₹500. On success it marks A7 and A8 BOOKED and B1 CONFIRMED.
+4. If she closes the app instead, the hold expires after 5 minutes and both seats become AVAILABLE again.
+
+[![Flow: the user selects seats, holdSeats checks every seat then holds all of them, payment runs, and confirmation books the seats; if a seat is taken the hold fails, and if payment fails or the hold expires the seats are released.](learning-figures/lld-4-flow.svg)](learning-figures/lld-4-flow.svg)
+
+The seat map on the screen is only a hint. Between drawing it and tapping Continue, someone else may have taken a seat. **The hold is the real check.**
+
+### The `ShowSeat` class
+
+```java
+class ShowSeat {
+    private final Seat seat;
+    private final long pricePaise;          // ₹250 = 25000 paise; never use double for money
+    private SeatStatus status = SeatStatus.AVAILABLE;
+    private String heldByBookingId;
+    private Instant holdExpiresAt;
+
+    boolean isAvailable(Instant now) {
+        if (status == SeatStatus.HELD && !now.isBefore(holdExpiresAt)) {
+            release();                       // an expired hold counts as free
+        }
+        return status == SeatStatus.AVAILABLE;
     }
-    Instant now=clock.instant(); long total=0;
-    for (String number:seats) {
-        Seat seat=new Seat(show,number);
-        Long price=prices.get(seat);
-        if (price==null) throw new IllegalArgumentException("unknown show-seat");
-        UUID owner=owners.get(seat);
-        if (owner!=null) expire(holds.get(owner),now);
-        if (owners.containsKey(seat)) throw new IllegalStateException("seat unavailable: "+number);
-        total=Math.addExact(total,price);
+
+    void hold(String bookingId, Instant until) {
+        status = SeatStatus.HELD;
+        heldByBookingId = bookingId;
+        holdExpiresAt = until;
     }
-    // Validation above changes no new ownership. Only a completely available cart reaches here.
-    Hold hold=new Hold(customer,show,seats,total,now.plus(holdFor));
-    holds.put(hold.id,hold);
-    for (String number:seats) owners.put(new Seat(show,number),hold.id);
-    requests.put(request,hold.id); fingerprints.put(request,fingerprint);
-    return hold.view();
+
+    boolean isHeldBy(String bookingId) {
+        return status == SeatStatus.HELD && bookingId.equals(heldByBookingId);
+    }
+
+    void book()    { status = SeatStatus.BOOKED; holdExpiresAt = null; }
+    void release() { status = SeatStatus.AVAILABLE; heldByBookingId = null; holdExpiresAt = null; }
 }
 ```
 
-Read the method in three parts. First, it checks the request and handles a successful prior request with the same key. Second, it checks every seat and adds the prices in paise, using overflow-checked integer arithmetic. Third, only after the entire set is available, it assigns every seat to the new reservation. Rejecting A8 must not leave A9 held from a partially completed cart.
+### Holding seats: all or nothing
 
-The sorted, immutable seat list gives equivalent retries the same meaning. The eight-seat limit is a chosen cart policy that bounds the work; it is not a limitation of object-oriented design. The price comes from server inventory, never from the amount submitted by a browser.
+```java
+public class BookingService {
+    private static final Duration HOLD_TIME = Duration.ofMinutes(5);
+    private static final int MAX_SEATS = 8;
 
-This is deliberately a small, complete object rather than a class hierarchy for every noun. There is one place responsible for the ownership rule. That follows single responsibility more usefully than adding an abstract factory before we have a real variation to support. A payment adapter is a sensible future interface because providers differ; a `SeatFactoryFactory` would add no useful capability here.
+    private final Map<String, Booking> bookings = new ConcurrentHashMap<>();
+    private final PaymentService paymentService;
+    private final PricingStrategy pricing;
+    private final Clock clock;
 
-### What changes when there are several servers?
+    public Booking holdSeats(User user, Show show, List<String> seatIds) {
+        if (seatIds.isEmpty() || seatIds.size() > MAX_SEATS) {
+            throw new IllegalArgumentException("Choose 1 to " + MAX_SEATS + " seats");
+        }
+        synchronized (show) {                       // one lock per show
+            Instant now = clock.instant();
+            List<ShowSeat> chosen = new ArrayList<>();
+            for (String id : seatIds) {
+                ShowSeat seat = show.getSeat(id);
+                if (!seat.isAvailable(now)) {
+                    throw new SeatUnavailableException(id);   // nothing has been changed yet
+                }
+                chosen.add(seat);
+            }
+            String bookingId = UUID.randomUUID().toString();
+            Instant holdUntil = now.plus(HOLD_TIME);
+            chosen.forEach(seat -> seat.hold(bookingId, holdUntil));
 
-Java's monitor protects one service instance. It cannot coordinate servers A and B. I would move the same atomic decision into a database transaction, using pre-created inventory rows keyed by `(show_id, seat_number)`:
+            Booking booking = new Booking(bookingId, user, show, chosen,
+                    pricing.total(show, chosen), holdUntil);
+            bookings.put(bookingId, booking);
+            return booking;
+        }
+    }
+}
+```
+
+Read it in two halves. The loop only **checks**. If A8 is taken, we throw before touching A7, so nothing is half-held. Only when every seat passed do we **change** them all.
+
+## 4. The hard part: two users, same seats
+
+Asha and Bilal both tap Continue on A7 and A8 at the same instant. Without protection, this can happen:
+
+| Time | Asha's request | Bilal's request |
+| --- | --- | --- |
+| t1 | Checks A7: available | |
+| t2 | | Checks A7: available |
+| t3 | Holds A7 | |
+| t4 | | Holds A7 – **double booking** |
+
+This is a classic **check-then-act race**: the check and the change are separate steps, and another thread slips in between.
+
+![Animation: Asha and Bilal ask for A7 and A8 at once; Asha gets the show lock first and holds both seats; Bilal then gets the lock, finds the seats held and is rejected with nothing changed.](learning-figures/lld-4-race.gif)
+
+`synchronized (show)` closes the gap. Only one thread at a time can run the check-and-hold block for the same show. Bilal's thread waits, then runs its check and sees A7 is HELD. He gets "seat unavailable". Requests for **different shows** use different locks and do not wait for each other.
+
+[![BookingService owns holds and the show-seat map inside one critical section; payment runs outside the lock, and a late payment leads to a refund instead of reclaiming a seat.](learning-figures/booking-ownership.svg)](learning-figures/booking-ownership.svg)
+
+### Confirming after payment
+
+Payment can take seconds. We must **not** hold the show lock while we wait for the bank, or every other customer of that show would freeze. So confirmation has three steps:
+
+```java
+public Booking confirmBooking(String bookingId, PaymentDetails details) {
+    Booking booking = bookings.get(bookingId);
+    Show show = booking.getShow();
+
+    synchronized (show) {                               // 1. still valid?
+        if (!booking.isPending() || booking.isExpired(clock.instant())) {
+            throw new BookingExpiredException(bookingId);
+        }
+    }
+
+    PaymentResult result = paymentService.charge(bookingId, booking.getAmount(), details); // 2. no lock
+
+    synchronized (show) {                               // 3. apply the result
+        boolean stillOurs = booking.getSeats().stream().allMatch(s -> s.isHeldBy(bookingId));
+        if (result.isSuccess() && stillOurs) {
+            booking.getSeats().forEach(ShowSeat::book);
+            booking.setStatus(BookingStatus.CONFIRMED);
+        } else {
+            if (result.isSuccess()) {
+                paymentService.refund(result.paymentId());   // paid too late: the hold expired
+            }
+            booking.getSeats().stream().filter(s -> s.isHeldBy(bookingId)).forEach(ShowSeat::release);
+            booking.setStatus(BookingStatus.EXPIRED);
+        }
+        return booking;
+    }
+}
+```
+
+Step 3 checks again because the world may have changed during payment. If the hold expired and another user took A7, Asha's late payment must not steal it back. We refund her instead. This one rule – **only confirm seats your booking still holds** – is what interviewers are looking for.
+
+### What about many servers?
+
+`synchronized` only works inside one JVM. With several servers, the database must be the referee. Two common answers:
+
+**Option A – conditional update (simple and popular).** Store one row per show seat, then hold all seats in one statement:
 
 ```sql
--- Protocol outline, not an executable database adapter in this example.
-BEGIN;
--- First create a lockable request identity, even on its first use.
-INSERT INTO booking_request(customer_id, request_key, payload_hash, status)
-VALUES (:customer, :key, :fingerprint, 'PROCESSING')
-ON CONFLICT (customer_id, request_key) DO NOTHING;
-SELECT * FROM booking_request
-WHERE customer_id = :customer AND request_key = :key FOR UPDATE;
--- Compare the fingerprint; replay a completed result if present.
--- Otherwise lock selected inventory rows in a consistent order.
-SELECT show_id, seat_number, owner_reservation, expires_at, state, price_paise
-FROM show_seat
-WHERE show_id = :show AND seat_number IN (:chosen_seats)
-ORDER BY show_id, seat_number
-FOR UPDATE;
--- Check the exact row count, expiry and availability of the whole cart.
--- Insert the reservation, assign every seat and complete the request row.
-COMMIT;
+UPDATE show_seat
+SET    status = 'HELD', booking_id = :bookingId, hold_expires_at = :holdUntil
+WHERE  show_id = :showId
+  AND  seat_id IN (:seatIds)
+  AND  (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at <= now()));
 ```
 
-The request insert uses a unique `(customer_id, request_key)` and waits for a conflicting transaction to finish. Under PostgreSQL READ COMMITTED, the following row-lock statement can read the winner's committed row. A missing-row `SELECT FOR UPDATE` alone would lock nothing. The initial `PROCESSING` row is never committed separately: the successful request result, reservation and seats commit together, or all roll back. A crash before commit leaves no abandoned claim. Compare the stored fingerprint before replaying so the key cannot identify another cart. Deadlocks or serialization failures require a bounded retry of the **whole transaction** under the same key. Inventory-changing writers, including expiry, cancellation and receipts, must use a compatible inventory lock order.
+Run it inside a transaction and check the number of updated rows. If it is less than the number of seats, roll back: someone else got at least one seat.
 
-A primary key prevents duplicate seat rows; it does **not** by itself stop two updates from assigning the existing row to different owners. The check and ownership change must be inside the transaction. PostgreSQL's [row-lock documentation](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-ROWS) explains what `FOR UPDATE` protects. The database adapter is an extension boundary, not a distributed guarantee established by the local Java tests.
+**Option B – row locks.** In a transaction, `SELECT ... FROM show_seat WHERE show_id = ? AND seat_id IN (...) ORDER BY seat_id FOR UPDATE`, check all statuses, update them and commit. Locking in a fixed order (by seat ID) prevents two transactions deadlocking each other.
 
-The seat-map cache may lag. This is acceptable because its job is to help a customer choose; the transactional hold operation remains authoritative. Never confirm from a cached availability response.
+A distributed lock in Redis per seat is a common suggestion, but it is harder to get right for a multi-seat cart. The database answer is simpler to explain and to trust.
 
-## 4. Keep reservation state separate from payment state
+## 5. Design patterns and extensibility
 
-“Has this customer got the seats?” and “Did we receive the money?” are different questions. Combining them into one enum makes timeout and late-callback cases difficult to represent.
+Use patterns where they solve a real change, not to decorate the diagram.
 
-[![A live hold can confirm before expiry, expire at its deadline or cancel; late captures on terminal reservations create one refund intent and never reacquire seats.](learning-figures/booking-states.svg)](learning-figures/booking-states.svg)
-
-Open the diagram at full size by selecting it.
-
-Reservation state is `HELD`, `CONFIRMED`, `EXPIRED` or `CANCELLED`. Payment state is `NOT_STARTED`, `PENDING`, `UNKNOWN`, `DECLINED` or `CAPTURED`. A reservation can be `EXPIRED` while its payment is `CAPTURED`; that is exactly the case that needs a refund. A confirmed reservation does not expire when the old hold deadline passes.
-
-The payment path has three stages:
-
-1. Under the short service lock, `beginPayment` checks ownership and expiry, then creates or returns the stable attempt key and frozen amount.
-2. Outside the lock, the adapter sends the payment request using that key. A timeout means **unknown**, because the provider might have captured money before the response was lost. The adapter queries/reconciles the same intent instead of inventing a new charge key.
-3. Under the lock again, `acceptReceipt` checks the attempt binding, applies the result and decides whether it can confirm. Signature verification and provider lookups happen at the adapter boundary, not by trusting a client field saying `paid=true`.
-
-The implementation is below. A first consistent capture follows the reservation diagram. Contradictory provider evidence is different: the service records a deduplicated `Reconciliation`, then throws a typed `ReceiptConflict` carrying that evidence. It does not silently confirm or refund a second, conflicting claim.
-
-```java
-public synchronized Attempt beginPayment(String customer, UUID id) {
-    Hold hold=owned(customer,id); expire(hold,clock.instant());
-    if (hold.state!=State.HELD) throw new IllegalStateException("hold is not payable");
-    if (hold.attempt==null) { hold.attempt="reservation/"+id; hold.payment=Payment.PENDING; }
-    return new Attempt(id,hold.attempt,hold.total);
-}
-// No provider call runs under the service monitor. The caller sends Attempt.key as its idempotency key.
-public synchronized Reservation acceptReceipt(UUID id, Receipt receipt) {
-    Objects.requireNonNull(receipt);
-    Hold hold=required(id);
-    if (hold.attempt==null || !hold.attempt.equals(receipt.attemptKey()))
-        throw new IllegalArgumentException("receipt does not match the payment attempt");
-    if (!Set.of(Payment.UNKNOWN,Payment.DECLINED,Payment.CAPTURED).contains(receipt.result()))
-        throw new IllegalArgumentException("not a provider outcome");
-    expire(hold,clock.instant());
-    if (receipt.result()==Payment.CAPTURED) {
-        text(receipt.chargeId());
-        if (receipt.amountPaise()<=0) throw new IllegalArgumentException("positive captured amount");
-        UUID previous=charges.get(receipt.chargeId());
-        if (previous!=null && !previous.equals(id)) throw conflict(hold,receipt,"charge already belongs to another reservation");
-        if (hold.charge!=null) {
-            if (!hold.charge.equals(receipt.chargeId()) || hold.chargedAmount!=receipt.amountPaise())
-                throw conflict(hold,receipt,"conflicting capture: reconcile with provider");
-            return hold.view(); // Identical callback is a no-op, even after cancellation.
-        }
-        if (hold.payment==Payment.DECLINED) throw conflict(hold,receipt,"conflicting terminal payment: reconcile");
-        charges.put(receipt.chargeId(),id); hold.charge=receipt.chargeId();
-        hold.chargedAmount=receipt.amountPaise(); hold.payment=Payment.CAPTURED;
-        if (hold.state==State.HELD && receipt.amountPaise()==hold.total) hold.state=State.CONFIRMED;
-        else {
-            if (hold.state==State.HELD) { hold.state=State.CANCELLED; release(hold); }
-            refund(hold,receipt.amountPaise()==hold.total?"paid after release":"captured amount differs from quote");
-        }
-    } else if (hold.payment!=Payment.CAPTURED && hold.payment!=Payment.DECLINED) {
-        hold.payment=receipt.result();
-        if (hold.payment==Payment.DECLINED && hold.state==State.HELD) { hold.state=State.CANCELLED; release(hold); }
-    }
-    return hold.view();
-}
-```
-
-A capture with the wrong amount cannot buy a ticket. This implementation cancels a still-live hold and creates a refund intent for the **actual captured amount**, not the expected quote. A duplicated identical capture is a no-op, including after cancellation. A stale decline cannot downgrade a capture already accepted.
-
-In a persistent implementation, the reservation update and refund intent belong in one database transaction. A worker sends the refund with a stable refund key, records its provider ID and retries uncertain outcomes. This is an **outbox**: a durable record of an action still to perform. The authenticated callback adapter also owns conflicts: catch `ReceiptConflict`, durably quarantine its attempt/charge/amount evidence in a successful transaction, and only then acknowledge delivery. Do not put the evidence only in the failed transaction that rolls back. A reconciler checks the provider's actual intent before choosing a financial action. The local maps demonstrate owned work and deduplication; they disappear on restart and do not settle refunds or prove durable quarantine.
-
-## 5. Walk through the race that usually breaks a booking system
-
-| Time since Asha's hold | Event | Seat owner and resulting action |
+| Pattern | Where | Why it helps |
 | --- | --- | --- |
-| 0 seconds | Asha holds A7 and A8 and starts payment | Asha; quote ₹500 |
-| 119 seconds | The provider response is still uncertain | Asha; payment `UNKNOWN`, hold still valid |
-| Exactly 120 seconds | Another operation checks expiry | No owner; Asha's reservation becomes `EXPIRED` |
-| 120 seconds | Bilal successfully holds both seats | Bilal, under a new reservation ID |
-| 121 seconds | Asha's capture callback arrives | Bilal stays owner; Asha stays expired; create one ₹500 refund intent |
-| 122 seconds | The same callback is delivered again | No new booking and no additional refund intent |
-
-The expiry boundary is `now >= expiresAt`. The release operation also compares the reservation ID. It does not just say “mark A7 available”, because by then A7 may belong to Bilal.
+| **Strategy** | `PricingStrategy` | Weekend pricing, recliner surcharge or dynamic pricing can change without touching `BookingService`. |
+| **Strategy / Adapter** | `PaymentService` interface with `RazorpayPayment`, `UpiPayment` | Payment providers differ; booking logic does not care which one. |
+| **Observer** | Booking confirmed → email, SMS, loyalty points | Listeners are added without changing the booking code. |
+| **Singleton (careful)** | One `BookingService` per application | In Spring this is simply a singleton bean; avoid a hand-written static singleton. |
 
 ```java
-private void expire(Hold hold, Instant now) {
-    if (hold.state==State.HELD && !now.isBefore(hold.expires)) { hold.state=State.EXPIRED; release(hold); }
+interface PricingStrategy {
+    long total(Show show, List<ShowSeat> seats);
 }
-private void release(Hold hold) {
-    // Compare owner as well as seat: an old callback must never release a newer hold.
-    for (String number:hold.seats) owners.remove(new Seat(hold.show,number),hold.id);
+
+class SeatTypePricing implements PricingStrategy {
+    public long total(Show show, List<ShowSeat> seats) {
+        return seats.stream().mapToLong(ShowSeat::getPricePaise).sum();
+    }
 }
 ```
 
-Expiry is lazy in this small implementation: a hold is checked when read, paid, cancelled or encountered during another hold request. A background sweep can make the displayed map fresher, but correctness cannot depend on that sweep running exactly on time. Every operation that might confirm or acquire ownership must check the deadline itself.
+**Extensions you can now explain quickly:**
 
-The server clock is injected so deadline tests are deterministic. In a shared database, use the database's time consistently for transactional decisions; do not let independent browser clocks decide ownership. A payment capture that happened before the deadline but was learned afterwards is refunded under our chosen firm-deadline policy. A product that wants a payment grace period must explicitly extend ownership before expiry and accept that other customers wait longer.
-
-### Run the complete solution
-
-The Java source is the implementation used by the tests and the step-through visual:
-
-- [BookingService.java](reference-code/learning/kb/booking/BookingService.java)
-- [BookingChecks.java](reference-code/learning/kb/booking/BookingChecks.java)
-- [BookingTrace.java](reference-code/learning/kb/booking/BookingTrace.java)
-
-With Java 21, save all three under `kb/booking/`, then compile and run:
-
-```sh
-javac -encoding UTF-8 -d out kb/booking/*.java
-java -ea -cp out kb.booking.BookingChecks
-java -cp out kb.booking.BookingTrace
-```
-
-The checks cover whole-cart rejection, equivalent retries, changed-payload rejection, cross-show seat identity, customer ownership, exact expiry, uncertain payment, late capture after a new owner, duplicate callbacks, cancellation, stale declines and a wrong captured amount. Forty rounds of forty competing callers check that exactly one complete cart wins. These are mechanism tests for one process, not a database integration or load test.
-
-### Keep the design simple, then strengthen the right boundary
-
-A global monitor is easy to reason about for an interview and this small executable example. Its cost is that unrelated shows contend. Per-show locks reduce that contention, but their lifecycle and lock order become part of the design; a database-backed service usually uses row-level transactions instead. A queue can absorb demand for a blockbuster, but it still needs an authoritative seat-allocation operation.
-
-One Redis lock per seat is not enough: a cart can acquire A7 and fail on A8, or the lease can expire while payment is still running. If Redis is used, the entire multi-seat decision, ownership token checks and recovery rules need a coherent atomic protocol. A cache is not automatically a simpler substitute for a transactional inventory table.
-
-The in-memory request history and refund map grow forever and disappear on restart. A real service persists them, defines retention based on retry/reconciliation windows, and restores pending work after a crash. Monitor hold-conflict rate, expiry rate, callbacks with no matching attempt, captured-but-unfulfilled reservations and oldest pending refund. Those metrics reveal broken customer promises more directly than server CPU alone.
+- *Coupons*: wrap the pricing strategy (`CouponPricing` decorates another `PricingStrategy`).
+- *Waitlist for sold-out shows*: when seats are released, notify users waiting for that show (Observer).
+- *Different hold time for different cities*: make `HOLD_TIME` part of configuration or the `Show`.
 
 ## 6. Interviewer follow-ups
 
-**Why hold seats before payment?** Otherwise two customers can both pay for the same seats, leaving the service to disappoint one afterwards. A short hold trades temporary blocked inventory for a clear ownership promise. The deadline limits abandoned-cart impact.
+**Why hold seats before payment instead of booking after payment?** Without a hold, two users can both pay for A7 and one must be refunded and disappointed. A short hold gives a clear promise: "these seats are yours for 5 minutes".
 
-**Can we guarantee exactly one provider charge?** The service guarantees one payment intent key per reservation. Preventing duplicate remote charges also depends on the provider honoring that key over the required retry period. If its idempotency window expires, reconcile by provider intent/charge ID before retrying; a local map is not proof of remote exactly-once execution.
+**Who releases expired holds?** Two ways, used together. Checks treat an expired hold as free (lazy expiry, as in `isAvailable`). A scheduled job also releases expired holds every few seconds so the seat map looks fresh. Correctness never depends on the job running on time.
 
-**What happens if payment succeeds and the application crashes before confirmation?** The durable reservation remains held or later expires. A verified callback or reconciliation job finds the intent and either confirms the still-owned seats or records a refund. The reservation, receipt processing and outbox must be persisted; the teaching process deliberately has no crash durability.
+**What if payment succeeds but the server crashes before confirming?** The payment provider calls our webhook or we poll it using the booking ID. If the booking still holds its seats, confirm it; otherwise refund. The booking ID is used as the payment's idempotency key so a retry never charges twice.
 
-**Can we give Asha her seats back after Bilal holds them?** No. Asha's reservation is terminal and her old owner token has no authority over Bilal's cart. Refund Asha or offer a new, separately accepted booking. Do not silently change Bilal's inventory to repair a previous payment race.
+**How do you show a live seat map to thousands of users?** Read seat status from a cache or a read replica and push updates over WebSocket. The map may be a second out of date; that is fine because the hold re-checks against the source of truth.
 
-**Which patterns are doing useful work?** Immutable records protect returned data; one application service owns state transitions; a payment adapter isolates provider-specific I/O; an outbox makes refund work recoverable in the persistent version. The State pattern could replace the enum if transitions became complex, but four states do not justify a hierarchy on their own.
+**Why one lock per show and not one lock for the whole system?** A global lock makes every show wait for every other show. Seats in different shows never conflict, so the show is the natural lock boundary.
 
-## 7. Closing answer
+**How would you add cancellation?** Allow it only for a CONFIRMED booking before the show starts. Mark the booking CANCELLED, set its show seats back to AVAILABLE and start a refund based on a `RefundPolicy` (another Strategy).
 
-“I would model inventory by show and seat, reserve a complete cart atomically, and return an immutable reservation with a frozen quote, deadline and pending-refund status. Payment uses one stable intent outside the inventory lock. Only a matching, paid, unexpired hold can confirm. A first consistent late capture records refund work without touching a newer owner; contradictory provider evidence goes to owned reconciliation work. Several servers need these decisions and work records inside durable transaction protocols.”
+**Isn't `synchronized` slow?** The critical section only touches at most 8 seats in memory, so it lasts microseconds. The slow part, payment, is deliberately outside it.
 
-![Selected design overview: the service owns reservation state and show-seat allocation, receives verified payment outcomes and records refund work for late captures.](designs/lld-4.svg)
+## 7. Going deeper (optional)
+
+You can pass most LLD rounds with sections 1–6. Senior interviews may push on the payment edge cases. The complete reference implementation explores them:
+
+- **Idempotency keys.** A retried "hold" request with the same key returns the same booking instead of creating a second one.
+- **Separate booking and payment states.** A booking can be EXPIRED while its payment is CAPTURED – exactly the refund case. Keeping two status fields makes this visible.
+- **Uncertain payments.** A timeout does not mean the payment failed. Keep the payment UNKNOWN and ask the provider again using the same key before charging anything new.
+- **Refund outbox.** In a database version, write "refund needed" in the same transaction as the expiry, and let a worker perform the refund with retries.
+
+[![Reservation state and payment state answer different questions: a late captured payment on an expired booking records a refund instead of reclaiming seats.](learning-figures/booking-states.svg)](learning-figures/booking-states.svg)
+
+[Step through both arrival orders and a late payment](learning-labs/index.html?topic=booking), or read the runnable Java: [BookingService.java](reference-code/learning/kb/booking/BookingService.java), [BookingChecks.java](reference-code/learning/kb/booking/BookingChecks.java) and [BookingTrace.java](reference-code/learning/kb/booking/BookingTrace.java). The checks race forty callers for the same seats and verify that exactly one cart wins.
+
+## 8. Closing answer
+
+"I model the catalogue as Movie, Cinema, Screen, Seat and Show, and the sellable inventory as `ShowSeat` – one per seat per show. `BookingService` is the only writer. `holdSeats` checks every requested seat and then holds all of them under a per-show lock, so a booking gets all its seats or none and two users can never hold the same seat. Holds expire after 5 minutes. Payment runs outside the lock; confirmation checks again that the booking still holds its seats, otherwise it refunds. With many servers, the same all-or-nothing rule moves into a database transaction using a conditional update or row locks. Pricing and payment providers are strategies, and notifications are observers."
 
 === LLD 5 ===
-N|n0|Card + secure PIN input|0|0|235|rect
-N|n1|ATM session|300|0|210|rect
-N|n2|Bank authority|590|0|210|rect
-N|n3|Withdrawal record|300|140|210|rect
-N|n4|Cash inventory|0|140|235|rect
-N|n5|Dispenser + evidence|590|140|240|rect
-E|n0|n1|card reference and PIN evidence
-E|n1|n2|authenticate and read balance
-E|n1|n3|start stable withdrawal ID
-E|n3|n4|reserve exact note plan
-E|n3|n2|hold then settle known delivery
-E|n3|n5|command once then query
+N|atm|ATM (context)|200|0|180|rect
+N|state|ATMState|460|0|160|rect
+N|bank|BankService|0|130|160|rect
+N|disp|CashDispenser|200|130|180|rect
+N|reader|CardReader + Keypad|460|130|200|rect
+N|txn|Transaction|0|0|150|rect
+E|atm|state|delegates to
+E|atm|bank|authenticate / debit
+E|atm|disp|plan and dispense
+E|atm|reader|reads card and PIN
+E|atm|txn|records
 ---
 ## Problem
 
-Design an ATM that lets a customer insert a card, authenticate, check a balance and withdraw cash.
+Design the software for an ATM. A customer inserts a card, enters a PIN, checks a balance or withdraws cash, and takes the card back.
 
-Suppose the customer asks for $60. The bank reserves $60, the machine starts dispensing three $20 notes, and then the device reply times out. Did the customer receive nothing, two notes or all three? The timeout does not tell us. Refunding the whole amount or sending another cash command could both be wrong.
-
-The design therefore needs to remember what it knows, preserve what is uncertain and resolve the original withdrawal before starting another one.
+The ATM is a favourite LLD question because the machine behaves differently depending on what has already happened. You cannot withdraw before entering a PIN, and you cannot insert a second card while one is inside. The design must make those rules hard to break.
 
 ## Requirements
 
-I will choose a small, explicit scope:
+- Insert a card and authenticate with a PIN. Three wrong PINs end the session.
+- After authentication, check balance or withdraw cash.
+- A withdrawal must be a multiple of ₹100, at most ₹20,000, and within the account balance.
+- Dispense the amount using ₹500, ₹200 and ₹100 notes from the machine's cassettes.
+- Never debit the account without giving the cash; never give cash without debiting.
+- Eject the card when the customer cancels or finishes.
 
-- One ATM serves one card session at a time, using one bank and one currency, US dollars.
-- The machine contains $20 and $50 notes. Amounts are represented as integer cents, never floating point. A request must be positive, in $10 increments and at most $500; the machine must still find an exact available note combination.
-- The bank authenticates the card and PIN evidence and owns account balances. The ATM owns its note inventory and withdrawal records.
-- A session can view its available balance and request a withdrawal. Under our chosen policy, three explicit authentication denials end the session and request card ejection. A bank outage does not count as a wrong PIN.
-- Each withdrawal has one stable ID. Retrying it returns the saved result; reusing it for another amount or session is rejected.
-- Reserve funds before sending a cash command. Settle the bank hold for the amount finally confirmed as delivered; release the unused part of the hold.
-- Unknown bank or device outcomes remain unresolved. Block further cash withdrawals until they are resolved. A jammed or quarantined note is unavailable until maintenance.
+Out of scope: deposits, transfers, PIN change, receipts, multiple currencies.
 
-Deposits, transfers, PIN changes, fees, other banks, currency conversion and receipt-printer hardware are outside this solution. The runnable Java mechanism uses local records and deterministic bank/device fixtures. The recovery section below explains the durable records required before connecting real cash hardware; a process lock and an in-memory map do not survive power loss.
+## 1. Clarify the scope
 
-## 1. Start with the customer's $60
-
-Assume the account has $100, with no other holds. The machine has three $20 notes and one $50 note, worth $110 in total.
-
-Two kinds of balance now matter:
-
-- **Ledger balance:** money recorded in the account, initially $100.
-- **Available balance:** ledger balance minus active holds. A $60 hold leaves $40 available while the withdrawal is being resolved.
-
-A hold reserves spending power. It is not yet the final debit. The bank must reserve atomically because the same account may also be used at another ATM or by another payment channel.
-
-There are also two separate inventories: money in the customer's bank account and notes inside this physical machine. A Java transaction cannot atomically update both the bank and the physical world.
-
-Here is the withdrawal that will carry the design:
-
-| Event | Bank | ATM cash | Withdrawal W17 |
-| --- | --- | --- | --- |
-| Customer requests $60 | Ledger $100; held $0 | Available: 3×$20, 1×$50 | Choose 3×$20. |
-| Bank confirms hold | Ledger $100; held $60 | Reserve 3×$20; only 1×$50 remains available. | Cash command may now start. |
-| Device outcome is unknown | Keep the hold. | Keep all three notes reserved. | `CASH_UNKNOWN`; no new cash command. |
-| Customer retries W17 | No new hold. | No new dispense. | Return the same unresolved result. |
-| Final evidence says two notes were delivered and one was quarantined | Debit $40, close the $60 hold and release the other $20. | Record 2×$20 delivered; keep 1×$20 quarantined. | `PARTIAL`, delivered $40. |
-
-The final account balance is $60, with no remaining hold. The customer received $40. One $20 note remains in the machine but is unavailable for another withdrawal. The available cassette still contains its $50 note.
-
-[Open the ATM walkthrough](learning-labs/atm.html) to follow these exact Java states, compare proven zero delivery with an unknown result, or inspect a lost bank reply. Every scenario has a complete text transcript.
-
-## 2. Give the bank, session and dispenser different jobs
-
-| Component | Responsibility | Important boundary |
+| Question to ask | Answer we choose | Why it matters |
 | --- | --- | --- |
-| Card reader | Detect insertion, supply an opaque card reference and attempt ejection. | A card reference is not a copied card secret. Failed ejection blocks another session. |
-| Secure PIN input | Obtain PIN input through the hardware/security integration and provide opaque evidence for authentication. | The domain model does not receive, log or compare PIN digits. |
-| ATM session | Track card insertion, authentication and account authority for the current customer. | Ending the card session does not erase an unresolved withdrawal. |
-| Bank port | Authenticate, read balances, reserve funds and settle a reservation idempotently. | It owns global account correctness; the ATM does not cache an authoritative balance. |
-| Cash inventory and planner | Choose and reserve an exact note combination, then account for the outcome. | Reserved or quarantined notes are unavailable to another withdrawal. |
-| Dispenser port | Execute one cash command and report or query its outcome. | A command acknowledgement, notes presented and notes taken are different facts. |
-| Withdrawal record | Bind ID, session, account, amount, note plan, phase and final evidence. | Retries and reconciliation refer to this record instead of creating another withdrawal. |
+| Who knows the balance and checks the PIN? | The bank. The ATM never stores balances or PINs. | The ATM talks to a `BankService` interface. |
+| Which operations? | Balance inquiry and withdrawal. | Keeps the state machine small; deposits are a follow-up. |
+| How many customers at once? | One card session per machine. | No need for complex locking inside the ATM. |
+| What if the machine cannot make the exact amount? | Reject before contacting the bank. | Check note availability first. |
+| What if cash fails to come out after the debit? | Reverse the debit. | We need an explicit failure path. |
 
-[![The card reader and secure PIN input feed the ATM session. A withdrawal record connects the bank's hold and settlement with an exact cash reservation and a dispenser command whose outcome can be queried.](designs/lld-5.svg)](designs/lld-5.svg)
+A 45-minute plan:
 
-The Java `Machine` coordinates these small components. An enum is enough for four session states: `IDLE`, `CARD_INSERTED`, `AUTHENTICATED` and `CARD_ERROR`. An authentication denial keeps the customer at PIN entry until the chosen attempt limit; successful authentication enables account operations. Ejection clears account authority. If ejection fails, the machine enters `CARD_ERROR` and cannot accept a new card.
+| Minutes | What you do |
+| --- | --- |
+| 0–5 | Requirements and the questions above |
+| 5–15 | States of the machine, then classes |
+| 15–30 | State pattern code and the withdrawal flow |
+| 30–40 | Cash dispensing algorithm and failure handling |
+| 40–45 | Follow-ups |
 
-There is no need for a subclass per screen or a transaction framework for four methods. If the product later has many state-specific events, a State pattern may help organize them. The state rules must be clear before introducing that pattern.
+## 2. Start with the states
 
-### Facts that must stay true
+Before drawing classes, draw what the machine can be doing. This is the heart of the answer:
 
-- Never send a cash command without a confirmed funds reservation for that withdrawal.
-- One live withdrawal record initiates at most one physical cash command. A retry or an inconclusive device lookup cannot initiate another.
-- Each note is available, reserved, delivered out of the machine or quarantined. Do not put an uncertain or jammed note back in the available cassette.
-- Final device evidence must account for every reserved note by denomination: **delivered + reusable + quarantined = planned**.
-- Settle only a confirmed delivered amount, between zero and the requested amount. Repeat the same settlement ID and amount if its response is lost.
-- A withdrawal's identity, account, amount and final evidence cannot silently change.
+[![ATM state machine: Idle moves to HasCard when a card is inserted; HasCard moves to Authenticated on a correct PIN and back to Idle after three wrong PINs or cancel; Authenticated handles balance and withdrawal and returns to Idle when the card is ejected.](learning-figures/lld-5-states.svg)](learning-figures/lld-5-states.svg)
 
-## 3. Find an exact note plan before touching the bank
+![Animation: one ATM session moves from Idle to HasCard on card insertion, stays in HasCard after a wrong PIN, moves to Authenticated on the correct PIN, performs balance and withdrawal, and returns to Idle when the card is ejected.](learning-figures/lld-5-states.gif)
 
-A large-note-first greedy chain is not enough for our chosen cassettes. For $60, it would take the $50 note, then fail to make the remaining $10. Three $20 notes are available, so rejecting that request would be a mistake.
-
-The planner tries each possible $50 count, starting with the largest available count. For each choice, it asks whether the remainder can be made entirely from available $20 notes:
-
-```text
-$60 with 1×$50: remainder $10 -> impossible
-$60 with 0×$50: remainder $60 -> 3×$20 -> exact plan
-```
-
-The maximum request is $500, so there are at most eleven possible $50 counts to try. With these two denominations, the first feasible plan also uses the fewest notes: for a fixed amount, using more $50 notes reduces the total note count. We do not claim this algorithm works unchanged for arbitrary denominations.
-
-```java
-public record Notes(int twenties, int fifties) {
-    public static final Notes NONE = new Notes(0, 0);
-    public Notes {
-        if (twenties < 0 || fifties < 0) throw new IllegalArgumentException("Negative note count");
-    }
-    public long valueCents() { return 2_000L * twenties + 5_000L * fifties; }
-    public Notes plus(Notes other) {
-        return new Notes(Math.addExact(twenties, other.twenties), Math.addExact(fifties, other.fifties));
-    }
-    public Notes minus(Notes other) { return new Notes(twenties - other.twenties, fifties - other.fifties); }
-}
-
-/** Try every feasible $50 count, largest first; the remaining amount must be $20 notes. */
-public static Optional<Notes> plan(int amountCents, Notes available) {
-    if (amountCents <= 0 || amountCents > 50_000 || amountCents % 1_000 != 0)
-        throw new IllegalArgumentException("Amount must be $10 increments, greater than 0, at most $500");
-    for (int fifties = Math.min(available.fifties(), amountCents / 5_000); fifties >= 0; fifties--) {
-        int rest = amountCents - 5_000 * fifties;
-        if (rest % 2_000 == 0 && rest / 2_000 <= available.twenties())
-            return Optional.of(new Notes(rest / 2_000, fifties));
-    }
-    return Optional.empty();
-}
-```
-
-`plan` only calculates. `CashInventory.reserve` then removes the selected notes from available inventory and records them against W17 under the machine's lock. If no exact plan exists, return `NO_NOTES` without asking the bank for a hold. Having enough total cash is insufficient: a machine containing only a $50 note cannot pay $20.
-
-## 4. Run a recoverable withdrawal
-
-The normal sequence is:
-
-1. Require an authenticated session and a valid request. Look up the stable withdrawal ID before starting new work.
-2. Reserve an exact note plan and create the withdrawal record, including its account and session. Record that bank authorization is pending before making that call.
-3. Ask the bank to reserve the requested funds using W17. A definite decline releases the unspent note reservation. An unknown result keeps the reservation and enters `FUNDS_UNKNOWN`; no cash command has started.
-4. After a confirmed hold, record `DISPENSING` before invoking the dispenser with command ID W17.
-5. If delivery is unknown or the reported counts do not account for the plan, enter `CASH_UNKNOWN`. Keep the whole hold and note reservation.
-6. When final evidence accounts for the notes, move reusable notes back to available inventory and jammed/rejected notes to quarantine. Save the delivered amount.
-7. Settle W17 for that delivered amount. The bank atomically debits it and releases the unused hold. A lost settlement response enters `SETTLEMENT_UNKNOWN`; repeat the same bank settlement to confirm it, without touching the dispenser again.
-8. Report `COMPLETED`, `PARTIAL` or `NO_CASH` only after settlement is confirmed.
-
-![The ATM reserves an exact note plan, obtains a bank hold and sends one cash command. Unknown outcomes keep reservations; final delivery evidence leads to idempotent settlement of the delivered amount.](learning-figures/lld-5-flow.svg)
-
-Our bank port deliberately promises an idempotent reservation and a single idempotent `settle(id, deliveredAmount)` operation that both debits delivered cash and closes the remaining hold. The teaching hold does not expire on its own. A real bank adapter must establish an equivalent contract; inventing a debit/credit pair in the ATM does not provide it.
-
-### Keep the three uncertain outcomes separate
-
-| Saved phase | What is uncertain | Next action |
+| State | Allowed actions | Everything else |
 | --- | --- | --- |
-| `FUNDS_UNKNOWN` | Whether the bank granted the hold. No cash command has been initiated. | Query the original bank reservation. Dispense only after confirmation. |
-| `DISPENSING` or `CASH_UNKNOWN` | Whether and how many notes reached the customer. | Query the original device command or escalate to physical reconciliation. Keep funds and notes reserved. |
-| `SETTLING` or `SETTLEMENT_UNKNOWN` | Cash delivery is known; bank settlement is not confirmed. | Repeat/query the same idempotent bank settlement for the saved delivered amount. Never dispense again. |
+| `IdleState` | insert card | "Please insert your card" |
+| `HasCardState` | enter PIN, cancel | "Please enter your PIN first" |
+| `AuthenticatedState` | balance, withdraw, eject card | inserting another card is rejected |
 
-A transport timeout is not a final “none delivered” report. Even a report labelled final is unusable if, for example, only one of three planned notes is accounted for.
+The naive version puts a big `switch (status)` in every method. Each new state then means editing every method. The **State pattern** gives each state its own class, and the ATM simply delegates to whichever state it is in.
 
-![A lost dispenser reply preserves the $60 hold and three-note reservation. A retry sends no cash. Final evidence of two delivered twenties and one quarantined twenty settles $40 and leaves the jammed note unavailable.](learning-figures/lld-5-unknown.svg)
+## 3. Core classes
 
-The device adapter's `Report` means **final customer delivery**, with every other reserved note classified as reusable or quarantined. It cannot simply treat a low-level “dispense” callback as “customer received cash.” The [CEN-hosted XFS cash-dispenser reference](https://www.cencenelec.eu/media/CEN-CENELEC/AreasOfWork/CEN%20sectors/Digital%20Society/CWA%20Download%20Area/XFS/CWA16926_Release3.40/TrackChanges/cwa-16926-64.pdf) distinguishes presentation, items taken and retraction. Our small Java port combines the evidence it needs into a teaching contract; it is not an implementation of that device API.
+| Class | Responsibility |
+| --- | --- |
+| `ATM` | The context: holds the current state, the inserted card and the hardware parts. Delegates every user action to the state. |
+| `ATMState` | Interface with one method per user action. |
+| `IdleState`, `HasCardState`, `AuthenticatedState` | The rules for each state, and which state comes next. |
+| `Card` | Card number and expiry read by the card reader. Contains no PIN. |
+| `BankService` | Interface to the bank: authenticate, get balance, debit, reverse. |
+| `CashDispenser` | Knows how many notes of each denomination are loaded; plans and dispenses notes. |
+| `Transaction` | A record of one operation: id, type, amount, status, time. Useful for audit and reversals. |
 
-## 5. Java mechanism, boundaries and checks
+[![Class diagram: ATM holds an ATMState, a CardReader, a CashDispenser and a BankService; IdleState, HasCardState and AuthenticatedState implement ATMState; the ATM records Transactions.](learning-figures/lld-5-classes.svg)](learning-figures/lld-5-classes.svg)
 
-These are the complete port contracts and values used by the example:
+[![Selected design: the ATM context delegates to its current ATMState, reads card and PIN, asks the BankService to authenticate and debit, asks the CashDispenser to plan and dispense, and records each Transaction.](designs/lld-5.svg)](designs/lld-5.svg)
 
-```java
-public enum SessionState { IDLE, CARD_INSERTED, AUTHENTICATED, CARD_ERROR }
-public enum AuthStatus { AUTHORIZED, DENIED, UNAVAILABLE }
-public enum HoldStatus { HELD, DECLINED, UNKNOWN }
-public enum Settlement { APPLIED, UNKNOWN }
-public enum Stage {
-    NO_NOTES, DECLINED, FUNDS_UNKNOWN, DISPENSING, CASH_UNKNOWN,
-    SETTLING, SETTLEMENT_UNKNOWN, COMPLETED, PARTIAL, NO_CASH
-}
-public record PinEvidence(String secureInputReference) {
-    public PinEvidence { requireKey(secureInputReference); }
-}
-public record AuthReply(AuthStatus status, String accountReference) {
-    public AuthReply {
-        Objects.requireNonNull(status);
-        if (status == AuthStatus.AUTHORIZED) requireKey(accountReference);
-    }
-}
-public record Funds(long ledgerCents, long heldCents) {
-    public long availableCents() { return ledgerCents - heldCents; }
-}
-public interface Bank {
-    AuthReply authenticate(String cardReference, PinEvidence evidence);
-    Funds balance(String accountReference);
-    HoldStatus reserve(String id, String accountReference, int requestedCents);
-    HoldStatus lookupHold(String id);
-    Settlement settle(String id, int deliveredCents);
-}
-public interface Dispenser {
-    Report dispense(String commandId, Notes plan);
-    Report lookup(String commandId);
-}
-public interface CardReader { boolean eject(); }
-
-/** The port must distinguish final customer delivery from notes merely presented. */
-public record Report(boolean finalEvidence, Notes delivered, Notes reusable, Notes quarantined) {
-    public Report {
-        Objects.requireNonNull(delivered);
-        Objects.requireNonNull(reusable);
-        Objects.requireNonNull(quarantined);
-    }
-    public static Report unknown() { return new Report(false, Notes.NONE, Notes.NONE, Notes.NONE); }
-    private boolean accountsFor(Notes plan) {
-        return finalEvidence
-            && (long) delivered.twenties() + reusable.twenties() + quarantined.twenties() == plan.twenties()
-            && (long) delivered.fifties() + reusable.fifties() + quarantined.fifties() == plan.fifties();
-    }
-}
-public record WithdrawalView(String id, Stage stage, int requestedCents,
-                             Notes plan, long deliveredCents) {}
-public record InventoryView(Notes available, Notes reserved, Notes quarantined) {}
-public record SessionView(SessionState state, String id, int failedAttempts) {}
-```
-
-`PinEvidence` contains a reference supplied by a trusted secure-input integration, not PIN digits or a reversible toy encoding. The fixture bank returns configured authentication results; it does not implement real PIN verification. Session handling is also implemented in the downloadable source, including unavailable authentication and failed card ejection.
-
-This is the full request/reconciliation entry point:
+## 4. The State pattern in code
 
 ```java
-public synchronized WithdrawalView withdraw(String id, int amountCents) {
-    requireAuthenticated(); requireKey(id);
-    Withdrawal old = withdrawals.get(id);
-    if (old != null) {
-        if (!old.sessionId.equals(sessionId) || old.requestedCents != amountCents)
-            throw new IllegalArgumentException("Withdrawal ID payload conflict");
-        return old.view();
-    }
-    if (cashBlocked()) throw new IllegalStateException("Cash operation unresolved or machine needs service");
-    Optional<Notes> selected = cash.reserve(id, amountCents);
-    Withdrawal op = new Withdrawal(id, sessionId, account, amountCents, selected.orElse(null));
-    withdrawals.put(id, op);
-    if (selected.isEmpty()) return op.view();
-    activeId = id;
-    handleHold(op, bank.reserve(id, account, amountCents));
-    return op.view();
-}
-
-/** Trusted maintenance operation; a customer UI must not expose this as an unrestricted endpoint. */
-public synchronized WithdrawalView reconcile(String id) {
-    Withdrawal op = Objects.requireNonNull(withdrawals.get(id), "Unknown withdrawal");
-    if (op.terminal()) return op.view();
-    switch (op.stage) {
-        case FUNDS_UNKNOWN -> handleHold(op, bank.lookupHold(id));
-        case DISPENSING, CASH_UNKNOWN -> handleReport(op, dispenser.lookup(id));
-        case SETTLING, SETTLEMENT_UNKNOWN -> settle(op);
-        default -> throw new IllegalStateException("Unexpected phase");
-    }
-    return op.view();
+interface ATMState {
+    void insertCard(ATM atm, Card card);
+    void enterPin(ATM atm, String pin);
+    void checkBalance(ATM atm);
+    void withdraw(ATM atm, int amount);
+    void ejectCard(ATM atm);
 }
 ```
 
-The old-ID branch returns before any new bank or hardware action. A same-ID request with a different amount or session is rejected. Validation errors before creating a record do not consume that ID. The caller must preserve the same ID when retrying; creating W18 after losing W17's response would describe a different withdrawal, which is why unresolved cash work also blocks new IDs on this machine.
-
-`reconcile` is a trusted maintenance operation, not an unrestricted customer endpoint. It can continue after the card has been ejected because the withdrawal keeps the account reference independently of the session.
-
-The remaining transitions are small enough to show in full:
+The ATM keeps the shared parts and forwards each action:
 
 ```java
-private void handleHold(Withdrawal op, HoldStatus result) {
-    if (result == null || result == HoldStatus.UNKNOWN) { op.stage = Stage.FUNDS_UNKNOWN; return; }
-    if (result == HoldStatus.DECLINED) {
-        cash.release(op.id); op.stage = Stage.DECLINED; activeId = null; return;
-    }
-    op.stage = Stage.DISPENSING; // Record intent before the first external cash command.
-    handleReport(op, dispenser.dispense(op.id, op.plan));
-}
+public class ATM {
+    private ATMState state = new IdleState();
+    private Card currentCard;
+    private int wrongPinAttempts;
 
-private void handleReport(Withdrawal op, Report report) {
-    if (report == null || !report.accountsFor(op.plan)) {
-        op.stage = Stage.CASH_UNKNOWN; // Do not refund, free notes or issue a new cash command.
-        return;
-    }
-    op.evidence = report;
-    cash.accountFor(op.id, report);
-    needsService |= report.quarantined().valueCents() > 0;
-    op.stage = Stage.SETTLING;
-    settle(op);
-}
+    final BankService bank;
+    final CashDispenser dispenser;
+    final Screen screen;
 
-private void settle(Withdrawal op) {
-    int deliveredCents = Math.toIntExact(op.evidence.delivered().valueCents());
-    if (bank.settle(op.id, deliveredCents) != Settlement.APPLIED) {
-        op.stage = Stage.SETTLEMENT_UNKNOWN;
-        return;
+    public ATM(BankService bank, CashDispenser dispenser, Screen screen) {
+        this.bank = bank; this.dispenser = dispenser; this.screen = screen;
     }
-    op.stage = deliveredCents == op.requestedCents ? Stage.COMPLETED
-        : deliveredCents == 0 ? Stage.NO_CASH : Stage.PARTIAL;
-    activeId = null;
+
+    public void insertCard(Card card) { state.insertCard(this, card); }
+    public void enterPin(String pin)  { state.enterPin(this, pin); }
+    public void checkBalance()        { state.checkBalance(this); }
+    public void withdraw(int amount)  { state.withdraw(this, amount); }
+    public void ejectCard()           { state.ejectCard(this); }
+
+    void setState(ATMState next) { state = next; }
+    // getters/setters for currentCard and wrongPinAttempts omitted
 }
 ```
 
-Final note accounting happens once, before settlement. A settlement retry uses the saved evidence and does not remove inventory again. Under our conservative policy, any quarantined note requires maintenance before another cash withdrawal, even after the money has been settled.
+Each state implements only what makes sense for it. Here is the PIN step:
 
-The machine synchronizes its operations because there is one card session and one physical cash path. In this focused example, calls to its ports have bounded deadlines and return explicit unknown outcomes. The bank fixture has its own atomic reservation boundary for shared account funds. A [Java instance lock](https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html#jls-8.4.3.6) protects only callers sharing that object; it does not lock a bank, another JVM or a motor.
+```java
+class HasCardState implements ATMState {
+    private static final int MAX_ATTEMPTS = 3;
 
-Download the complete files: [Atm.java](reference-code/learning/kb/atm/Atm.java), [DemoPorts.java](reference-code/learning/kb/atm/DemoPorts.java), [AtmDemo.java](reference-code/learning/kb/atm/AtmDemo.java) and [AtmChecks.java](reference-code/learning/kb/atm/AtmChecks.java). Save them under `examples/learning-java/src/kb/atm/`, then run from the repository root with Java 21:
+    public void enterPin(ATM atm, String pin) {
+        if (atm.bank.authenticate(atm.getCurrentCard(), pin)) {   // the bank checks the PIN
+            atm.setWrongPinAttempts(0);
+            atm.setState(new AuthenticatedState());
+            atm.screen.show("Choose an operation");
+            return;
+        }
+        int attempts = atm.getWrongPinAttempts() + 1;
+        atm.setWrongPinAttempts(attempts);
+        if (attempts >= MAX_ATTEMPTS) {
+            atm.screen.show("Too many wrong PINs");
+            ejectCard(atm);                                        // ends the session
+        } else {
+            atm.screen.show("Wrong PIN, " + (MAX_ATTEMPTS - attempts) + " tries left");
+        }
+    }
 
-```text
-javac --release 21 -encoding UTF-8 -d examples/learning-java/out examples/learning-java/src/kb/atm/*.java
-java -cp examples/learning-java/out kb.atm.AtmDemo
-java -cp examples/learning-java/out kb.atm.AtmChecks
+    public void ejectCard(ATM atm) {
+        atm.setCurrentCard(null);
+        atm.setWrongPinAttempts(0);
+        atm.setState(new IdleState());
+    }
+
+    public void insertCard(ATM atm, Card card) { atm.screen.show("A card is already inserted"); }
+    public void checkBalance(ATM atm)          { atm.screen.show("Enter your PIN first"); }
+    public void withdraw(ATM atm, int amount)  { atm.screen.show("Enter your PIN first"); }
+}
 ```
 
-The demo runs five complete scenarios: successful exact allocation, ambiguous cash followed by partial delivery, proven zero delivery, a lost hold response and a lost settlement response. The walkthrough exports those same states with `AtmDemo --json`; it does not send money or operate a device.
+Notice what happened: `withdraw` in `HasCardState` cannot reach the bank at all. The illegal action is impossible by construction, not prevented by an `if` that someone might forget.
 
-The checks compare note allocation with an independent bounded search, then verify session rules, unchanged effects on retry, payload conflicts, insufficient notes, a bank decline, unknown funds/cash/settlement, partial delivery, quarantine, inconsistent device evidence and competing account holds. Local fixtures verify our application decisions, not real banking or device guarantees.
+## 5. The withdrawal flow
 
-### What the in-memory example cannot recover
+Inside `AuthenticatedState`, withdrawing ₹2,700 follows a careful order:
 
-The map remembers operations only while the process runs. Connecting real cash hardware requires a durable withdrawal journal. Store at least:
+1. **Validate**: positive, a multiple of ₹100, at most ₹20,000.
+2. **Plan the notes first**: ask the dispenser whether it can make ₹2,700 from the notes it has. If not, stop before touching the account.
+3. **Debit at the bank**: the bank checks the balance and debits in one atomic step. If the balance is too low, it says no.
+4. **Dispense**: release the planned notes.
+5. **If dispensing fails**, ask the bank to reverse the debit.
 
-```text
-withdrawal_id, machine_id, session_ref, account_ref, requested_cents,
-reserved_note_counts, bank_reservation_ref, phase, device_command_id,
-final_delivered/reusable/quarantined_counts, settlement_amount, receipt
+```java
+class AuthenticatedState implements ATMState {
+    private static final int MAX_WITHDRAWAL = 20_000;
+
+    public void withdraw(ATM atm, int amount) {
+        if (amount <= 0 || amount % 100 != 0 || amount > MAX_WITHDRAWAL) {
+            atm.screen.show("Enter a multiple of ₹100, up to ₹" + MAX_WITHDRAWAL);
+            return;
+        }
+        Optional<Map<Integer, Integer>> plan = atm.dispenser.plan(amount);
+        if (plan.isEmpty()) {
+            atm.screen.show("This ATM cannot dispense that amount");
+            return;
+        }
+        String txnId = UUID.randomUUID().toString();
+        if (!atm.bank.debit(atm.getCurrentCard(), amount, txnId)) {
+            atm.screen.show("Insufficient balance");
+            return;
+        }
+        try {
+            atm.dispenser.dispense(plan.get());
+            atm.screen.show("Please take your cash");
+        } catch (DispenseException e) {
+            atm.bank.reverse(txnId);                    // money goes back to the account
+            atm.screen.show("Could not dispense cash. Your account was not charged.");
+        }
+    }
+    // checkBalance asks atm.bank.getBalance(card); ejectCard returns to IdleState; insertCard is rejected
+}
 ```
 
-Persist the reservation and phase before each external effect. In particular, commit a cash-command intent **before** invoking the motor. If that write cannot be confirmed, do not send cash. On restart, take cash service out of use, load unresolved records and reconcile their original bank/device IDs before serving another withdrawal.
+The transaction ID passed to `debit` is reused by `reverse`, so the bank knows exactly which debit to undo.
 
-A crash after cash-command intent creates an awkward window: the command might never have been sent, or it might have delivered cash before the process died. Both cases have the same local phase. Query the device journal; do not infer non-delivery from a missing reply. If the device cannot prove a final outcome or safely identify an original command across restart, keep the machine blocked and perform bank/device/operator reconciliation. A fresh command ID does not solve that uncertainty.
+### Planning the notes
 
-No software transaction can pull back notes the customer already took. Durable records, explicit device evidence and the bank's settlement contract are the pieces that make recovery possible; this local example does not claim to supply a certified ATM stack.
+With ₹500, ₹200 and ₹100 notes, a **greedy** plan works: take as many of the largest note as possible, then the next, and so on. It must also respect how many notes are actually loaded.
 
-## 6. Interviewer follow-ups
+```java
+class CashDispenser {
+    private final TreeMap<Integer, Integer> notes = new TreeMap<>(Comparator.reverseOrder());
+    // e.g. {500=40, 200=50, 100=100}
 
-**Why hold first instead of debit and blindly refund on failure?** A hold reserves funds without prematurely treating the requested amount as delivered. Later evidence can settle all, part or none. A device timeout is not proof that a refund is due; blindly refunding it can give the customer both cash and a restored balance. The bank must support the chosen settlement contract or provide an equivalent specified protocol.
+    synchronized Optional<Map<Integer, Integer>> plan(int amount) {
+        Map<Integer, Integer> plan = new LinkedHashMap<>();
+        int remaining = amount;
+        for (Map.Entry<Integer, Integer> e : notes.entrySet()) {
+            int note = e.getKey();
+            int use = Math.min(remaining / note, e.getValue());
+            if (use > 0) { plan.put(note, use); remaining -= use * note; }
+        }
+        return remaining == 0 ? Optional.of(plan) : Optional.empty();
+    }
 
-**When may you safely release all reserved funds and notes?** After a definite bank decline before any cash command, or after final device evidence proves zero delivery and accounts for every note. Only notes confirmed reusable return to the available cassette. Notes in a reject bin or jam remain quarantined even when no customer cash was delivered.
+    synchronized void dispense(Map<Integer, Integer> plan) {
+        plan.forEach((note, count) -> notes.merge(note, -count, Integer::sum));
+        // send the command to the hardware; throw DispenseException if it jams
+    }
+}
+```
 
-**What if the bank hold expires while the device outcome is unknown?** Our chosen port has no automatic expiry. For a real adapter, hold lifetime and late settlement are explicit bank-contract requirements. Reaching a local timeout cannot make a physical delivery disappear or justify forgetting the withdrawal. Keep reconciling the original operation and handle any expired authorization through the bank's supported exception process; do not claim a normal hold still exists after its authority has expired.
+For ₹2,700: 5 × ₹500 = ₹2,500, then 1 × ₹200 = ₹2,700. Done with 6 notes. If the ₹500 cassette is empty, the same loop uses ₹200 and ₹100 notes instead.
 
-**Are stable IDs enough to make physical cash exactly once?** No. Our live-process record prevents repeated command initiation. Recovery also needs a durable record and a device protocol that can identify and query the original command. A Java map cannot promise that a device forgets nothing after power loss. If that protocol is unavailable, uncertain cases require physical reconciliation rather than automatic resend.
+Greedy is the expected first answer and works while the ₹100 cassette has notes. Be ready to say where it breaks (see follow-ups): it never "goes back" to try fewer large notes.
 
-**What happens if two withdrawals compete for the last notes or the same bank balance?** This single ATM serializes cash reservation and withdrawal progression. The bank atomically checks available funds and creates each hold, so other machines cannot spend the same funds. A process lock at one ATM is not the bank's global account lock. The test exercises the local bank fixture's atomic behavior; a real bank adapter must provide that contract.
+## 6. Design patterns and extensibility
 
-**Should a slow bank call hold the machine lock?** This example does so to keep one physical cash path easy to inspect; the adapters must use bounded waits. A responsive production UI would record a pending phase under the lock, release it for I/O, then apply the result under the lock only if it still matches that withdrawal and phase. Ejecting a card must not cancel a command already sent. Do not introduce another device command while the first is unresolved.
+| Pattern | Where | Why it helps |
+| --- | --- | --- |
+| **State** | `ATMState` and its three classes | Each state's rules live in one class; adding `OutOfServiceState` does not touch the others. |
+| **Strategy** | Note-planning algorithm | Swap greedy for an exact search if the denominations change (see follow-ups). |
+| **Chain of Responsibility** (often mentioned) | One handler per note size passes the remainder on | Readable for canonical notes like 500/200/100, but it is just greedy in disguise. |
+| **Interface for external systems** | `BankService` | Test the ATM with a fake bank; swap bank networks without changing states. |
 
-**Why not use Chain of Responsibility for each denomination?** A greedy chain gives the wrong answer for our $60 example. The important abstraction is a side-effect-free exact planner over bounded cassette counts, followed by a reservation. For many denominations, use bounded dynamic programming or backtracking with explicit limits. Change the algorithm only when the denomination set justifies it; physical dispense remains one recorded operation, not one independent command per handler.
+**Adding a new feature**, for example deposits: add `deposit(ATM, amount)` to `ATMState`, implement it in `AuthenticatedState`, and reject it in the others. Adding `OutOfServiceState` (cash empty or maintenance) only needs one new class and a transition into it.
 
-**What if printing the receipt fails?** Keep the saved withdrawal result and offer an on-screen or later receipt for W17. Printing failure does not refund confirmed cash or initiate another withdrawal. The receipt must say unresolved while evidence or settlement is unknown; it must not confidently claim cash was or was not delivered.
+## 7. Interviewer follow-ups
 
-## 7. Closing answer
+**Why not store the PIN on the card or in the ATM?** Anyone who reads the card or the ATM's memory would learn it. The ATM sends the PIN (encrypted by the keypad hardware) to the bank, which checks it. The ATM only learns yes or no.
 
-“I would separate the card session from a withdrawal that can outlive it. The ATM reserves an exact note plan, asks the bank to hold funds and records one stable cash command. Final delivery evidence determines how much to settle; unknown outcomes keep the funds and notes reserved and block further cash. Retries return the original operation, and reconciliation queries its bank and device IDs. Before connecting real hardware, I would persist each phase and verify the bank/device recovery contracts, because a Java rollback cannot undo cash already handed to a customer.”
+**Does greedy always work?** No. Suppose the ₹100 cassette is empty. For ₹600, greedy takes one ₹500 and is left with ₹100 it cannot make, yet 3 × ₹200 works. The fix: try each possible count of the largest note, from high to low, and plan the rest the same way (a small backtracking search, or coin-change dynamic programming). With only three note sizes, this search is tiny.
+
+**What if the debit succeeds but the cash jams?** The bank reverses the debit using the same transaction ID. Notes that jammed stay inside the machine and are counted by an engineer, not returned to the available stock automatically.
+
+**What if two people use the same account at two ATMs at once?** The balance lives at the bank, and the bank checks-and-debits atomically. Two ATMs cannot both spend the same last ₹1,000.
+
+**Why check notes before debiting?** Debiting first and then discovering the machine cannot pay would force a reversal for a perfectly predictable failure.
+
+**How would you add a daily withdrawal limit?** The bank already knows today's withdrawals for the card, so the limit belongs in `bank.debit`, not in the ATM.
+
+**What if the network to the bank fails during a withdrawal?** Do not dispense. If the ATM does not know whether the debit happened, it records the transaction as uncertain and the bank's reconciliation decides; see the next section.
+
+## 8. Going deeper (optional)
+
+Real ATMs face a harder problem: a reply that never arrives. If the dispenser times out, did the customer get zero notes, two notes or all of them? The full reference design handles this carefully:
+
+- The bank first places a **hold** for the amount instead of a final debit. After the device reports what was actually delivered, the ATM **settles** that amount and releases the rest.
+- Every withdrawal has a stable ID. Retrying returns the same result instead of dispensing again.
+- An unknown device outcome blocks further withdrawals until it is reconciled; jammed notes are quarantined.
+
+[![An unknown cash outcome keeps the $60 hold and the reserved notes; a retry sends no cash; final evidence of two delivered notes settles $40 and keeps the jammed note out of stock.](learning-figures/lld-5-unknown.svg)](learning-figures/lld-5-unknown.svg)
+
+[Open the ATM walkthrough](learning-labs/atm.html) to follow these states, or read the runnable Java: [Atm.java](reference-code/learning/kb/atm/Atm.java), [DemoPorts.java](reference-code/learning/kb/atm/DemoPorts.java), [AtmDemo.java](reference-code/learning/kb/atm/AtmDemo.java) and [AtmChecks.java](reference-code/learning/kb/atm/AtmChecks.java). The reference uses $20 and $50 notes on purpose, because that is where a greedy plan fails.
+
+## 9. Closing answer
+
+"I model the ATM with the State pattern: Idle, HasCard and Authenticated, each in its own class, and the `ATM` delegates every action to the current state. That makes illegal actions, like withdrawing before entering a PIN, impossible by design. The bank owns PINs and balances behind a `BankService` interface. A withdrawal validates the amount, plans the notes first, asks the bank to debit atomically, dispenses, and reverses the debit with the same transaction ID if dispensing fails. Greedy note planning works for ₹500/₹200/₹100; for other denominations I would use an exact search. New operations or an out-of-service state are added as new state methods or classes."
 
 === LLD 6 ===
-N|n0|Rental service|260|0|220|rect
-N|n1|Vehicle + readiness|0|130|220|rect
-N|n2|Reservation + interval|260|130|240|rect
-N|n3|Frozen quote|560|130|220|rect
-N|n4|Rental agreement|260|260|240|rect
-N|n5|Return invoice|560|260|220|rect
-E|n0|n1|search and handover checks
-E|n0|n2|atomic interval allocation
-E|n2|n3|accepted price and dates
-E|n2|n4|pickup creates actual visit
-E|n4|n1|current physical owner
-E|n4|n5|record return and assess
+N|svc|RentalService|220|0|180|rect
+N|branch|Branch|0|0|140|rect
+N|vehicle|Vehicle|0|130|140|rect
+N|res|Reservation|220|130|180|rect
+N|price|PricingStrategy|460|0|170|rect
+N|bill|Invoice|460|130|140|rect
+E|svc|branch|search vehicles
+E|branch|vehicle|has many
+E|svc|res|reserve / pickup / return
+E|res|vehicle|books time slot
+E|svc|price|calculate fee
+E|res|bill|produces
 ---
 ## Problem
 
-Design a car rental service. Customer A books CAR17 from 09:00 to 11:00. The branch needs one hour to inspect and prepare it, so customer B can book it from 12:00.
+Design a car rental system such as Zoomcar or Hertz. A customer searches for a car type at a branch for some dates, reserves a car, picks it up, and returns it later. The branch needs time to clean a car between customers.
 
-Now A is late. At 12:00 B arrives, but CAR17 is still on the road. The software must preserve B's reservation without pretending it can hand out a car that has not returned. It must also reject two customers trying to reserve the same time and prevent a delayed return message from releasing somebody else's later rental.
+The key question hides in the dates: two customers must never be promised the same car for overlapping times, and a late return must be charged fairly.
 
 ## Requirements
 
-I will choose one branch and allocate a specific vehicle when a reservation is confirmed:
+- Search available vehicles by branch, vehicle type (hatchback, sedan, SUV) and time range.
+- Reserve a specific vehicle for a time range and get a price quote.
+- Pick up the car at the start time and return it later; record odometer and fuel.
+- Charge ₹1,800 for each started 24 hours of the booking and ₹200 for each started late hour.
+- Keep one hour after every rental for cleaning before the car can go out again.
+- Cancel a reservation before pickup.
 
-- Search by category and time range. A quote does not reserve a car; confirmation rechecks availability.
-- Rental time is `[start,end)`. Add one hour of preparation after the planned return when checking future reservations.
-- New reservations start now or later, last at most 30 days, and use an immutable quote valid for five minutes.
-- The example tariff is ₹1,800 per started 24-hour planned period, plus ₹200 per started late hour after the booked return. Early return keeps the booked base price. Store whole paise.
-- Pickup is allowed from the booked start up to, but not including, 30 minutes later. Recheck eligibility, physical ownership, maintenance and preparation completion at handover.
-- Before pickup, cancellation is free before the start; at or after the start it costs ₹500. A ready vehicle left uncollected after the grace period can be cancelled as a no-show. Operator unreadiness is not a customer no-show and permits free cancellation.
-- After pickup, close an actual rental through return rather than cancelling its history. Record odometer, fuel and condition. A damaged vehicle needs maintenance.
-- Retries retain reservation and command identities. A late return or timer for R1 cannot release a vehicle currently held by R2.
+Out of scope: one-way rentals between branches, insurance and add-ons, driver licence verification, payment gateway details.
 
-Customers pay at the counter against an invoice in this first design. Deposits, payment networks, tax calculation, fuel/damage pricing, one-way returns, category-only promises and reservation modification are outside the implementation. Eligibility is a trusted adapter's boolean result; the Java example does not verify a real licence or identity.
+## 1. Clarify the scope
 
-## 1. Start with the car, then separate the promise from the visit
-
-Three IDs mean different things:
-
-| ID | Meaning | Lifetime |
+| Question to ask | Answer we choose | Why it matters |
 | --- | --- | --- |
-| CAR17 | The physical asset | Remains the same across customers. |
-| R1 | A's reservation for particular dates and price | Remains in history after return or cancellation. |
-| A/R1 | A's actual rental agreement | Created only when the car is handed over. |
+| Do we reserve a car type or a specific car? | A specific car, chosen by the system. | Availability becomes a per-car calendar check. |
+| Same branch for pickup and return? | Yes. | One-way rentals need cars to move between branches; skip it. |
+| What happens between two rentals? | A one-hour cleaning buffer. | The buffer must be part of the overlap check. |
+| How are late returns handled? | Charge per started late hour. | Pricing needs the actual return time, not just the booked one. |
+| How many staff or apps reserve at once? | Several at the same time. | Reserving needs protection against two people taking the same slot. |
 
-A reservation promises future access. The agreement records what actually happened: pickup time, starting inspection and return evidence. It is possible to have a confirmed reservation while the car is not currently ready, which is exactly B's late-return problem.
+A 45-minute plan:
 
-The selected lifecycle is `CONFIRMED → ACTIVE → RETURNED`, or `CONFIRMED → CANCELLED`. `ACTIVE` means the customer actually has the car. It is not inferred from the clock reaching the start time.
-
-[![Rental service checks Vehicle readiness, allocates a Reservation interval with a frozen Quote, creates an Agreement at pickup and assesses an Invoice at return.](designs/lld-6.svg)](designs/lld-6.svg)
-
-## 2. Give each object a clear job
-
-| Type | Responsibility |
+| Minutes | What you do |
 | --- | --- |
-| `Vehicle` | Category, current active reservation, actual ready-at time and maintenance flag. |
-| `Window` | Valid planned start/end and interval overlap including preparation. |
-| `Quote` | Bind customer, vehicle, exact dates, tariff, base amount and expiry. |
-| `Reservation` | Own the accepted quote and legal reservation transitions. |
-| `AgreementView` | Keep actual pickup/return times and inspection readings under a distinct agreement identity. |
-| `Invoice` | Preserve the assessed base, late or cancellation amounts once. It is not a payment receipt. |
-| `Service` | Coordinate the vehicle schedule, ownership and command replay boundary. |
+| 0–5 | Requirements and the questions above |
+| 5–15 | Classes and statuses |
+| 15–25 | Availability check (interval overlap) |
+| 25–35 | Reserve, pickup, return and pricing code |
+| 35–45 | Concurrency, patterns and follow-ups |
 
-Category is an enum here: Economy and SUV are data used for search. A factory and a subclass for every category would not solve an interval race. Introduce different vehicle behavior only when the product requires it. Likewise the selected tariff is an immutable value; a pricing interface becomes useful when genuinely different charging algorithms must coexist.
+## 2. Core classes
 
-These invariants carry the design:
-
-- Confirmed/active promises for one vehicle do not overlap their planned blocking intervals.
-- A vehicle has at most one active physical rental. Handover changes both the reservation and vehicle owner together.
-- A quote cannot silently change customer, dates or price after acceptance.
-- A returned/cancelled reservation remains historical; replaying it cannot mutate the vehicle's new owner.
-- Actual return readiness is separate from the planned promise. A late car creates a visible conflict, not permission to invent another car.
-
-## 3. Availability is an interval check, not AVAILABLE=true
-
-For A's 09:00–11:00 rental, block `[09:00,12:00)`: two hours on rent followed by one hour of preparation. A proposed 11:00 pickup overlaps that interval. A 12:00 pickup touches its end and is allowed as a future promise.
-
-Two half-open blocking intervals overlap when:
-
-```text
-existing.start < requested.blockedUntil
-and requested.start < existing.blockedUntil
-
-blockedUntil = plannedReturn + 1 hour preparation
-```
-
-Strict `<` matters. Using `<=` would reject the valid 12:00 boundary. Checking only whether one start lies inside the other interval would miss a requested interval that surrounds an existing booking.
-
-![A's rental ends at 11:00, but its blocking interval extends through preparation until 12:00. An 11:00 pickup overlaps; 12:00 does not. Reservation confirmation checks and inserts under one authority.](learning-figures/lld-6-intervals.svg)
-
-The example scans the selected vehicle's blocking reservations, which is simple and correct for a small branch. An interval tree or a carefully maintained ordered schedule can improve lookup when measured history justifies it. A single arbitrary predecessor lookup is not a general overlap algorithm unless its non-overlap and boundary assumptions have been proved.
-
-### Quote first; allocate atomically
-
-The server creates a quote and stores it. The caller later submits the quote ID, not a price it calculated. Confirmation checks the owner, expiry, current eligibility, dates and schedule again, then records the reservation and replay identity together:
-
-```java
-public synchronized ReservationView reserve(String requestId, String customerId, String quoteId) {
-    key(requestId); key(customerId);
-    RequestKey key=new RequestKey(customerId,requestId); SavedRequest saved=requests.get(key);
-    if (saved != null) {
-        if (!saved.quoteId().equals(quoteId)) throw new IllegalArgumentException("Request ID payload conflict");
-        return view(booking(saved.reservationId()));
-    }
-    Quote quote=Objects.requireNonNull(quotes.get(quoteId),"Unknown quote");
-    if (!quote.customerId().equals(customerId)) throw new IllegalArgumentException("Quote belongs to another customer");
-    requireEligible(customerId);
-    if (!now().isBefore(quote.validUntil())) throw new IllegalStateException("Quote expired");
-    validateWindow(quote.window());
-    if (!free(asset(quote.vehicleId()),quote.window())) throw new IllegalStateException("Vehicle interval already allocated or not ready");
-    Booking booking=new Booking("R" + ++reservationSequence,quote);
-    bookings.put(booking.id,booking); requests.put(key,new SavedRequest(quoteId,booking.id));
-    return view(booking);
-}
-```
-
-The replay key is scoped to the customer. A retry with the same key and quote refers to the same reservation, even after the quote expires. A different quote under that key is a conflict. Read the returned current reservation state; replay does not create another future promise.
-
-A quote is deliberately not a temporary inventory hold. Two customers can obtain quotes for the same car. One confirmation wins the schedule check; the other must select another vehicle or interval. The Java lock coordinates one process only. A durable multi-server implementation must serialize all allocation writers for that vehicle and commit the reservation plus request identity together.
-
-## 4. Recheck physical readiness at pickup and return
-
-At pickup, require the customer and reservation, then check the chosen grace window. Only a ready, non-maintenance car with no active owner may be handed over. A retry returns `REPLAYED`; it does not authorize another physical handover.
-
-```java
-public synchronized PickupResult pickup(String reservationId, String customerId, Reading reading) {
-    Booking booking=owned(reservationId,customerId); Objects.requireNonNull(reading);
-    if (booking.agreement != null) {
-        if (!booking.agreement.pickup().equals(reading)) throw new IllegalArgumentException("Pickup payload conflict");
-        return new PickupResult(Handover.REPLAYED,booking.agreement);
-    }
-    if (booking.state != State.CONFIRMED) throw new IllegalStateException("Reservation cannot be picked up");
-    requireEligible(customerId); Instant now=now(); Window window=booking.quote.window();
-    if (now.isBefore(window.start())) return new PickupResult(Handover.TOO_EARLY,null);
-    if (!now.isBefore(window.start().plus(PICKUP_GRACE))) return new PickupResult(Handover.WINDOW_CLOSED,null);
-    Vehicle vehicle=asset(booking.quote.vehicleId());
-    if (vehicle.activeId != null || vehicle.maintenance || now.isBefore(vehicle.readyAt))
-        return new PickupResult(Handover.NOT_READY,null);
-    if (reading.damaged()) throw new IllegalArgumentException("Do not hand over a damaged vehicle");
-    booking.agreement=new AgreementView("A/" + booking.id,now,reading,null,null);
-    booking.state=State.ACTIVE; vehicle.activeId=booking.id;
-    return new PickupResult(Handover.STARTED,booking.agreement);
-}
-```
-
-When the customer returns, the reservation ID identifies the borrowing visit. Verify its active ownership and odometer, preserve the return evidence and invoice, then release that exact owner. Preparation runs until **actual return + one hour**. Early return can therefore release future inventory after actual preparation while still honoring the quoted base price.
-
-```java
-public synchronized Invoice returnVehicle(String reservationId, String customerId, Reading reading) {
-    Booking booking=owned(reservationId,customerId); Objects.requireNonNull(reading);
-    if (booking.agreement == null) throw new IllegalStateException("No rental agreement");
-    if (booking.state == State.RETURNED) {
-        if (!booking.agreement.returned().equals(reading)) throw new IllegalArgumentException("Return payload conflict");
-        return booking.invoice; // A replay never changes the vehicle's newer active reservation.
-    }
-    Vehicle vehicle=asset(booking.quote.vehicleId());
-    if (booking.state != State.ACTIVE || !booking.id.equals(vehicle.activeId)) throw new IllegalStateException("Stale rental owner");
-    if (reading.odometerKm() < booking.agreement.pickup().odometerKm()) throw new IllegalArgumentException("Odometer moved backwards");
-    Instant now=now();
-    if (now.isBefore(booking.agreement.pickedUpAt())) throw new IllegalStateException("Return before pickup");
-    Duration late=now.isAfter(booking.quote.window().end()) ? Duration.between(booking.quote.window().end(),now) : Duration.ZERO;
-    long latePaise=Math.multiplyExact(startedUnits(late,Duration.ofHours(1)),booking.quote.tariff().lateHourPaise());
-    long base=booking.quote.basePaise();
-    Invoice invoice=new Invoice("invoice/"+booking.id,booking.id,base,latePaise,0,Math.addExact(base,latePaise),now);
-    booking.agreement=new AgreementView(booking.agreement.id(),booking.agreement.pickedUpAt(),booking.agreement.pickup(),now,reading);
-    booking.invoice=invoice; booking.state=State.RETURNED;
-    vehicle.activeId=null; vehicle.readyAt=now.plus(PREPARATION); vehicle.maintenance=reading.damaged();
-    return invoice;
-}
-```
-
-An old R1 return first finds R1's saved return and invoice. It does not clear whichever reservation happens to own CAR17 now. A return with different readings under that completed identity is a conflict requiring an explicit correction process, rather than overwriting the evidence.
-
-### Follow the late return to its next customer
-
-| Event | Actual owner/readiness | Reservation consequence |
+| Class | What it represents | Key fields |
 | --- | --- | --- |
-| A collects at 09:00 | R1 owns CAR17 | B's R2 still promises pickup at 12:00. |
-| 12:00: A has not returned | Still R1; readiness unknown | B gets `NOT_READY`. R2 remains confirmed and visibly at risk. |
-| A returns at 12:10 | No active owner; ready at 13:10 | The original 12:00 promise cannot be honored. |
-| 12:30: no-show worker checks R2 | Operator preparation still conflicts | Do not classify B as a customer no-show. |
-| B chooses cancellation | No new handover | Cancel R2 for ₹0 because the operator was not ready. |
-
-![A's late return leaves CAR17 physically owned by R1 when B arrives. Return at 12:10 moves readiness to 13:10. B's promise stays visible, and company unreadiness cannot produce a customer no-show fee.](learning-figures/lld-6-readiness.svg)
-
-This solution chooses a complete remedy—free cancellation—rather than claiming to find a replacement automatically. A replacement feature would need another vehicle allocation transaction and the customer's acceptance of the changed asset.
-
-[Open the rental timeline walkthrough](learning-labs/rental.html) to step through preparation boundaries, this late-return conflict, or an old return arriving after B's pickup. Each state is exported by the Java example and has a text transcript.
-
-## 5. Price and cancellation boundaries are business rules
-
-The booked base uses **started 24-hour durations**, not calendar dates:
-
-| Planned duration | Periods | Base at ₹1,800/period |
-| --- | ---: | ---: |
-| Exactly 24 hours | 1 | ₹1,800 |
-| 24 hours plus 1 nanosecond | 2 | ₹3,600 |
-| 49 hours | 3 | ₹5,400 |
-
-After the planned end, lateness uses started hours. Exactly one late hour costs ₹200; one hour plus a fraction costs ₹400. A's two-hour booked rental returning 70 minutes late costs ₹1,800 base + 2×₹200 = ₹2,200.
-
-Do not truncate fractional seconds before rounding. The helper uses quotient and remainder against the original Duration:
+| `Branch` | A rental location | id, name, city, vehicles |
+| `Vehicle` | One physical car | id ("CAR17"), registration, `VehicleType`, `VehicleStatus` |
+| `Customer` | The person renting | id, name, licenceNumber |
+| `Reservation` | A booking of one vehicle for one time range | id, customer, vehicle, start, end, `ReservationStatus`, pickedUpAt, returnedAt |
+| `Invoice` | What the customer owes | reservationId, baseAmount, lateFee, total |
+| `RentalService` | Coordinates search, reserve, pickup, return, cancel | branches, reservations, pricing |
+| `PricingStrategy` | Calculates base and late charges | rates per vehicle type |
 
 ```java
-public static long startedUnits(Duration elapsed, Duration unit) {
-    if (elapsed.isNegative() || unit.isNegative() || unit.isZero()) throw new IllegalArgumentException("Invalid duration");
-    long whole=elapsed.dividedBy(unit);
-    return elapsed.minus(unit.multipliedBy(whole)).isZero() ? whole : Math.incrementExact(whole);
-}
+enum VehicleType { HATCHBACK, SEDAN, SUV }
+enum VehicleStatus { AVAILABLE, RENTED, IN_MAINTENANCE }
+enum ReservationStatus { CONFIRMED, PICKED_UP, RETURNED, CANCELLED }
 ```
 
-Java's [Duration API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/Duration.html) defines a duration day as exactly 24 hours. This policy therefore differs from local calendar-day charging around daylight-saving changes. Store instants for ordering and use the branch zone when displaying them. Opening hours and a calendar-day tariff would be additional explicit rules.
+[![Class diagram: Branch has Vehicles; Reservation links a Customer to one Vehicle for a start and end time and produces an Invoice; RentalService searches, reserves, picks up, returns and cancels, and uses a PricingStrategy.](learning-figures/lld-6-classes.svg)](learning-figures/lld-6-classes.svg)
 
-### Cancellation has its own cutoff
+**Do we need `Car`, `Suv` and `Hatchback` subclasses?** Only if they behave differently. Here they differ only by data (type and rate), so an enum is enough. If SUVs later needed a special deposit rule, that rule would go into a pricing or deposit strategy rather than a subclass.
 
-Before the start, cancellation costs zero. At the start or later, but before pickup, it costs ₹500 unless the operator cannot provide the vehicle. At the 30-minute pickup deadline, the customer may no longer start that reservation; a matching confirmed no-show can be cancelled once. After pickup, use return rather than deleting the visit.
+**Why keep `VehicleStatus` and reservations separate?** The status says what the car is doing *now* (on the road, in maintenance). Reservations say what is promised for the *future*. A car can be AVAILABLE today and fully booked next weekend.
+
+[![Selected design: RentalService searches a Branch's vehicles, creates Reservations that book a vehicle's time slot, uses a PricingStrategy and produces an Invoice on return.](designs/lld-6.svg)](designs/lld-6.svg)
+
+## 3. The availability algorithm: an interval check
+
+Example: customer A books CAR17 from 09:00 to 11:00. With one hour of cleaning, the car is **blocked from 09:00 to 12:00**.
+
+- Customer B asks for 11:00–14:00: it overlaps the blocked time, so CAR17 is not available.
+- Customer B asks for 12:00–15:00: it starts exactly when the block ends, so CAR17 is available.
+
+[![Timeline: A's rental from 09:00 to 11:00 plus cleaning until 12:00 blocks the car; a request starting at 11:00 overlaps and is rejected, a request starting at 12:00 is allowed.](learning-figures/lld-6-intervals.svg)](learning-figures/lld-6-intervals.svg)
+
+Two time ranges `[start, end)` overlap when **each starts before the other ends**:
 
 ```java
-public synchronized Invoice cancel(String reservationId, String customerId) {
-    Booking booking=owned(reservationId,customerId);
-    if (booking.state == State.CANCELLED) return booking.invoice;
-    if (booking.state != State.CONFIRMED) throw new IllegalStateException("After pickup, return the vehicle instead");
-    long fee=now().isBefore(booking.quote.window().start()) || readinessIssue(booking)!=null
-        ? 0 : booking.quote.tariff().lateCancelPaise();
-    booking.invoice=new Invoice("cancel/"+booking.id,booking.id,0,0,fee,fee,now());
-    booking.state=State.CANCELLED; return booking.invoice;
-}
-public synchronized boolean expireNoShow(String reservationId) {
-    Booking booking=booking(reservationId);
-    if (booking.state != State.CONFIRMED || now().isBefore(booking.quote.window().start().plus(PICKUP_GRACE))
-        || readinessIssue(booking)!=null) return false; // Operator unreadiness is not a customer no-show.
-    cancel(booking.id,booking.quote.customerId()); return true;
+class Reservation {
+    static final Duration CLEANING = Duration.ofHours(1);
+    // id, customer, vehicle, start, end, status, pickedUpAt, returnedAt ...
+
+    Instant blockedUntil() {
+        return end.plus(CLEANING);
+    }
+
+    boolean isActive() {
+        return status == ReservationStatus.CONFIRMED || status == ReservationStatus.PICKED_UP;
+    }
+
+    boolean overlaps(Instant otherStart, Instant otherEnd) {
+        Instant otherBlockedUntil = otherEnd.plus(CLEANING);
+        return start.isBefore(otherBlockedUntil) && otherStart.isBefore(blockedUntil());
+    }
 }
 ```
 
-The no-show job acts on its reservation ID and still requires `CONFIRMED`. A delayed job for an active, returned or cancelled R1 cannot release R2. A damaged return sets maintenance; clearing that flag after repair does not erase the independent preparation deadline.
+Three details interviewers check:
 
-These invoices exclude taxes, fuel and damage charges. Those readings are preserved, but inventing an adjustment without an agreed rule or inspection evidence would be wrong. Payment collection would have its own receipt and retry identity. A payment timeout must not reopen the rental or erase the recorded physical return.
+- **Strict `isBefore`, not `<=`.** A 12:00 start touching a 12:00 end is allowed.
+- **Both conditions.** Checking only "does the new start fall inside the old booking?" misses a new booking that completely surrounds an old one.
+- **The buffer on both sides.** The new booking also needs its own cleaning time before the next existing booking.
 
-### Run the complete Java 21 mechanism
+## 4. Reserve, pick up and return
 
-Download [Rental.java](reference-code/learning/kb/rental/Rental.java), [RentalDemo.java](reference-code/learning/kb/rental/RentalDemo.java) and [RentalChecks.java](reference-code/learning/kb/rental/RentalChecks.java). Save them under `examples/learning-java/src/kb/rental/` and run from the repository root:
+```java
+public class RentalService {
+    private final Map<String, List<Reservation>> reservationsByVehicle = new ConcurrentHashMap<>();
+    private final PricingStrategy pricing;
+    private final Clock clock;
 
-```text
-javac --release 21 -encoding UTF-8 -d examples/learning-java/out examples/learning-java/src/kb/rental/*.java
-java -cp examples/learning-java/out kb.rental.RentalDemo
-java -cp examples/learning-java/out kb.rental.RentalChecks
+    public List<Vehicle> search(Branch branch, VehicleType type, Instant start, Instant end) {
+        return branch.getVehicles().stream()
+                .filter(v -> v.getType() == type && v.getStatus() != VehicleStatus.IN_MAINTENANCE)
+                .filter(v -> isFree(v, start, end))
+                .toList();
+    }
+
+    public Reservation reserve(Customer customer, Vehicle vehicle, Instant start, Instant end) {
+        if (!start.isBefore(end) || start.isBefore(clock.instant())) {
+            throw new IllegalArgumentException("Invalid time range");
+        }
+        synchronized (vehicle) {                     // check and insert together
+            if (!isFree(vehicle, start, end)) {
+                throw new VehicleUnavailableException(vehicle.getId());
+            }
+            Reservation r = new Reservation(UUID.randomUUID().toString(), customer, vehicle, start, end);
+            reservationsByVehicle.computeIfAbsent(vehicle.getId(), id -> new CopyOnWriteArrayList<>()).add(r);
+            return r;
+        }
+    }
+
+    private boolean isFree(Vehicle vehicle, Instant start, Instant end) {
+        return reservationsByVehicle.getOrDefault(vehicle.getId(), List.of()).stream()
+                .filter(Reservation::isActive)
+                .noneMatch(r -> r.overlaps(start, end));
+    }
+}
 ```
 
-The source implements search, quote, confirmation, pickup, return, cancellation, no-show expiry and maintenance completion. The checks exercise nested/adjacent intervals, preparation, quote expiry/replay, frozen rates, nanosecond pricing boundaries, early/late returns, stale owner events, operator fault and two competing confirmations. The clock is injected for reproducible examples; this is a local mechanism, not a durable database, licence integration or production clock-health test.
+The search result is a suggestion. Between search and reserve another customer may take the car, so `reserve` checks again inside `synchronized (vehicle)`. Two requests for **different** cars never wait for each other.
+
+Pickup and return move the reservation through its statuses:
+
+```java
+public void pickup(Reservation r, int odometerKm) {
+    synchronized (r.getVehicle()) {
+        if (r.getStatus() != ReservationStatus.CONFIRMED) throw new IllegalStateException("Not pickable");
+        if (r.getVehicle().getStatus() != VehicleStatus.AVAILABLE) throw new VehicleNotReadyException();
+        r.markPickedUp(clock.instant(), odometerKm);
+        r.getVehicle().setStatus(VehicleStatus.RENTED);
+    }
+}
+
+public Invoice returnVehicle(Reservation r, int odometerKm, boolean damaged) {
+    synchronized (r.getVehicle()) {
+        if (r.getStatus() != ReservationStatus.PICKED_UP) throw new IllegalStateException("Not on rent");
+        Instant now = clock.instant();
+        r.markReturned(now, odometerKm);
+        r.getVehicle().setStatus(damaged ? VehicleStatus.IN_MAINTENANCE : VehicleStatus.AVAILABLE);
+        return pricing.invoice(r, now);
+    }
+}
+```
+
+### Pricing
+
+```java
+interface PricingStrategy {
+    Invoice invoice(Reservation r, Instant returnedAt);
+}
+
+class DailyRatePricing implements PricingStrategy {
+    private static final long DAY_RATE_PAISE = 1_80_000;   // ₹1,800
+    private static final long LATE_HOUR_PAISE = 20_000;    // ₹200
+
+    public Invoice invoice(Reservation r, Instant returnedAt) {
+        long days = startedUnits(Duration.between(r.getStart(), r.getEnd()), Duration.ofDays(1));
+        Duration late = returnedAt.isAfter(r.getEnd()) ? Duration.between(r.getEnd(), returnedAt) : Duration.ZERO;
+        long lateHours = startedUnits(late, Duration.ofHours(1));
+        long base = days * DAY_RATE_PAISE, lateFee = lateHours * LATE_HOUR_PAISE;
+        return new Invoice(r.getId(), base, lateFee, base + lateFee);
+    }
+
+    static long startedUnits(Duration d, Duration unit) {   // 25 hours -> 2 days
+        long whole = d.dividedBy(unit);
+        return d.equals(unit.multipliedBy(whole)) ? whole : whole + 1;
+    }
+}
+```
+
+Worked example: A booked 09:00–11:00 (one started day, ₹1,800) and returned at 12:10 (70 minutes late, two started hours, ₹400). Total ₹2,200. Money is kept in paise as a `long` so rounding never loses a rupee.
+
+## 5. Design patterns and extensibility
+
+| Pattern | Where | Why it helps |
+| --- | --- | --- |
+| **Strategy** | `PricingStrategy` | Weekend rates, per-km pricing or memberships without touching `RentalService`. |
+| **Factory** (optional) | Creating vehicles from a type | Useful if vehicle creation grows; not needed for an enum. |
+| **Observer** | Reservation created / car returned late | Email, SMS or "your car may be late" alerts without changing core code. |
+
+Extensions to mention:
+
+- *Add-ons* (child seat, GPS): a list of `AddOn` items on the reservation, each with its own price.
+- *Different cleaning times*: move `CLEANING` onto `VehicleType` (SUVs may need longer).
+- *Faster search for big fleets*: keep each car's reservations sorted by start time, or use an interval tree, instead of scanning all.
 
 ## 6. Interviewer follow-ups
 
-**Could we promise a category instead of a particular car?** Yes, but then the allocation fact is capacity over time for the category, followed by later asset assignment. Counting today's free cars cannot prove capacity over every future interval. Specific-vehicle allocation makes the first solution easier to verify and makes the next customer's affected asset explicit.
+**A is late and B's pickup time arrives. What now?** B's reservation still exists, but CAR17 is RENTED, so pickup fails with "vehicle not ready". The system should offer B another available car of the same type (a new reserve call for that car). If none exists, cancel B's booking free of charge – the delay is not B's fault. A is charged the late fee.
 
-**How would modification work?** Only for a confirmed reservation under a stated cutoff. Calculate a new quote, lock the affected vehicle schedule, exclude the reservation's own old interval when checking its replacement, and commit the new interval and quote together. Failure preserves the old allocation. Moving between vehicles needs both allocation authorities coordinated; cancelling first and hoping the replacement succeeds would lose the original promise. Modification is not exposed in this implementation.
+**How do you prevent two staff members reserving the same car for the same time?** Check and insert in one critical section per vehicle. With a database, lock that vehicle's row (`SELECT ... FOR UPDATE`) while checking overlaps and inserting, or use a database exclusion constraint on the time range (PostgreSQL supports this). Both make the database the single referee.
 
-**Can we use a database constraint for overlap?** Some databases support range/exclusion constraints; others need a different transaction design. One simple durable adapter locks the selected vehicle's schedule authority before checking and inserting, with every writer following that protocol. Request replay, cancellation and availability changes must use that same boundary. A Java lock on each web server does not coordinate those servers.
+**Why reserve a specific car and not just "an SUV"?** It makes availability a simple per-car check. Promising only a type needs capacity counting across overlapping times, which is harder; you can still let customers *search* by type.
 
-**Is a late return solved by extending R1's end?** No. That would hide R2's existing promise. Keep planned allocation and actual ownership separate, record the readiness conflict and apply the chosen remedy. More sophisticated replacement or compensation must be its own recorded operation.
+**What if the car comes back damaged?** Mark it IN_MAINTENANCE so search skips it, and charge damage through a separate inspection step. Future reservations on that car need to be moved to another car.
 
-**Why not use the vehicle's last drop-off branch for one-way search?** The last reservation in storage is not necessarily the relevant one for the requested time. One-way rentals require a time-ordered location plan, transfer/preparation constraints and conflict handling when an earlier trip changes. We deliberately keep same-branch return here.
+**How do you handle cancellation?** Only a CONFIRMED reservation can be cancelled. Set it to CANCELLED so it stops blocking the calendar. A `CancellationPolicy` (another strategy) decides the fee, for example free before the start time.
 
-**What survives a process crash?** Nothing in the memory-only example. A durable adapter stores quote terms, reservation/command identity, actual handover/return evidence and invoice together at their transition boundaries. It must recover the current physical owner before allowing another handover. A payment system cannot be used as the inventory authority.
+**Where do time zones fit?** Store times as `Instant` (UTC). Convert to the branch's time zone only when displaying.
 
-## 7. Closing answer
+## 7. Going deeper (optional)
 
-“I would reserve a specific vehicle against a half-open interval that includes preparation, using a frozen quote and one atomic allocation check. Pickup separately verifies the actual car is ready and creates an agreement. Return records the visit and price once, then releases only that visit's ownership and starts actual preparation. A late car makes later promises visibly at risk; the chosen remedy is free cancellation rather than a fictional handover or customer no-show fee. Durable adapters must preserve those same allocation and identity boundaries.”
+The full reference design adds production details you can bring up in senior rounds:
+
+- **Quotes**: the server stores a quote (car, dates, price, valid for 5 minutes). The customer confirms the quote ID, so the price cannot change between screens.
+- **Retry safety**: a confirmation retried with the same request ID returns the same reservation instead of booking twice.
+- **Old events**: a delayed "return" message for an old rental must not free a car that is now on a newer rental. Each event names the reservation it belongs to.
+- **Operator vs customer fault**: if the car is not ready because of a late return, the next customer is never charged a no-show fee.
+
+[![A's late return leaves CAR17 with R1 when B arrives; the return at 12:10 moves readiness to 13:10, B's reservation stays visible and is not charged a no-show fee.](learning-figures/lld-6-readiness.svg)](learning-figures/lld-6-readiness.svg)
+
+[Open the rental timeline walkthrough](learning-labs/rental.html), or read the runnable Java: [Rental.java](reference-code/learning/kb/rental/Rental.java), [RentalDemo.java](reference-code/learning/kb/rental/RentalDemo.java) and [RentalChecks.java](reference-code/learning/kb/rental/RentalChecks.java).
+
+## 8. Closing answer
+
+"I model Branch, Vehicle, Customer, Reservation and Invoice, with a `RentalService` coordinating search, reserve, pickup, return and cancel. Vehicle status describes the car now; reservations describe the future. Availability is an interval-overlap check on half-open ranges that include a one-hour cleaning buffer. Reserving re-checks and inserts under a per-vehicle lock, or a row lock in the database, so two customers can never get the same slot. Pricing is a strategy that charges per started day plus per started late hour, in paise. A late return blocks the next pickup, so the system offers another car or a free cancellation."
+
