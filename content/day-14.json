@@ -12,89 +12,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "RateLimiter",
+            "id": "req",
+            "label": "Request (key)",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "KeyPolicy",
-            "x": 250,
+            "id": "lim",
+            "label": "TokenBucketLimiter",
+            "x": 190,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "BucketRegistry",
-            "x": 500,
+            "id": "map",
+            "label": "Buckets by key",
+            "x": 420,
             "y": 0,
-            "w": 200,
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "bucket",
+            "label": "TokenBucket.tryTake",
+            "x": 420,
+            "y": 130,
+            "w": 190,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "TokenBucket",
+            "id": "clock",
+            "label": "Clock (nanos)",
+            "x": 190,
+            "y": 130,
+            "w": 140,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "res",
+            "label": "allow / reject",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "MonotonicClock",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "AdmissionResult",
-            "x": 500,
-            "y": 110,
-            "w": 200,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "resolves key"
+            "from": "req",
+            "to": "lim",
+            "label": "allow(key)"
           },
           {
-            "from": "n0",
-            "to": "n2",
-            "label": "looks up"
+            "from": "lim",
+            "to": "map",
+            "label": "computeIfAbsent"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "owns per key"
+            "from": "map",
+            "to": "bucket",
+            "label": "this key's bucket"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "measures elapsed"
+            "from": "clock",
+            "to": "bucket",
+            "label": "now"
           },
           {
-            "from": "n3",
-            "to": "n5",
-            "label": "returns"
+            "from": "bucket",
+            "to": "res",
+            "label": "refill + take"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a rate limiter class in Java (the LLD version, inside one JVM): `boolean allow(String key)` limits each user or API key to N requests per time window. You must implement the algorithms correctly, make them **thread-safe**, and make the algorithm swappable (**Strategy**).\n\n## Requirements\n\n**Functional**\n- Per-key limits (user ID, IP, API key), with different limits per tier or endpoint.\n- Algorithms: fixed window, sliding window log, sliding window counter, token bucket, leaky bucket.\n- Return allowed or denied, plus metadata (remaining requests, retry-after).\n\n**Non-functional**\n- O(1) per call where possible, safe under many concurrent threads, and bounded memory (evict idle keys).\n\n## 1. Scope and chosen solution\n\nI enforce capacity 5 and refill 2 permits/second per authenticated caller in one JVM. `RateLimiter` resolves keys, `TokenBucket` owns state, and an injected monotonic clock makes arithmetic testable. Costs are positive and no larger than capacity.\n\n## 2. Atomic decision\n\n```text\nsynchronized tryAcquire(cost,nowNanos):\n  elapsed = max(0,nowNanos-lastNanos)\n  tokens = min(capacity,tokens + elapsed/1e9*rate)\n  lastNanos = max(lastNanos,nowNanos)\n  if tokens >= cost: tokens -= cost; return ALLOW\n  return DENY with retryAfterNanos = ceil((cost-tokens)/rate * 1e9)\n```\n\nAfter depletion, 1.25 seconds refills 2.5 permits: two unit requests pass, then the next waits 0.25 seconds before HTTP-header rounding. I use fine-grained retry durations internally; a whole-second header rounds upward. Registry lookup is thread-safe but bucket synchronization covers the multi-field calculation. Idle eviction occurs only after a period long enough to restore a full bucket under the policy; premature deletion would grant another burst. Twenty-four simultaneous calls with frozen time admit exactly five. Multiple servers do not share this lock, so I do not claim global enforcement from this implementation.\n\n## 3. Final design diagram\n\n[![Design Rate Limiter: RateLimiter resolves key KeyPolicy; RateLimiter looks up BucketRegistry; BucketRegistry owns per key TokenBucket; TokenBucket measures elapsed MonotonicClock; TokenBucket returns AdmissionResult](designs/lld-14.svg)](designs/lld-14.svg)\n\nI start with one JVM and one caller. Then add multiple callers and finally multiple servers. The algorithm's arithmetic and its deployment authority are separate lessons; a correct local bucket does not automatically become a global quota.\n\n## 4. Critical operation: worked execution\n\n![Refill and consumption form one atomic operation.](lessons/lld-14-flow.svg)\n\n*Refill and consumption form one atomic operation.*\n\n![Atomic check-and-consume prevents overspending the bucket.](lessons/lld-14-failure.svg)\n\n*Atomic check-and-consume prevents overspending the bucket.*\n\n![Five-token capacity empties after five requests; at two tokens per second, 1.25 seconds refills 2.5 tokens.](lessons/lld-14-bucket.svg)\n\n*Fractional permits explain why two requests can pass now while the next must wait.*\n\n### Worked calculation and implementation\n\nWith capacity 5, rate 2/s and an empty bucket at t=0, t=1.25 has 2.5 tokens. Two unit-cost requests succeed, leaving 0.5. The next needs another 0.5 token, so its earliest retry is 0.25 seconds later. Do not round retry delay downward.\n\n```text\nelapsed = max(0, nowNanos - previousNanos)\ntokens = min(capacity, tokens + elapsedSeconds * rate)\nif tokens >= requestCost: tokens -= requestCost; ALLOW\nelse: DENY, retryAfter = (requestCost - tokens) / rate\n```\n\nHandle nonpositive capacity/rate and cost greater than capacity explicitly. Floating-point arithmetic can be acceptable for an educational bucket with bounded values; fixed-point arithmetic is an alternative when exact quotas and reproducibility require it.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `RateLimiter` | Facade: `allow(key)`; looks up the key's limiter |\n| `RateLimitAlgorithm` (Strategy) | `allow()` on one key's state |\n| `TokenBucket`, `SlidingWindowLog`, `SlidingWindowCounter`, `FixedWindow` | Implementations |\n| `RateLimitConfig` | capacity, refill rate or window, per tier |\n| `LimiterRegistry` | `ConcurrentHashMap<String, RateLimitAlgorithm>` plus idle eviction |\n| `Clock` | Injected time source, so tests are deterministic |\n\n\n### Design decisions & trade-offs\n\n| Algorithm | Pros | Cons |\n|---|---|---|\n| Fixed window | Tiny state, simple | Up to 2× burst at window edges |\n| Sliding log | Exact | O(N) memory per key |\n| Sliding counter | ~Exact, O(1) memory (weighted previous window) | Approximation |\n| Token bucket | Allows controlled bursts, smooth refill | Two params to tune |\n| Leaky bucket | Smooths output rate | Queues add latency |\n\n**1. Lazy refill.** Never use a background thread to add tokens. Compute the refill from elapsed time on each call. That's O(1) and scales to millions of keys.\n\n**2. Thread safety.** `synchronized` per bucket means contention only on the same key, which is usually fine. For a lock-free version, pack state into an `AtomicLong` or use `AtomicReference<State>` with a CAS loop. `computeIfAbsent` on the registry avoids creating duplicate buckets.\n\n**3. Memory.** Evict keys idle longer than the window (a Caffeine cache with `expireAfterAccess`, or a periodic sweep).\n\n**4. Testability.** Inject a `Clock`. Never call `System.currentTimeMillis()` inside the algorithm.\n\n**5. Distributed version (preview of HLD #2).** State moves to Redis, and the logic runs atomically as a Lua script.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Time measurement and atomic token accounting define a limiter more than the chosen class pattern.\n\nRateLimitKey identifies principal, route and policy version. RatePolicy contains capacity and refill rate. TokenBucket owns tokens and last refill time. Clock is monotonic for elapsed time. LimiterRegistry supplies bounded per-key state; Decision includes allowed, remaining and retry delay.\n\n**Correctness rule:** At a fixed instant, accepted requests never spend more tokens than available. Refilling cannot exceed capacity, and elapsed-time calculations cannot create tokens from a backward wall clock jump.\n\n```text\nkey(principal,route,policy_version); bucket(tokens,last_refill_nanos); policy(capacity,rate_per_second)\n```\n\n### End-to-end execution trace\n\nResolve policy; locate the bucket; acquire its synchronization boundary; calculate elapsed monotonic time; refill with a cap; consume if enough; return a retry delay based on the deficit; release the lock before request processing.\n\n### Concurrency and recovery walkthrough\n\nOne hundred threads request the final token simultaneously. Refill and consume must be one critical section; a thread-safe map does not make a read-modify-write bucket sequence atomic.\n\n### Policy choices and extension seams\n\nToken bucket permits bounded bursts; leaky bucket smooths output; fixed windows permit boundary bursts; sliding logs offer exact windows at higher memory cost. Single-JVM correctness does not imply global quotas across replicas.\n\n### Edge cases that change the design\n\nIdle-key eviction can reset quota if implemented carelessly. Fractional refill needs numeric care and overflow-safe elapsed handling. Costs must be positive; reject configuration with zero refill when retry calculation divides by rate.\n\n**Topic-specific cases:** Initial burst cap; concurrent last-token race; fractional refill; clock behavior; bounded key eviction; exact retry-after calculation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through deployment boundaries\n\nThree servers each allowing five immediate requests can collectively allow fifteen. For a global five-request burst, use a shared atomic decision store, route each key to one owner, or explicitly allocate sub-budgets. The latter can underuse quota and needs reassignment rules.\n\nUse monotonic elapsed time for a local bucket; wall-clock corrections must not mint tokens. Evicting idle callers is safe only when the recreated state matches the policy. Deleting an exhausted bucket and recreating it full immediately grants another burst.\n\n## 6. Interviewer follow-ups\n\n**Does a thread-safe map make the whole bucket algorithm atomic?** No. Coordinate state calculation and consumption for each key.\n\n**Does a denied request consume a token?** Define it; a common admission policy consumes only allowed work.\n\n## 7. Closing answer\n\nI choose a per-key token bucket with atomic refill-and-consume, monotonic time and explicit retry delay. The local implementation serializes one bucket without blocking unrelated keys. A global quota needs one shared decision authority or consciously allocated local sub-budgets.\n"
+      "markdown": "## Problem\n\nDesign a rate limiter class in Java – the low-level version that runs inside one service. The API is one method: `boolean allow(String key)`. For example, each user may make at most 5 requests in a burst and 2 requests per second after that.\n\nAsha's app fires 7 requests at once: 5 go through, 2 are refused. A second later she can send 2 more. Bilal, meanwhile, has his own limit. And when 100 threads call `allow` for the same key at once, exactly the right number must succeed.\n\n## Requirements\n\n- `allow(key)` returns true if the request may go ahead.\n- Each key (user, API key, IP) has its own limit.\n- Allow short bursts up to a capacity, with a steady refill rate.\n- Correct under many threads; fast (no locks shared by all keys).\n- Easy to test without waiting for real time; easy to swap the algorithm.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Is this inside one JVM, or across many servers?\n\n**Interviewer:** One JVM. The distributed version is HLD-2.\n\n**Candidate:** Do we allow bursts, or a strict per-second count?\n\n**Interviewer:** Allow a small burst, then a steady rate.\n\n**Candidate:** Are limits the same for every key?\n\n**Interviewer:** For now, yes: burst 5, then 2 per second.\n\n**Candidate:** What happens to refused requests – queue or reject?\n\n**Interviewer:** Reject. The caller returns 429.\n\n**Candidate:** How many keys?\n\n**Interviewer:** Up to a million active users.\n\n> **🎯 In the interview**\n> Name the algorithm you'll use and why before coding. \"Token bucket, because it allows bursts and has a steady average rate\" is a strong opening.\n\n| Functional | Non-functional |\n| --- | --- |\n| `allow(key)` per key | Thread-safe: no token spent twice |\n| Burst + steady rate | Low contention between keys |\n| Pluggable algorithm | Testable with a fake clock |\n\n## Step 2: Identify the core objects\n\n- **RateLimiter** – the interface with `allow(key)`.\n- **TokenBucket** – the state for one key: tokens left and when it was last refilled.\n- **TokenBucketLimiter** – maps each key to its bucket; implements `RateLimiter`.\n- **SlidingWindowLimiter** – an alternative algorithm behind the same interface.\n- **Clock** – a `LongSupplier` of nanoseconds, so tests control time.\n\n[![Selected design: a request for a key reaches the rate limiter, which finds or creates that key's token bucket in a concurrent map, refills it for the time passed and takes one token in a single atomic step, returning allow or reject.](designs/lld-14.svg)](designs/lld-14.svg)\n\n> **⚖️ Design choice**\n> **Token bucket.** It allows a burst up to the capacity and then a steady rate, needs only two numbers per key, and has no \"boundary\" problem like fixed windows.\n\n## Step 3: Design the classes\n\n### RateLimiter\n\nOne method. Callers don't care which algorithm is behind it (Strategy).\n\n### TokenBucket\n\nStores `tokens` and `lastNanos`. `tryTake(now)` adds tokens for the time passed (never above capacity), then takes one if available. It is `synchronized` so refill and take happen together.\n\n### TokenBucketLimiter\n\nA `ConcurrentHashMap<String, TokenBucket>`. `computeIfAbsent` creates a bucket the first time a key is seen – safely, even if two threads ask at once.\n\n[![Class diagram: TokenBucketLimiter and SlidingWindowLimiter implement RateLimiter; TokenBucketLimiter has a map of TokenBuckets and a clock; each TokenBucket has capacity, refill rate, tokens and last refill time.](learning-figures/lld-14-classes.svg)](learning-figures/lld-14-classes.svg)\n\n## Step 4: Write the code\n\n### RateLimiter\n\n```java\n/** Decides whether one request for a key may go ahead now. */\ninterface RateLimiter {\n    boolean allow(String key);\n}\n```\n\n### TokenBucket\n\n```java\n/** Holds up to `capacity` tokens and refills at `perSecond`. One request = one token. */\nclass TokenBucket {\n    private final double capacity, perNano;\n    private double tokens;\n    private long lastNanos;\n\n    TokenBucket(int capacity, double perSecond, long nowNanos) {\n        this.capacity = capacity;\n        this.perNano = perSecond / 1_000_000_000.0;\n        this.tokens = capacity;                         // start full\n        this.lastNanos = nowNanos;\n    }\n\n    /** Refill and take in one step, so two threads can't spend the same token. */\n    synchronized boolean tryTake(long nowNanos) {\n        tokens = Math.min(capacity, tokens + (nowNanos - lastNanos) * perNano);\n        lastNanos = nowNanos;\n        if (tokens < 1) return false;\n        tokens -= 1;\n        return true;\n    }\n}\n```\n\n### TokenBucketLimiter\n\n```java\nclass TokenBucketLimiter implements RateLimiter {\n    private final int capacity;\n    private final double perSecond;\n    private final LongSupplier clock;                   // System::nanoTime in production\n    private final ConcurrentHashMap<String, TokenBucket> buckets = new ConcurrentHashMap<>();\n\n    TokenBucketLimiter(int capacity, double perSecond, LongSupplier clock) {\n        this.capacity = capacity; this.perSecond = perSecond; this.clock = clock;\n    }\n\n    public boolean allow(String key) {\n        long now = clock.getAsLong();\n        TokenBucket b = buckets.computeIfAbsent(key,\n                k -> new TokenBucket(capacity, perSecond, now));\n        return b.tryTake(now);\n    }\n}\n```\n\n### Worked example\n\nCapacity 5, refill 2 tokens per second, fake clock.\n\n| Time | Requests | Tokens before → after | Result |\n| --- | --- | --- | --- |\n| 0 s | Asha × 7 | 5 → 0 | 5 allowed, 2 refused |\n| 0 s | Bilal × 1 | his own bucket: 5 → 4 | allowed |\n| 1.25 s | Asha × 3 | 0 + 2.5 = 2.5 → 0.5 | 2 allowed, 1 refused |\n| 60 s | Asha × 10 | refill capped at 5 → 0 | 5 allowed, 5 refused |\n| 0 s | 100 threads, new key, no refill | 5 → 0 | exactly 5 allowed |\n\n[![Five-token capacity empties after five requests; at two tokens per second, 1.25 seconds refills 2.5 tokens.](lessons/lld-14-bucket.svg)](lessons/lld-14-bucket.svg)\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Long idle time | Tokens capped at capacity – no giant burst |\n| Fractional tokens | Kept as `double`; a request needs a whole token |\n| First request for a key | Bucket starts full |\n| Clock goes backwards | `System.nanoTime` is monotonic; never use wall-clock time |\n\n## Step 5: The tricky part: a race on the last token\n\nTwo threads call `allow(\"asha\")` when she has exactly 1 token left.\n\n1. Thread A reads `tokens = 1`.\n2. Thread B reads `tokens = 1`.\n3. Both decide \"allowed\" and both write `tokens = 0`.\n\nTwo requests passed on one token. The fix: refill, check and take inside **one** synchronized method on that key's bucket. Different keys use different buckets, so Asha's requests never wait on Bilal's lock.\n\n![Animation: two threads ask for Asha's last token at the same time; without a lock both read one token and both are allowed; with the synchronized tryTake, the first thread refills, takes the token and leaves zero, and the second thread sees zero and is refused.](learning-figures/lld-14-race.gif)\n\n> **⚠️ Common mistake**\n> Making `allow` itself `synchronized` on the limiter. It's correct but every user in the system now waits on one lock. Lock per key (per bucket) instead.\n\n> **🎯 In the interview**\n> Mention injecting the clock. With a `LongSupplier`, tests move time forward instantly – no `Thread.sleep`, no flaky tests.\n\n## Step 6: Deep dives\n\n### Sliding window log: an alternative\n\n```java\n/** Alternative: at most `limit` requests in any rolling window. Stores timestamps. */\nclass SlidingWindowLimiter implements RateLimiter {\n    private final int limit;\n    private final long windowNanos;\n    private final LongSupplier clock;\n    private final ConcurrentHashMap<String, Deque<Long>> log = new ConcurrentHashMap<>();\n\n    SlidingWindowLimiter(int limit, long windowMillis, LongSupplier clock) {\n        this.limit = limit; this.windowNanos = windowMillis * 1_000_000; this.clock = clock;\n    }\n\n    public boolean allow(String key) {\n        long now = clock.getAsLong();\n        Deque<Long> times = log.computeIfAbsent(key, k -> new ArrayDeque<>());\n        synchronized (times) {\n            while (!times.isEmpty() && now - times.peekFirst() >= windowNanos) {\n                times.pollFirst();                      // drop requests outside the window\n            }\n            if (times.size() >= limit) return false;\n            times.addLast(now);\n            return true;\n        }\n    }\n}\n```\n\nExact \"at most N in any rolling second\", but it stores one timestamp per request – fine for small limits, heavy for large ones. Fixed windows are cheaper but allow 2× bursts at window edges.\n\n### Different limits per key\n\nPass a `Function<String, Limit>` (e.g. free plan 5/2s, paid plan 50/20s) and create each bucket with its own limit.\n\n### Cleaning up idle keys\n\nA million keys means a million buckets. Use a cache with expiry (Caffeine's `expireAfterAccess`) instead of a plain map, so idle buckets disappear.\n\n### Many servers\n\nPer-JVM limits multiply by the number of servers. For a global limit, keep buckets in Redis and update them atomically with a Lua script (see HLD-2).\n\n## Interviewer follow-ups\n\n**Token bucket vs leaky bucket?** Token bucket allows bursts up to capacity; leaky bucket smooths output to a constant rate, queuing or dropping the excess.\n\n**Why `double` tokens?** Refill happens continuously; 1.25 s × 2/s = 2.5 tokens. Rounding down each time would slowly lose tokens.\n\n**Could you use `AtomicLong` instead of `synchronized`?** Yes – store tokens and time in one value and update with compare-and-set in a loop. It's lock-free but harder to read; `synchronized` per key is usually fast enough.\n\n**How do you tell the client when to retry?** Compute the time until one token is available and return it in a `Retry-After` header.\n\n## Wrap up\n\nA `RateLimiter` interface with a token bucket per key: refill for elapsed time, take one token, all in one synchronized step per key, with an injectable clock for testing.\n\n> **📝 Key takeaways**\n> - Token bucket: burst up to capacity, steady refill rate.\n> - Refill-check-take must be atomic – per key, not one global lock.\n> - `ConcurrentHashMap.computeIfAbsent` creates buckets safely.\n> - Inject the clock; swap algorithms behind one interface.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [RateLimiterDemo.java](reference-code/learning/kb/ratelimiterlld/RateLimiterDemo.java). It replays the worked example, including the 100-thread race, and checks every result.\n\n[![Refill and consumption form one atomic operation.](lessons/lld-14-flow.svg)](lessons/lld-14-flow.svg)\n\n## Closing answer\n\n\"I define a RateLimiter interface with `allow(key)`. The default implementation is a token bucket per key, held in a ConcurrentHashMap and created with computeIfAbsent. Each bucket stores fractional tokens and the last refill time; `tryTake` adds tokens for the elapsed time, capped at capacity, then takes one if at least one is available – all inside one synchronized method, so two threads can never spend the same token, while different keys never block each other. Time comes from an injected nanosecond clock, so tests are instant. A sliding-window log is an alternative behind the same interface, and across servers the bucket moves to Redis with an atomic script.\"\n"
     },
     {
       "category": "HLD",

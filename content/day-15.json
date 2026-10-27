@@ -12,103 +12,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "TransferService",
+            "id": "app",
+            "label": "Asha's app",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 130,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Wallet",
-            "x": 250,
+            "id": "svc",
+            "label": "WalletService",
+            "x": 180,
             "y": 0,
-            "w": 200,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Transfer",
-            "x": 500,
+            "id": "keys",
+            "label": "Idempotency keys",
+            "x": 400,
             "y": 0,
-            "w": 200,
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "locks",
+            "label": "Lock wallets in ID order",
+            "x": 400,
+            "y": 130,
+            "w": 210,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "LedgerEntry",
+            "id": "w",
+            "label": "Debit + credit",
+            "x": 180,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "ledger",
+            "label": "Ledger (append-only)",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "BalanceProjection",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "PaymentPort",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Reconciler",
-            "x": 0,
-            "y": 220,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "y": 130,
+            "w": 180,
+            "h": 62,
+            "shape": "cylinder"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "locks in order"
+            "from": "app",
+            "to": "svc",
+            "label": "transfer + key"
           },
           {
-            "from": "n0",
-            "to": "n2",
-            "label": "records once"
+            "from": "svc",
+            "to": "keys",
+            "label": "seen before?"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "posts balanced"
+            "from": "svc",
+            "to": "locks",
+            "label": "new request"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "projects"
+            "from": "locks",
+            "to": "w",
+            "label": "both wallets"
           },
           {
-            "from": "n0",
-            "to": "n5",
-            "label": "external boundary"
-          },
-          {
-            "from": "n6",
-            "to": "n2",
-            "label": "resolves pending"
+            "from": "w",
+            "to": "ledger",
+            "label": "one transaction"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a digital wallet like Paytm or PhonePe: users top up from a bank or card, pay merchants, transfer to other users, and see a history. Money moves must be **atomic**, **idempotent** and **auditable**. This combines a transaction **State machine**, **Strategy** for payment instruments, and careful concurrency.\n\n## Requirements\n\n**Functional**\n- Create a wallet, top up via a gateway, pay a merchant, P2P transfer, withdraw to a bank, view the statement.\n- Limits (per-transaction, daily, KYC tier). Refunds and reversals.\n\n**Non-functional**\n- Never lose or create money. Balances must match the ledger exactly.\n- Client retries must not double-charge. Concurrent transfers must not overdraw.\n\n## 1. Scope and chosen solution\n\nI transfer INR minor units between internal wallets with no overdraft. Wallet identity and transfer identity are separate; the ledger explains balances. External top-up/cash-out uses a separate provider workflow, not the internal atomic transfer transaction.\n\n## 2. Internal transfer transaction\n\n```text\ntransfer(id,from,to,amount,currency):\n  validate positive amount, same currency, distinct wallets and actor permission\n  return existing result for matching id/payload, reject conflicting reuse\n  lock wallets in stable ID order\n  verify spendable balance; insert transfer and debit/credit entries\n  update protected balance projection and commit\n```\n\nFor ₹500 in A and a ₹200 transfer, entries are A −20,000 paise and B +20,000. The sum is zero and A becomes ₹300. Two ₹400 debits against ₹500 cannot both pass the locked funds check. Fee collection adds balanced entries to an explicit fee account. Reversal is another uniquely identified transfer linked to the original. A provider timeout remains pending under its original reference; reconciliation confirms whether collection happened before another attempt or refund is authorized.\n\n## 3. Final design diagram\n\n[![Design Wallet / Payment System: TransferService locks in order Wallet; TransferService records once Transfer; Transfer posts balanced LedgerEntry; LedgerEntry projects BalanceProjection; TransferService external boundary PaymentPort; Reconciler resolves pending Transfer](designs/lld-15.svg)](designs/lld-15.svg)\n\nI begin with one currency and one database transaction. A wallet identifies an account; a transfer identifies the business operation; balanced ledger entries explain its effect. External card or bank payments add a separate uncertain network boundary.\n\n## 4. Critical operation: worked execution\n\n![Both sides commit together under one transfer identity.](lessons/lld-15-flow.svg)\n\n*Both sides commit together under one transfer identity.*\n\n![Retry returns the original transfer instead of debiting again.](lessons/lld-15-failure.svg)\n\n*Retry returns the original transfer instead of debiting again.*\n\n### Worked calculation and implementation\n\nIf A has 50,000 paise and transfers 20,000 to B, A ends with 30,000 and B increases by 20,000. The signed entry sum for the internal transfer is zero. Fees require explicit entries to a fee account; otherwise conservation appears to break.\n\n```text\nTransfer(id, fromWallet, toWallet, currency, amountMinor, payloadHash)\nLedgerEntry(transferId, walletId, signedAmountMinor)\nT4/A: -20000 INR paise\nT4/B: +20000 INR paise\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Wallet` | id, user, `balance` (derived or cached), status, version |\n| `LedgerEntry` | Immutable: txnId, walletId, `DEBIT/CREDIT`, amount, balanceAfter |\n| `Transfer` | id, type, amount, from, to, `TransferState`, idempotencyKey |\n| `TransferState` | `POSTED → REVERSED`; external funding intents separately track pending/unknown results |\n| `PaymentInstrument` (Strategy) | `Card`, `UPI`, `NetBanking` for top-ups |\n| `IdempotencyStore` | key → result (first result wins) |\n| `LimitPolicy` | Chain of checks: KYC tier, daily cap, velocity |\n\n### Design decisions & trade-offs\n\n**1. Double-entry ledger as the source of truth.** Each transfer writes two entries (debit A, credit B) that sum to zero, in one transaction. A balance is the sum of entries. Cache it on the wallet row for speed, but you can always rebuild and reconcile it.\n\n**2. Atomic transfer without deadlocks.**\n```java\nvoid transfer(Wallet a, Wallet b, Money amt) {\n    Wallet first = a.id().compareTo(b.id()) < 0 ? a : b, second = first == a ? b : a;\n    synchronized (first) { synchronized (second) {\n        if (a.balance().lt(amt)) throw new InsufficientFunds();\n        a.debit(amt); b.credit(amt); ledger.append(/* two entries */);\n    }}\n}\n```\nLock in a global order (by ID) to avoid A→B / B→A deadlock. In a DB: `SELECT … FOR UPDATE` in ID order, or a conditional `UPDATE wallet SET balance = balance - :x WHERE id=:a AND balance >= :x`.\n\n**3. Idempotency.** The client sends `Idempotency-Key`. The first request stores `key → PROCESSING`, then the result. Retries return the stored result. The key's insert must be atomic (unique constraint).\n\n**4. External top-ups are a State machine.** Gateway calls are slow and may time out with an unknown outcome. Mark the transaction `PROCESSING`, credit the wallet only on a confirmed webhook or status poll, and reconcile pending ones on a schedule.\n\n**5. Reversal, never deletion.** A refund is a new transaction with opposite entries. The ledger is append-only for audit.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** An append-only balanced ledger is the authority; a wallet balance is a projection of that ledger.\n\nWallet holds owner and currency. Transfer identifies source, destination, amount and idempotency key. LedgerTransaction owns balanced Debit/Credit entries. PaymentGateway handles external funding; ReconciliationService resolves uncertain external outcomes. Money stores currency plus integral minor units.\n\n**Correctness rule:** Each posted transfer balances to zero per currency, and a wallet cannot go negative unless overdraft is explicitly permitted. A repeated operation key with the same payload returns the same transfer; a different payload is rejected.\n\n```text\nwallet(id,currency,balance_minor,version); transfer(id,request_key,payload_hash,status); entry(transfer_id,wallet_id,delta_minor)\n```\n\n### End-to-end execution trace\n\nAuthenticate and authorize; validate positive amount and currency; lock wallet rows in stable ID order; check balance; insert transfer and balanced entries atomically; update cached balances; commit; publish events using an outbox. External funding follows a separate pending/settled protocol.\n\n### Concurrency and recovery walkthrough\n\nConcurrent debits both observe enough funds. A database conditional debit or row lock serializes the balance check with the debit. An in-memory synchronized method cannot protect other service instances.\n\n### Policy choices and extension seams\n\nStoring just a mutable balance is quick but loses auditability. Ledger entries enable reconstruction and reconciliation. Avoid distributed transactions with a card provider; use operation identities and compensation.\n\n### Edge cases that change the design\n\nTimeout after bank acceptance means UNKNOWN. Reversal is a new balanced transaction, never deletion of the original. Currency conversion needs an explicit rate snapshot and balancing entries in each currency domain.\n\n**Topic-specific cases:** Concurrent overdraft prevention; payload mismatch; self-transfer policy; arithmetic overflow; balanced reversal; provider timeout; ledger-to-balance reconciliation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through contention and corrections\n\nTwo transfers of ₹400 each compete against ₹500. Checking the balance before entering the transaction permits both. Serialize the spendable-funds decision or use a conditional debit; one must lose. Locking A then B in one transfer and B then A in another can deadlock, so establish a consistent order and a retry policy for transaction conflicts.\n\nA correction is a reversing transaction linked to the original, never deletion of posted ledger history. For an external provider timeout, record `PENDING` or `UNKNOWN` and reconcile by provider reference. A database rollback cannot reverse a successful card charge.\n\n## 6. Interviewer follow-ups\n\n**Can different currencies share one arithmetic balance?** No. Model conversion with explicit amounts, currency pair, rate and rounding.\n\n**Can the same transfer ID carry another amount?** Reject it as conflicting intent, even if the original operation succeeded.\n\n## 7. Closing answer\n\nI use immutable balanced ledger entries, stable transfer identities and one transactional spendable-funds decision. Corrections reverse rather than erase entries. External provider uncertainty has a pending reconciliation state because a database rollback cannot undo a captured payment.\n"
+      "markdown": "## Problem\n\nDesign the core of a digital wallet like Paytm or PhonePe. Asha tops up ₹2,000 from her bank by UPI, then sends ₹500 to Bilal. Her app's network is flaky, so it sends the transfer request twice.\n\nThe wallet must move money exactly once, never let a balance go negative, respect each wallet's limit, and stay correct when thousands of transfers run at the same time – including Asha paying Bilal while Bilal pays Asha.\n\n## Requirements\n\n- Open wallets with a maximum balance (for example ₹10,000).\n- Top up from a bank; transfer between wallets; pay merchants.\n- A transfer changes both wallets or neither.\n- A retried request (same idempotency key) moves money only once.\n- Every movement is recorded in an append-only ledger; concurrent transfers never deadlock.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Which operations do we need?\n\n**Interviewer:** Top-up, wallet-to-wallet transfer, and merchant payment.\n\n**Candidate:** Are there balance limits?\n\n**Interviewer:** Yes. A basic wallet can hold at most ₹10,000.\n\n**Candidate:** How should retries from the app be handled?\n\n**Interviewer:** The app sends an idempotency key. A retry must not move money again.\n\n**Candidate:** Do we need history?\n\n**Interviewer:** Yes, every transaction, never edited.\n\n**Candidate:** Is this one server or many?\n\n**Interviewer:** Design the classes for one service; tell me what changes with a database.\n\n> **🎯 In the interview**\n> Say the three money rules out loud: never negative, all-or-nothing, exactly once. Interviewers check every design choice against them.\n\n| Functional | Non-functional |\n| --- | --- |\n| Top-up, transfer, pay | Exactly once per idempotency key |\n| Wallet limits | Atomic: both wallets or neither |\n| Ledger | No deadlocks; money is conserved |\n\n## Step 2: Identify the core objects\n\n- **Wallet** – an owner, a balance and a maximum balance; can credit and debit.\n- **Transaction** – one recorded movement: type, from, to, amount, idempotency key, time.\n- **TxType** – top-up, payment, transfer.\n- **WalletService** – runs operations, enforces idempotency and records the ledger.\n- **WalletException** – a business rule was broken (insufficient balance, limit exceeded).\n\n[![Selected design: the app sends a transfer with an idempotency key; the wallet service returns the earlier result for a repeated key, otherwise locks both wallets in a fixed order, debits and credits them together and appends one transaction to the ledger.](designs/lld-15.svg)](designs/lld-15.svg)\n\n> **⚖️ Design choice**\n> Store money as `long` **paise** and record every movement as an immutable `Transaction`. Balances are the result of the ledger; nothing in the ledger is ever updated.\n\n## Step 3: Design the classes\n\n### Wallet\n\nHolds the balance. `debit` refuses to go negative; `credit` refuses to exceed the limit. It doesn't lock itself – the service decides the locking, because a transfer needs two wallets at once.\n\n### Transaction and TxType\n\nAn immutable record. The `idempotencyKey` links it to the request that created it.\n\n### WalletService\n\n`topUp` and `transfer`. Both run inside `once(key, …)`, which returns the earlier result for a repeated key.\n\n[![Class diagram: WalletService has Wallets and an append-only list of Transactions; a Transaction has a TxType, a from wallet, a to wallet, an amount and an idempotency key; Wallet has an owner, a balance and a maximum balance.](learning-figures/lld-15-classes.svg)](learning-figures/lld-15-classes.svg)\n\n## Step 4: Write the code\n\n### Wallet\n\n```java\nclass Wallet {\n    private final String id, owner;\n    private final long maxBalancePaise;\n    private long balancePaise;\n\n    Wallet(String id, String owner, long maxBalancePaise) {\n        this.id = id; this.owner = owner; this.maxBalancePaise = maxBalancePaise;\n    }\n    String getId()        { return id; }\n    String getOwner()     { return owner; }\n    long getBalance()     { return balancePaise; }\n\n    void credit(long amount) {\n        if (balancePaise + amount > maxBalancePaise)\n            throw new WalletException(\"Wallet limit exceeded for \" + owner);\n        balancePaise += amount;\n    }\n    void debit(long amount) {\n        if (balancePaise < amount) throw new WalletException(\"Insufficient balance\");\n        balancePaise -= amount;\n    }\n}\n\nclass WalletException extends RuntimeException {\n    WalletException(String msg) { super(msg); }\n}\n```\n\n### Transaction\n\n```java\nenum TxType { TOP_UP, PAYMENT, TRANSFER }\n\n/** One money movement, recorded once and never edited. */\nrecord Transaction(String id, String idempotencyKey, TxType type,\n                   String fromWallet, String toWallet, long amountPaise, Instant at) {}\n```\n\n### WalletService\n\n```java\nclass WalletService {\n    private final Map<String, Wallet> wallets = new ConcurrentHashMap<>();\n    private final Map<String, Transaction> byKey = new ConcurrentHashMap<>();\n    private final List<Transaction> ledger = Collections.synchronizedList(new ArrayList<>());\n    private final Map<String, Object> keyLocks = new ConcurrentHashMap<>();\n    private final AtomicLong nextTx = new AtomicLong(1);\n\n    Wallet open(String id, String owner, long maxBalancePaise) {\n        Wallet w = new Wallet(id, owner, maxBalancePaise);\n        wallets.put(id, w);\n        return w;\n    }\n\n    Transaction topUp(String key, String walletId, long amount) {\n        return once(key, () -> {\n            Wallet w = wallet(walletId);\n            synchronized (w) { w.credit(amount); }\n            return record(key, TxType.TOP_UP, \"BANK\", walletId, amount);\n        });\n    }\n\n    /** Move money between two wallets: both change, or neither does. */\n    Transaction transfer(String key, String fromId, String toId, long amount) {\n        if (amount <= 0) throw new WalletException(\"Amount must be positive\");\n        if (fromId.equals(toId)) throw new WalletException(\"Same wallet\");\n        return once(key, () -> {\n            Wallet from = wallet(fromId), to = wallet(toId);\n            Wallet first = fromId.compareTo(toId) < 0 ? from : to;   // fixed lock order\n            Wallet second = first == from ? to : from;\n            synchronized (first) {\n                synchronized (second) {\n                    from.debit(amount);                 // throws before anything changes\n                    try { to.credit(amount); }\n                    catch (WalletException e) { from.credit(amount); throw e; }   // undo\n                }\n            }\n            return record(key, TxType.TRANSFER, fromId, toId, amount);\n        });\n    }\n\n    /** The same idempotency key always returns the first result. */\n    private Transaction once(String key, Callable<Transaction> work) {\n        synchronized (keyLocks.computeIfAbsent(key, k -> new Object())) {   // per key only\n            Transaction done = byKey.get(key);\n            if (done != null) return done;\n            try { return work.call(); }\n            catch (WalletException e) { throw e; }\n            catch (Exception e) { throw new IllegalStateException(e); }\n        }\n    }\n\n    private Transaction record(String key, TxType type, String from, String to, long amt) {\n        Transaction t = new Transaction(\"TX-\" + nextTx.getAndIncrement(), key, type,\n                from, to, amt, Instant.now());\n        ledger.add(t);\n        byKey.put(key, t);\n        return t;\n    }\n\n    Wallet wallet(String id) {\n        Wallet w = wallets.get(id);\n        if (w == null) throw new WalletException(\"No wallet \" + id);\n        return w;\n    }\n    List<Transaction> ledger() { return List.copyOf(ledger); }\n}\n```\n\n### Worked example\n\nAmounts in paise: ₹500 = 50,000.\n\n| Step | What happens | Asha | Bilal |\n| --- | --- | --- | --- |\n| Top-up ₹2,000 (key `upi-ref-771`) | Credit | ₹2,000 | ₹0 |\n| Transfer ₹500 (key `asha-pay-1`) | Debit + credit | ₹1,500 | ₹500 |\n| Same request again (network retry) | Key seen → same transaction returned | ₹1,500 | ₹500 |\n| Transfer ₹9,000 | Insufficient balance – nothing changes | ₹1,500 | ₹500 |\n| Bilal tops up ₹9,400 | Credit | ₹1,500 | ₹9,900 |\n| Asha sends ₹200 | Bilal would exceed ₹10,000 → debit undone | ₹1,500 | ₹9,900 |\n| 100 transfers each way at once | No deadlock | Total unchanged | |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Amount ≤ 0 | Rejected |\n| Same wallet on both sides | Rejected |\n| Unknown wallet | Rejected before any change |\n| Credit fails after debit | Debit is reversed inside the same locks |\n\n## Step 5: The transfer algorithm: locks without deadlock\n\nAsha → Bilal and Bilal → Asha start at the same moment.\n\n1. Thread 1 locks Asha's wallet, then waits for Bilal's.\n2. Thread 2 locks Bilal's wallet, then waits for Asha's.\n3. Each waits for the other forever – a **deadlock**.\n\nThe fix is a **fixed lock order**: always lock the wallet with the smaller ID first. Both threads now try `W-ASHA` first; one waits for the other to finish, and nobody waits in a circle.\n\n![Animation: Asha-to-Bilal and Bilal-to-Asha transfers start together; in the naive version each locks its own sender first and they wait on each other forever; with a fixed lock order both lock W-ASHA first, so one transfer finishes and then the other runs.](learning-figures/lld-15-deadlock.gif)\n\nInside the locks, debit first (it may fail with no change made), then credit; if the credit fails, reverse the debit before releasing the locks. Nobody can see the in-between state.\n\n> **⚠️ Common mistake**\n> Checking the balance, then debiting in a separate step without a lock. Two ₹1,500 payments from a ₹1,500 balance can both pass the check. Check and change must happen together.\n\n> **🎯 In the interview**\n> With a database, the same ideas become: one transaction that updates both rows with `balance >= amount` conditions (or `SELECT … FOR UPDATE` in ID order), and a unique constraint on the idempotency key.\n\n## Step 6: Deep dives\n\n### Double-entry ledger\n\nReal wallets record each transfer as two entries – a debit on Asha's account and a credit on Bilal's – that must sum to zero. Balances can be rebuilt from entries for audits (see the Payments lesson, HLD-14).\n\n### Merchant payments and refunds\n\nA payment is a transfer to a merchant wallet with its own type. A refund is a **new** transaction in the other direction – never an edit of the original.\n\n### Top-up from a bank\n\nThe bank or UPI call can time out after the money left Asha's bank. Mark the top-up PENDING, confirm with the bank's status, and only then credit the wallet.\n\n### Limits and KYC\n\nLimits come from the wallet's KYC level (basic vs full KYC) and may include monthly caps. Put them in a `LimitPolicy` checked before credit.\n\n## Interviewer follow-ups\n\n**Why not `synchronized` on every method of the service?** It's correct but turns the whole wallet system into one queue. Locking just the two wallets involved lets unrelated transfers run in parallel.\n\n**Why is the idempotency check per key?** So two different requests run in parallel while retries of the same request wait for, and then reuse, the first result.\n\n**How long do you keep idempotency keys?** Long enough to cover client retries – typically 24 hours – stored with a unique constraint in the database.\n\n**How do you keep balances and ledger consistent in a database?** Update the balances and insert the ledger rows in one database transaction.\n\n## Wrap up\n\nWallets hold balances in paise; transfers lock both wallets in a fixed order, debit and credit together, and record one immutable transaction; idempotency keys make retries harmless.\n\n> **📝 Key takeaways**\n> - Never negative, all-or-nothing, exactly once.\n> - Lock two wallets in a fixed order to avoid deadlock.\n> - Debit first, credit second, undo inside the same lock if needed.\n> - Idempotency key → same result; ledger entries are never edited.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [WalletDemo.java](reference-code/learning/kb/wallet/WalletDemo.java). It replays the worked example, including 200 concurrent opposite transfers, and checks that money is conserved.\n\nThe production version commits both sides together under one transfer identity, and a retry returns the original transfer instead of debiting again.\n\n[![Both sides commit together under one transfer identity.](lessons/lld-15-flow.svg)](lessons/lld-15-flow.svg)\n\n## Closing answer\n\n\"A Wallet holds a balance in paise and a maximum; debit refuses to go negative and credit refuses to exceed the limit. The WalletService runs top-ups and transfers. Every request carries an idempotency key: a per-key lock and a map of completed keys mean a retry returns the original transaction instead of moving money again. A transfer locks both wallets in a fixed order – smallest ID first – so opposite transfers can't deadlock, debits first, credits second, and reverses the debit if the credit fails, all before releasing the locks. Each movement is appended to an immutable ledger. In a database this becomes one transaction with conditional updates and a unique idempotency key.\"\n"
     },
     {
       "category": "HLD",
