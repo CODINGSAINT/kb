@@ -5,28 +5,26 @@ N|match|MatchingStrategy|440|0|180|rect
 N|driver|Driver|440|130|140|rect
 N|trip|Trip|200|130|140|rect
 N|fare|FareStrategy|0|130|160|rect
-E|rider|svc|request / cancel
+E|rider|svc|request ride
 E|svc|match|find nearby drivers
 E|svc|driver|claim atomically
 E|svc|trip|create and update
 E|trip|driver|assigned to
-E|svc|fare|estimate and final fare
+E|svc|fare|final fare
 ---
 ## Problem
 
-Design the core of a cab-booking app such as Uber or Ola. A rider requests a ride from a pickup point to a drop point. The system finds a nearby driver, the driver accepts, picks the rider up, completes the trip, and the rider pays a fare.
+Design the core of a cab-booking app like Uber or Ola. A rider asks for a ride from a pickup point to a drop point. The app finds a nearby driver, the driver accepts, picks the rider up, finishes the trip, and the rider pays a fare.
 
-The core challenge: many riders request at the same time, and **one driver must never be assigned to two trips**.
+The hard part: many riders request at once, and **one driver must never be assigned to two trips**.
 
 ## Requirements
 
-- Riders request a ride with pickup, drop and vehicle type (mini, sedan, SUV) and see a fare estimate.
-- Drivers go online or offline and share their location every few seconds.
-- Match the request to a nearby available driver of the right type. The driver can accept or decline.
-- Track the trip: driver assigned, driver arrived, trip started, trip completed.
-- Calculate the final fare from distance and time. Allow cancellation before the trip starts.
-
-Out of scope: payments integration, ratings, ride sharing/pooling, surge pricing details, maps and routing internals.
+- Request a ride with pickup, drop and vehicle type (mini, sedan, SUV).
+- Find nearby available drivers of that type; a driver accepts or declines.
+- Track the trip: driver assigned, arrived, in progress, completed.
+- Calculate the fare from distance and time.
+- A rider has at most one active trip.
 
 ## Step 1: Clarify the requirements
 
@@ -36,7 +34,7 @@ Out of scope: payments integration, ratings, ride sharing/pooling, surge pricing
 
 **Candidate:** Does the driver have to accept?
 
-**Interviewer:** Yes, within 15 seconds. Otherwise try the next driver.
+**Interviewer:** Yes. If they don't, try the next driver.
 
 **Candidate:** Can a rider have two trips at once?
 
@@ -44,7 +42,7 @@ Out of scope: payments integration, ratings, ride sharing/pooling, surge pricing
 
 **Candidate:** How is the fare calculated?
 
-**Interviewer:** Base fare plus per kilometre plus per minute. Surge is a follow-up.
+**Interviewer:** ₹40 base, ₹12 per km, ₹2 per minute. Surge is a follow-up.
 
 **Candidate:** Should I cover maps and payments?
 
@@ -56,224 +54,282 @@ Out of scope: payments integration, ratings, ride sharing/pooling, surge pricing
 | Functional | Non-functional |
 | --- | --- |
 | Request a ride with pickup, drop and type | One driver, one trip – always |
-| Match nearby drivers; driver accepts or declines | Matching and pricing rules are replaceable |
-| Track the trip and calculate the final fare | Fast matching with many online drivers |
+| Match nearby drivers; driver accepts | Matching and pricing rules are replaceable |
+| Track the trip; calculate the fare | Fast matching with many online drivers |
 
-## Step 2: Core classes and the trip lifecycle
+## Step 2: Identify the core objects
 
-| Class | Responsibility | Key fields |
-| --- | --- | --- |
-| `Rider` | The customer | id, name, phone |
-| `Driver` | A driver and their car | id, name, vehicle, location, `DriverStatus` |
-| `Vehicle` | The car | number, `VehicleType` |
-| `Location` | A point on the map | latitude, longitude |
-| `Trip` | One ride from request to completion | id, rider, driver, pickup, drop, `TripStatus`, fare, timestamps |
-| `RideService` | Coordinates request, accept, start, end, cancel | trips, drivers |
-| `MatchingStrategy` | Chooses candidate drivers for a request | e.g. nearest first |
-| `FareStrategy` | Estimates and calculates fares | rates per vehicle type |
+- **Location** – a point on the map, with a distance function.
+- **Driver** – name, vehicle type, current location and status (offline, available, on trip).
+- **Trip** – one ride: rider, pickup, drop, status, assigned driver and fare.
+- **MatchingStrategy** – how we choose candidate drivers.
+- **FareStrategy** – how we price a trip.
+- **RideService** – the coordinator: request, accept, arrive, start, end.
+
+[![Selected design: the Rider requests a ride from RideService, which asks a MatchingStrategy for nearby drivers, claims one Driver atomically, creates and updates the Trip and uses a FareStrategy for the final fare.](designs/lld-7.svg)](designs/lld-7.svg)
+
+> **⚖️ Design choice**
+> A driver is assigned when they **accept**, not when the search finds them. Search results are only suggestions; the accept step is where we guarantee one driver, one trip.
+
+## Step 3: Design the classes
+
+### Trip and its states
+
+A trip moves forward through fixed states. Each step is only allowed from the state before it, so a trip can never be "completed" before it started.
+
+[![Trip lifecycle: REQUESTED to DRIVER_ASSIGNED when a driver accepts, to DRIVER_ARRIVED, to IN_PROGRESS when the rider is picked up, to COMPLETED at the drop; cancellation is allowed before the trip starts.](learning-figures/lld-7-states.svg)](learning-figures/lld-7-states.svg)
+
+### Driver
+
+A driver's status is an `AtomicReference`. Claiming a driver is one atomic step: "become ON_TRIP, but only if still AVAILABLE".
+
+### MatchingStrategy and FareStrategy
+
+Both are interfaces. "Nearest driver" can later become "fastest arrival time"; standard fares can later get surge pricing – without touching `RideService`.
+
+### RideService
+
+Holds the drivers and the strategies, and runs every step of a trip.
+
+[![Class diagram: RideService manages Trips and uses a MatchingStrategy and a FareStrategy; a Trip links a rider and, after acceptance, one Driver; a Driver has a vehicle type, a location and an atomic status.](learning-figures/lld-7-classes.svg)](learning-figures/lld-7-classes.svg)
+
+## Step 4: Write the code
+
+### Enums and Location
 
 ```java
 enum VehicleType { MINI, SEDAN, SUV }
 enum DriverStatus { OFFLINE, AVAILABLE, ON_TRIP }
-enum TripStatus { REQUESTED, DRIVER_ASSIGNED, DRIVER_ARRIVED, IN_PROGRESS, COMPLETED, CANCELLED }
+enum TripStatus {
+    REQUESTED, DRIVER_ASSIGNED, DRIVER_ARRIVED, IN_PROGRESS, COMPLETED, CANCELLED
+}
 ```
-
-[![Class diagram: RideService uses a MatchingStrategy and a FareStrategy and manages Trips; a Trip links a Rider and a Driver with pickup and drop Locations; a Driver has a Vehicle, a Location and a DriverStatus.](learning-figures/lld-7-classes.svg)](learning-figures/lld-7-classes.svg)
-
-A trip moves forward through clear states. Each method only works from the right state:
-
-[![Trip lifecycle: REQUESTED to DRIVER_ASSIGNED when a driver accepts, to DRIVER_ARRIVED, to IN_PROGRESS when the rider is picked up, to COMPLETED at the drop; cancellation is allowed from REQUESTED, DRIVER_ASSIGNED and DRIVER_ARRIVED.](learning-figures/lld-7-states.svg)](learning-figures/lld-7-states.svg)
-
-[![Selected design: the Rider calls RideService, which asks a MatchingStrategy for nearby drivers, claims one Driver atomically, creates and updates the Trip and uses a FareStrategy.](designs/lld-7.svg)](designs/lld-7.svg)
-
-## Step 3: Request, match and accept (the matching algorithm)
-
-Walk through one ride. Asha requests a mini from MG Road. Three drivers are online: Ravi (400 m away), Sunil (900 m) and Meena (3 km).
-
-1. `requestRide` creates Asha's trip in REQUESTED and asks the matching strategy for candidates: Ravi, Sunil, Meena – nearest first.
-2. The app sends Ravi an offer. He has 15 seconds to accept.
-3. Ravi accepts. `acceptRide` assigns him to Asha's trip and marks him ON_TRIP.
-4. If Ravi declines or does not answer, the offer goes to Sunil.
-
-Matching is a strategy, so "nearest driver" can later become "fastest ETA" or "highest rated":
 
 ```java
-interface MatchingStrategy {
-    List<Driver> findCandidates(Location pickup, VehicleType type, Collection<Driver> drivers);
-}
-
-class NearestDriverStrategy implements MatchingStrategy {
-    private static final double MAX_KM = 5.0;
-
-    public List<Driver> findCandidates(Location pickup, VehicleType type, Collection<Driver> drivers) {
-        return drivers.stream()
-                .filter(d -> d.getStatus() == DriverStatus.AVAILABLE)
-                .filter(d -> d.getVehicle().getType() == type)
-                .filter(d -> d.getLocation().distanceKm(pickup) <= MAX_KM)
-                .sorted(Comparator.comparingDouble(d -> d.getLocation().distanceKm(pickup)))
-                .limit(5)
-                .toList();
+record Location(double lat, double lng) {
+    /** Straight-line distance in km (haversine). Real apps use road ETA. */
+    double distanceKm(Location o) {
+        double dLat = Math.toRadians(o.lat - lat), dLng = Math.toRadians(o.lng - lng);
+        double a = Math.pow(Math.sin(dLat / 2), 2) + Math.cos(Math.toRadians(lat))
+                * Math.cos(Math.toRadians(o.lat)) * Math.pow(Math.sin(dLng / 2), 2);
+        return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 }
 ```
 
-`distanceKm` is the straight-line (haversine) distance. That is fine for a first answer; real apps use road ETA from a maps service.
-
-```java
-public class RideService {
-    private final Map<String, Driver> drivers = new ConcurrentHashMap<>();
-    private final Map<String, Trip> trips = new ConcurrentHashMap<>();
-    private final Map<String, String> activeTripByRider = new ConcurrentHashMap<>();
-    private final MatchingStrategy matching;
-    private final FareStrategy fares;
-    private final NotificationService notifications;
-
-    public Trip requestRide(Rider rider, Location pickup, Location drop, VehicleType type) {
-        Trip trip = new Trip(UUID.randomUUID().toString(), rider, pickup, drop, type,
-                fares.estimate(pickup, drop, type));
-        if (activeTripByRider.putIfAbsent(rider.getId(), trip.getId()) != null) {
-            throw new IllegalStateException("Rider already has an active trip");
-        }
-        trips.put(trip.getId(), trip);
-        List<Driver> candidates = matching.findCandidates(pickup, type, drivers.values());
-        notifications.sendOffers(trip, candidates);   // one at a time, 15 s each
-        return trip;
-    }
-
-    public boolean acceptRide(String tripId, String driverId) {
-        Trip trip = trips.get(tripId);
-        Driver driver = drivers.get(driverId);
-        synchronized (trip) {
-            if (trip.getStatus() != TripStatus.REQUESTED) {
-                return false;                               // someone else accepted, or rider cancelled
-            }
-            if (!driver.tryClaim()) {
-                return false;                               // driver is already on another trip
-            }
-            trip.assignDriver(driver);                      // status -> DRIVER_ASSIGNED
-        }
-        notifications.driverAssigned(trip);
-        return true;
-    }
-}
-```
-
-## Step 4: The hard part: one driver, one trip
-
-Two races can break assignment:
-
-1. **Two trips, one driver.** Ravi is the nearest driver for both Asha and Bilal and accepts both offers almost together.
-2. **One trip, two drivers.** Asha's offer reaches Ravi, times out and goes to Sunil – then Ravi's late "accept" arrives just as Sunil accepts.
-
-Both are check-then-act races. The fix is to make each "claim" a single atomic step:
+### Driver
 
 ```java
 class Driver {
-    private final AtomicReference<DriverStatus> status = new AtomicReference<>(DriverStatus.OFFLINE);
+    private final String name;
+    private final VehicleType type;
+    private volatile Location location;
+    private final AtomicReference<DriverStatus> status =
+            new AtomicReference<>(DriverStatus.OFFLINE);
 
+    Driver(String name, VehicleType type, Location location) {
+        this.name = name; this.type = type; this.location = location;
+    }
+    void goOnline()           { status.set(DriverStatus.AVAILABLE); }
+    /** Atomic: becomes ON_TRIP only if still AVAILABLE. */
     boolean tryClaim() {
         return status.compareAndSet(DriverStatus.AVAILABLE, DriverStatus.ON_TRIP);
     }
+    void release()            { status.set(DriverStatus.AVAILABLE); }
+    String getName()          { return name; }
+    VehicleType getType()     { return type; }
+    Location getLocation()    { return location; }
+    DriverStatus getStatus()  { return status.get(); }
+}
+```
 
-    void release() {
-        status.set(DriverStatus.AVAILABLE);
+### Trip
+
+```java
+class Trip {
+    private final String rider;
+    private final Location pickup, drop;
+    private final VehicleType type;
+    private TripStatus status = TripStatus.REQUESTED;
+    private Driver driver;
+    private long fareRupees;
+
+    Trip(String rider, Location pickup, Location drop, VehicleType type) {
+        this.rider = rider; this.pickup = pickup; this.drop = drop; this.type = type;
+    }
+    /** Moves to the next status only from the expected one. */
+    void transition(TripStatus from, TripStatus to) {
+        if (status != from) {
+            throw new IllegalStateException("Trip is " + status + ", not " + from);
+        }
+        status = to;
+    }
+    void assign(Driver d) {
+        transition(TripStatus.REQUESTED, TripStatus.DRIVER_ASSIGNED);
+        driver = d;
+    }
+    String getRider()        { return rider; }
+    Location getPickup()     { return pickup; }
+    VehicleType getType()    { return type; }
+    TripStatus getStatus()   { return status; }
+    Driver getDriver()       { return driver; }
+    long getFare()           { return fareRupees; }
+    void setFare(long fare)  { fareRupees = fare; }
+}
+```
+
+### The matching algorithm and fare strategy
+
+```java
+interface MatchingStrategy {
+    List<Driver> findCandidates(Trip trip, Collection<Driver> drivers);
+}
+
+class NearestDriverStrategy implements MatchingStrategy {
+    public List<Driver> findCandidates(Trip trip, Collection<Driver> drivers) {
+        return drivers.stream()
+                .filter(d -> d.getStatus() == DriverStatus.AVAILABLE)
+                .filter(d -> d.getType() == trip.getType())
+                .filter(d -> d.getLocation().distanceKm(trip.getPickup()) <= 5)
+                .sorted(Comparator.comparingDouble(
+                        d -> d.getLocation().distanceKm(trip.getPickup())))
+                .toList();
+    }
+}
+
+interface FareStrategy {
+    long fare(double km, Duration time);
+}
+
+/** Rs 40 base + Rs 12 per km + Rs 2 per minute. */
+class StandardFare implements FareStrategy {
+    public long fare(double km, Duration time) {
+        return Math.round(40 + 12 * km + 2 * time.toMinutes());
     }
 }
 ```
 
-- `compareAndSet` changes AVAILABLE to ON_TRIP **only if** the driver is still AVAILABLE. If Ravi has already been claimed for Bilal's trip, the second claim returns false. That solves race 1.
-- `synchronized (trip)` with the `REQUESTED` check means only the first accept for a trip wins. Ravi's late accept finds the trip already DRIVER_ASSIGNED and returns false. That solves race 2.
+### RideService
+
+```java
+class RideService {
+    private final List<Driver> drivers;
+    private final MatchingStrategy matching;
+    private final FareStrategy fares;
+    private final Set<String> ridersOnTrip = new HashSet<>();
+
+    RideService(List<Driver> drivers, MatchingStrategy matching, FareStrategy fares) {
+        this.drivers = drivers; this.matching = matching; this.fares = fares;
+    }
+
+    synchronized Trip requestRide(String rider, Location pickup, Location drop,
+                                  VehicleType type) {
+        if (!ridersOnTrip.add(rider)) {
+            throw new IllegalStateException(rider + " already has a trip");
+        }
+        return new Trip(rider, pickup, drop, type);
+    }
+
+    List<Driver> candidates(Trip trip) { return matching.findCandidates(trip, drivers); }
+
+    /** Called when a driver taps Accept. Only one driver per trip, one trip per driver. */
+    boolean accept(Trip trip, Driver driver) {
+        synchronized (trip) {
+            if (trip.getStatus() != TripStatus.REQUESTED) return false;  // trip taken
+            if (!driver.tryClaim()) return false;                         // driver busy
+            trip.assign(driver);
+            return true;
+        }
+    }
+
+    void arrive(Trip trip) {
+        synchronized (trip) {
+            trip.transition(TripStatus.DRIVER_ASSIGNED, TripStatus.DRIVER_ARRIVED);
+        }
+    }
+
+    void start(Trip trip) {
+        synchronized (trip) {
+            trip.transition(TripStatus.DRIVER_ARRIVED, TripStatus.IN_PROGRESS);
+        }
+    }
+
+    long end(Trip trip, double km, Duration time) {
+        synchronized (trip) {
+            trip.transition(TripStatus.IN_PROGRESS, TripStatus.COMPLETED);
+            trip.setFare(fares.fare(km, time));
+            trip.getDriver().release();                     // ready for the next ride
+            synchronized (this) { ridersOnTrip.remove(trip.getRider()); }
+            return trip.getFare();
+        }
+    }
+}
+```
+
+Try it. Asha and Bilal both request a mini at MG Road. Ravi is 400 m away, Sunil 800 m away; Meena drives a sedan.
+
+| What happens | Result |
+| --- | --- |
+| Candidates for Asha | Ravi first (nearest mini); Meena is skipped (sedan) |
+| Ravi accepts Asha's trip | Assigned. Ravi is ON_TRIP |
+| Ravi also taps accept for Bilal's trip | Rejected – Ravi is busy |
+| Sunil tries to take Asha's trip | Rejected – it already has a driver |
+| Sunil accepts Bilal's trip | Assigned |
+| Asha's trip ends: 2.1 km, 8 minutes | ₹40 + ₹25.20 + ₹16 = ₹81. Ravi is available again |
+
+## Step 5: One driver, one trip
+
+Two races can break assignment:
+
+1. **Two trips, one driver.** Ravi is nearest for both Asha and Bilal and accepts both offers almost together.
+2. **One trip, two drivers.** Asha's offer times out at Ravi and goes to Sunil – then Ravi's late "accept" arrives just as Sunil accepts.
 
 ![Animation: Ravi accepts Asha's and Bilal's trips almost together; the first compareAndSet from AVAILABLE to ON_TRIP succeeds and assigns Asha's trip, the second fails, so Bilal's trip stays REQUESTED and is offered to the next driver.](learning-figures/lld-7-race.gif)
 
+`accept` solves both:
+
+- `driver.tryClaim()` uses `compareAndSet`: only one claim on Ravi can succeed. That fixes race 1.
+- `synchronized (trip)` plus the REQUESTED check means only the first accept for a trip wins. That fixes race 2.
+
+We check the trip **before** claiming the driver. If the trip is already taken, we never touch the driver, so no driver is left stuck as ON_TRIP with no trip.
+
 > **⚠️ Common mistake**
-> Checking `driver.getStatus() == AVAILABLE` and then setting it in a second statement. Two accepts can both pass the check. `compareAndSet` does both in one atomic step.
+> Checking `driver.getStatus() == AVAILABLE` and then setting ON_TRIP in a second statement. Two accepts can both pass the check. `compareAndSet` does both in one atomic step.
 
-Order matters: we check the trip first, then claim the driver. If the trip check fails, we never touch the driver, so we never leave a driver stuck as ON_TRIP with no trip.
+> **🎯 In the interview**
+> With several servers, the claim becomes a conditional update: `UPDATE driver SET status = 'ON_TRIP' WHERE id = ? AND status = 'AVAILABLE'`. One updated row means you won the driver.
 
-[![A driver candidate receives one exclusive offer; acceptance checks the offer and then sets the trip to assigned and the driver to on-trip together, so a location match alone never assigns a driver.](learning-figures/lld-7-assignment.svg)](learning-figures/lld-7-assignment.svg)
+## Step 6: Deep dives
 
-## Step 5: Finishing the trip and the fare
+### Finding nearby drivers fast
 
-```java
-public void startTrip(String tripId) {            // rider is in the car
-    Trip trip = trips.get(tripId);
-    synchronized (trip) { trip.transition(TripStatus.DRIVER_ARRIVED, TripStatus.IN_PROGRESS); }
-}
+Scanning 100,000 online drivers per request is too slow. Divide the map into cells (geohash or Uber's H3) and keep a map from cell to available drivers. Search the rider's cell and its neighbours.
 
-public Trip endTrip(String tripId, double distanceKm, Duration duration) {
-    Trip trip = trips.get(tripId);
-    synchronized (trip) {
-        trip.transition(TripStatus.IN_PROGRESS, TripStatus.COMPLETED);
-        trip.setFinalFare(fares.calculate(trip.getType(), distanceKm, duration));
-        trip.getDriver().release();                  // driver can take the next ride
-        activeTripByRider.remove(trip.getRider().getId());
-    }
-    return trip;
-}
-```
+### Surge pricing
 
-`transition(from, to)` throws if the trip is not currently in `from`. That keeps the lifecycle honest: you cannot complete a trip that never started.
+Wrap the fare strategy: `SurgeFare` multiplies whatever `StandardFare` returns. This is the **Decorator pattern** – surge is added without changing the base fare.
 
-The fare is another strategy:
+### Cancellation
 
-```java
-interface FareStrategy {
-    long estimate(Location pickup, Location drop, VehicleType type);
-    long calculate(VehicleType type, double distanceKm, Duration duration);
-}
+Allow it before the trip starts: move the trip to CANCELLED and release the driver. A `CancellationPolicy` decides the fee, for example ₹50 after the driver has arrived.
 
-class StandardFare implements FareStrategy {
-    // mini: ₹40 base + ₹12 per km + ₹2 per minute (values in paise)
-    public long calculate(VehicleType type, double distanceKm, Duration duration) {
-        long base = 4_000, perKm = 1_200, perMinute = 200;
-        return base + Math.round(distanceKm * perKm) + duration.toMinutes() * perMinute;
-    }
-    // estimate() calls calculate() with the route's expected distance and time
-}
-```
+### Notifications
 
-Example: an estimate of 2 km and 5 minutes gives ₹40 + ₹24 + ₹10 = ₹74. The actual trip took 2.1 km and 8 minutes: ₹40 + ₹25.20 + ₹16 = ₹81.20. The estimate is a guide; the final fare uses what really happened.
-
-## Step 6: Design patterns and extensibility
-
-| Pattern | Where | Why it helps |
-| --- | --- | --- |
-| **Strategy** | `MatchingStrategy`, `FareStrategy` | Nearest vs ETA-based matching; normal vs surge pricing. |
-| **State** (lightweight) | `TripStatus` with `transition(from, to)` | Illegal jumps are rejected in one place. Full State classes are possible if each state gains a lot of behaviour. |
-| **Observer** | `NotificationService` | Rider and driver apps get "driver assigned", "arrived", "completed" events. |
-| **Decorator** | `SurgeFare` wraps `StandardFare` and multiplies it | Surge added without changing the base fare class. |
-
-```java
-class SurgeFare implements FareStrategy {
-    private final FareStrategy inner;
-    private final double multiplier;
-    public long calculate(VehicleType t, double km, Duration d) {
-        return Math.round(inner.calculate(t, km, d) * multiplier);
-    }
-    // estimate() delegates the same way
-}
-```
+"Driver assigned", "driver arrived" and "trip completed" are events. The rider's and driver's apps are **observers**.
 
 ## Interviewer follow-ups
 
-**How do you find nearby drivers quickly with 100,000 drivers online?** Do not scan everyone. Divide the map into cells (a geohash or Uber's H3 grid) and keep a map from cell → available drivers. Look in the rider's cell and the neighbouring cells. Drivers move cells as their location updates arrive.
+**Is the nearest driver always the fastest?** No – roads, traffic and one-way streets matter. Start with straight-line distance, then swap in a `MatchingStrategy` that ranks by road ETA from a maps service.
 
-**Why not assign the nearest driver immediately, without asking?** Drivers may be on a break or prefer not to go somewhere. An accept step avoids sending a driver who will not come. The cost is a few seconds of waiting.
+**Why ask drivers to accept instead of assigning automatically?** A driver may be on a break or about to go offline. Accepting avoids sending someone who will not come; the cost is a few seconds of waiting.
 
-**Why send offers one driver at a time?** It keeps the rule "one pending offer per driver" simple. Sending to several drivers at once is faster but needs a first-accept-wins step and cancelling the other offers – which our `synchronized (trip)` check already supports.
+**What if the driver's phone loses network mid-trip?** The trip stays IN_PROGRESS; only location updates pause. A timer must never hand the driver to another rider.
 
-**What happens if the rider cancels while a driver is accepting?** Both go through `synchronized (trip)`. Whichever runs first wins: if cancel wins, the accept sees CANCELLED and returns false; if accept wins, cancel releases the driver as part of cancelling.
-
-**What if the driver's phone loses network during the trip?** The trip stays IN_PROGRESS; location updates simply pause. A timer does not hand the driver to another rider. Support can end the trip manually if needed.
-
-**How would you add a cancellation fee?** A `CancellationPolicy` strategy: free before the driver arrives, ₹50 after arrival.
-
-**How would this scale across servers?** Location updates go to a fast in-memory store (Redis with geo commands). Driver status moves to a database or Redis, and the claim becomes a conditional update: `UPDATE driver SET status='ON_TRIP', trip_id=? WHERE id=? AND status='AVAILABLE'`. One updated row means you won the driver.
+**What if the rider cancels while a driver is accepting?** Both go through `synchronized (trip)`. Whichever runs first wins; the other sees the new status and stops.
 
 ## Wrap up
 
-We modelled riders, drivers and trips, matched with a strategy, and made assignment safe with a trip lock plus an atomic driver claim.
+We modelled riders, drivers and trips, matched them with a strategy, and made assignment safe with a trip lock plus an atomic driver claim.
 
 > **📝 Key takeaways**
 > - Assignment happens on accept, not on search.
@@ -283,19 +339,17 @@ We modelled riders, drivers and trips, matched with a strategy, and made assignm
 
 ## Going deeper (optional)
 
-The full reference design models offers explicitly, which matters once you discuss timeouts in detail:
+The complete, runnable code is [CabBookingDemo.java](reference-code/learning/kb/cabbooking/CabBookingDemo.java). It replays the table above and checks every result.
 
-- Each offer has an ID and a deadline. A driver accepts **an offer**, not just a trip, so an old offer that expired cannot be accepted later.
-- Expiry, decline and cancel all check the exact offer ID, so a delayed timer for an old offer cannot free a driver who has since received a new one.
-- The rider's cancel carries the trip version they saw, so a fee is never charged for a state the rider did not see.
+The production-depth version models each offer explicitly with an ID and a deadline, so an old offer that expired can never be accepted later, and a delayed timer can never free a driver who has since received a new offer.
 
 [![An old offer expires and the driver receives a new offer for another trip; timers and accepts for the old offer are ignored because it is no longer the current offer.](learning-figures/lld-7-offer-tokens.svg)](learning-figures/lld-7-offer-tokens.svg)
 
-[Open the driver-ownership walkthrough](learning-labs/cab.html), or read the runnable Java: [Cab.java](reference-code/learning/kb/cab/Cab.java), [CabDemo.java](reference-code/learning/kb/cab/CabDemo.java) and [CabChecks.java](reference-code/learning/kb/cab/CabChecks.java).
+[Open the driver-ownership walkthrough](learning-labs/cab.html), or read the advanced code: [Cab.java](reference-code/learning/kb/cab/Cab.java) and [CabChecks.java](reference-code/learning/kb/cab/CabChecks.java).
 
 ## Closing answer
 
-"I model Rider, Driver, Vehicle, Location and Trip, with `RideService` coordinating request, accept, start, end and cancel. A matching strategy finds the nearest available drivers of the right type; offers go out one at a time. Assignment happens on accept: under the trip's lock I check that the trip is still REQUESTED, then claim the driver with a compare-and-set from AVAILABLE to ON_TRIP, so one driver never gets two trips and one trip never gets two drivers. The trip moves through clear states, the fare is a strategy with surge as a decorator, and notifications are observers. At scale, drivers are found through a geo grid and claimed with a conditional database or Redis update."
+"I'd model Location, Driver, Trip and a `RideService`, with matching and fares as strategies. A trip moves REQUESTED → DRIVER_ASSIGNED → DRIVER_ARRIVED → IN_PROGRESS → COMPLETED, and each step is only allowed from the previous one. A driver is assigned on accept: under the trip's lock I check the trip is still REQUESTED, then claim the driver with `compareAndSet` from AVAILABLE to ON_TRIP – so one driver never gets two trips and one trip never gets two drivers. The fare is base plus per km plus per minute; surge is a decorator and notifications are observers. At scale, drivers are found through a geo grid and claimed with a conditional database update."
 
 === LLD 8 ===
 N|n0|Order|0|0|200|rect
@@ -464,34 +518,31 @@ My order freezes accepted commercial terms and coordinates separate restaurant, 
 
 === LLD 9 ===
 N|svc|LibraryService|220|0|180|rect
-N|catalog|Catalog|0|0|140|rect
-N|book|Book|0|130|140|rect
-N|item|BookItem|220|130|160|rect
+N|book|Book|0|0|140|rect
+N|item|BookItem|0|130|150|rect
 N|member|Member|460|0|150|rect
-N|loan|Loan|460|130|140|rect
-E|svc|catalog|search
-E|catalog|book|indexes
+N|loan|Loan|220|130|140|rect
+N|hold|Hold queue|460|130|150|rect
 E|book|item|has copies
 E|svc|item|checkout / return
-E|svc|member|checks limits
-E|item|loan|one active loan
+E|svc|member|checks plan limits
+E|loan|item|one copy
+E|book|hold|FIFO per title
+E|svc|loan|creates
 ---
 ## Problem
 
-Design a library management system. Members search for books, borrow physical copies, return them, renew loans and join a waiting list when every copy is out. Late returns are fined.
+Design a library management system. Members search the catalogue, borrow physical books, return them, renew loans and join a waiting list when every copy is out. Late returns are fined.
 
-The design question underneath: a *book* (a title in the catalogue) is not the same thing as a *copy* on the shelf. Getting that distinction right makes everything else simple.
+The key idea is that a *book* (a title in the catalogue) is not the same as a *copy* on the shelf. Get that right and the rest falls into place.
 
 ## Requirements
 
-- Search the catalogue by title, author or ISBN.
-- A member can borrow up to 3 books at a time, for 14 days each.
-- Renew a loan once, unless another member is waiting for that book.
-- Return a book; charge ₹10 for every day it is late.
-- If all copies are out, a member can place a hold. When a copy comes back, the first person in the queue gets it and has 2 days to collect it.
-- Librarians add books and copies.
-
-Out of scope: e-books, multiple branches, payments for fines, membership sign-up.
+- Members borrow up to a limit set by their plan, for a fixed number of days.
+- Return a book; charge a fine for every late day.
+- Renew a loan, unless someone else is waiting for that title.
+- If every copy is out, a member can place a hold. The first person in the queue gets the next returned copy and has 2 days to collect it.
+- Several library desks work at the same time.
 
 ## Step 1: Clarify the requirements
 
@@ -501,328 +552,403 @@ Out of scope: e-books, multiple branches, payments for fines, membership sign-up
 
 **Candidate:** Are borrowing limits the same for everyone?
 
-**Interviewer:** No. Basic members get 3 books for 14 days; Premium get 5 for 21 days.
+**Interviewer:** No. Basic members get 3 books for 14 days; Premium get 5 books for 21 days.
 
 **Candidate:** If every copy is out, can members wait for it?
 
-**Interviewer:** Yes. First come, first served. They get 2 days to collect.
+**Interviewer:** Yes. First come, first served, with 2 days to collect.
 
 **Candidate:** How are fines calculated and paid?
 
-**Interviewer:** ₹10 per late day. Record it on return; payment is separate.
+**Interviewer:** ₹10 a day for Basic, ₹5 for Premium. Record it on return; payment is separate.
 
-**Candidate:** Can two library desks work at the same time?
+**Candidate:** Can two desks lend the last copy at the same time?
 
-**Interviewer:** Yes.
+**Interviewer:** They must not.
 
 | Functional | Non-functional |
 | --- | --- |
-| Search by title, author or ISBN | The last copy is never lent twice |
-| Borrow, return, renew, place a hold | New membership plans need no new code |
-| Charge late fines; serve holds in order | Search stays fast for a large catalogue |
+| Borrow, return, renew, place a hold | The last copy is never lent twice |
+| Fines for late returns | New membership plans need no new code |
+| Holds served in order | Search stays fast for a large catalogue |
 
-## Step 2: Core classes
+## Step 2: Identify the core objects
 
-| Class | What it represents | Key fields |
-| --- | --- | --- |
-| `Book` | A title in the catalogue | isbn, title, authors, subject, copies, hold queue |
-| `BookItem` | One physical copy | barcode, book, `ItemStatus`, rack |
-| `Member` | A library user | id, name, `MembershipPlan`, active loans |
-| `MembershipPlan` | Borrowing rules | maxBooks, loanDays, maxRenewals, finePerDay |
-| `Loan` | One member borrowing one copy | id, item, member, issueDate, dueDate, returnDate, renewals |
-| `Hold` | A member waiting for a title | member, book, placedAt, `HoldStatus`, pickupBy |
-| `Catalog` | Search indexes | maps by title words, author, ISBN |
-| `LibraryService` | Checkout, return, renew, hold | the only place that changes loans and statuses |
+- **Book** – a title in the catalogue (ISBN, title, author). It also keeps the waiting list.
+- **BookItem** – one physical copy with a barcode and a status: available, on loan, on the hold shelf.
+- **Member** and **MembershipPlan** – who is borrowing, and their rules.
+- **Loan** – one member borrowing one copy, with a due date.
+- **Hold** – a member waiting for a title.
+- **LibraryService** – the only place that lends, returns and hands out held copies.
+
+[![Selected design: LibraryService checks member plan limits and checks copies out and in; a Book has physical BookItems and a first-in-first-out hold queue; each copy has at most one Loan.](designs/lld-9.svg)](designs/lld-9.svg)
+
+> **⚖️ Design choice**
+> A loan is for a **copy**; a hold is for a **title**. If Asha waits for *Practical Java*, any copy will do – she should not wait for one particular barcode while another copy sits on the shelf.
+
+## Step 3: Design the classes
+
+### MembershipPlan and Member
+
+Basic and Premium members behave the same; only the numbers differ. So the numbers live in a `MembershipPlan` record, and a new plan is new data, not a new subclass.
+
+### Book and BookItem
+
+`Book` describes the title and owns the hold queue. `BookItem` is the copy you can hold in your hand.
+
+### Loan and Hold
+
+A `Loan` knows its due date and how many times it was renewed. A `Hold` knows who is waiting and, once a copy is set aside, the last day to collect it.
+
+### LibraryService
+
+Checkout, return, renew, place hold, and a daily job that passes uncollected copies to the next person.
+
+[![Class diagram: a Book has many BookItems and a queue of Holds; a Member has a MembershipPlan; a Loan links one BookItem to one Member with a due date; LibraryService checks out, returns, renews and places holds.](learning-figures/lld-9-classes.svg)](learning-figures/lld-9-classes.svg)
+
+## Step 4: Write the code
+
+### MembershipPlan and Member
 
 ```java
-enum ItemStatus { AVAILABLE, ON_LOAN, ON_HOLD_SHELF, LOST }
-enum HoldStatus { WAITING, READY_FOR_PICKUP, FULFILLED, EXPIRED }
-record MembershipPlan(String name, int maxBooks, int loanDays, int maxRenewals, long finePerDayRupees) {}
+/** Borrowing rules. A new plan is new data, not a new class. */
+record MembershipPlan(String name, int maxBooks, int loanDays,
+                      int maxRenewals, long finePerDay) {
+    static final MembershipPlan BASIC   = new MembershipPlan("Basic", 3, 14, 1, 10);
+    static final MembershipPlan PREMIUM = new MembershipPlan("Premium", 5, 21, 2, 5);
+}
+
+record Member(String name, MembershipPlan plan) {}
 ```
 
-[![Class diagram: a Book has many BookItems and a queue of Holds; a Member has a MembershipPlan and Loans; a Loan links one BookItem to one Member with issue, due and return dates; LibraryService checks out, returns, renews and places holds; Catalog indexes Books.](learning-figures/lld-9-classes.svg)](learning-figures/lld-9-classes.svg)
-
-Why `Book` and `BookItem`? If the library owns three copies of *Clean Code*, they share a title and author (the `Book`) but each has its own barcode, shelf and status (the `BookItem`). A loan is always for a copy. A hold is for the title, because any copy will do.
-
-Why a `MembershipPlan` instead of `StudentMember` and `FacultyMember` subclasses? The members behave the same way; only the numbers differ. Composition lets the library add a new plan without writing a new class.
-
-[![Selected design: LibraryService searches through the Catalog, which indexes Books; a Book has BookItems; LibraryService checks member limits and checks copies in and out; each BookItem has at most one active Loan.](designs/lld-9.svg)](designs/lld-9.svg)
-
-## Step 3: Checkout and return
-
-Example: Asha (Basic plan) borrows a copy of *Practical Java* on 1 October. It is due on 15 October.
+### Book and BookItem
 
 ```java
-public class LibraryService {
-    private final Map<String, BookItem> itemsByBarcode;
-    private final Map<String, Loan> activeLoanByBarcode = new HashMap<>();
-    private final Notifier notifier;
-    private final Clock clock;
+enum ItemStatus { AVAILABLE, ON_LOAN, ON_HOLD_SHELF }
 
-    public synchronized Loan checkout(Member member, String barcode) {
-        BookItem item = itemsByBarcode.get(barcode);
-        MembershipPlan plan = member.getPlan();
-        if (member.activeLoanCount() >= plan.maxBooks()) {
-            throw new LimitReachedException(member.getId());
-        }
-        boolean collectingHold = item.getStatus() == ItemStatus.ON_HOLD_SHELF
-                && item.getBook().isReadyFor(member, today());
-        if (item.getStatus() != ItemStatus.AVAILABLE && !collectingHold) {
-            throw new ItemNotAvailableException(barcode);
-        }
-        if (collectingHold) item.getBook().fulfilHold(member);
+/** One physical copy with its own barcode. */
+class BookItem {
+    private final String barcode;
+    private final Book book;
+    private ItemStatus status = ItemStatus.AVAILABLE;
 
-        LocalDate today = today();
-        Loan loan = new Loan(UUID.randomUUID().toString(), item, member, today, today.plusDays(plan.loanDays()));
+    BookItem(String barcode, Book book) { this.barcode = barcode; this.book = book; }
+    String getBarcode()            { return barcode; }
+    Book getBook()                 { return book; }
+    ItemStatus getStatus()         { return status; }
+    void setStatus(ItemStatus s)   { status = s; }
+}
+
+/** A title in the catalogue. Holds are per title, because any copy will do. */
+class Book {
+    private final String isbn, title, author;
+    private final Deque<Hold> holds = new ArrayDeque<>();
+
+    Book(String isbn, String title, String author) {
+        this.isbn = isbn; this.title = title; this.author = author;
+    }
+    String getTitle()     { return title; }
+    String getAuthor()    { return author; }
+    Deque<Hold> holds()   { return holds; }
+}
+```
+
+### Loan and Hold
+
+```java
+class Loan {
+    private final BookItem item;
+    private final Member member;
+    private LocalDate dueDate;
+    private int renewals;
+
+    Loan(BookItem item, Member member, LocalDate today) {
+        this.item = item; this.member = member;
+        this.dueDate = today.plusDays(member.plan().loanDays());
+    }
+    void extend() {
+        dueDate = dueDate.plusDays(member.plan().loanDays());
+        renewals++;
+    }
+    BookItem getItem()      { return item; }
+    Member getMember()      { return member; }
+    LocalDate getDueDate()  { return dueDate; }
+    int getRenewals()       { return renewals; }
+}
+
+class Hold {
+    private final Member member;
+    private LocalDate pickupBy;           // set when a copy is waiting on the shelf
+
+    Hold(Member member) { this.member = member; }
+    Member getMember()               { return member; }
+    LocalDate getPickupBy()          { return pickupBy; }
+    void readyUntil(LocalDate date)  { pickupBy = date; }
+}
+```
+
+### LibraryService
+
+```java
+class LibraryService {
+    private final Map<String, BookItem> items = new HashMap<>();
+    private final Map<String, Loan> activeLoans = new HashMap<>();   // barcode -> loan
+    private final Map<BookItem, Hold> heldFor = new HashMap<>();     // copies on hold shelf
+
+    void addCopy(BookItem item) { items.put(item.getBarcode(), item); }
+
+    synchronized Loan checkout(Member member, String barcode, LocalDate today) {
+        BookItem item = items.get(barcode);
+        long borrowed = activeLoans.values().stream()
+                .filter(l -> l.getMember() == member).count();
+        if (borrowed >= member.plan().maxBooks()) {
+            throw new IllegalStateException(member.name() + " has reached the limit");
+        }
+        Hold hold = heldFor.get(item);
+        boolean waitingForThisMember = hold != null && hold.getMember() == member;
+        if (item.getStatus() != ItemStatus.AVAILABLE && !waitingForThisMember) {
+            throw new IllegalStateException("Copy " + barcode + " is not available");
+        }
+        if (waitingForThisMember) heldFor.remove(item);
+        Loan loan = new Loan(item, member, today);
         item.setStatus(ItemStatus.ON_LOAN);
-        activeLoanByBarcode.put(barcode, loan);
-        member.addLoan(loan);
+        activeLoans.put(barcode, loan);
         return loan;
     }
 
-    private LocalDate today() { return LocalDate.now(clock); }
-}
-```
-
-`synchronized` matters at a busy library: two desks scanning the last copy (or the same member at two desks taking their last allowed book) must not both succeed. The check and the change happen together.
-
-Returning closes the loan, records the fine, and decides where the copy goes next:
-
-```java
-public synchronized long returnBook(String barcode) {
-    Loan loan = activeLoanByBarcode.remove(barcode);
-    if (loan == null) throw new IllegalStateException("Copy is not on loan");
-    LocalDate today = today();
-    loan.close(today);
-    loan.getMember().removeLoan(loan);
-
-    long daysLate = Math.max(0, ChronoUnit.DAYS.between(loan.getDueDate(), today));
-    long fine = daysLate * loan.getMember().getPlan().finePerDayRupees();
-
-    BookItem item = loan.getItem();
-    Optional<Hold> next = item.getBook().nextWaitingHold();
-    if (next.isPresent()) {
-        next.get().markReady(today.plusDays(2));     // 2 days to collect
-        item.setStatus(ItemStatus.ON_HOLD_SHELF);
-        notifier.bookReady(next.get());               // Observer
-    } else {
-        item.setStatus(ItemStatus.AVAILABLE);
+    /** Returns the fine in rupees. */
+    synchronized long returnBook(String barcode, LocalDate today) {
+        Loan loan = activeLoans.remove(barcode);
+        if (loan == null) throw new IllegalStateException("Copy is not on loan");
+        long daysLate = Math.max(0, ChronoUnit.DAYS.between(loan.getDueDate(), today));
+        giveToNextInQueue(loan.getItem(), today);
+        return daysLate * loan.getMember().plan().finePerDay();
     }
-    return fine;
-}
-```
 
-Asha returns the book on 18 October. `DAYS.between(15 Oct, 18 Oct)` is 3, so the fine is 3 × ₹10 = ₹30. Returning on the 15th itself costs nothing: the due date is still on time.
-
-> **⚠️ Common mistake**
-> Calculating days late from milliseconds. Use calendar dates (`LocalDate`) so midnight and daylight-saving changes cannot add or lose a day.
-
-Use `LocalDate` and calendar days, not milliseconds divided by 86,400,000. Dates avoid off-by-one surprises around midnight and daylight-saving changes.
-
-## Step 4: Holds: a fair waiting list
-
-Bilal and then Chetan place holds on *Practical Java* while Asha has the only copy. Each `Book` keeps a FIFO queue:
-
-```java
-class Book {
-    private final Deque<Hold> holds = new ArrayDeque<>();
-
-    Hold placeHold(Member member, LocalDate today) {
-        if (holds.stream().anyMatch(h -> h.getMember().equals(member) && h.isOpen())) {
-            throw new IllegalStateException("Already waiting");
-        }
-        Hold hold = new Hold(member, this, today);
-        holds.addLast(hold);
+    synchronized Hold placeHold(Member member, Book book) {
+        Hold hold = new Hold(member);
+        book.holds().addLast(hold);
         return hold;
     }
 
-    Optional<Hold> nextWaitingHold() {
-        return holds.stream().filter(h -> h.getStatus() == HoldStatus.WAITING).findFirst();
+    synchronized Loan renew(String barcode, LocalDate today) {
+        Loan loan = activeLoans.get(barcode);
+        if (today.isAfter(loan.getDueDate())) throw new IllegalStateException("Overdue");
+        if (loan.getRenewals() >= loan.getMember().plan().maxRenewals()) {
+            throw new IllegalStateException("No renewals left");
+        }
+        if (!loan.getItem().getBook().holds().isEmpty()) {
+            throw new IllegalStateException("Someone is waiting for this book");
+        }
+        loan.extend();
+        return loan;
+    }
+
+    /** Daily job: a copy nobody collected goes to the next person in the queue. */
+    synchronized void expireHolds(LocalDate today) {
+        for (Map.Entry<BookItem, Hold> e : new ArrayList<>(heldFor.entrySet())) {
+            if (today.isAfter(e.getValue().getPickupBy())) {
+                heldFor.remove(e.getKey());
+                giveToNextInQueue(e.getKey(), today);
+            }
+        }
+    }
+
+    private void giveToNextInQueue(BookItem item, LocalDate today) {
+        Hold next = item.getBook().holds().pollFirst();       // first come, first served
+        if (next == null) {
+            item.setStatus(ItemStatus.AVAILABLE);
+            return;
+        }
+        next.readyUntil(today.plusDays(2));                    // 2 days to collect
+        heldFor.put(item, next);
+        item.setStatus(ItemStatus.ON_HOLD_SHELF);
     }
 }
 ```
 
-[![Returning a copy closes the loan and records the fine once; a healthy copy goes straight to the first waiting hold, a damaged one goes to repair; payment happens separately.](learning-figures/lld-9-return.svg)](learning-figures/lld-9-return.svg)
+`giveToNextInQueue` is used by both `returnBook` and the daily expiry job. Either a waiting member gets the copy for 2 days, or the copy goes back on the shelf.
 
-The timeline for our example:
+> **⚠️ Common mistake**
+> Counting days late from milliseconds. Use calendar dates (`LocalDate` and `ChronoUnit.DAYS`) so midnight and daylight-saving changes cannot add or lose a day.
 
-| Date | Event | The copy |
+## Step 5: The waiting-list algorithm in action
+
+Asha (Basic) borrows the only copy of *Practical Java* on 1 October. It is due on 15 October.
+
+| Date | What happens | The copy |
 | --- | --- | --- |
-| 1 Oct | Asha borrows | ON_LOAN (Asha) |
-| 2 Oct | Bilal, then Chetan, place holds | still ON_LOAN |
-| 18 Oct | Asha returns, fine ₹30 | ON_HOLD_SHELF for Bilal until 20 Oct |
-| 21 Oct | Bilal did not come; a daily job expires his hold | ON_HOLD_SHELF for Chetan until 23 Oct |
-| 22 Oct | Chetan collects | ON_LOAN (Chetan) |
+| 1 Oct | Asha borrows | On loan to Asha |
+| 2 Oct | Bilal, then Chetan, place holds | Still with Asha |
+| 6 Oct | Asha tries to renew | Refused – someone is waiting |
+| 18 Oct | Asha returns, 3 days late | Fine ₹30. On the hold shelf for Bilal until 20 Oct |
+| 19 Oct | Chetan tries to borrow it | Refused – it is Bilal's turn |
+| 21 Oct | Bilal never came; the daily job runs | On the hold shelf for Chetan until 23 Oct |
+| 22 Oct | Chetan (Premium) borrows | Due 12 Nov (21 days) |
 
 ![Animation: Asha borrows the only copy; Bilal and Chetan queue; Asha returns late and is fined; the copy waits for Bilal, his hold expires, and Chetan collects it.](learning-figures/lld-9-holds.gif)
 
-The daily expiry job does the same thing as a return: mark the old hold EXPIRED and give the copy to the next WAITING hold, or make it AVAILABLE if nobody is waiting.
+`synchronized` on every `LibraryService` method makes "check and lend" one step. Two desks scanning the last copy cannot both succeed.
 
-**Renewal** extends the same loan instead of creating a new one. It is refused if the loan is overdue, the plan's renewals are used up, or someone is waiting for the title:
+> **🎯 In the interview**
+> With a database, lend with one conditional update: `UPDATE book_item SET status = 'ON_LOAN' WHERE barcode = ? AND status = 'AVAILABLE'`. If no row changed, another desk got there first.
 
-```java
-public synchronized Loan renew(Loan loan) {
-    MembershipPlan plan = loan.getMember().getPlan();
-    if (today().isAfter(loan.getDueDate())) throw new RenewalDeniedException("Overdue");
-    if (loan.getRenewals() >= plan.maxRenewals()) throw new RenewalDeniedException("No renewals left");
-    if (loan.getItem().getBook().nextWaitingHold().isPresent()) throw new RenewalDeniedException("Someone is waiting");
-    loan.extendBy(plan.loanDays());
-    return loan;
-}
-```
+## Step 6: Deep dives
 
-## Step 5: Search, patterns and extensibility
+### Search
 
-Search uses simple indexes, built when books are added:
+Keep indexes by title words, author and ISBN. For millions of titles, use a search engine such as Elasticsearch. Search can be slightly stale – checkout always checks the copy's real status.
 
-```java
-class Catalog {
-    private final Map<String, List<Book>> byAuthor = new HashMap<>();
-    private final Map<String, List<Book>> byTitleWord = new HashMap<>();
-    private final Map<String, Book> byIsbn = new HashMap<>();
+### Damaged or lost copies
 
-    List<Book> searchByTitle(String query) {
-        return byTitleWord.getOrDefault(query.toLowerCase(), List.of());
-    }
-}
-```
+Add `IN_REPAIR` and `LOST` statuses. A damaged return goes to repair instead of the hold shelf; the next member keeps waiting for a healthy copy.
 
-For a real library with millions of titles, this becomes a search engine such as Elasticsearch. Search may be slightly stale; checkout always checks the copy's real status.
+### Notifications
 
-| Pattern | Where | Why it helps |
-| --- | --- | --- |
-| **Composition over inheritance** | `Member` has a `MembershipPlan` | New plans are data, not classes. |
-| **Observer** | "Book ready for pickup", "due tomorrow" notices | Email/SMS added without changing `LibraryService`. |
-| **Strategy** | `FinePolicy` (per day, capped, grace period) | Fine rules change per library. |
-| **Facade** | `LibraryService` | Desks and apps call one simple API; internals stay hidden. |
+"Your book is ready for pickup" and "due tomorrow" messages are **observers** of library events.
+
+### Different fine rules
+
+A grace period or a maximum fine becomes a `FinePolicy` strategy, chosen per plan.
 
 ## Interviewer follow-ups
 
-**Can two members take the last copy at the same time?** No. Checkout checks status and changes it inside one synchronized method (or one database transaction with a row lock on the copy). The second desk sees ON_LOAN.
+**Why not `StudentMember` and `FacultyMember` subclasses?** They behave identically; only limits differ. Composition with a `MembershipPlan` keeps one `Member` class.
 
-**Why is the hold on the `Book`, not the `BookItem`?** The member wants the title, not a particular barcode. A hold on a copy would leave them waiting for that one copy while another copy sits on the shelf.
+**What if the first person in the queue has reached their limit?** Skip them for now (or cancel their hold with a reason) and offer the copy to the next eligible member. State the rule you choose.
 
-**What if a returned book is damaged?** Mark the copy as being repaired (an extra status) and do not offer it to the hold queue. The waiting member stays in the queue for the next healthy copy.
+**Why doesn't a return wait for the fine to be paid?** The book is physically back. Record the fine and accept the book; payment can happen later and must never block the next reader.
 
-**What if the first person in the queue has reached their borrowing limit?** Skip them for now (or cancel their hold with a reason) and offer the copy to the next eligible member. State whichever policy you choose.
-
-**Why doesn't return wait for the fine to be paid?** The physical book is back on the desk. Accepting it and recording the fine are local steps; payment can fail or take time and should never block the next reader.
-
-**How would you store this in a database?** Tables for `book`, `book_item`, `member`, `loan`, `hold`. A copy may appear in many historical loans, so do not put a unique constraint on `loan.item_id`; instead allow only one loan per item with `return_date IS NULL` (a partial unique index in PostgreSQL).
+**How would you store loans in a database?** A copy appears in many past loans, so don't make `item_id` unique. Allow only one loan per copy with `returned_on IS NULL` (a partial unique index in PostgreSQL).
 
 ## Wrap up
 
-We separated titles from physical copies, put limits in membership plans, and made checkout, return and holds fair and safe.
+We separated titles from physical copies, put limits in membership plans, and made lending, returning and the waiting list fair and safe.
 
 > **📝 Key takeaways**
 > - `Book` is the title; `BookItem` is the physical copy with a barcode.
 > - Limits live in a `MembershipPlan` – composition, not subclasses.
-> - Holds are a FIFO queue per title with a 2-day pickup window.
+> - Holds are a first-in-first-out queue per title, with a 2-day pickup window.
 > - Fines use calendar dates and are recorded on return, never blocking it.
 
 ## Going deeper (optional)
 
-The full reference implementation adds the protections a production system needs:
+The complete, runnable code is [LibraryDemo.java](reference-code/learning/kb/librarymgmt/LibraryDemo.java). It replays the table above and checks every result.
 
-- **Request IDs** on checkout and renewal, so a retried request after a lost response does not lend twice or renew twice.
-- **Pickup tokens**: each "ready for pickup" assignment has its own token. An old expiry job for Bilal's token cannot take the copy away from Chetan.
-- **Return by loan ID**: a delayed duplicate return for Asha's closed loan returns the saved receipt instead of closing Chetan's newer loan.
+The production-depth version adds retry-safe checkout and renewal requests, and a token for every pickup assignment, so a delayed expiry job for one member can never take a copy from the next.
 
-[![Each pickup assignment has its own token: after Chetan receives his, an old expiry job for Bilal's token or a late duplicate of Asha's return cannot take the copy away from him.](learning-figures/lld-9-tokens.svg)](learning-figures/lld-9-tokens.svg)
+[![Returning a copy closes the loan and records the fine once; a healthy copy goes straight to the first waiting hold, a damaged one goes to repair; payment happens separately.](learning-figures/lld-9-return.svg)](learning-figures/lld-9-return.svg)
 
-[Open the copy-ownership walkthrough](learning-labs/library.html), or read the runnable Java: [Library.java](reference-code/learning/kb/library/Library.java), [LibraryDemo.java](reference-code/learning/kb/library/LibraryDemo.java) and [LibraryChecks.java](reference-code/learning/kb/library/LibraryChecks.java).
+[Open the copy-ownership walkthrough](learning-labs/library.html), or read the advanced code: [Library.java](reference-code/learning/kb/library/Library.java) and [LibraryChecks.java](reference-code/learning/kb/library/LibraryChecks.java).
 
 ## Closing answer
 
-"I separate `Book`, the catalogue title, from `BookItem`, the physical copy with a barcode and status. Members have a `MembershipPlan` that holds their limits, so new plans need no new classes. `LibraryService` is the single place that changes loans: checkout checks the member's limit and the copy's status together, return closes the loan, calculates the fine with calendar dates and hands the copy to the first waiting hold for that title with a 2-day pickup window. Renewal extends the same loan unless someone is waiting. Search uses indexes, notifications are observers, and fine rules are a strategy."
+"I separate `Book`, the catalogue title, from `BookItem`, the physical copy with a barcode and status. Members have a `MembershipPlan` with their limits, loan length, renewals and fine rate, so new plans need no new classes. `LibraryService` is the single place that lends: checkout checks the member's limit and the copy's status in one synchronized step. Return closes the loan, calculates the fine with calendar dates, and gives the copy to the first waiting hold for that title with a two-day pickup window; a daily job passes uncollected copies on. Renewal extends the same loan unless someone is waiting."
 
 === LLD 10 ===
 N|svc|ExpenseService|220|0|180|rect
-N|group|Group|0|0|130|rect
+N|user|User|0|0|130|rect
 N|exp|Expense|220|130|150|rect
 N|split|SplitStrategy|460|0|170|rect
 N|sheet|BalanceSheet|460|130|170|rect
 N|settle|DebtSimplifier|0|130|170|rect
-E|group|svc|members
+E|user|svc|adds expense
 E|svc|split|compute shares
 E|svc|exp|records
-E|exp|sheet|updates balances
-E|sheet|settle|suggest payments
+E|svc|sheet|updates balances
+E|sheet|settle|net balances
 ---
 ## Problem
 
-Design an expense-sharing app such as Splitwise. Friends add shared expenses ("I paid ₹900 for dinner, split between three of us"), see who owes whom, and settle up.
+Design an expense-sharing app like Splitwise. Friends record shared expenses ("I paid ₹900 for dinner, split three ways"), see who owes whom, and settle up.
 
-The design must keep every paisa accounted for, support different ways of splitting, and suggest a short list of payments to settle the group.
+The design must keep every paisa accounted for, support different ways of splitting, and suggest a short list of payments that settles everyone.
 
 ## Requirements
 
-- Users belong to groups. Any member can add an expense paid by one member and shared by some members.
-- Split types: equal, exact amounts, and percentages.
-- Show each user's balance: how much they owe or are owed, overall and per person.
-- Record a settlement payment ("Ben paid Asha ₹300").
-- Suggest a small set of payments that settles everyone.
-
-Out of scope: multiple currencies, receipts and images, recurring expenses, actual money transfers.
+- Add an expense paid by one person and shared by some people.
+- Split equally, by exact amounts, or by percentages.
+- Show how much each person owes or is owed.
+- Record a payment ("Ben paid Asha ₹300").
+- Suggest a short list of payments that settles everyone.
 
 ## Step 1: Clarify the requirements
 
 **Candidate:** Does one person pay for each expense?
 
-**Interviewer:** Usually one payer. Multiple payers can be a follow-up.
+**Interviewer:** Yes. Multiple payers can be a follow-up.
 
 **Candidate:** Which split types do we need?
 
 **Interviewer:** Equal, exact amounts and percentages.
 
-**Candidate:** How do we handle ₹100.01 split three ways?
+**Candidate:** What about ₹100.01 split three ways?
 
-**Interviewer:** Every paisa must be accounted for. You choose the rule for the leftover.
+**Interviewer:** Every paisa must be accounted for. You choose who gets the extra.
 
-**Candidate:** Do suggested settle-up payments have to be the minimum possible?
+**Candidate:** Must the settle-up list be the shortest possible?
 
-**Interviewer:** No. A small, simple list is enough.
+**Interviewer:** Short and simple is enough.
 
-**Candidate:** Can expenses be edited?
+**Candidate:** Can expenses be edited later?
 
-**Interviewer:** Yes, but people must still understand their balance.
+**Interviewer:** Yes, but balances must still make sense.
 
 > **🎯 In the interview**
-> Asking about the leftover paisa shows you think about money precisely. Say "I'll store money as whole paise in a `long`".
+> The leftover-paisa question shows you think about money precisely. Say: "I'll store money as whole paise in a `long`".
 
 | Functional | Non-functional |
 | --- | --- |
 | Add expenses with equal, exact or percentage splits | Shares always add up exactly to the total |
-| Show who owes whom | Net balances always sum to zero |
-| Record payments; suggest a short settle-up list | New split types are easy to add |
+| Show who owes whom | Balances always sum to zero |
+| Record payments; suggest how to settle up | New split types are easy to add |
 
-## Step 2: Core classes
+## Step 2: Identify the core objects
 
-| Class | Responsibility |
-| --- | --- |
-| `User` | id, name, email |
-| `Group` | id, name, members |
-| `Expense` | id, description, paidBy, amount, list of `Split`, createdAt. Immutable once saved. |
-| `Split` | One participant's share: user and amount |
-| `SplitStrategy` | Turns an amount and inputs into a list of `Split`: `EqualSplit`, `ExactSplit`, `PercentSplit` |
-| `BalanceSheet` | Who owes whom: `balances[a][b] = x` means **b owes a** x paise |
-| `ExpenseService` | Validates and records expenses and settlements, updates the balance sheet |
-| `DebtSimplifier` | Suggests a short list of payments from net balances |
+- **User** – a person in the group.
+- **Expense** – what was bought, who paid, the amount, and each person's share.
+- **Split** – one person's share of one expense.
+- **SplitStrategy** – how an amount is divided: equal, exact or percent.
+- **BalanceSheet** – who owes whom, and how much.
+- **ExpenseService** – records expenses and payments and updates balances.
+- **DebtSimplifier** – suggests a short list of payments.
 
-[![Class diagram: a Group has Users; an Expense has a payer, an amount and a list of Splits; SplitStrategy has Equal, Exact and Percent implementations; ExpenseService uses a SplitStrategy, records Expenses and updates the BalanceSheet; DebtSimplifier suggests payments from the BalanceSheet.](learning-figures/lld-10-classes.svg)](learning-figures/lld-10-classes.svg)
+[![Selected design: a User adds an expense through ExpenseService, which computes shares with a SplitStrategy, records the Expense and updates the BalanceSheet; the DebtSimplifier turns net balances into suggested payments.](designs/lld-10.svg)](designs/lld-10.svg)
 
-[![Selected design: a Group supplies members to ExpenseService, which computes shares through a SplitStrategy, records an Expense, updates the BalanceSheet, and lets the DebtSimplifier suggest payments.](designs/lld-10.svg)](designs/lld-10.svg)
+> **⚖️ Design choice**
+> Splitting and balances are separate jobs. A split strategy only returns shares; the service then updates balances. A new split type never touches balance code.
 
-## Step 3: Splitting without losing a paisa
+## Step 3: Design the classes
 
-Asha, Ben and Cara take a taxi. Asha pays **₹100.01 = 10,001 paise**, split equally. 10,001 / 3 = 3,333 with 2 paise left over. Give the extra paise to the first two members in a fixed order:
+### User, Split and Expense
 
-| Member | Share |
-| --- | --- |
-| Asha | 3,334 |
-| Ben | 3,334 |
-| Cara | 3,333 |
-| **Total** | **10,001** |
+Simple records. An expense is never changed after it is saved – a mistake is fixed by adding a reversal, so history stays explainable.
+
+### SplitStrategy
+
+One interface, three implementations. Every implementation must return shares that add up **exactly** to the total.
+
+### BalanceSheet
+
+A map of maps: `owes[Asha][Ben] = 3,334` means Ben owes Asha ₹33.34. Every entry is written twice, once each way, so the sheet always balances.
+
+### ExpenseService and DebtSimplifier
+
+The service is the only writer. The simplifier only reads net balances and suggests payments – it changes nothing.
+
+[![Class diagram: an Expense has a payer, an amount and Splits; SplitStrategy has Equal, Exact and Percent implementations; ExpenseService uses a SplitStrategy, records Expenses and updates the BalanceSheet; DebtSimplifier reads balances.](learning-figures/lld-10-classes.svg)](learning-figures/lld-10-classes.svg)
+
+## Step 4: Write the code
+
+### User, Split and Expense
+
+```java
+record User(String name) {}
+record Split(User user, long paise) {}
+record Expense(String description, User paidBy, long amountPaise, List<Split> splits) {}
+```
+
+### Split strategies
 
 ```java
 interface SplitStrategy {
@@ -832,185 +958,215 @@ interface SplitStrategy {
 class EqualSplit implements SplitStrategy {
     public List<Split> split(long amount, List<User> users, List<Long> ignored) {
         long base = amount / users.size();
-        long remainder = amount % users.size();
+        long leftover = amount % users.size();                  // e.g. 2 paise
         List<Split> result = new ArrayList<>();
         for (int i = 0; i < users.size(); i++) {
-            result.add(new Split(users.get(i), base + (i < remainder ? 1 : 0)));
+            result.add(new Split(users.get(i), base + (i < leftover ? 1 : 0)));
         }
         return result;
     }
 }
 
 class ExactSplit implements SplitStrategy {
-    public List<Split> split(long amount, List<User> users, List<Long> exactPaise) {
-        if (exactPaise.stream().mapToLong(Long::longValue).sum() != amount) {
+    public List<Split> split(long amount, List<User> users, List<Long> exact) {
+        if (exact.stream().mapToLong(Long::longValue).sum() != amount) {
             throw new IllegalArgumentException("Exact shares must add up to the total");
         }
         List<Split> result = new ArrayList<>();
-        for (int i = 0; i < users.size(); i++) result.add(new Split(users.get(i), exactPaise.get(i)));
+        for (int i = 0; i < users.size(); i++) {
+            result.add(new Split(users.get(i), exact.get(i)));
+        }
         return result;
     }
 }
 
+/** Inputs are percentages in basis points: 100% = 10,000. */
 class PercentSplit implements SplitStrategy {
-    // inputs are basis points: 100% = 10,000, so 12.5% = 1,250
     public List<Split> split(long amount, List<User> users, List<Long> basisPoints) {
         if (basisPoints.stream().mapToLong(Long::longValue).sum() != 10_000) {
             throw new IllegalArgumentException("Percentages must add up to 100");
         }
-        List<Split> result = new ArrayList<>();
+        long[] shares = new long[users.size()];
         long used = 0;
-        for (int i = 0; i < users.size(); i++) {
-            long share = amount * basisPoints.get(i) / 10_000;    // rounds down
-            result.add(new Split(users.get(i), share));
-            used += share;
+        for (int i = 0; i < shares.length; i++) {
+            shares[i] = amount * basisPoints.get(i) / 10_000;    // rounds down
+            used += shares[i];
         }
-        for (int i = 0; used < amount; i++, used++) {             // hand out leftover paise
-            Split s = result.get(i);
-            result.set(i, new Split(s.user(), s.amount() + 1));
+        for (int i = 0; used < amount; i++, used++) shares[i]++;   // leftover paise
+        List<Split> result = new ArrayList<>();
+        for (int i = 0; i < shares.length; i++) {
+            result.add(new Split(users.get(i), shares[i]));
         }
         return result;
     }
 }
 ```
 
-> **⚖️ Design choice**
-> Each split type is a Strategy that only returns shares. Updating balances is a separate job, so a new split type never touches the balance code.
+Asha pays **₹100.01 = 10,001 paise** for a taxi, split equally among three. 10,001 ÷ 3 = 3,333 with 2 paise left. The first two people get one extra paisa each:
 
-Every strategy ends with shares that **add up exactly to the total**. That single rule is what keeps the group's books balanced. (For very large amounts, use `Math.multiplyExact` or `BigInteger` for the multiplication.)
+| Person | Share |
+| --- | --- |
+| Asha | 3,334 |
+| Ben | 3,334 |
+| Cara | 3,333 |
+| **Total** | **10,001** |
 
-## Step 4: Updating balances
+Percentages use **basis points** (100% = 10,000), so 12.5% is exactly 1,250 – no decimals. ₹1.01 split 50/30/20 gives 51, 30 and 20 paise.
 
-The balance sheet stores pairwise debts. When Asha pays and Ben's share is ₹33.34, Ben owes Asha ₹33.34 more, which is the same as Asha owing Ben ₹33.34 less:
+> **⚠️ Common mistake**
+> Using `double` for money. `0.1 + 0.2` is not `0.3` in binary floating point, so shares stop adding up to the total. Whole paise in a `long` never drift.
+
+### BalanceSheet
 
 ```java
 class BalanceSheet {
-    // balances.get(a).get(b) > 0  means  b owes a that many paise
-    private final Map<String, Map<String, Long>> balances = new HashMap<>();
+    // owes.get(a).get(b) > 0 means b owes a that many paise
+    private final Map<User, Map<User, Long>> owes = new HashMap<>();
 
-    void add(String creditor, String debtor, long amount) {
-        if (creditor.equals(debtor) || amount == 0) return;   // you don't owe yourself
-        balances.computeIfAbsent(creditor, k -> new HashMap<>()).merge(debtor, amount, Long::sum);
-        balances.computeIfAbsent(debtor, k -> new HashMap<>()).merge(creditor, -amount, Long::sum);
+    void add(User creditor, User debtor, long paise) {
+        if (creditor.equals(debtor) || paise == 0) return;       // you never owe yourself
+        owes.computeIfAbsent(creditor, k -> new HashMap<>())
+            .merge(debtor, paise, Long::sum);
+        owes.computeIfAbsent(debtor, k -> new HashMap<>())
+            .merge(creditor, -paise, Long::sum);
     }
 
-    long netBalance(String user) {                 // positive: is owed, negative: owes
-        return balances.getOrDefault(user, Map.of()).values().stream().mapToLong(Long::longValue).sum();
-    }
-}
-
-public class ExpenseService {
-    private final BalanceSheet sheet = new BalanceSheet();
-    private final List<Expense> expenses = new ArrayList<>();
-
-    public synchronized Expense addExpense(String description, User paidBy, long amount,
-                                           List<User> users, SplitStrategy strategy, List<Long> inputs) {
-        if (amount <= 0) throw new IllegalArgumentException("Amount must be positive");
-        List<Split> splits = strategy.split(amount, users, inputs);
-        Expense expense = new Expense(UUID.randomUUID().toString(), description, paidBy, amount, splits);
-        for (Split s : splits) {
-            sheet.add(paidBy.getId(), s.user().getId(), s.amount());
-        }
-        expenses.add(expense);
-        return expense;
-    }
-
-    public synchronized void settle(User from, User to, long amount) {
-        sheet.add(from.getId(), to.getId(), amount);   // paying reduces what "from" owes "to"
+    /** Positive: is owed money. Negative: owes money. */
+    long net(User user) {
+        return owes.getOrDefault(user, Map.of()).values().stream()
+                   .mapToLong(Long::longValue).sum();
     }
 }
 ```
 
-After the taxi, `add` skips Asha's own share (you never owe yourself), so Asha is owed 3,334 + 3,333 = **6,667 paise = ₹66.67**. Ben owes ₹33.34 and Cara owes ₹33.33. The net balances add to zero: 6,667 − 3,334 − 3,333 = 0. **Net balances always sum to zero** – a great invariant to mention and to test.
-
-`settle(Ben, Asha, 3334)` adds 3,334 to "Asha owes Ben", cancelling Ben's debt exactly.
-
-[![Ben reports paying Asha; when Asha confirms receipt, one balanced entry credits Ben and debits Asha, and a repeated confirmation creates no second entry.](learning-figures/lld-10-payment.svg)](learning-figures/lld-10-payment.svg)
-
-## Step 5: Simplifying debts
-
-Suppose after many expenses the net balances are: Asha +₹70, Ben −₹30, Cara −₹40. Instead of everyone paying everyone, settle with net amounts. Greedy rule: repeatedly match the person who owes the most with the person owed the most.
+### ExpenseService
 
 ```java
-record Payment(String from, String to, long amount) {}
+class ExpenseService {
+    private final BalanceSheet sheet = new BalanceSheet();
+    private final List<Expense> expenses = new ArrayList<>();
+
+    synchronized Expense addExpense(String description, User paidBy, long amountPaise,
+            List<User> users, SplitStrategy strategy, List<Long> inputs) {
+        if (amountPaise <= 0) throw new IllegalArgumentException("Amount must be positive");
+        List<Split> splits = strategy.split(amountPaise, users, inputs);
+        for (Split s : splits) sheet.add(paidBy, s.user(), s.paise());
+        var expense = new Expense(description, paidBy, amountPaise, List.copyOf(splits));
+        expenses.add(expense);
+        return expense;
+    }
+
+    /** "from" paid "to" back: their debt goes down. */
+    synchronized void settle(User from, User to, long paise) {
+        sheet.add(from, to, paise);
+    }
+
+    synchronized long net(User user) { return sheet.net(user); }
+}
+```
+
+After the taxi: Asha is owed 3,334 + 3,333 = ₹66.67 (her own share is skipped – you never owe yourself). Ben owes ₹33.34, Cara owes ₹33.33. Then Ben buys ₹30 of snacks for Ben and Cara, ₹15 each:
+
+| Person | After taxi | After snacks |
+| --- | --- | --- |
+| Asha | +₹66.67 | +₹66.67 |
+| Ben | −₹33.34 | −₹18.34 |
+| Cara | −₹33.33 | −₹48.33 |
+| **Sum** | **0** | **0** |
+
+The balances always sum to zero – a great check to mention and to test.
+
+## Step 5: Settle up with fewer payments
+
+Say the net balances are Asha +₹70, Ben −₹30, Cara −₹40. Instead of everyone paying everyone, repeatedly match the biggest debtor with the biggest creditor.
+
+```java
+record Payment(User from, User to, long paise) {}
 
 class DebtSimplifier {
-    List<Payment> simplify(Map<String, Long> net) {
-        PriorityQueue<Map.Entry<String, Long>> creditors =
-                new PriorityQueue<>((a, b) -> Long.compare(b.getValue(), a.getValue()));
-        PriorityQueue<Map.Entry<String, Long>> debtors =
-                new PriorityQueue<>((a, b) -> Long.compare(a.getValue(), b.getValue()));
-        net.entrySet().forEach(e -> {
-            if (e.getValue() > 0) creditors.add(new AbstractMap.SimpleEntry<>(e));
-            if (e.getValue() < 0) debtors.add(new AbstractMap.SimpleEntry<>(e));
+    /** Greedy: biggest debtor pays biggest creditor, repeat. At most n - 1 payments. */
+    List<Payment> simplify(Map<User, Long> net) {
+        Comparator<Map.Entry<User, Long>> byAmount = Map.Entry.comparingByValue();
+        var creditors = new PriorityQueue<>(byAmount.reversed());   // largest credit first
+        var debtors = new PriorityQueue<>(byAmount);                // most negative first
+        net.forEach((user, amount) -> {
+            if (amount > 0) creditors.add(Map.entry(user, amount));
+            if (amount < 0) debtors.add(Map.entry(user, amount));
         });
-
         List<Payment> payments = new ArrayList<>();
         while (!creditors.isEmpty() && !debtors.isEmpty()) {
             var c = creditors.poll();
             var d = debtors.poll();
             long amount = Math.min(c.getValue(), -d.getValue());
             payments.add(new Payment(d.getKey(), c.getKey(), amount));
-            if (c.getValue() - amount > 0) creditors.add(new AbstractMap.SimpleEntry<>(c.getKey(), c.getValue() - amount));
-            if (d.getValue() + amount < 0) debtors.add(new AbstractMap.SimpleEntry<>(d.getKey(), d.getValue() + amount));
+            if (c.getValue() > amount) {
+                creditors.add(Map.entry(c.getKey(), c.getValue() - amount));
+            }
+            if (-d.getValue() > amount) {
+                debtors.add(Map.entry(d.getKey(), d.getValue() + amount));
+            }
         }
         return payments;
     }
 }
 ```
 
-Result: Cara pays Asha ₹40, Ben pays Asha ₹30. Two payments. Each step settles at least one person fully, so with *n* people there are at most *n − 1* payments, and the heaps make it O(n log n).
+Result: Cara pays Asha ₹40, then Ben pays Asha ₹30. Two payments. Each step settles at least one person, so *n* people need at most *n − 1* payments; the two heaps make it O(n log n).
 
 ![Animation: net balances Asha +70, Ben −30, Cara −40; the largest debtor Cara pays the largest creditor Asha 40; then Ben pays Asha 30; everyone reaches zero in two payments.](learning-figures/lld-10-simplify.gif)
 
-## Step 6: Design patterns and extensibility
+> **🎯 In the interview**
+> Say clearly that greedy is not always the theoretical minimum. Finding the true minimum means finding sub-groups whose balances cancel out, which is NP-hard. Greedy is what real apps use.
 
-| Pattern | Where | Why it helps |
-| --- | --- | --- |
-| **Strategy** | `EqualSplit`, `ExactSplit`, `PercentSplit` | A new split type (shares, e.g. 1:2) is one new class. |
-| **Factory** | `SplitStrategyFactory.of(SplitType)` | The API receives "EQUAL" and gets the right strategy. |
-| **Observer** | Expense added → notify group members | Notifications stay out of the core logic. |
-| **Immutable value objects** | `Expense`, `Split` as records | History cannot be changed by accident. |
+## Step 6: Deep dives
+
+### Multiple payers
+
+Each person's change for an expense = what they paid − their share. Asha pays ₹600 and Ben ₹400 for a ₹1,000 dinner split four ways (₹250 each): Asha +₹350, Ben +₹150, the other two −₹250 each.
+
+### Editing an expense
+
+Do not rewrite history. Add a reversal (the same splits with opposite signs), then the corrected expense.
+
+### A new split type
+
+Splitting by shares (for example 1:2) is one new `SplitStrategy` class. A **factory** can pick the strategy from the API's `"EQUAL"`, `"EXACT"` or `"PERCENT"` value.
+
+### Notifications
+
+"Ben added an expense" messages are **observers** of the expense-added event.
 
 ## Interviewer follow-ups
 
-**Is the greedy simplification always minimal?** Not guaranteed. The true minimum is *n* minus the largest number of separate sub-groups whose balances each sum to zero (for example, if Ben owes exactly what Dev is owed, they can settle between themselves). Finding those sub-groups is NP-hard in general, so real apps use greedy. Say clearly: greedy gives at most *n − 1* payments and is good enough in practice.
+**Why store pairwise debts and not just one number per person?** Pairwise debts show *who* owes *whom*. Net balances (one number per person) are enough to suggest payments; keep both views.
 
-**How do you handle multiple payers?** Each person's change = what they paid − their share. Asha paid ₹600 and Ben ₹400 for a ₹1,000 dinner split four ways (₹250 each): Asha +₹350, Ben +₹150, Cara −₹250, Dev −₹250. Work with these net changes per expense.
+**Two people add expenses at the same moment?** `addExpense` is synchronized (one lock per group in a real system), or each expense and its balance changes are written in one database transaction.
 
-**How do you edit or delete an expense?** Do not silently change history. Add a reversal (the same splits with opposite signs) and then a new corrected expense. Balances stay explainable.
-
-**Why `long` paise and not `double`?** `0.1 + 0.2 != 0.3` in binary floating point. Integer paise make "shares add up to the total" exactly checkable.
-
-**Two members add expenses at the same time?** `addExpense` is synchronized per group (one lock per group in a real system), or each expense is written in one database transaction together with its balance changes.
-
-**How would you store this?** Tables for `expense`, `expense_split` and either a `balance` table updated in the same transaction, or compute balances from splits on demand and cache them.
+**How would you store this?** Tables for `expense` and `expense_split`; balances either stored and updated in the same transaction, or calculated from splits and cached.
 
 ## Wrap up
 
 We separated how an expense is split from how balances change, kept every amount in exact paise, and used a greedy heap-based simplifier to settle up.
 
 > **📝 Key takeaways**
-> - Store money as whole paise; give leftover paise by a fixed rule.
+> - Store money as whole paise; hand out leftover paise by a fixed rule.
 > - Split types are strategies that always add up exactly to the total.
-> - Net balances always sum to zero – a great test.
-> - Greedy settle-up gives at most n − 1 payments; the true minimum is NP-hard.
+> - Balances always sum to zero – a great test.
+> - Greedy settle-up needs at most n − 1 payments; the true minimum is NP-hard.
 
 ## Going deeper (optional)
 
-The full reference implementation goes further on correctness:
+The complete, runnable code is [SplitwiseDemo.java](reference-code/learning/kb/expensesplit/SplitwiseDemo.java). It replays the examples above and checks every result.
 
-- **Journal entries.** Every expense, confirmed payment and reversal is an immutable balanced entry; balances are rebuilt from the journal.
-- **Two-step payments.** The sender reports a payment; it changes balances only when the receiver confirms it.
-- **Retry safety.** An expense ID retried with the same data returns the original expense; the same ID with different data is rejected.
+The production-depth version records every change as an immutable journal entry, requires the receiver to confirm a payment before balances change, and makes retried requests safe.
 
-[![Reversing a dinner expense after Ben has paid creates a new obligation for Asha to refund Ben, without deleting the original payment from history.](learning-figures/lld-10-correction.svg)](learning-figures/lld-10-correction.svg)
+[![Ben reports paying Asha; when Asha confirms receipt, one balanced entry credits Ben and debits Asha, and a repeated confirmation creates no second entry.](learning-figures/lld-10-payment.svg)](learning-figures/lld-10-payment.svg)
 
-[Step through the trip, retries and a later correction](learning-labs/splitwise.html), or read the runnable Java: [Splits.java](reference-code/learning/kb/splitwise/Splits.java), [SplitLedger.java](reference-code/learning/kb/splitwise/SplitLedger.java), [SplitChecks.java](reference-code/learning/kb/splitwise/SplitChecks.java) and [SplitTrace.java](reference-code/learning/kb/splitwise/SplitTrace.java).
+[Step through the trip, retries and a later correction](learning-labs/splitwise.html), or read the advanced code: [SplitLedger.java](reference-code/learning/kb/splitwise/SplitLedger.java) and [SplitChecks.java](reference-code/learning/kb/splitwise/SplitChecks.java).
 
 ## Closing answer
 
-"I model User, Group, Expense and Split, with split types as strategies – equal, exact and percent – that always return shares adding up exactly to the total in paise, giving leftover paise by a fixed rule. `ExpenseService` records an expense and updates a pairwise `BalanceSheet`; net balances always sum to zero. Settlements are just entries in the opposite direction. To settle up, a greedy simplifier matches the biggest debtor with the biggest creditor using two heaps, giving at most n − 1 payments – simple, though not always the theoretical minimum. Edits are reversals plus new expenses, so history stays explainable."
+"I'd model User, Expense and Split, with split types as strategies – equal, exact and percent – that always return shares adding up exactly to the total in whole paise, giving leftover paise by a fixed rule. `ExpenseService` records an expense and updates a pairwise `BalanceSheet`; every entry is written both ways, so balances always sum to zero. A payment is just an entry in the other direction. To settle up, a greedy simplifier matches the biggest debtor with the biggest creditor using two heaps – at most n − 1 payments, though not always the theoretical minimum. Edits are reversals plus new expenses, so history stays explainable."
 
 === LLD 11 ===
 N|n0|VendingMachine|0|0|200|rect

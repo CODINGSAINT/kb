@@ -651,23 +651,19 @@ E|ui|game|makeMove(row, col)
 E|game|board|place and check win
 E|game|player|whose turn
 E|game|status|updates
-E|player|ui|chooses move
 ---
 ## Problem
 
 Design a game of tic-tac-toe. Two players, X and O, take turns placing their mark on an empty cell of a 3×3 board. Three in a row, column or diagonal wins. If the board fills up with no winner, it is a draw.
 
-This is often the first LLD question in an interview. The board is tiny, so the interviewer is watching how you split responsibilities, validate moves, detect a win efficiently, and how easily the design extends (N×N boards, a computer player, undo).
+This is often the first LLD question in an interview. The board is tiny on purpose: the interviewer is watching how you split responsibilities, validate moves, detect a win, and extend the design.
 
 ## Requirements
 
 - Two players take turns; X moves first.
-- A move is rejected if it is out of the board, on an occupied cell, by the wrong player, or after the game is over. A rejected move changes nothing.
-- After every move, detect a win or a draw.
-- Show the board after each move.
-- Keep the game rules independent of how moves arrive (console, web, bot).
-
-Out of scope: accounts, online matchmaking, saving games.
+- Reject a move that is outside the board, on an occupied cell, by the wrong player, or after the game is over. A rejected move changes nothing.
+- Detect a win or a draw after every move.
+- Keep the rules independent of how moves arrive (console, web, bot).
 
 ## Step 1: Clarify the requirements
 
@@ -679,121 +675,88 @@ Out of scope: accounts, online matchmaking, saving games.
 
 **Interviewer:** Two humans first. A bot is a follow-up.
 
-**Candidate:** What happens on an invalid move – an occupied cell, or the wrong player?
+**Candidate:** What happens on an invalid move?
 
 **Interviewer:** Reject it. The same player tries again.
 
 **Candidate:** Do we need undo?
 
-**Interviewer:** Not now. Tell me how you would add it.
+**Interviewer:** Not now. Tell me how you'd add it.
 
 > **💡 Tip**
-> Tic-tac-toe is small on purpose. The interviewer is judging responsibilities, validation and extensibility – not the rules of the game.
+> The interviewer is judging responsibilities, validation and extensibility – not whether you know the rules of tic-tac-toe.
 
 | Functional | Non-functional |
 | --- | --- |
 | Players alternate; X moves first | A rejected move changes nothing |
 | Detect a win or a draw after every move | Easy to grow to N×N, bots and undo |
-| Show the board after each move | Rules independent of console, web or bot input |
+| Show the board | Rules independent of console, web or bot |
 
-## Step 2: Core classes
+## Step 2: Identify the core objects
 
-| Class | Responsibility |
-| --- | --- |
-| `Symbol` | Enum: `X`, `O`, `EMPTY` |
-| `Player` | name and symbol; can choose a move (human input or bot) |
-| `Board` | size and cells; place a symbol; check whether a cell is free; check lines through a cell |
-| `Game` | Owns the board, the two players, whose turn it is and the status. The only public way to play. |
-| `GameStatus` | Enum: `IN_PROGRESS`, `X_WON`, `O_WON`, `DRAW` |
-| `MoveResult` | Accepted or the reason for rejection, plus the current board |
+- **Player** – a name and a symbol (X or O).
+- **Board** – the grid of cells; can place a mark and check lines.
+- **Game** – owns the board, the two players, whose turn it is, and the status.
+- **GameStatus** – in progress, X won, O won or draw.
+- **Decision** – the result of a move: accepted, or why it was rejected.
 
-[![Class diagram: Game owns a Board, two Players and a GameStatus; Board holds Symbol cells and checks lines; Player has a Symbol and a MoveStrategy, implemented by HumanMove and BotMove.](learning-figures/lld-16-classes.svg)](learning-figures/lld-16-classes.svg)
+[![Selected design: a console, UI or bot sends a move to Game; Game checks whose turn it is from the Players, places the mark on the Board, checks for a win and updates the GameStatus.](designs/lld-16.svg)](designs/lld-16.svg)
 
-**Why does `Game` own the turn and the status, not `Board`?** The board only knows cells. Whose turn it is and whether the game is over are game rules. Keeping them in `Game` means one place decides whether a move is legal.
+> **⚖️ Design choice**
+> `Game` owns the turn and the status, not `Board`. The board only knows cells; whose turn it is and whether the game is over are game rules. One place decides whether a move is legal.
 
-**Do we need `HumanPlayer` and `BotPlayer` subclasses?** Only the way they choose a move differs. Give `Player` a `MoveStrategy` (human input or bot) instead.
+## Step 3: Design the classes
 
-[![Selected design: a console, UI or bot sends a move to Game; Game asks whose turn it is from the Players, places the mark on the Board and checks the win, and updates the GameStatus.](designs/lld-16.svg)](designs/lld-16.svg)
+### Player
 
-## Step 3: Making a move
+A record with a name and a symbol. A human and a bot behave the same way here – they just choose moves differently (see Step 6).
 
-Every move follows the same order: **validate everything first, then change state, then decide the result.**
+### Board
 
-[![Move flow: reject a finished game, wrong player, out-of-range or occupied cell without changing anything; otherwise place the mark, check for a win before checking for a draw, and only then switch turns.](learning-figures/tictactoe-flow.svg)](learning-figures/tictactoe-flow.svg)
+An N×N grid of symbols. It can say whether a cell is inside and empty, place a symbol, and check whether a move completed a line.
+
+### Game
+
+The only public way to play. `makeMove` validates, places, then decides the result.
+
+[![Class diagram: Game owns a Board, two Players, the current turn and a GameStatus; Board holds Symbol cells and checks lines; Player has a name, a Symbol and a MoveStrategy, implemented by HumanMove and BotMove.](learning-figures/lld-16-classes.svg)](learning-figures/lld-16-classes.svg)
+
+## Step 4: Write the code
+
+### Enums and Player
 
 ```java
-public enum Symbol { X, O, EMPTY }
-public enum GameStatus { IN_PROGRESS, X_WON, O_WON, DRAW }
-public enum Decision { ACCEPTED, GAME_OVER, WRONG_TURN, OUT_OF_BOUNDS, OCCUPIED }
+enum Symbol { X, O, EMPTY }
+enum GameStatus { IN_PROGRESS, X_WON, O_WON, DRAW }
+enum Decision { ACCEPTED, GAME_OVER, WRONG_TURN, OUT_OF_BOUNDS, OCCUPIED }
 
-public class Game {
-    private final Board board;
-    private final Player[] players;
-    private int current = 0;                          // index of the player to move; X first
-    private int movesMade = 0;
-    private GameStatus status = GameStatus.IN_PROGRESS;
-
-    public Game(int size, Player x, Player o) {
-        this.board = new Board(size);
-        this.players = new Player[] { x, o };
-    }
-
-    public synchronized Decision makeMove(Player player, int row, int col) {
-        if (status != GameStatus.IN_PROGRESS) return Decision.GAME_OVER;
-        if (player != players[current])       return Decision.WRONG_TURN;
-        if (!board.isInside(row, col))        return Decision.OUT_OF_BOUNDS;
-        if (!board.isEmpty(row, col))         return Decision.OCCUPIED;
-
-        Symbol s = player.getSymbol();
-        board.place(row, col, s);
-        movesMade++;
-
-        if (board.winsThrough(row, col, s)) {
-            status = (s == Symbol.X) ? GameStatus.X_WON : GameStatus.O_WON;
-        } else if (movesMade == board.size() * board.size()) {
-            status = GameStatus.DRAW;
-        } else {
-            current = 1 - current;                    // switch turns
-        }
-        return Decision.ACCEPTED;
-    }
-}
+record Player(String name, Symbol symbol) {}
 ```
 
-> **⚠️ Common mistake**
-> Checking for a draw before checking for a win. If the ninth move completes a line, it is a win.
-
-Three details are worth saying out loud:
-
-- **All checks happen before `place`.** A rejected move leaves the board, turn and status exactly as they were.
-- **Win is checked before draw.** If the ninth move completes a line, it is a win, not a draw.
-- **`synchronized`** makes the whole check-and-place one step, so two quick clicks cannot both be accepted.
-
-## Step 4: Detecting a win
-
-Before this move there was no winner, so a new winning line **must pass through the cell just played**. Check only that row, that column, and a diagonal if the cell is on one:
+### Board
 
 ```java
-public class Board {
+class Board {
     private final int n;
     private final Symbol[][] cells;
 
-    public Board(int n) {
+    Board(int n) {
         this.n = n;
-        this.cells = new Symbol[n][n];
+        cells = new Symbol[n][n];
         for (Symbol[] row : cells) Arrays.fill(row, Symbol.EMPTY);
     }
 
-    boolean isInside(int r, int c) { return r >= 0 && r < n && c >= 0 && c < n; }
-    boolean isEmpty(int r, int c)  { return cells[r][c] == Symbol.EMPTY; }
+    int size()                         { return n; }
+    boolean isInside(int r, int c)     { return r >= 0 && r < n && c >= 0 && c < n; }
+    boolean isEmpty(int r, int c)      { return cells[r][c] == Symbol.EMPTY; }
     void place(int r, int c, Symbol s) { cells[r][c] = s; }
-    int size() { return n; }
 
+    /** A new win must pass through the cell just played: check only its lines. */
     boolean winsThrough(int r, int c, Symbol s) {
         return line(r, 0, 0, 1, s)                              // row r
             || line(0, c, 1, 0, s)                              // column c
             || (r == c && line(0, 0, 1, 1, s))                  // main diagonal
-            || (r + c == n - 1 && line(0, n - 1, 1, -1, s));    // anti-diagonal
+            || (r + c == n - 1 && line(0, n - 1, 1, -1, s));    // other diagonal
     }
 
     private boolean line(int r, int c, int dr, int dc, Symbol s) {
@@ -802,16 +765,82 @@ public class Board {
         }
         return true;
     }
+
+    String row(int r) {
+        StringBuilder sb = new StringBuilder();
+        for (Symbol s : cells[r]) sb.append(s == Symbol.EMPTY ? '.' : s.name().charAt(0));
+        return sb.toString();
+    }
 }
 ```
 
-This is O(N) per move instead of scanning all 2N + 2 lines (O(N²)).
+Before this move there was no winner, so a new winning line **must pass through the cell just played**. Checking only that row, that column and the diagonals is O(N) – instead of scanning every line.
 
-Walk through a short game:
+### Game
+
+```java
+class Game {
+    private final Board board;
+    private final Player[] players;
+    private int current = 0;                       // index of the player to move; X first
+    private int moves = 0;
+    private GameStatus status = GameStatus.IN_PROGRESS;
+
+    Game(int size, Player x, Player o) {
+        board = new Board(size);
+        players = new Player[] { x, o };
+    }
+
+    synchronized Decision makeMove(Player player, int row, int col) {
+        // 1. Validate everything first. A rejected move changes nothing.
+        if (status != GameStatus.IN_PROGRESS) return Decision.GAME_OVER;
+        if (player != players[current])       return Decision.WRONG_TURN;
+        if (!board.isInside(row, col))        return Decision.OUT_OF_BOUNDS;
+        if (!board.isEmpty(row, col))         return Decision.OCCUPIED;
+
+        // 2. Change state.
+        Symbol s = player.symbol();
+        board.place(row, col, s);
+        moves++;
+
+        // 3. Decide the result: win before draw, then switch turns.
+        if (board.winsThrough(row, col, s)) {
+            status = (s == Symbol.X) ? GameStatus.X_WON : GameStatus.O_WON;
+        } else if (moves == board.size() * board.size()) {
+            status = GameStatus.DRAW;
+        } else {
+            current = 1 - current;
+        }
+        return Decision.ACCEPTED;
+    }
+
+    GameStatus getStatus() { return status; }
+    Board getBoard()       { return board; }
+}
+```
+
+Three things worth saying out loud:
+
+- **All checks come before `place`.** A rejected move leaves the board, turn and status untouched.
+- **Win is checked before draw.** If the ninth move completes a line, it is a win.
+- **`synchronized`** makes check-and-place one step, so two quick clicks cannot both be accepted.
+
+> **⚠️ Common mistake**
+> Checking for a draw before checking for a win. A full board can still contain a winning line made by the last move.
+
+Try it with Asha (X) and Bilal (O):
+
+| Move | Result |
+| --- | --- |
+| Asha (0,0) | Accepted |
+| Bilal (0,0) | OCCUPIED – Bilal tries again |
+| Asha (1,1) | WRONG_TURN – it is still Bilal's turn |
+| Bilal (3,0) | OUT_OF_BOUNDS |
+| Bilal (1,0), Asha (0,1), Bilal (1,1) | Accepted |
+| Asha (0,2) | Accepted – row 0 complete, X_WON |
+| Bilal (2,2) | GAME_OVER |
 
 ```text
-X (0,0)   O (1,0)   X (0,1)   O (1,1)   X (0,2)  -> X wins along row 0
-
       col 0  1  2
 row 0     X  X  X
 row 1     O  O  .
@@ -820,60 +849,63 @@ row 2     .  .  .
 
 ![Animation: X and O alternate moves; an attempt by O on the occupied top-left cell is rejected without losing O's turn; X completes the top row and wins, after which further moves are rejected.](learning-figures/lld-16-game.gif)
 
-### The O(1) trick for N×N
+## Step 5: An O(1) win check for big boards
 
-Interviewers love this follow-up. Keep a counter per row, per column and for both diagonals. X adds +1, O adds −1. After a move, update the counters for that row, column and any diagonal. If any counter reaches **+N or −N**, that line is complete.
+Interviewers love this follow-up. Keep a counter for every row, every column and both diagonals. X adds +1, O adds −1. A line is complete when its counter reaches **+N or −N** – a mixed line can never get there, because X and O cancel out.
 
 ```java
-private final int[] rows = new int[n], cols = new int[n];   // one counter per row and column
-private int diag, antiDiag;
+/** O(1) win check for N x N: X adds +1, O adds -1 to its row, column and diagonals. */
+class WinCounters {
+    private final int n;
+    private final int[] rows, cols;
+    private int diag, antiDiag;
 
-boolean recordAndCheck(int r, int c, Symbol s, int n) {
-    int v = (s == Symbol.X) ? 1 : -1;
-    rows[r] += v; cols[c] += v;
-    if (r == c) diag += v;
-    if (r + c == n - 1) antiDiag += v;
-    return Math.abs(rows[r]) == n || Math.abs(cols[c]) == n
-        || Math.abs(diag) == n || Math.abs(antiDiag) == n;
+    WinCounters(int n) { this.n = n; rows = new int[n]; cols = new int[n]; }
+
+    boolean record(int r, int c, Symbol s) {
+        int v = (s == Symbol.X) ? 1 : -1;
+        rows[r] += v;
+        cols[c] += v;
+        if (r == c) diag += v;
+        if (r + c == n - 1) antiDiag += v;
+        return Math.abs(rows[r]) == n || Math.abs(cols[c]) == n
+            || Math.abs(diag) == n || Math.abs(antiDiag) == n;
+    }
 }
 ```
 
-A line can only reach ±N if all N cells hold the same symbol, because a mixed line cancels out. This uses O(N) extra memory and O(1) time per move.
+This uses O(N) extra memory and checks a win in O(1). On a 3×3 board the line check is already instant, so mention the counters as the scalable version.
 
-## Step 5: Design patterns and extensibility
+> **🎯 In the interview**
+> For "K in a row" on a big board (like Gomoku), counters no longer work – they only detect full lines. From the last move, count matching marks in both directions along each of the four axes.
 
-| Pattern | Where | Why it helps |
-| --- | --- | --- |
-| **Strategy** | `MoveStrategy` for `Player`: human input, random bot, minimax bot | New player types without touching `Game`. |
-| **Strategy** (optional) | `WinningRule` | Gomoku-style "K in a row" on a big board can replace the full-line rule. |
-| **Encapsulation** | `Board` is private to `Game` | The UI cannot place marks directly and skip validation. |
-| **Command** (for undo) | Each accepted move stored as a `Move` object | Undo pops the last move and restores the cell, turn and status. |
+## Step 6: Deep dives
 
-```java
-interface MoveStrategy {
-    int[] chooseMove(Board snapshot, Symbol mySymbol);
-}
-```
+### A computer player
 
-A bot chooses on a **copy** of the board and still calls `game.makeMove`, so it obeys exactly the same rules as a human.
+Give `Player` a `MoveStrategy` interface with `chooseMove(board, symbol)`. A human strategy reads input; a bot picks a random empty cell or uses **minimax** (try every move, assume the opponent replies with their best move, pick the best outcome). The bot still calls `game.makeMove`, so it obeys exactly the same rules. This is the **Strategy pattern**.
+
+### Undo
+
+Keep a stack of accepted moves. Undo pops the last one, empties the cell, decrements `moves`, gives the turn back and sets the status to IN_PROGRESS. Each move as an object is the **Command pattern**.
+
+### N×N boards
+
+Already supported: `Game` takes the size, and the win and draw checks use `n`, never a hard-coded 3.
 
 ## Interviewer follow-ups
 
-**How would you support N×N boards?** Pass `n` to the constructor (already done); the win check and draw check use `n`, not 3. Use the counter trick for O(1) wins.
-
-**What about "K in a row" on a big board (like Gomoku)?** Counters no longer work, because they only detect *full* lines. From the last move, count matching symbols in both directions along each of the four axes; if the total including the new mark is at least K, it is a win. Still O(K) per move.
-
-**How would you add undo?** Keep a stack of accepted moves. Undo pops the last one, sets the cell back to EMPTY, decrements `movesMade`, restores the previous player and resets the status to IN_PROGRESS.
-
-**How would you build an unbeatable bot?** Minimax: try every empty cell, recursively assume the opponent plays their best reply, and score win/draw/loss. On 3×3 the full tree is small; on larger boards add depth limits and alpha-beta pruning.
-
-**Why not let the UI read the board array?** It could overwrite a cell or "unwin" a game without going through validation. Return a read-only copy (a snapshot) for display.
+**Why not let the UI read and change the board array directly?** It could overwrite a cell or "unwin" a game without validation. The UI only calls `makeMove` and reads a copy for display.
 
 **What if two clicks arrive at once?** `makeMove` is synchronized, and the second click by the same player is rejected as WRONG_TURN because the turn has already switched.
 
+**Why return a `Decision` instead of throwing exceptions?** Invalid moves are normal in a game. A result value lets the UI show a friendly message without exception handling.
+
+**Do we need `HumanPlayer` and `BotPlayer` subclasses?** No – only how they choose a move differs. A `MoveStrategy` field keeps one `Player` class.
+
 ## Wrap up
 
-We kept the rules in `Game`, the cells in a private `Board`, and made win detection fast by checking only the lines through the last move.
+We kept the rules in `Game`, the cells in a private `Board`, and made the win check fast by looking only at the lines through the last move.
 
 > **📝 Key takeaways**
 > - Validate everything first, then change state, then decide the result.
@@ -883,13 +915,15 @@ We kept the rules in `Game`, the cells in a private `Board`, and made win detect
 
 ## Going deeper (optional)
 
-The full reference implementation adds a **position version** to every move. A request says "I am moving based on position 3"; if the game is already at position 4, the request is rejected as stale. This protects against a delayed click from an older screen being accepted later, which matters for web or multiplayer clients. It also returns an immutable `Snapshot` for display and is checked against all 5,478 reachable board positions.
+The complete, runnable code is [TicTacToeDemo.java](reference-code/learning/kb/tictactoegame/TicTacToeDemo.java). It replays the table above, the ninth-move win and the counter check.
 
-[![Two X requests both based on version zero: one wins the Game lock and advances to version one; the other is rejected as stale, leaving exactly one X on the board.](learning-figures/tictactoe-failure.svg)](learning-figures/tictactoe-failure.svg)
+The production-depth version adds a **position version** to each move, so a delayed click from an old screen is rejected, and checks itself against all 5,478 reachable board positions.
 
-[Open the board walkthrough](learning-labs/tictactoe.html), or read the runnable Java: [TicTacToe.java](reference-code/learning/kb/tictactoe/TicTacToe.java), [TicTacToeDemo.java](reference-code/learning/kb/tictactoe/TicTacToeDemo.java) and [TicTacToeChecks.java](reference-code/learning/kb/tictactoe/TicTacToeChecks.java).
+[![Move flow: reject a finished game, wrong player, out-of-range or occupied cell without changing anything; otherwise place the mark, check for a win before a draw, and only then switch turns.](learning-figures/tictactoe-flow.svg)](learning-figures/tictactoe-flow.svg)
+
+[Open the board walkthrough](learning-labs/tictactoe.html), or read the advanced code: [TicTacToe.java](reference-code/learning/kb/tictactoe/TicTacToe.java) and [TicTacToeChecks.java](reference-code/learning/kb/tictactoe/TicTacToeChecks.java).
 
 ## Closing answer
 
-"I use a `Game` that owns a private `Board`, two `Player`s, the current turn and the status. `makeMove` validates game-over, turn, bounds and occupancy before changing anything, then places the mark, checks for a win through the last cell before checking for a draw, and only then switches turns. Win detection is O(N) by checking just the row, column and diagonals through the last move, or O(1) with per-line counters. Players get their moves from a `MoveStrategy`, so a bot plugs in without changing the rules, and undo can be added with a stack of moves."
+"I use a `Game` that owns a private `Board`, two `Player`s, the current turn and the status. `makeMove` validates game-over, turn, bounds and occupancy before changing anything, then places the mark, checks for a win through the last cell before checking for a draw, and only then switches turns. Win detection is O(N) by checking just the row, column and diagonals through the last move, or O(1) with per-line counters for big boards. Players get their moves from a `MoveStrategy`, so a minimax bot plugs in without changing the rules, and undo can be added with a stack of move commands."
 
