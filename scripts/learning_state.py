@@ -172,7 +172,7 @@ def main():
             stale=stale_topics(manifest)
             owner=read_json(WORK/'lease.json');required=[t for t in manifest['topics'] if t['required']]
             batch=manifest.get('review_batch');allowed=set(batch['topics']) if batch else {t['id'] for t in required}
-            return {'required':len(required),'written':sum(t['generation']=='written' for t in required),'validated':sum(t['validation']=='passed' and t['id'] not in stale for t in required),'complete':sum(t['completion']=='complete' and t['id'] not in stale for t in required),'stale':stale,'writer':{k:v for k,v in owner.items() if k!='token'} if owner else None,'next':[t['id'] for t in sorted(required,key=lambda t:t['priority']) if t['id'] in allowed and (t['completion']!='complete' or t['id'] in stale)][:8],'owner_next':manifest.get('next_action'),'deferred':len([t for t in required if t['id'] not in allowed])}
+            return {'required':len(required),'written':sum(t['generation']=='written' for t in required),'validated':sum(t['validation']=='passed' and t['id'] not in stale for t in required),'complete':sum(t['completion']=='complete' and t['id'] not in stale for t in required),'stale':stale,'writer':{k:v for k,v in owner.items() if k!='token'} if owner else None,'next':[t['id'] for t in sorted(required,key=lambda t:t['priority']) if t['id'] in allowed and (t['completion']!='complete' or t['id'] in stale)][:8],'owner_next':manifest.get('next_action'),'deferred':len([t for t in required if t['id'] not in allowed and t['completion']!='complete'])}
         if args.command=='claim':
             old=read_json(WORK/'lease.json')
             if old and old['expires']>time.time():return {'status':'busy','run':old['run']}
