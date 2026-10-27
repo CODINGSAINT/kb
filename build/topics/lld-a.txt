@@ -702,20 +702,17 @@ E|booking|pay|charge
 ---
 ## Problem
 
-Design the booking part of a movie-ticket app such as BookMyShow. Users browse movies and shows in their city, pick seats on a seat map, pay, and receive a ticket.
+Design the booking part of a movie-ticket app such as BookMyShow. Users pick a show, choose seats on a seat map, pay, and get a ticket.
 
-The interesting part is not the catalogue. It is this: two people select the same seats at the same moment. Only one of them may get those seats, and nobody should be charged for seats they did not get.
+The interesting part is not the movie catalogue. It is this: two people tap the same seats at the same moment. Only one of them may get those seats, and nobody should pay for seats they did not get.
 
 ## Requirements
 
-- Browse movies by city, then see cinemas and show times for a movie.
-- Show the seat map for one show with each seat's type (silver, gold, recliner), price and status.
-- Let a user select up to 8 seats and hold them for a few minutes while they pay.
-- Confirm the booking after a successful payment. Release the seats if payment fails or the hold expires.
+- Browse movies and shows; see the seat map for one show.
+- Hold up to 8 seats for 5 minutes while the user pays.
+- Confirm the booking after payment; release the seats if payment fails or time runs out.
 - Never sell the same seat for the same show twice.
-- Let a user cancel a confirmed booking before the show starts.
-
-Out of scope: food add-ons, offers and coupons, reviews, admin screens for adding cinemas.
+- Seat price depends on the seat type (silver, gold, recliner).
 
 ## Step 1: Clarify the requirements
 
@@ -729,11 +726,11 @@ Out of scope: food add-ons, offers and coupons, reviews, admin screens for addin
 
 **Candidate:** How long do we keep seats for a user while they pay?
 
-**Interviewer:** Five minutes. After that the seats go back on sale.
+**Interviewer:** Five minutes. After that they go back on sale.
 
 **Candidate:** Does every seat cost the same?
 
-**Interviewer:** No. Price depends on the seat type and the show.
+**Interviewer:** No. Gold seats cost more than silver.
 
 **Candidate:** Should I design for one server first?
 
@@ -744,314 +741,342 @@ Out of scope: food add-ons, offers and coupons, reviews, admin screens for addin
 
 | Functional | Non-functional |
 | --- | --- |
-| Browse movies, shows and the seat map | The same seat is never sold twice |
+| Show the seat map for a show | The same seat is never sold twice |
 | Hold up to 8 seats for 5 minutes | A booking gets all its seats or none |
-| Confirm after payment, release on failure or timeout | Pricing and payment providers are easy to change |
-| Cancel before the show | |
+| Confirm after payment; release on failure or timeout | Payment never blocks other customers |
+| Price by seat type | Pricing and payment providers are easy to change |
 
-## Step 2: Core classes
+## Step 2: Identify the core objects
 
-Start from the nouns in the problem and keep only the ones that hold state or enforce a rule.
+- **Movie** – the film: title and length.
+- **Screen** and **Seat** – the hall and its physical seats. Seat A7 is furniture; it never changes.
+- **Show** – one movie on one screen at one time.
+- **ShowSeat** – seat A7 *for this show*. This is the thing we actually sell.
+- **Booking** – one user's seats for one show, with an amount and a status.
+- **BookingService** – the only class that changes who owns a seat.
+- **PaymentService** – the payment provider, behind an interface.
 
-| Class | What it represents | Key fields |
-| --- | --- | --- |
-| `Movie` | A film | id, title, durationMinutes, language |
-| `Cinema` | A building in a city | id, name, city, list of screens |
-| `Screen` | One hall inside a cinema | id, name, physical seats |
-| `Seat` | A physical seat in a screen | id ("A7"), row, number, `SeatType` |
-| `Show` | One movie on one screen at one time | id, movie, screen, startTime, its show seats |
-| `ShowSeat` | A seat **for one show** – the thing we sell | seat, price, `SeatStatus`, heldBy, holdExpiresAt |
-| `Booking` | One user's purchase for one show | id, user, show, seats, amount, `BookingStatus` |
-| `Payment` | One payment attempt for a booking | id, bookingId, amount, status |
-| `User` | The customer | id, name, email |
+How they connect:
 
-Enums keep the states explicit:
-
-```java
-enum SeatType { SILVER, GOLD, RECLINER }
-enum SeatStatus { AVAILABLE, HELD, BOOKED }
-enum BookingStatus { PENDING, CONFIRMED, CANCELLED, EXPIRED }
-```
-
-The most important modelling decision is **`ShowSeat`**. A `Seat` is furniture: it belongs to a screen forever. A `ShowSeat` is inventory: A7 for the 7 pm show on 12 May. Status lives on the show seat, because A7 can be booked for one show and free for the next.
-
-[![Class diagram: Cinema has Screens, Screen has Seats, Show links a Movie and a Screen and owns ShowSeats; Booking holds ShowSeats for a User; BookingService coordinates holds, payment and confirmation.](learning-figures/lld-4-classes.svg)](learning-figures/lld-4-classes.svg)
+[![Selected design: User calls BookingService, which locks one Show, holds its ShowSeats in a Booking and charges through PaymentService.](designs/lld-4.svg)](designs/lld-4.svg)
 
 > **⚖️ Design choice**
 > Status lives on `ShowSeat`, not on `Seat`. A7 can be booked for the 7 pm show and free for the 10 pm show at the same time.
 
-Two services do the work:
+## Step 3: Design the classes
 
-- `CatalogService` answers browse questions: movies in a city, shows for a movie, the seat map for a show. It only reads.
-- `BookingService` changes seat ownership: hold, confirm, cancel. All changes to show seats go through it.
+### Catalogue: Movie, Screen, Seat
 
-Keeping writes in one place matters. If the seat-map screen could change a seat's status directly, two screens could each believe they own A7.
+These only describe things. They never change during a booking, so simple Java records are enough.
 
-[![Selected design: User calls BookingService, which locks one Show, holds its ShowSeats in a Booking and charges through PaymentService.](designs/lld-4.svg)](designs/lld-4.svg)
+### ShowSeat
 
-## Step 3: The booking flow
+A `ShowSeat` knows its price and its status: AVAILABLE, HELD or BOOKED. When it is held, it remembers which booking holds it and until when.
 
-Follow one user, Asha, booking two gold seats, A7 and A8, for the 7 pm show. Each costs ₹250.
+### Show
 
-1. Asha opens the seat map. `CatalogService` returns every show seat with its status. A7 and A8 show as AVAILABLE.
-2. She taps Continue. `BookingService.holdSeats` checks both seats and marks both HELD for her booking for the next 5 minutes. It creates a PENDING booking for ₹500.
-3. She pays. `confirmBooking` charges ₹500. On success it marks A7 and A8 BOOKED and the booking CONFIRMED.
-4. If she closes the app instead, the hold expires after 5 minutes and both seats become AVAILABLE again.
+A show creates one `ShowSeat` for every seat in its screen, priced by seat type. It is also what we lock, so different shows never wait for each other.
 
-[![Flow: the user selects seats, holdSeats checks every seat then holds all of them, payment runs, and confirmation books the seats; if a seat is taken the hold fails, and if payment fails or the hold expires the seats are released.](learning-figures/lld-4-flow.svg)](learning-figures/lld-4-flow.svg)
+### Booking
 
-The seat map on the screen is only a hint. Between drawing it and tapping Continue, someone else may have taken a seat. **The hold is the real check.**
+A booking records the user, the show, the chosen seats, the amount and when the hold ends. Its status moves from PENDING to CONFIRMED or EXPIRED.
 
-### The `ShowSeat` class
+### BookingService and PaymentService
+
+`BookingService` has two jobs: `holdSeats` and `confirm`. It talks to the payment provider through `PaymentService`, so Razorpay or UPI can be swapped in later.
+
+[![Class diagram: a Screen has Seats; a Show plays a Movie on a Screen and owns one ShowSeat per Seat; a Booking holds ShowSeats; BookingService holds and confirms bookings using the PaymentService interface.](learning-figures/lld-4-classes.svg)](learning-figures/lld-4-classes.svg)
+
+## Step 4: Write the code
+
+### Enums and catalogue
+
+```java
+enum SeatType { SILVER, GOLD, RECLINER }
+enum SeatStatus { AVAILABLE, HELD, BOOKED }
+enum BookingStatus { PENDING, CONFIRMED, EXPIRED, CANCELLED }
+```
+
+```java
+record Movie(String title, int durationMinutes) {}
+record Seat(String number, SeatType type) {}                 // furniture: A7 in Screen 2
+record Screen(String name, List<Seat> seats) {}
+```
+
+### ShowSeat
 
 ```java
 class ShowSeat {
     private final Seat seat;
-    private final long pricePaise;          // ₹250 = 25000 paise; never use double for money
+    private final long pricePaise;                           // ₹250 = 25,000 paise
     private SeatStatus status = SeatStatus.AVAILABLE;
-    private String heldByBookingId;
+    private String heldBy;                                   // booking that holds it
     private Instant holdExpiresAt;
+
+    ShowSeat(Seat seat, long pricePaise) { this.seat = seat; this.pricePaise = pricePaise; }
 
     boolean isAvailable(Instant now) {
         if (status == SeatStatus.HELD && !now.isBefore(holdExpiresAt)) {
-            release();                       // an expired hold counts as free
+            release();                                       // an expired hold counts as free
         }
         return status == SeatStatus.AVAILABLE;
     }
 
     void hold(String bookingId, Instant until) {
-        status = SeatStatus.HELD;
-        heldByBookingId = bookingId;
-        holdExpiresAt = until;
+        status = SeatStatus.HELD; heldBy = bookingId; holdExpiresAt = until;
     }
-
     boolean isHeldBy(String bookingId) {
-        return status == SeatStatus.HELD && bookingId.equals(heldByBookingId);
+        return status == SeatStatus.HELD && bookingId.equals(heldBy);
     }
-
     void book()    { status = SeatStatus.BOOKED; holdExpiresAt = null; }
-    void release() { status = SeatStatus.AVAILABLE; heldByBookingId = null; holdExpiresAt = null; }
+    void release() { status = SeatStatus.AVAILABLE; heldBy = null; holdExpiresAt = null; }
+
+    long getPricePaise()   { return pricePaise; }
+    SeatStatus getStatus() { return status; }
 }
 ```
 
-### Holding seats: all or nothing
+`isAvailable` treats an expired hold as free. So even if nobody cleans up old holds, a seat is never stuck.
+
+### Show
 
 ```java
-public class BookingService {
+class Show {
+    private final Movie movie;
+    private final Screen screen;
+    private final Instant startTime;
+    private final Map<String, ShowSeat> seats = new LinkedHashMap<>();
+
+    Show(Movie movie, Screen screen, Instant startTime, Map<SeatType, Long> prices) {
+        this.movie = movie; this.screen = screen; this.startTime = startTime;
+        for (Seat seat : screen.seats()) {
+            seats.put(seat.number(), new ShowSeat(seat, prices.get(seat.type())));
+        }
+    }
+    ShowSeat getSeat(String number) {
+        ShowSeat s = seats.get(number);
+        if (s == null) throw new IllegalArgumentException("No seat " + number);
+        return s;
+    }
+    Movie getMovie() { return movie; }
+}
+```
+
+### Booking
+
+```java
+class Booking {
+    private final String id;
+    private final String user;
+    private final Show show;
+    private final List<ShowSeat> seats;
+    private final long amountPaise;
+    private final Instant holdUntil;
+    private BookingStatus status = BookingStatus.PENDING;
+
+    Booking(String id, String user, Show show, List<ShowSeat> seats,
+            long amountPaise, Instant holdUntil) {
+        this.id = id; this.user = user; this.show = show;
+        this.seats = List.copyOf(seats);
+        this.amountPaise = amountPaise; this.holdUntil = holdUntil;
+    }
+    boolean isExpired(Instant now) { return !now.isBefore(holdUntil); }
+    String getId()            { return id; }
+    Show getShow()            { return show; }
+    List<ShowSeat> getSeats() { return seats; }
+    long getAmountPaise()     { return amountPaise; }
+    BookingStatus getStatus() { return status; }
+    void setStatus(BookingStatus s) { status = s; }
+}
+```
+
+### PaymentService
+
+```java
+interface PaymentService {
+    boolean charge(String bookingId, long amountPaise);   // true if the money was taken
+    void refund(String bookingId, long amountPaise);
+}
+```
+
+### BookingService
+
+```java
+class BookingService {
     private static final Duration HOLD_TIME = Duration.ofMinutes(5);
     private static final int MAX_SEATS = 8;
+    private final Map<String, Booking> bookings = new HashMap<>();
+    private final PaymentService payments;
+    private int nextId = 1;
 
-    private final Map<String, Booking> bookings = new ConcurrentHashMap<>();
-    private final PaymentService paymentService;
-    private final PricingStrategy pricing;
-    private final Clock clock;
+    BookingService(PaymentService payments) { this.payments = payments; }
 
-    public Booking holdSeats(User user, Show show, List<String> seatIds) {
-        if (seatIds.isEmpty() || seatIds.size() > MAX_SEATS) {
+    Booking holdSeats(String user, Show show, List<String> seatNumbers, Instant now) {
+        if (seatNumbers.isEmpty() || seatNumbers.size() > MAX_SEATS) {
             throw new IllegalArgumentException("Choose 1 to " + MAX_SEATS + " seats");
         }
-        synchronized (show) {                       // one lock per show
-            Instant now = clock.instant();
+        synchronized (show) {                                   // one show at a time
             List<ShowSeat> chosen = new ArrayList<>();
-            for (String id : seatIds) {
-                ShowSeat seat = show.getSeat(id);
+            for (String number : seatNumbers) {                 // 1. check every seat
+                ShowSeat seat = show.getSeat(number);
                 if (!seat.isAvailable(now)) {
-                    throw new SeatUnavailableException(id);   // nothing has been changed yet
+                    throw new IllegalStateException("Seat " + number + " is not available");
                 }
                 chosen.add(seat);
             }
-            String bookingId = UUID.randomUUID().toString();
-            Instant holdUntil = now.plus(HOLD_TIME);
-            chosen.forEach(seat -> seat.hold(bookingId, holdUntil));
+            String id = "booking-" + nextId++;                  // 2. then hold all of them
+            Instant until = now.plus(HOLD_TIME);
+            chosen.forEach(seat -> seat.hold(id, until));
+            long total = chosen.stream().mapToLong(ShowSeat::getPricePaise).sum();
+            Booking booking = new Booking(id, user, show, chosen, total, until);
+            bookings.put(id, booking);
+            return booking;
+        }
+    }
 
-            Booking booking = new Booking(bookingId, user, show, chosen,
-                    pricing.total(show, chosen), holdUntil);
-            bookings.put(bookingId, booking);
+    Booking confirm(String bookingId, Instant paidAt) {
+        Booking booking = bookings.get(bookingId);
+        // Payment can take seconds, so it runs without holding the show lock.
+        boolean paid = payments.charge(bookingId, booking.getAmountPaise());
+        synchronized (booking.getShow()) {
+            boolean stillOurs = booking.getSeats().stream()
+                                       .allMatch(s -> s.isHeldBy(bookingId));
+            if (paid && stillOurs && !booking.isExpired(paidAt)) {
+                booking.getSeats().forEach(ShowSeat::book);
+                booking.setStatus(BookingStatus.CONFIRMED);
+            } else {
+                if (paid) payments.refund(bookingId, booking.getAmountPaise());
+                booking.getSeats().stream().filter(s -> s.isHeldBy(bookingId))
+                       .forEach(ShowSeat::release);
+                booking.setStatus(BookingStatus.EXPIRED);
+            }
             return booking;
         }
     }
 }
 ```
 
-Read it in two halves. The loop only **checks**. If A8 is taken, we throw before touching A7, so nothing is half-held. Only when every seat passed do we **change** them all.
+Read `holdSeats` in two halves. The loop only **checks**. If A8 is taken, we throw before touching A7, so nothing is half-held. Only when every seat passed do we **hold** them all.
 
-## Step 4: The hard part: two users, same seats
+Try it. Asha holds two gold seats, A7 and A8, at ₹250 each:
 
-Asha and Bilal both tap Continue on A7 and A8 at the same instant. Without protection, this can happen:
+| What happens | Result |
+| --- | --- |
+| Asha holds A7, A8 | Booking for ₹500, both seats HELD for 5 minutes |
+| Bilal tries A8 and F1 | Rejected – A8 is held. F1 stays AVAILABLE |
+| Asha pays within 5 minutes | Booking CONFIRMED, A7 and A8 BOOKED |
+| Chetan holds F1 but pays after 7 minutes | Hold expired; Bilal took F1 meanwhile. Chetan is refunded |
+
+[![Booking flow: the user selects seats; under the show lock all seats are checked and then held for 5 minutes; payment runs without the lock; if paid and the seats are still held they are booked, otherwise they are released and any payment refunded.](learning-figures/lld-4-flow.svg)](learning-figures/lld-4-flow.svg)
+
+## Step 5: Two users, same seats
+
+Asha and Bilal tap Continue on A7 and A8 at the same instant. Without protection:
 
 1. Asha's request checks A7: available.
 2. Bilal's request checks A7: still available.
 3. Asha's request holds A7.
 4. Bilal's request also holds A7 – **double booking**.
 
-This is a classic **check-then-act race**: the check and the change are separate steps, and another thread slips in between.
-
 ![Animation: Asha and Bilal ask for A7 and A8 at once; Asha gets the show lock first and holds both seats; Bilal then gets the lock, finds the seats held and is rejected with nothing changed.](learning-figures/lld-4-race.gif)
 
-`synchronized (show)` closes the gap. Only one thread at a time can run the check-and-hold block for the same show. Bilal's thread waits, then runs its check and sees A7 is HELD. He gets "seat unavailable". Requests for **different shows** use different locks and do not wait for each other.
-
-[![BookingService owns holds and the show-seat map inside one critical section; payment runs outside the lock, and a late payment leads to a refund instead of reclaiming a seat.](learning-figures/booking-ownership.svg)](learning-figures/booking-ownership.svg)
-
-### Confirming after payment
-
-Payment can take seconds. We must **not** hold the show lock while we wait for the bank, or every other customer of that show would freeze. So confirmation has three steps:
-
-```java
-public Booking confirmBooking(String bookingId, PaymentDetails details) {
-    Booking booking = bookings.get(bookingId);
-    Show show = booking.getShow();
-
-    synchronized (show) {                               // 1. still valid?
-        if (!booking.isPending() || booking.isExpired(clock.instant())) {
-            throw new BookingExpiredException(bookingId);
-        }
-    }
-
-    PaymentResult result = paymentService.charge(bookingId, booking.getAmount(), details); // 2. no lock
-
-    synchronized (show) {                               // 3. apply the result
-        boolean stillOurs = booking.getSeats().stream().allMatch(s -> s.isHeldBy(bookingId));
-        if (result.isSuccess() && stillOurs) {
-            booking.getSeats().forEach(ShowSeat::book);
-            booking.setStatus(BookingStatus.CONFIRMED);
-        } else {
-            if (result.isSuccess()) {
-                paymentService.refund(result.paymentId());   // paid too late: the hold expired
-            }
-            booking.getSeats().stream().filter(s -> s.isHeldBy(bookingId)).forEach(ShowSeat::release);
-            booking.setStatus(BookingStatus.EXPIRED);
-        }
-        return booking;
-    }
-}
-```
-
-Step 3 checks again because the world may have changed during payment. If the hold expired and another user took A7, Asha's late payment must not steal it back. We refund her instead. This one rule – **only confirm seats your booking still holds** – is what interviewers are looking for.
+`synchronized (show)` makes check-and-hold one step. Bilal's request waits, then finds A7 held and is rejected. Requests for other shows use other locks and never wait.
 
 > **⚠️ Common mistake**
-> Calling the payment provider while holding the show lock. Every other customer of that show would wait for the bank.
+> Calling the payment provider while holding the show lock. Every other customer of that show would wait for the bank. That is why `confirm` charges first and only then takes the lock.
 
-### What about many servers?
+`confirm` checks again after payment because the world may have changed: if the hold expired and someone else took the seat, a late payment must not steal it back. We refund instead.
 
-`synchronized` only works inside one JVM. With several servers, the database must be the referee. Two common answers:
-
-**Option A – conditional update (simple and popular).** Store one row per show seat, then hold all seats in one statement:
+> **🎯 In the interview**
+> With several servers, `synchronized` is not enough. Let the database decide: one statement holds all seats only if they are free.
 
 ```sql
 UPDATE show_seat
-SET    status = 'HELD', booking_id = :bookingId, hold_expires_at = :holdUntil
-WHERE  show_id = :showId
-  AND  seat_id IN (:seatIds)
-  AND  (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at <= now()));
+SET    status = 'HELD', booking_id = :bookingId, hold_until = :holdUntil
+WHERE  show_id = :showId AND seat_number IN (:seats)
+  AND  (status = 'AVAILABLE' OR (status = 'HELD' AND hold_until <= now()));
 ```
 
-Run it inside a transaction and check the number of updated rows. If it is less than the number of seats, roll back: someone else got at least one seat.
+If fewer rows are updated than seats requested, roll back – someone else got at least one seat.
 
-**Option B – row locks.** In a transaction, `SELECT ... FROM show_seat WHERE show_id = ? AND seat_id IN (...) ORDER BY seat_id FOR UPDATE`, check all statuses, update them and commit. Locking in a fixed order (by seat ID) prevents two transactions deadlocking each other.
+## Step 6: Deep dives
 
-A distributed lock in Redis per seat is a common suggestion, but it is harder to get right for a multi-seat cart. The database answer is simpler to explain and to trust.
+### Different prices for weekends or recliners
 
-## Step 5: Design patterns and extensibility
+Move pricing behind a `PricingStrategy` interface. Weekend pricing or a recliner surcharge becomes a new class; `BookingService` does not change. This is the **Strategy pattern**.
 
-Use patterns where they solve a real change, not to decorate the diagram.
+### Notifications
 
-| Pattern | Where | Why it helps |
-| --- | --- | --- |
-| **Strategy** | `PricingStrategy` | Weekend pricing, recliner surcharge or dynamic pricing can change without touching `BookingService`. |
-| **Strategy / Adapter** | `PaymentService` interface with `RazorpayPayment`, `UpiPayment` | Payment providers differ; booking logic does not care which one. |
-| **Observer** | Booking confirmed → email, SMS, loyalty points | Listeners are added without changing the booking code. |
-| **Singleton (careful)** | One `BookingService` per application | In Spring this is simply a singleton bean; avoid a hand-written static singleton. |
+When a booking is confirmed, send an email and SMS and add loyalty points. Make these **observers** of the "booking confirmed" event, so adding one never touches booking code.
 
-```java
-interface PricingStrategy {
-    long total(Show show, List<ShowSeat> seats);
-}
+### Cleaning up expired holds
 
-class SeatTypePricing implements PricingStrategy {
-    public long total(Show show, List<ShowSeat> seats) {
-        return seats.stream().mapToLong(ShowSeat::getPricePaise).sum();
-    }
-}
-```
+`isAvailable` already treats expired holds as free. A background job that releases them every few seconds just keeps the seat map fresh for everyone else.
 
-**Extensions you can now explain quickly:**
+### A live seat map for thousands of users
 
-- *Coupons*: wrap the pricing strategy (`CouponPricing` decorates another `PricingStrategy`).
-- *Waitlist for sold-out shows*: when seats are released, notify users waiting for that show (Observer).
-- *Different hold time for different cities*: make `HOLD_TIME` part of configuration or the `Show`.
+Read seat status from a cache and push updates over WebSocket. The map may be a second out of date – the hold re-checks the truth.
 
 ## Interviewer follow-ups
 
-**Why hold seats before payment instead of booking after payment?** Without a hold, two users can both pay for A7 and one must be refunded and disappointed. A short hold gives a clear promise: "these seats are yours for 5 minutes".
+**Why hold seats before payment?** Without a hold, two users could both pay for A7, and one must be refunded. A short hold is a clear promise: "these seats are yours for 5 minutes".
 
-**Who releases expired holds?** Two ways, used together. Checks treat an expired hold as free (lazy expiry, as in `isAvailable`). A scheduled job also releases expired holds every few seconds so the seat map looks fresh. Correctness never depends on the job running on time.
+**What if payment succeeds but our server crashes before confirming?** The provider calls our webhook (or we poll it) with the booking ID. If the booking still holds its seats, confirm; otherwise refund. Using the booking ID as the payment's idempotency key means a retry never charges twice.
 
-**What if payment succeeds but the server crashes before confirming?** The payment provider calls our webhook or we poll it using the booking ID. If the booking still holds its seats, confirm it; otherwise refund. The booking ID is used as the payment's idempotency key so a retry never charges twice.
+**Why lock per show and not one lock for everything?** Seats in different shows never conflict. One global lock would make every show wait for every other show.
 
-**How do you show a live seat map to thousands of users?** Read seat status from a cache or a read replica and push updates over WebSocket. The map may be a second out of date; that is fine because the hold re-checks against the source of truth.
+**How would you add cancellation?** Allow it for a CONFIRMED booking before the show starts: mark it CANCELLED, release its seats, and refund using a refund policy.
 
-**Why one lock per show and not one lock for the whole system?** A global lock makes every show wait for every other show. Seats in different shows never conflict, so the show is the natural lock boundary.
-
-**How would you add cancellation?** Allow it only for a CONFIRMED booking before the show starts. Mark the booking CANCELLED, set its show seats back to AVAILABLE and start a refund based on a `RefundPolicy` (another Strategy).
-
-**Isn't `synchronized` slow?** The critical section only touches at most 8 seats in memory, so it lasts microseconds. The slow part, payment, is deliberately outside it.
+**Isn't `synchronized` slow?** The locked section touches at most 8 seats in memory – microseconds. The slow part, payment, is outside it.
 
 ## Wrap up
 
-We modelled the catalogue (Movie, Cinema, Screen, Seat, Show), the sellable inventory (`ShowSeat`) and one writer (`BookingService`).
+We modelled the catalogue, the sellable `ShowSeat`, and one writer, `BookingService`, that holds and confirms seats safely.
 
 > **📝 Key takeaways**
 > - A `ShowSeat` exists per seat per show – that is what you sell.
-> - Check all seats first, then hold all of them: all or nothing.
-> - A per-show lock stops two users holding the same seat; with many servers, use a conditional update or row locks.
+> - Check every seat first, then hold all of them: all or nothing.
+> - A per-show lock stops two users holding the same seat; with many servers, use a conditional update.
 > - Pay outside the lock, then confirm only if the booking still holds its seats.
 
 ## Going deeper (optional)
 
-You can pass most LLD rounds with sections 1–6. Senior interviews may push on the payment edge cases. The complete reference implementation explores them:
+The complete, runnable code for this lesson is [MovieBookingDemo.java](reference-code/learning/kb/moviebooking/MovieBookingDemo.java). It replays the table above and checks every result.
 
-- **Idempotency keys.** A retried "hold" request with the same key returns the same booking instead of creating a second one.
-- **Separate booking and payment states.** A booking can be EXPIRED while its payment is CAPTURED – exactly the refund case. Keeping two status fields makes this visible.
-- **Uncertain payments.** A timeout does not mean the payment failed. Keep the payment UNKNOWN and ask the provider again using the same key before charging anything new.
-- **Refund outbox.** In a database version, write "refund needed" in the same transaction as the expiry, and let a worker perform the refund with retries.
+Senior interviews may push on payment edge cases: retried requests, a payment whose result is unknown, and refunds that must survive a crash. The production-depth version handles them with idempotency keys, separate booking and payment states, and a refund outbox.
 
 [![Reservation state and payment state answer different questions: a late captured payment on an expired booking records a refund instead of reclaiming seats.](learning-figures/booking-states.svg)](learning-figures/booking-states.svg)
 
-[Step through both arrival orders and a late payment](learning-labs/index.html?topic=booking), or read the runnable Java: [BookingService.java](reference-code/learning/kb/booking/BookingService.java), [BookingChecks.java](reference-code/learning/kb/booking/BookingChecks.java) and [BookingTrace.java](reference-code/learning/kb/booking/BookingTrace.java). The checks race forty callers for the same seats and verify that exactly one cart wins.
+[Step through both arrival orders and a late payment](learning-labs/index.html?topic=booking), or read the advanced code: [BookingService.java](reference-code/learning/kb/booking/BookingService.java) and [BookingChecks.java](reference-code/learning/kb/booking/BookingChecks.java).
 
 ## Closing answer
 
-"I model the catalogue as Movie, Cinema, Screen, Seat and Show, and the sellable inventory as `ShowSeat` – one per seat per show. `BookingService` is the only writer. `holdSeats` checks every requested seat and then holds all of them under a per-show lock, so a booking gets all its seats or none and two users can never hold the same seat. Holds expire after 5 minutes. Payment runs outside the lock; confirmation checks again that the booking still holds its seats, otherwise it refunds. With many servers, the same all-or-nothing rule moves into a database transaction using a conditional update or row locks. Pricing and payment providers are strategies, and notifications are observers."
+"I model the catalogue as Movie, Screen, Seat and Show, and the sellable inventory as `ShowSeat` – one per seat per show. `BookingService` is the only writer. `holdSeats` locks the show, checks every requested seat and only then holds all of them for five minutes, so a booking gets all its seats or none and two users never hold the same seat. Payment runs outside the lock; `confirm` then checks the booking still holds its seats, otherwise it releases them and refunds. With many servers, the same rule becomes one conditional database update. Pricing is a strategy and notifications are observers."
 
 === LLD 5 ===
 N|atm|ATM (context)|200|0|180|rect
 N|state|ATMState|460|0|160|rect
 N|bank|BankService|0|130|160|rect
 N|disp|CashDispenser|200|130|180|rect
-N|reader|CardReader + Keypad|460|130|200|rect
-N|txn|Transaction|0|0|150|rect
+N|card|Card|460|130|140|rect
 E|atm|state|delegates to
 E|atm|bank|authenticate / debit
 E|atm|disp|plan and dispense
-E|atm|reader|reads card and PIN
-E|atm|txn|records
+E|atm|card|reads
 ---
 ## Problem
 
-Design the software for an ATM. A customer inserts a card, enters a PIN, checks a balance or withdraws cash, and takes the card back.
+Design the software for an ATM. A customer inserts a card, enters a PIN, checks the balance or withdraws cash, and takes the card back.
 
-The ATM is a favourite LLD question because the machine behaves differently depending on what has already happened. You cannot withdraw before entering a PIN, and you cannot insert a second card while one is inside. The design must make those rules hard to break.
+Interviewers love this question because the machine behaves differently depending on what has already happened. You cannot withdraw before entering a PIN, and you cannot insert a second card while one is inside. A good design makes those mistakes impossible.
 
 ## Requirements
 
-- Insert a card and authenticate with a PIN. Three wrong PINs end the session.
-- After authentication, check balance or withdraw cash.
-- A withdrawal must be a multiple of ₹100, at most ₹20,000, and within the account balance.
-- Dispense the amount using ₹500, ₹200 and ₹100 notes from the machine's cassettes.
-- Never debit the account without giving the cash; never give cash without debiting.
-- Eject the card when the customer cancels or finishes.
-
-Out of scope: deposits, transfers, PIN change, receipts, multiple currencies.
+- Insert a card and enter a PIN. Three wrong PINs end the session.
+- After a correct PIN: check balance or withdraw cash.
+- Withdrawals are multiples of ₹100, up to ₹20,000.
+- Dispense ₹500, ₹200 and ₹100 notes.
+- Never debit the account without giving the cash.
 
 ## Step 1: Clarify the requirements
 
@@ -1065,58 +1090,89 @@ Out of scope: deposits, transfers, PIN change, receipts, multiple currencies.
 
 **Candidate:** What happens after wrong PINs?
 
-**Interviewer:** Three wrong PINs end the session.
+**Interviewer:** Three wrong PINs end the session and return the card.
 
 **Candidate:** Which notes does the machine hold?
 
-**Interviewer:** ₹500, ₹200 and ₹100. Withdrawals are multiples of ₹100, up to ₹20,000.
+**Interviewer:** ₹500, ₹200 and ₹100.
 
 **Candidate:** What if the cash fails to come out after the account is debited?
 
 **Interviewer:** The customer must not lose money.
 
-| Functional | Non-functional |
-| --- | --- |
-| Insert card, enter PIN, check balance, withdraw, eject | Never debit without dispensing, never dispense without debiting |
-| End the session after three wrong PINs | Impossible to withdraw before a correct PIN |
-| Dispense with ₹500/₹200/₹100 notes | Easy to add operations such as deposits |
-
-## Step 2: Start with the states
-
-Before drawing classes, draw what the machine can be doing. This is the heart of the answer:
-
-[![ATM state machine: Idle moves to HasCard when a card is inserted; HasCard moves to Authenticated on a correct PIN and back to Idle after three wrong PINs or cancel; Authenticated handles balance and withdrawal and returns to Idle when the card is ejected.](learning-figures/lld-5-states.svg)](learning-figures/lld-5-states.svg)
-
-![Animation: one ATM session moves from Idle to HasCard on card insertion, stays in HasCard after a wrong PIN, moves to Authenticated on the correct PIN, performs balance and withdrawal, and returns to Idle when the card is ejected.](learning-figures/lld-5-states.gif)
-
-| State | Allowed actions | Everything else |
-| --- | --- | --- |
-| `IdleState` | insert card | "Please insert your card" |
-| `HasCardState` | enter PIN, cancel | "Please enter your PIN first" |
-| `AuthenticatedState` | balance, withdraw, eject card | inserting another card is rejected |
-
 > **💡 Tip**
 > For any "machine" question – ATM, vending machine, elevator – draw the states before the classes. The states are the design.
 
-The naive version puts a big `switch (status)` in every method. Each new state then means editing every method. The **State pattern** gives each state its own class, and the ATM simply delegates to whichever state it is in.
-
-## Step 3: Core classes
-
-| Class | Responsibility |
+| Functional | Non-functional |
 | --- | --- |
-| `ATM` | The context: holds the current state, the inserted card and the hardware parts. Delegates every user action to the state. |
-| `ATMState` | Interface with one method per user action. |
-| `IdleState`, `HasCardState`, `AuthenticatedState` | The rules for each state, and which state comes next. |
-| `Card` | Card number and expiry read by the card reader. Contains no PIN. |
-| `BankService` | Interface to the bank: authenticate, get balance, debit, reverse. |
-| `CashDispenser` | Knows how many notes of each denomination are loaded; plans and dispenses notes. |
-| `Transaction` | A record of one operation: id, type, amount, status, time. Useful for audit and reversals. |
+| Insert card, enter PIN, balance, withdraw, eject | Impossible to withdraw before a correct PIN |
+| End the session after three wrong PINs | Never debit without dispensing |
+| Dispense with ₹500/₹200/₹100 notes | Easy to add operations such as deposits |
 
-[![Class diagram: ATM holds an ATMState, a CardReader, a CashDispenser and a BankService; IdleState, HasCardState and AuthenticatedState implement ATMState; the ATM records Transactions.](learning-figures/lld-5-classes.svg)](learning-figures/lld-5-classes.svg)
+## Step 2: Identify the states and core objects
 
-[![Selected design: the ATM context delegates to its current ATMState, reads card and PIN, asks the BankService to authenticate and debit, asks the CashDispenser to plan and dispense, and records each Transaction.](designs/lld-5.svg)](designs/lld-5.svg)
+The ATM is always in one of three states:
 
-## Step 4: The State pattern in code
+| State | What the customer can do |
+| --- | --- |
+| **Idle** | Insert a card |
+| **Has card** | Enter a PIN, or cancel |
+| **Authenticated** | Check balance, withdraw, take the card |
+
+[![ATM state machine: Idle moves to HasCard when a card is inserted; HasCard moves to Authenticated on a correct PIN and back to Idle after three wrong PINs or cancel; Authenticated handles balance and withdrawal and returns to Idle when the card is ejected.](learning-figures/lld-5-states.svg)](learning-figures/lld-5-states.svg)
+
+The core objects:
+
+- **ATM** – the machine. It remembers the current state and the inserted card.
+- **ATMState** – one class per state, each deciding what an action means *in that state*.
+- **BankService** – the bank: checks PINs, holds balances, debits and reverses.
+- **CashDispenser** – the notes inside the machine.
+- **Card** – the card number read from the card.
+
+[![Selected design: the ATM delegates every action to its current ATMState, reads the Card, asks the BankService to authenticate and debit, and asks the CashDispenser to plan and dispense notes.](designs/lld-5.svg)](designs/lld-5.svg)
+
+> **⚖️ Design choice**
+> We use the **State pattern** instead of a big `switch (status)` in every method. Each state is its own class, so adding an "Out of service" state is one new class, not edits in every method.
+
+## Step 3: Design the classes
+
+### ATMState and its three states
+
+`ATMState` has one method per customer action. `IdleState`, `HasCardState` and `AuthenticatedState` each implement all five, but only the actions that make sense in that state do real work. The others show a helpful message.
+
+### ATM
+
+The ATM forwards every action to its current state. States move the ATM to the next state with `setState`.
+
+### BankService
+
+An interface, because the bank is an external system. The ATM never sees a PIN check or a balance rule – it only asks.
+
+### CashDispenser
+
+Knows how many notes of each value it holds, plans which notes to give, and dispenses them.
+
+[![Class diagram: ATM holds an ATMState, a Card, a CashDispenser and a BankService; IdleState, HasCardState and AuthenticatedState implement ATMState.](learning-figures/lld-5-classes.svg)](learning-figures/lld-5-classes.svg)
+
+## Step 4: Write the code
+
+### Card and BankService
+
+```java
+record Card(String number) {}
+```
+
+```java
+/** The bank owns PINs and balances. The ATM only asks questions. */
+interface BankService {
+    boolean authenticate(Card card, String pin);
+    long getBalance(Card card);
+    boolean debit(Card card, int amount, String txnId);   // false if the balance is too low
+    void reverse(String txnId);                          // undo a debit
+}
+```
+
+### ATMState
 
 ```java
 interface ATMState {
@@ -1128,240 +1184,281 @@ interface ATMState {
 }
 ```
 
-The ATM keeps the shared parts and forwards each action:
+### ATM
 
 ```java
-public class ATM {
+class ATM {
     private ATMState state = new IdleState();
     private Card currentCard;
-    private int wrongPinAttempts;
-
+    private int wrongPins;
+    private String lastMessage = "";
     final BankService bank;
     final CashDispenser dispenser;
-    final Screen screen;
 
-    public ATM(BankService bank, CashDispenser dispenser, Screen screen) {
-        this.bank = bank; this.dispenser = dispenser; this.screen = screen;
+    ATM(BankService bank, CashDispenser dispenser) {
+        this.bank = bank;
+        this.dispenser = dispenser;
     }
 
-    public void insertCard(Card card) { state.insertCard(this, card); }
-    public void enterPin(String pin)  { state.enterPin(this, pin); }
-    public void checkBalance()        { state.checkBalance(this); }
-    public void withdraw(int amount)  { state.withdraw(this, amount); }
-    public void ejectCard()           { state.ejectCard(this); }
+    // Every user action is forwarded to the current state.
+    void insertCard(Card card) { state.insertCard(this, card); }
+    void enterPin(String pin)  { state.enterPin(this, pin); }
+    void checkBalance()        { state.checkBalance(this); }
+    void withdraw(int amount)  { state.withdraw(this, amount); }
+    void ejectCard()           { state.ejectCard(this); }
 
     void setState(ATMState next) { state = next; }
-    // getters/setters for currentCard and wrongPinAttempts omitted
+    ATMState getState()          { return state; }
+    Card getCard()               { return currentCard; }
+    void setCard(Card card)      { currentCard = card; }
+    int addWrongPin()            { return ++wrongPins; }
+    void resetWrongPins()        { wrongPins = 0; }
+    void show(String message)    { lastMessage = message; }
+    String lastMessage()         { return lastMessage; }
 }
 ```
 
-Each state implements only what makes sense for it. Here is the PIN step:
+### IdleState
+
+```java
+class IdleState implements ATMState {
+    public void insertCard(ATM atm, Card card) {
+        atm.setCard(card);
+        atm.setState(new HasCardState());
+        atm.show("Enter your PIN");
+    }
+    public void enterPin(ATM atm, String pin)  { atm.show("Insert your card first"); }
+    public void checkBalance(ATM atm)          { atm.show("Insert your card first"); }
+    public void withdraw(ATM atm, int amount)  { atm.show("Insert your card first"); }
+    public void ejectCard(ATM atm)             { atm.show("No card inserted"); }
+}
+```
+
+### HasCardState
 
 ```java
 class HasCardState implements ATMState {
     private static final int MAX_ATTEMPTS = 3;
 
     public void enterPin(ATM atm, String pin) {
-        if (atm.bank.authenticate(atm.getCurrentCard(), pin)) {   // the bank checks the PIN
-            atm.setWrongPinAttempts(0);
+        if (atm.bank.authenticate(atm.getCard(), pin)) {
+            atm.resetWrongPins();
             atm.setState(new AuthenticatedState());
-            atm.screen.show("Choose an operation");
-            return;
-        }
-        int attempts = atm.getWrongPinAttempts() + 1;
-        atm.setWrongPinAttempts(attempts);
-        if (attempts >= MAX_ATTEMPTS) {
-            atm.screen.show("Too many wrong PINs");
-            ejectCard(atm);                                        // ends the session
+            atm.show("Choose an operation");
+        } else if (atm.addWrongPin() >= MAX_ATTEMPTS) {
+            ejectCard(atm);
+            atm.show("Too many wrong PINs. Card returned");
         } else {
-            atm.screen.show("Wrong PIN, " + (MAX_ATTEMPTS - attempts) + " tries left");
+            atm.show("Wrong PIN, try again");
         }
     }
-
     public void ejectCard(ATM atm) {
-        atm.setCurrentCard(null);
-        atm.setWrongPinAttempts(0);
+        atm.setCard(null);
+        atm.resetWrongPins();
         atm.setState(new IdleState());
     }
-
-    public void insertCard(ATM atm, Card card) { atm.screen.show("A card is already inserted"); }
-    public void checkBalance(ATM atm)          { atm.screen.show("Enter your PIN first"); }
-    public void withdraw(ATM atm, int amount)  { atm.screen.show("Enter your PIN first"); }
+    public void insertCard(ATM atm, Card card) { atm.show("A card is already inserted"); }
+    public void checkBalance(ATM atm)          { atm.show("Enter your PIN first"); }
+    public void withdraw(ATM atm, int amount)  { atm.show("Enter your PIN first"); }
 }
 ```
 
-Notice what happened: `withdraw` in `HasCardState` cannot reach the bank at all. The illegal action is impossible by construction, not prevented by an `if` that someone might forget.
+Look at `withdraw` here: it cannot reach the bank. Withdrawing before a PIN is impossible by design, not blocked by an `if` someone might forget.
 
-## Step 5: The withdrawal flow
-
-Inside `AuthenticatedState`, withdrawing ₹2,700 follows a careful order:
-
-1. **Validate**: positive, a multiple of ₹100, at most ₹20,000.
-2. **Plan the notes first**: ask the dispenser whether it can make ₹2,700 from the notes it has. If not, stop before touching the account.
-3. **Debit at the bank**: the bank checks the balance and debits in one atomic step. If the balance is too low, it says no.
-4. **Dispense**: release the planned notes.
-5. **If dispensing fails**, ask the bank to reverse the debit.
+### AuthenticatedState
 
 ```java
 class AuthenticatedState implements ATMState {
     private static final int MAX_WITHDRAWAL = 20_000;
+    private int nextTxn = 1;
 
     public void withdraw(ATM atm, int amount) {
         if (amount <= 0 || amount % 100 != 0 || amount > MAX_WITHDRAWAL) {
-            atm.screen.show("Enter a multiple of ₹100, up to ₹" + MAX_WITHDRAWAL);
+            atm.show("Enter a multiple of Rs 100, up to Rs " + MAX_WITHDRAWAL);
             return;
         }
+        // 1. Can the machine make this amount from the notes it has?
         Optional<Map<Integer, Integer>> plan = atm.dispenser.plan(amount);
         if (plan.isEmpty()) {
-            atm.screen.show("This ATM cannot dispense that amount");
+            atm.show("This ATM cannot dispense that amount");
             return;
         }
-        String txnId = UUID.randomUUID().toString();
-        if (!atm.bank.debit(atm.getCurrentCard(), amount, txnId)) {
-            atm.screen.show("Insufficient balance");
+        String txnId = "txn-" + nextTxn++;
+        // 2. The bank checks the balance and debits in one step.
+        if (!atm.bank.debit(atm.getCard(), amount, txnId)) {
+            atm.show("Insufficient balance");
             return;
         }
         try {
-            atm.dispenser.dispense(plan.get());
-            atm.screen.show("Please take your cash");
-        } catch (DispenseException e) {
-            atm.bank.reverse(txnId);                    // money goes back to the account
-            atm.screen.show("Could not dispense cash. Your account was not charged.");
+            atm.dispenser.dispense(plan.get());                // 3. give the cash
+            atm.show("Please take your cash");
+        } catch (IllegalStateException jammed) {
+            atm.bank.reverse(txnId);                           // 4. undo the debit
+            atm.show("Could not dispense. Your account was not charged");
         }
     }
-    // checkBalance asks atm.bank.getBalance(card); ejectCard returns to IdleState; insertCard is rejected
+    public void checkBalance(ATM atm) {
+        atm.show("Balance: Rs " + atm.bank.getBalance(atm.getCard()));
+    }
+    public void ejectCard(ATM atm) {
+        atm.setCard(null);
+        atm.setState(new IdleState());
+        atm.show("Thank you");
+    }
+    public void insertCard(ATM atm, Card card) { atm.show("A card is already inserted"); }
+    public void enterPin(ATM atm, String pin)  { atm.show("Already authenticated"); }
 }
 ```
+
+The withdrawal order matters:
+
+1. **Plan the notes first.** If the machine cannot make the amount, stop before touching the account.
+2. **Debit at the bank.** The bank checks the balance and debits in one step.
+3. **Dispense.**
+4. **If the cash jams, reverse the debit** using the same transaction ID.
 
 > **⚠️ Common mistake**
 > Debiting first and checking notes later. If the machine cannot make the amount, you now need a reversal for a failure you could have predicted.
 
-The transaction ID passed to `debit` is reused by `reverse`, so the bank knows exactly which debit to undo.
-
-### Planning the notes
-
-With ₹500, ₹200 and ₹100 notes, a **greedy** plan works: take as many of the largest note as possible, then the next, and so on. It must also respect how many notes are actually loaded.
+### CashDispenser
 
 ```java
 class CashDispenser {
+    // Largest note first: {500 -> count, 200 -> count, 100 -> count}
     private final TreeMap<Integer, Integer> notes = new TreeMap<>(Comparator.reverseOrder());
-    // e.g. {500=40, 200=50, 100=100}
+    private boolean jammed;
 
-    synchronized Optional<Map<Integer, Integer>> plan(int amount) {
+    CashDispenser(Map<Integer, Integer> loaded) { notes.putAll(loaded); }
+
+    /** Greedy: take as many of the largest note as possible, then the next. */
+    Optional<Map<Integer, Integer>> plan(int amount) {
         Map<Integer, Integer> plan = new LinkedHashMap<>();
         int remaining = amount;
         for (Map.Entry<Integer, Integer> e : notes.entrySet()) {
-            int note = e.getKey();
-            int use = Math.min(remaining / note, e.getValue());
-            if (use > 0) { plan.put(note, use); remaining -= use * note; }
+            int use = Math.min(remaining / e.getKey(), e.getValue());
+            if (use > 0) { plan.put(e.getKey(), use); remaining -= use * e.getKey(); }
         }
         return remaining == 0 ? Optional.of(plan) : Optional.empty();
     }
 
-    synchronized void dispense(Map<Integer, Integer> plan) {
+    void dispense(Map<Integer, Integer> plan) {
+        if (jammed) throw new IllegalStateException("Dispenser jammed");
         plan.forEach((note, count) -> notes.merge(note, -count, Integer::sum));
-        // send the command to the hardware; throw DispenseException if it jams
     }
+    void jam() { jammed = true; }
 }
 ```
 
-For ₹2,700: 5 × ₹500 = ₹2,500, then 1 × ₹200 = ₹2,700. Done with 6 notes. If the ₹500 cassette is empty, the same loop uses ₹200 and ₹100 notes instead.
+Try it with ₹10,000 in the account and a machine holding ten ₹500 and ten ₹200 notes, but no ₹100 notes:
 
-Greedy is the expected first answer and works while the ₹100 cassette has notes. Be ready to say where it breaks (see follow-ups): it never "goes back" to try fewer large notes.
+| Action | Result |
+| --- | --- |
+| Withdraw before inserting a card | "Insert your card first" |
+| Insert card, withdraw before PIN | "Enter your PIN first" |
+| Wrong PIN, then correct PIN | Authenticated |
+| Withdraw ₹2,700 | 5 × ₹500 + 1 × ₹200. Balance ₹7,300 |
+| Withdraw ₹600 | Greedy takes ₹500, cannot make ₹100 → "cannot dispense" |
+| Withdraw ₹1,000 while jammed | Debit reversed. Balance still ₹7,300 |
+| Three wrong PINs | Card returned, back to Idle |
 
-## Step 6: Design patterns and extensibility
+![Animation: one ATM session moves from Idle to HasCard on card insertion, stays in HasCard after a wrong PIN, moves to Authenticated on the correct PIN, performs balance and withdrawal, and returns to Idle when the card is ejected.](learning-figures/lld-5-states.gif)
 
-| Pattern | Where | Why it helps |
-| --- | --- | --- |
-| **State** | `ATMState` and its three classes | Each state's rules live in one class; adding `OutOfServiceState` does not touch the others. |
-| **Strategy** | Note-planning algorithm | Swap greedy for an exact search if the denominations change (see follow-ups). |
-| **Chain of Responsibility** (often mentioned) | One handler per note size passes the remainder on | Readable for canonical notes like 500/200/100, but it is just greedy in disguise. |
-| **Interface for external systems** | `BankService` | Test the ATM with a fake bank; swap bank networks without changing states. |
+## Step 5: When greedy is not enough
 
-**Adding a new feature**, for example deposits: add `deposit(ATM, amount)` to `ATMState`, implement it in `AuthenticatedState`, and reject it in the others. Adding `OutOfServiceState` (cash empty or maintenance) only needs one new class and a transition into it.
+The ₹600 case above is worth explaining in the interview. Greedy took one ₹500 note and was stuck with ₹100 – yet 3 × ₹200 works.
+
+The fix: try each possible number of the largest note, from high to low, and plan the rest the same way. With only three note sizes this tiny search is instant. Coin-change dynamic programming is the general version.
+
+> **🎯 In the interview**
+> Present greedy first – it is the expected answer – then say "it fails when a cassette runs out; I'd switch to a small search". That shows you know the limit.
+
+## Step 6: Deep dives
+
+### Adding deposits
+
+Add `deposit(atm, amount)` to `ATMState`. Implement it in `AuthenticatedState`; the other states show a message. No other class changes.
+
+### Out of service
+
+Add `OutOfServiceState`, entered when cash runs out or an engineer opens the machine. Every action shows "Out of service".
+
+### Daily withdrawal limits
+
+The bank already knows today's withdrawals, so the limit belongs in `bank.debit`, not in the ATM.
+
+### Chain of Responsibility for notes
+
+Many courses build one handler per note size that passes the remainder on. It reads nicely, but it is greedy in disguise and has the same ₹600 problem.
 
 ## Interviewer follow-ups
 
-**Why not store the PIN on the card or in the ATM?** Anyone who reads the card or the ATM's memory would learn it. The ATM sends the PIN (encrypted by the keypad hardware) to the bank, which checks it. The ATM only learns yes or no.
+**Why not store the PIN on the card or in the ATM?** Anyone reading the card or the machine's memory would learn it. The keypad encrypts the PIN and the bank checks it; the ATM only learns yes or no.
 
-**Does greedy always work?** No. Suppose the ₹100 cassette is empty. For ₹600, greedy takes one ₹500 and is left with ₹100 it cannot make, yet 3 × ₹200 works. The fix: try each possible count of the largest note, from high to low, and plan the rest the same way (a small backtracking search, or coin-change dynamic programming). With only three note sizes, this search is tiny.
+**What if two people use the same account at two ATMs?** The bank checks and debits in one atomic step, so two machines can never both spend the last ₹1,000.
 
-**What if the debit succeeds but the cash jams?** The bank reverses the debit using the same transaction ID. Notes that jammed stay inside the machine and are counted by an engineer, not returned to the available stock automatically.
+**What if the network to the bank fails during a withdrawal?** Do not dispense. If the ATM does not know whether the debit happened, it records the withdrawal as uncertain and the bank reconciles it later.
 
-**What if two people use the same account at two ATMs at once?** The balance lives at the bank, and the bank checks-and-debits atomically. Two ATMs cannot both spend the same last ₹1,000.
-
-**Why check notes before debiting?** Debiting first and then discovering the machine cannot pay would force a reversal for a perfectly predictable failure.
-
-**How would you add a daily withdrawal limit?** The bank already knows today's withdrawals for the card, so the limit belongs in `bank.debit`, not in the ATM.
-
-**What if the network to the bank fails during a withdrawal?** Do not dispense. If the ATM does not know whether the debit happened, it records the transaction as uncertain and the bank's reconciliation decides; see the next section.
+**Why is `BankService` an interface?** The bank is outside our system. An interface lets us test with a fake bank and switch bank networks without touching the states.
 
 ## Wrap up
 
-We designed the ATM around its states, kept PINs and balances at the bank, and ordered the withdrawal so money is never lost.
+We designed the ATM around its three states, kept PINs and balances at the bank, and ordered the withdrawal so money is never lost.
 
 > **📝 Key takeaways**
 > - Draw the states first; implement them with the State pattern.
 > - The bank owns PINs and balances behind a `BankService` interface.
-> - Withdraw in this order: validate, plan notes, debit, dispense, reverse on failure.
-> - Greedy note planning is the first answer; know the case where it fails.
+> - Withdraw in this order: plan notes, debit, dispense, reverse on failure.
+> - Greedy note planning is the first answer – know the case where it fails.
 
 ## Going deeper (optional)
 
-Real ATMs face a harder problem: a reply that never arrives. If the dispenser times out, did the customer get zero notes, two notes or all of them? The full reference design handles this carefully:
+The complete, runnable code is [AtmDemo.java](reference-code/learning/kb/atmstate/AtmDemo.java). It replays the table above and checks every result.
 
-- The bank first places a **hold** for the amount instead of a final debit. After the device reports what was actually delivered, the ATM **settles** that amount and releases the rest.
-- Every withdrawal has a stable ID. Retrying returns the same result instead of dispensing again.
-- An unknown device outcome blocks further withdrawals until it is reconciled; jammed notes are quarantined.
+Real ATMs face a harder problem: a dispenser reply that never arrives. Did the customer get no notes, two or all? The production-depth version places a **hold** at the bank, settles only the amount actually delivered, and blocks the machine until an uncertain withdrawal is reconciled.
 
-[![An unknown cash outcome keeps the $60 hold and the reserved notes; a retry sends no cash; final evidence of two delivered notes settles $40 and keeps the jammed note out of stock.](learning-figures/lld-5-unknown.svg)](learning-figures/lld-5-unknown.svg)
+[![An unknown cash outcome keeps the bank hold and the reserved notes; a retry sends no cash; final evidence of two delivered notes settles only that amount and keeps the jammed note out of stock.](learning-figures/lld-5-unknown.svg)](learning-figures/lld-5-unknown.svg)
 
-[Open the ATM walkthrough](learning-labs/atm.html) to follow these states, or read the runnable Java: [Atm.java](reference-code/learning/kb/atm/Atm.java), [DemoPorts.java](reference-code/learning/kb/atm/DemoPorts.java), [AtmDemo.java](reference-code/learning/kb/atm/AtmDemo.java) and [AtmChecks.java](reference-code/learning/kb/atm/AtmChecks.java). The reference uses $20 and $50 notes on purpose, because that is where a greedy plan fails.
+[Open the ATM walkthrough](learning-labs/atm.html), or read the advanced code: [Atm.java](reference-code/learning/kb/atm/Atm.java) and [AtmChecks.java](reference-code/learning/kb/atm/AtmChecks.java).
 
 ## Closing answer
 
-"I model the ATM with the State pattern: Idle, HasCard and Authenticated, each in its own class, and the `ATM` delegates every action to the current state. That makes illegal actions, like withdrawing before entering a PIN, impossible by design. The bank owns PINs and balances behind a `BankService` interface. A withdrawal validates the amount, plans the notes first, asks the bank to debit atomically, dispenses, and reverses the debit with the same transaction ID if dispensing fails. Greedy note planning works for ₹500/₹200/₹100; for other denominations I would use an exact search. New operations or an out-of-service state are added as new state methods or classes."
+"I'd model the ATM with the State pattern: Idle, HasCard and Authenticated, each its own class, and the `ATM` forwards every action to its current state. That makes illegal actions, like withdrawing before a PIN, impossible by design. The bank owns PINs and balances behind a `BankService` interface. A withdrawal validates the amount, plans the notes first, asks the bank to debit in one step, dispenses, and reverses the debit with the same transaction ID if the cash jams. Greedy note planning works until a cassette runs out; then I'd use a small search. New operations or an out-of-service state are new methods or classes."
 
 === LLD 6 ===
 N|svc|RentalService|220|0|180|rect
-N|branch|Branch|0|0|140|rect
 N|vehicle|Vehicle|0|130|140|rect
 N|res|Reservation|220|130|180|rect
 N|price|PricingStrategy|460|0|170|rect
 N|bill|Invoice|460|130|140|rect
-E|svc|branch|search vehicles
-E|branch|vehicle|has many
+E|svc|vehicle|search fleet
 E|svc|res|reserve / pickup / return
 E|res|vehicle|books time slot
 E|svc|price|calculate fee
-E|res|bill|produces
+E|price|bill|produces
 ---
 ## Problem
 
-Design a car rental system such as Zoomcar or Hertz. A customer searches for a car type at a branch for some dates, reserves a car, picks it up, and returns it later. The branch needs time to clean a car between customers.
+Design a car rental system like Zoomcar or Hertz. A customer searches for a car type for some dates, reserves a car, picks it up and returns it later. The branch needs an hour to clean each car between customers.
 
-The key question hides in the dates: two customers must never be promised the same car for overlapping times, and a late return must be charged fairly.
+The real question hides in the dates: two customers must never be promised the same car for overlapping times, and a late return must be charged fairly.
 
 ## Requirements
 
-- Search available vehicles by branch, vehicle type (hatchback, sedan, SUV) and time range.
-- Reserve a specific vehicle for a time range and get a price quote.
-- Pick up the car at the start time and return it later; record odometer and fuel.
-- Charge ₹1,800 for each started 24 hours of the booking and ₹200 for each started late hour.
-- Keep one hour after every rental for cleaning before the car can go out again.
-- Cancel a reservation before pickup.
-
-Out of scope: one-way rentals between branches, insurance and add-ons, driver licence verification, payment gateway details.
+- Search available cars by type and dates.
+- Reserve a car, pick it up, return it, or cancel before pickup.
+- Keep one hour after every rental for cleaning.
+- Charge ₹1,800 for each started day booked and ₹200 for each started hour late.
+- Several staff members can make bookings at the same time.
 
 ## Step 1: Clarify the requirements
 
 **Candidate:** Does the customer reserve a car type or a specific car?
 
-**Interviewer:** They search by type. The system can assign a specific car.
+**Interviewer:** They search by type; the system assigns a specific car.
 
-**Candidate:** Do customers return to the same branch?
+**Candidate:** Do they return it to the same branch?
 
-**Interviewer:** Yes, same branch for now.
+**Interviewer:** Yes, for now.
 
 **Candidate:** Is there a gap between two rentals of the same car?
 
@@ -1371,27 +1468,55 @@ Out of scope: one-way rentals between branches, insurance and add-ons, driver li
 
 **Interviewer:** ₹1,800 for each started day, plus ₹200 for each started hour late.
 
-**Candidate:** Can two staff members book cars at the same time?
+**Candidate:** Can two people book at the same moment?
 
-**Interviewer:** Yes, several bookings can happen together.
+**Interviewer:** Yes. Make sure they can't get the same car for the same time.
+
+> **🎯 In the interview**
+> Ask about the cleaning gap. It is easy to miss, and it changes the availability check.
 
 | Functional | Non-functional |
 | --- | --- |
-| Search by branch, type and dates | The same car is never promised twice for overlapping times |
+| Search by type and dates | The same car is never promised twice for overlapping times |
 | Reserve, pick up, return, cancel | Pricing rules are easy to change |
-| Charge per started day plus late hours | Fast search even for big fleets |
+| Charge per started day plus late hours | Search stays fast for a big fleet |
 
-## Step 2: Core classes
+## Step 2: Identify the core objects
 
-| Class | What it represents | Key fields |
-| --- | --- | --- |
-| `Branch` | A rental location | id, name, city, vehicles |
-| `Vehicle` | One physical car | id, registration ("KA-01-MJ-4521"), `VehicleType`, `VehicleStatus` |
-| `Customer` | The person renting | id, name, licenceNumber |
-| `Reservation` | A booking of one vehicle for one time range | id, customer, vehicle, start, end, `ReservationStatus`, pickedUpAt, returnedAt |
-| `Invoice` | What the customer owes | reservationId, baseAmount, lateFee, total |
-| `RentalService` | Coordinates search, reserve, pickup, return, cancel | branches, reservations, pricing |
-| `PricingStrategy` | Calculates base and late charges | rates per vehicle type |
+- **Vehicle** – one physical car, with a registration, a type and a status (available, rented, in maintenance).
+- **Reservation** – one customer's booking of one car for one time range.
+- **PricingStrategy** – the rule that turns a reservation into a bill.
+- **Invoice** – the bill: base amount and late fee.
+- **RentalService** – the coordinator: search, reserve, pick up, return, cancel.
+
+[![Selected design: RentalService searches the fleet of Vehicles, creates Reservations that book a vehicle's time slot, and asks the PricingStrategy for an Invoice.](designs/lld-6.svg)](designs/lld-6.svg)
+
+> **⚖️ Design choice**
+> Keep vehicle status and reservations separate. The status says what the car is doing *now*; reservations say what is promised for the *future*. A car can be available today and fully booked next weekend.
+
+## Step 3: Design the classes
+
+### Vehicle
+
+A car's registration and type never change; its status does. Hatchback, sedan and SUV differ only by data here, so an enum is enough – no subclasses.
+
+### Reservation
+
+A reservation holds the customer, the car, a start and an end, and a status: confirmed, picked up, returned or cancelled. Its key method answers: *does this booking clash with another time range?*
+
+### PricingStrategy and Invoice
+
+Pricing changes often (weekend rates, memberships), so it sits behind an interface. The default charges per started day plus per started late hour.
+
+### RentalService
+
+Keeps the fleet and a calendar of reservations per car. Every change goes through it.
+
+[![Class diagram: RentalService searches Vehicles and manages Reservations; a Reservation links a customer to one Vehicle for a start and end time; PricingStrategy produces an Invoice.](learning-figures/lld-6-classes.svg)](learning-figures/lld-6-classes.svg)
+
+## Step 4: Write the code
+
+### Enums and Vehicle
 
 ```java
 enum VehicleType { HATCHBACK, SEDAN, SUV }
@@ -1399,197 +1524,246 @@ enum VehicleStatus { AVAILABLE, RENTED, IN_MAINTENANCE }
 enum ReservationStatus { CONFIRMED, PICKED_UP, RETURNED, CANCELLED }
 ```
 
-[![Class diagram: Branch has Vehicles; Reservation links a Customer to one Vehicle for a start and end time and produces an Invoice; RentalService searches, reserves, picks up, returns and cancels, and uses a PricingStrategy.](learning-figures/lld-6-classes.svg)](learning-figures/lld-6-classes.svg)
+```java
+class Vehicle {
+    private final String registration;           // KA-01-MJ-4521
+    private final VehicleType type;
+    private VehicleStatus status = VehicleStatus.AVAILABLE;
 
-**Do we need `Car`, `Suv` and `Hatchback` subclasses?** Only if they behave differently. Here they differ only by data (type and rate), so an enum is enough. If SUVs later needed a special deposit rule, that rule would go into a pricing or deposit strategy rather than a subclass.
+    Vehicle(String registration, VehicleType type) {
+        this.registration = registration;
+        this.type = type;
+    }
+    String getRegistration()          { return registration; }
+    VehicleType getType()             { return type; }
+    VehicleStatus getStatus()         { return status; }
+    void setStatus(VehicleStatus s)   { status = s; }
+}
+```
 
-> **⚖️ Design choice**
-> Keep `VehicleStatus` and reservations separate. The status says what the car is doing *now*; reservations say what is promised for the *future*. A car can be AVAILABLE today and fully booked next weekend.
+### Reservation and the overlap algorithm
 
-[![Selected design: RentalService searches a Branch's vehicles, creates Reservations that book a vehicle's time slot, uses a PricingStrategy and produces an Invoice on return.](designs/lld-6.svg)](designs/lld-6.svg)
+```java
+class Reservation {
+    static final Duration CLEANING = Duration.ofHours(1);
 
-## Step 3: The availability algorithm: an interval check
+    private final String customer;
+    private final Vehicle vehicle;
+    private final Instant start, end;              // the time range [start, end)
+    private ReservationStatus status = ReservationStatus.CONFIRMED;
 
-Example: Asha books the car KA-01-MJ-4521 from 09:00 to 11:00. With one hour of cleaning, the car is **blocked from 09:00 to 12:00**.
+    Reservation(String customer, Vehicle vehicle, Instant start, Instant end) {
+        this.customer = customer; this.vehicle = vehicle;
+        this.start = start; this.end = end;
+    }
+
+    boolean isActive() {
+        return status == ReservationStatus.CONFIRMED
+            || status == ReservationStatus.PICKED_UP;
+    }
+
+    /** Two ranges overlap when each starts before the other ends (cleaning included). */
+    boolean overlaps(Instant otherStart, Instant otherEnd) {
+        return start.isBefore(otherEnd.plus(CLEANING))
+            && otherStart.isBefore(end.plus(CLEANING));
+    }
+
+    Vehicle getVehicle()                 { return vehicle; }
+    Instant getStart()                   { return start; }
+    Instant getEnd()                     { return end; }
+    ReservationStatus getStatus()        { return status; }
+    void setStatus(ReservationStatus s)  { status = s; }
+}
+```
+
+Example: Asha books the car KA-01-MJ-4521 from 09:00 to 11:00. With cleaning, the car is **blocked from 09:00 to 12:00**.
 
 - Bilal asks for 11:00–14:00: it overlaps the blocked time, so the car is not available.
 - Bilal asks for 12:00–15:00: it starts exactly when the block ends, so the car is available.
 
 [![Timeline: Asha's rental from 09:00 to 11:00 plus cleaning until 12:00 blocks the car; a request starting at 11:00 overlaps and is rejected, a request starting at 12:00 is allowed.](learning-figures/lld-6-intervals.svg)](learning-figures/lld-6-intervals.svg)
 
-Two time ranges `[start, end)` overlap when **each starts before the other ends**:
-
-```java
-class Reservation {
-    static final Duration CLEANING = Duration.ofHours(1);
-    // id, customer, vehicle, start, end, status, pickedUpAt, returnedAt ...
-
-    Instant blockedUntil() {
-        return end.plus(CLEANING);
-    }
-
-    boolean isActive() {
-        return status == ReservationStatus.CONFIRMED || status == ReservationStatus.PICKED_UP;
-    }
-
-    boolean overlaps(Instant otherStart, Instant otherEnd) {
-        Instant otherBlockedUntil = otherEnd.plus(CLEANING);
-        return start.isBefore(otherBlockedUntil) && otherStart.isBefore(blockedUntil());
-    }
-}
-```
-
-> **⚖️ Design choice**
-> Use half-open ranges `[start, end)`. A booking that ends at 12:00 and one that starts at 12:00 do not overlap.
-
-Three details interviewers check:
-
-- **Strict `isBefore`, not `<=`.** A 12:00 start touching a 12:00 end is allowed.
-- **Both conditions.** Checking only "does the new start fall inside the old booking?" misses a new booking that completely surrounds an old one.
-- **The buffer on both sides.** The new booking also needs its own cleaning time before the next existing booking.
-
-## Step 4: Reserve, pick up and return
-
-```java
-public class RentalService {
-    private final Map<String, List<Reservation>> reservationsByVehicle = new ConcurrentHashMap<>();
-    private final PricingStrategy pricing;
-    private final Clock clock;
-
-    public List<Vehicle> search(Branch branch, VehicleType type, Instant start, Instant end) {
-        return branch.getVehicles().stream()
-                .filter(v -> v.getType() == type && v.getStatus() != VehicleStatus.IN_MAINTENANCE)
-                .filter(v -> isFree(v, start, end))
-                .toList();
-    }
-
-    public Reservation reserve(Customer customer, Vehicle vehicle, Instant start, Instant end) {
-        if (!start.isBefore(end) || start.isBefore(clock.instant())) {
-            throw new IllegalArgumentException("Invalid time range");
-        }
-        synchronized (vehicle) {                     // check and insert together
-            if (!isFree(vehicle, start, end)) {
-                throw new VehicleUnavailableException(vehicle.getId());
-            }
-            Reservation r = new Reservation(UUID.randomUUID().toString(), customer, vehicle, start, end);
-            reservationsByVehicle.computeIfAbsent(vehicle.getId(), id -> new CopyOnWriteArrayList<>()).add(r);
-            return r;
-        }
-    }
-
-    private boolean isFree(Vehicle vehicle, Instant start, Instant end) {
-        return reservationsByVehicle.getOrDefault(vehicle.getId(), List.of()).stream()
-                .filter(Reservation::isActive)
-                .noneMatch(r -> r.overlaps(start, end));
-    }
-}
-```
-
-The search result is a suggestion. Between search and reserve another customer may take the car, so `reserve` checks again inside `synchronized (vehicle)`. Two requests for **different** cars never wait for each other.
-
-Pickup and return move the reservation through its statuses:
-
-```java
-public void pickup(Reservation r, int odometerKm) {
-    synchronized (r.getVehicle()) {
-        if (r.getStatus() != ReservationStatus.CONFIRMED) throw new IllegalStateException("Not pickable");
-        if (r.getVehicle().getStatus() != VehicleStatus.AVAILABLE) throw new VehicleNotReadyException();
-        r.markPickedUp(clock.instant(), odometerKm);
-        r.getVehicle().setStatus(VehicleStatus.RENTED);
-    }
-}
-
-public Invoice returnVehicle(Reservation r, int odometerKm, boolean damaged) {
-    synchronized (r.getVehicle()) {
-        if (r.getStatus() != ReservationStatus.PICKED_UP) throw new IllegalStateException("Not on rent");
-        Instant now = clock.instant();
-        r.markReturned(now, odometerKm);
-        r.getVehicle().setStatus(damaged ? VehicleStatus.IN_MAINTENANCE : VehicleStatus.AVAILABLE);
-        return pricing.invoice(r, now);
-    }
-}
-```
+> **⚠️ Common mistake**
+> Checking only "does the new start fall inside an old booking?". That misses a new booking that completely surrounds an old one. Check both sides: each range must start before the other ends.
 
 ### Pricing
 
 ```java
+record Invoice(long baseRupees, long lateFeeRupees) {
+    long total() { return baseRupees + lateFeeRupees; }
+}
+
 interface PricingStrategy {
     Invoice invoice(Reservation r, Instant returnedAt);
 }
 
+/** Rs 1,800 per started day booked, plus Rs 200 per started hour late. */
 class DailyRatePricing implements PricingStrategy {
-    private static final long DAY_RATE_PAISE = 1_80_000;   // ₹1,800
-    private static final long LATE_HOUR_PAISE = 20_000;    // ₹200
-
     public Invoice invoice(Reservation r, Instant returnedAt) {
-        long days = startedUnits(Duration.between(r.getStart(), r.getEnd()), Duration.ofDays(1));
-        Duration late = returnedAt.isAfter(r.getEnd()) ? Duration.between(r.getEnd(), returnedAt) : Duration.ZERO;
+        Duration booked = Duration.between(r.getStart(), r.getEnd());
+        long days = startedUnits(booked, Duration.ofDays(1));
+        Duration late = returnedAt.isAfter(r.getEnd())
+                ? Duration.between(r.getEnd(), returnedAt) : Duration.ZERO;
         long lateHours = startedUnits(late, Duration.ofHours(1));
-        long base = days * DAY_RATE_PAISE, lateFee = lateHours * LATE_HOUR_PAISE;
-        return new Invoice(r.getId(), base, lateFee, base + lateFee);
+        return new Invoice(days * 1_800, lateHours * 200);
     }
 
-    static long startedUnits(Duration d, Duration unit) {   // 25 hours -> 2 days
+    static long startedUnits(Duration d, Duration unit) {   // 25 hours -> 2 started days
         long whole = d.dividedBy(unit);
         return d.equals(unit.multipliedBy(whole)) ? whole : whole + 1;
     }
 }
 ```
 
-Worked example: Asha booked 09:00–11:00 (one started day, ₹1,800) and returned at 12:10 (70 minutes late, two started hours, ₹400). Total ₹2,200. Money is kept in paise as a `long` so rounding never loses a rupee.
+Asha booked 09:00–11:00 (one started day, ₹1,800) and came back at 12:10 – 70 minutes late, two started hours, ₹400. Total ₹2,200.
 
-## Step 5: Design patterns and extensibility
+### RentalService
 
-| Pattern | Where | Why it helps |
-| --- | --- | --- |
-| **Strategy** | `PricingStrategy` | Weekend rates, per-km pricing or memberships without touching `RentalService`. |
-| **Factory** (optional) | Creating vehicles from a type | Useful if vehicle creation grows; not needed for an enum. |
-| **Observer** | Reservation created / car returned late | Email, SMS or "your car may be late" alerts without changing core code. |
+```java
+class RentalService {
+    private final List<Vehicle> fleet;
+    private final Map<Vehicle, List<Reservation>> calendar = new HashMap<>();
+    private final PricingStrategy pricing;
 
-Extensions to mention:
+    RentalService(List<Vehicle> fleet, PricingStrategy pricing) {
+        this.fleet = fleet;
+        this.pricing = pricing;
+    }
 
-- *Add-ons* (child seat, GPS): a list of `AddOn` items on the reservation, each with its own price.
-- *Different cleaning times*: move `CLEANING` onto `VehicleType` (SUVs may need longer).
-- *Faster search for big fleets*: keep each car's reservations sorted by start time, or use an interval tree, instead of scanning all.
+    List<Vehicle> search(VehicleType type, Instant start, Instant end) {
+        return fleet.stream()
+                .filter(v -> v.getType() == type)
+                .filter(v -> v.getStatus() != VehicleStatus.IN_MAINTENANCE)
+                .filter(v -> isFree(v, start, end))
+                .toList();
+    }
+
+    Reservation reserve(String customer, Vehicle vehicle, Instant start, Instant end) {
+        if (!start.isBefore(end)) {
+            throw new IllegalArgumentException("End must be after start");
+        }
+        synchronized (vehicle) {                           // check and insert together
+            if (!isFree(vehicle, start, end)) {
+                throw new IllegalStateException(vehicle.getRegistration() + " is not free");
+            }
+            Reservation r = new Reservation(customer, vehicle, start, end);
+            calendar.computeIfAbsent(vehicle, v -> new ArrayList<>()).add(r);
+            return r;
+        }
+    }
+
+    private boolean isFree(Vehicle vehicle, Instant start, Instant end) {
+        return calendar.getOrDefault(vehicle, List.of()).stream()
+                .filter(Reservation::isActive)
+                .noneMatch(r -> r.overlaps(start, end));
+    }
+
+    void pickup(Reservation r) {
+        synchronized (r.getVehicle()) {
+            if (r.getStatus() != ReservationStatus.CONFIRMED
+                    || r.getVehicle().getStatus() != VehicleStatus.AVAILABLE) {
+                throw new IllegalStateException("Vehicle not ready");
+            }
+            r.setStatus(ReservationStatus.PICKED_UP);
+            r.getVehicle().setStatus(VehicleStatus.RENTED);
+        }
+    }
+
+    Invoice returnVehicle(Reservation r, Instant returnedAt, boolean damaged) {
+        synchronized (r.getVehicle()) {
+            if (r.getStatus() != ReservationStatus.PICKED_UP) {
+                throw new IllegalStateException("Not on rent");
+            }
+            r.setStatus(ReservationStatus.RETURNED);
+            r.getVehicle().setStatus(damaged ? VehicleStatus.IN_MAINTENANCE
+                                             : VehicleStatus.AVAILABLE);
+            return pricing.invoice(r, returnedAt);
+        }
+    }
+
+    void cancel(Reservation r) {
+        synchronized (r.getVehicle()) {
+            if (r.getStatus() != ReservationStatus.CONFIRMED) {
+                throw new IllegalStateException("Only a confirmed reservation can be cancelled");
+            }
+            r.setStatus(ReservationStatus.CANCELLED);     // stops blocking the calendar
+        }
+    }
+}
+```
+
+The search result is only a suggestion. Between search and reserve, someone else may take the car – so `reserve` checks again inside `synchronized (vehicle)`. Bookings for different cars never wait for each other.
+
+| What happens | Result |
+| --- | --- |
+| Asha reserves 09:00–11:00 | Confirmed |
+| Bilal tries 11:00–14:00 | Rejected – clashes with cleaning |
+| Bilal reserves 12:00–15:00 | Confirmed |
+| Asha returns at 12:10 | Invoice ₹1,800 + ₹400 = ₹2,200 |
+| Bilal cancels | The 12:00 slot is free again |
+
+## Step 5: Two bookings at the same moment
+
+Two staff members try to reserve the same car for overlapping times at the same moment:
+
+1. Desk A checks the calendar: free.
+2. Desk B checks the calendar: still free.
+3. Both add a reservation – the car is promised twice.
+
+`synchronized (vehicle)` makes "check and insert" one step for that car. Desk B waits, then sees Desk A's booking and is rejected.
+
+> **🎯 In the interview**
+> With several servers, lock the car's row in the database (`SELECT ... FOR UPDATE`) while checking and inserting, or use a database constraint that forbids overlapping ranges (PostgreSQL has exclusion constraints).
+
+## Step 6: Deep dives
+
+### A late return blocks the next customer
+
+Asha is late, and Bilal's pickup time arrives. The car is still RENTED, so `pickup` fails. Offer Bilal another free car of the same type; if there is none, cancel his booking free of charge. Asha pays the late fee.
+
+### Weekend or membership pricing
+
+Write another `PricingStrategy`. `RentalService` does not change – this is the **Strategy pattern**.
+
+### Faster search for a big fleet
+
+Keep each car's reservations sorted by start time; you only need to check the neighbours of the requested range. An interval tree does this in O(log n).
+
+### Add-ons and notifications
+
+Child seats and GPS become a list of add-ons on the reservation, each with a price. "Your car is ready" and "you are late" messages are **observers** of reservation events.
 
 ## Interviewer follow-ups
 
-**Asha is late and Bilal's pickup time arrives. What now?** Bilal's reservation still exists, but the car is RENTED, so pickup fails with "vehicle not ready". Offer Bilal another available car of the same type. If none exists, cancel his booking free of charge – the delay is not his fault. Asha pays the late fee.
+**Why reserve a specific car and not just "an SUV"?** It makes availability a simple per-car check. Promising only a type means counting capacity across overlapping times, which is harder. Customers still *search* by type.
 
-**How do you prevent two staff members reserving the same car for the same time?** Check and insert in one critical section per vehicle. With a database, lock that vehicle's row (`SELECT ... FOR UPDATE`) while checking overlaps and inserting, or use a database exclusion constraint on the time range (PostgreSQL supports this). Both make the database the single referee.
+**What if the car comes back damaged?** Mark it IN_MAINTENANCE so search skips it, charge damage through an inspection step, and move its future reservations to other cars.
 
-**Why reserve a specific car and not just "an SUV"?** It makes availability a simple per-car check. Promising only a type needs capacity counting across overlapping times, which is harder; you can still let customers *search* by type.
+**Where do time zones fit?** Store times as `Instant` (UTC). Convert to the branch's time zone only for display.
 
-**What if the car comes back damaged?** Mark it IN_MAINTENANCE so search skips it, and charge damage through a separate inspection step. Future reservations on that car need to be moved to another car.
-
-**How do you handle cancellation?** Only a CONFIRMED reservation can be cancelled. Set it to CANCELLED so it stops blocking the calendar. A `CancellationPolicy` (another strategy) decides the fee, for example free before the start time.
-
-**Where do time zones fit?** Store times as `Instant` (UTC). Convert to the branch's time zone only when displaying.
+**Why a strict `isBefore`?** A booking ending at 12:00 and one starting at 12:00 must not clash. `<=` would reject a perfectly valid booking.
 
 ## Wrap up
 
-We modelled branches, vehicles, reservations and invoices, and made availability a simple interval-overlap check.
+We modelled cars, reservations and invoices, and made availability a simple interval-overlap check guarded by one lock per car.
 
 > **📝 Key takeaways**
 > - Vehicle status is *now*; reservations are the *future*.
 > - Two ranges overlap when each starts before the other ends – include the cleaning buffer.
-> - Check and insert under one lock per vehicle (or a row lock in the database).
+> - Check and insert under one lock per car (or a row lock in the database).
 > - Pricing is a Strategy: per started day plus per started late hour.
 
 ## Going deeper (optional)
 
-The full reference design adds production details you can bring up in senior rounds:
+The complete, runnable code is [CarRentalDemo.java](reference-code/learning/kb/carrental/CarRentalDemo.java). It replays the table above and checks every result.
 
-- **Quotes**: the server stores a quote (car, dates, price, valid for 5 minutes). The customer confirms the quote ID, so the price cannot change between screens.
-- **Retry safety**: a confirmation retried with the same request ID returns the same reservation instead of booking twice.
-- **Old events**: a delayed "return" message for an old rental must not free a car that is now on a newer rental. Each event names the reservation it belongs to.
-- **Operator vs customer fault**: if the car is not ready because of a late return, the next customer is never charged a no-show fee.
+The production-depth version adds stored price quotes that cannot change between screens, retry-safe confirmations, and protection against a delayed "returned" message freeing a car that is already on its next rental.
 
 [![Asha's late return means the car is still out when Bilal arrives at noon; it comes back at 12:10, is ready at 13:10, and Bilal's booking stays visible and is not charged a no-show fee.](learning-figures/lld-6-readiness.svg)](learning-figures/lld-6-readiness.svg)
 
-[Open the rental timeline walkthrough](learning-labs/rental.html), or read the runnable Java: [Rental.java](reference-code/learning/kb/rental/Rental.java), [RentalDemo.java](reference-code/learning/kb/rental/RentalDemo.java) and [RentalChecks.java](reference-code/learning/kb/rental/RentalChecks.java).
+[Open the rental timeline walkthrough](learning-labs/rental.html), or read the advanced code: [Rental.java](reference-code/learning/kb/rental/Rental.java) and [RentalChecks.java](reference-code/learning/kb/rental/RentalChecks.java).
 
 ## Closing answer
 
-"I model Branch, Vehicle, Customer, Reservation and Invoice, with a `RentalService` coordinating search, reserve, pickup, return and cancel. Vehicle status describes the car now; reservations describe the future. Availability is an interval-overlap check on half-open ranges that include a one-hour cleaning buffer. Reserving re-checks and inserts under a per-vehicle lock, or a row lock in the database, so two customers can never get the same slot. Pricing is a strategy that charges per started day plus per started late hour, in paise. A late return blocks the next pickup, so the system offers another car or a free cancellation."
+"I'd model Vehicle, Reservation and Invoice, with a `RentalService` coordinating search, reserve, pickup, return and cancel. Vehicle status describes the car now; reservations describe the future. Availability is an interval-overlap check on half-open ranges that include a one-hour cleaning buffer: two bookings clash when each starts before the other ends. Reserving re-checks and inserts under one lock per car, or a row lock in the database, so a car is never promised twice. Pricing is a strategy – per started day plus per started late hour. A late return blocks the next pickup, so I'd offer another car or a free cancellation."
 
