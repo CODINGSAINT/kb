@@ -352,169 +352,365 @@ The production-depth version models each offer explicitly with an ID and a deadl
 "I'd model Location, Driver, Trip and a `RideService`, with matching and fares as strategies. A trip moves REQUESTED → DRIVER_ASSIGNED → DRIVER_ARRIVED → IN_PROGRESS → COMPLETED, and each step is only allowed from the previous one. A driver is assigned on accept: under the trip's lock I check the trip is still REQUESTED, then claim the driver with `compareAndSet` from AVAILABLE to ON_TRIP – so one driver never gets two trips and one trip never gets two drivers. The fare is base plus per km plus per minute; surge is a decorator and notifications are observers. At scale, drivers are found through a geo grid and claimed with a conditional database update."
 
 === LLD 8 ===
-N|n0|Order|0|0|200|rect
-N|n1|OrderLine|250|0|200|rect
-N|n2|RestaurantFulfilment|500|0|200|rect
-N|n3|PaymentIntent|0|110|200|rect
-N|n4|Delivery|250|110|200|rect
-N|n5|CancellationPolicy|500|110|200|rect
-N|n6|Outbox|0|220|200|rect
-E|n0|n1|owns snapshots
-E|n0|n2|coordinates
-E|n0|n3|references
-E|n0|n4|tracks
-E|n0|n5|evaluates
-E|n0|n6|publishes through
+N|cust|Customer|0|0|130|rect
+N|rest|Restaurant + menu|180|0|170|rect
+N|svc|Order service|400|0|150|rect
+N|state|Order status rules|400|130|170|rect
+N|assign|Assignment strategy|180|130|180|rect
+N|rider|Delivery partner|0|130|160|rect
+E|cust|svc|place order
+E|svc|rest|items + accept
+E|svc|state|moveTo(next)
+E|svc|assign|pick partner
+E|assign|rider|tryAssign
 ---
 ## Problem
 
-Design a food delivery system like Swiggy or Zomato: browse restaurants, place an order, the restaurant accepts and prepares it, an agent is assigned and picks it up, and the customer tracks it live. The heart of it is the **order state machine**, with **Strategy** for agent assignment and **Observer** for notifications.
+Design the core classes of a food delivery app like Swiggy or Zomato. Asha orders a Chicken Biryani and a Paneer Biryani from Meghana Foods. The restaurant accepts, Ravi – the nearest free delivery partner – is assigned, the food is cooked, picked up and delivered.
+
+The interesting parts are the **order's life cycle** (what may happen next, and when cancelling is still allowed) and **assigning one partner to one order** when many orders arrive at once.
 
 ## Requirements
 
-**Functional**
-- Browse restaurants and menus (with availability), build a cart from **one** restaurant, place an order, pay.
-- Restaurant accepts or rejects. Agent assignment, pickup, delivery and live tracking.
-- Cancellation rules that depend on the stage. Ratings for food and delivery.
+- Customers browse a restaurant's menu and place an order with several items.
+- The restaurant accepts the order; a free delivery partner is assigned.
+- The order moves through clear statuses: placed → accepted → preparing → ready → picked up → delivered.
+- Customers can cancel with a full refund until cooking starts.
+- A partner carries one order at a time; delivery is free above ₹499.
 
-**Non-functional**
-- Only valid state transitions are allowed.
-- An agent carries at most N orders. Assignment rules differ by city.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Is this the whole Swiggy, or the core ordering flow?
 
-I support a single-restaurant basket, restaurant acceptance, payment, preparation and delivery. I choose an Order aggregate with immutable line/address/price snapshots; fulfilment, payment and delivery keep independent identities and state. Restaurant inventory and courier navigation are external services.
+**Interviewer:** The core: menu, order, status changes, partner assignment.
 
-## 2. Submission and recovery contracts
+**Candidate:** Can one order contain items from several restaurants?
 
-```text
-placeOrder(checkoutId,customer,acceptedQuote,address) -> Order
-restaurantDecision(orderId,decisionId,ACCEPT|REJECT) -> CurrentState
-recordPayment(orderId,providerRef,outcome) -> CurrentState
-cancel(orderId,actor,expectedVersion) -> CancellationDisposition
-```
+**Interviewer:** No. One restaurant per order.
 
-Submission validates the quote and records order plus outbox event in one transaction. A relay requests payment authorization and restaurant acceptance using stable operation references. The workflow starts preparation only when its chosen acceptance/payment prerequisites hold. Duplicate callbacks are deduplicated and rejected if inconsistent with a terminal state. Kitchen acceptance after cancellation cannot restart preparation through this service.
+**Candidate:** When can a customer cancel?
 
-For two ₹300 pizzas and a ₹60 drink, subtotal is ₹660; with ₹50 delivery and ₹40 discount the pre-tax total is ₹670. That quote is frozen. Restaurant rejection voids an uncollected authorization or creates a refund intent after capture. If capture outcome is unknown, reconciliation resolves the original payment before deciding which compensation applies. Courier replacement changes delivery assignment, not food-order identity. Cancellation after preparation records the applicable charge and remaining refund rather than deleting the order.
+**Interviewer:** Free cancellation until the restaurant starts cooking. After that, no.
 
-## 3. Final design diagram
+**Candidate:** How do we choose a delivery partner?
 
-[![Design Food Delivery System: Order owns snapshots OrderLine; Order coordinates RestaurantFulfilment; Order references PaymentIntent; Order tracks Delivery; Order evaluates CancellationPolicy; Order publishes through Outbox](designs/lld-8.svg)](designs/lld-8.svg)
+**Interviewer:** The nearest free one. We may change the rule later.
 
-Separate the **order** (the commercial agreement), **restaurant fulfilment** (acceptance and preparation), **payment** and **delivery assignment**. They are related lifecycles, not interchangeable enums. I start with a modular application and explicit transitions between these responsibilities.
+**Candidate:** Can a partner carry two orders together?
 
-## 4. Critical operation: worked execution
+**Interviewer:** Not for now – one at a time.
 
-![A visible order status summarizes several independently recorded facts.](lessons/lld-8-flow.svg)
+**Candidate:** Is there a delivery fee?
 
-*A visible order status summarizes several independently recorded facts.*
+**Interviewer:** ₹30, free if the food costs ₹499 or more.
 
-![Recover the financial operation without inventing a food delivery.](lessons/lld-8-failure.svg)
+> **🎯 In the interview**
+> Ask about cancellation and assignment early. They decide the two most important parts of the design: the state machine and the concurrency fix.
 
-*Recover the financial operation without inventing a food delivery.*
+| Functional | Non-functional |
+| --- | --- |
+| Menu, place order, accept, assign partner | One partner never gets two orders at once |
+| Status updates through delivery | Illegal status jumps are impossible |
+| Cancel with refund before cooking | Easy to change the assignment rule |
 
-### Core implementation
+## Step 2: Identify the core objects
 
-An order line needs item ID, chosen options, quantity and a snapshot of unit price. A menu entry can change tomorrow; yesterday's order must remain explainable. For two ₹300 pizzas and a ₹60 drink, subtotal is ₹660. A ₹50 delivery fee and ₹40 discount give ₹670 before the chosen tax policy. Apply discount allocation and rounding explicitly.
+- **Restaurant** – has a menu and can be open or closed.
+- **MenuItem** – a dish with a price and a veg flag.
+- **Order** – one customer, one restaurant, some order lines, a status and a partner.
+- **OrderLine** – a menu item and a quantity.
+- **OrderStatus** – the allowed statuses and which moves are legal.
+- **DeliveryPartner** – a rider who carries at most one order.
+- **AssignmentStrategy** – the rule for picking a partner (nearest free, for now).
+- **FoodDeliveryService** – places orders and drives each step.
 
-```text
-OrderLine(menuItemId, nameSnapshot, optionsSnapshot, quantity, unitPrice)
-Order(orderId, customerId, addressSnapshot, lines, total, version)
-RestaurantDecision(orderId, acceptedItems, reason, decisionId)
-Delivery(deliveryId, orderId, partnerId, state)
-```
+[![Selected design: a customer places an order at a restaurant; the order service tracks its status; an assignment strategy picks a free delivery partner; payment and refund are recorded against the order.](designs/lld-8.svg)](designs/lld-8.svg)
 
-A restaurant cannot silently replace an item with a higher-priced alternative. Record substitution consent or reject/partially fulfil under a documented policy.
+> **⚖️ Design choice**
+> Put the allowed status changes in **one place** – the `OrderStatus` enum – instead of scattering `if` checks across the code. Every change goes through `order.moveTo(next)`, which refuses illegal jumps.
 
-## 5. Detailed decisions, algorithms and failure behaviour
+## Step 3: Design the classes
 
-### Key abstractions
+### Restaurant and MenuItem
 
-| Type | Responsibility |
-|---|---|
-| `Restaurant`, `Menu`, `MenuItem` | Catalogue with an `isAvailable` flag |
-| `Cart` → `Order` | Order snapshots item prices at placement time |
-| `OrderState` | `PLACED → ACCEPTED → PREPARING → READY_FOR_PICKUP → PICKED_UP → DELIVERED`; `CANCELLED`, `REJECTED` |
-| `DeliveryAgent` | Location, capacity, current orders |
-| `AssignmentStrategy` | `Nearest`, `BatchingAware`, `LeastLoaded` |
-| `OrderObserver` | `CustomerNotifier`, `RestaurantNotifier`, `AgentNotifier` |
-| `PaymentService`, `RefundPolicy` | Refund amount by state |
+A `MenuItem` is a small immutable record. A `Restaurant` owns its menu and refuses items that aren't on it.
+
+### OrderStatus
+
+An enum with a table of legal next statuses. `PLACED` may go to `ACCEPTED` or `CANCELLED`; `PREPARING` may only go to `READY` – that is how "no cancelling after cooking starts" is enforced.
+
+### Order and OrderLine
+
+An `Order` keeps a copy of its lines and calculates totals. Its status can only change through `moveTo`.
+
+### DeliveryPartner and AssignmentStrategy
+
+A partner holds at most one current order. Picking a partner is a **Strategy**, so "nearest free" can later become "best rated" or "batch two orders" without touching the order code.
+
+[![Class diagram: a Restaurant has MenuItems; an Order has OrderLines, an OrderStatus and a DeliveryPartner; FoodDeliveryService places and moves orders and uses an AssignmentStrategy, implemented by NearestFreePartner, to pick a partner.](learning-figures/lld-8-classes.svg)](learning-figures/lld-8-classes.svg)
+
+## Step 4: Write the code
+
+### Restaurant and MenuItem
 
 ```java
-enum OrderStatus {
-    PLACED, ACCEPTED, PREPARING, READY_FOR_PICKUP, PICKED_UP, DELIVERED, CANCELLED, REJECTED;
-    private static final Map<OrderStatus, Set<OrderStatus>> NEXT = Map.of(
-        PLACED, Set.of(ACCEPTED, REJECTED, CANCELLED),
-        ACCEPTED, Set.of(PREPARING, CANCELLED), /* ... */);
-    boolean canGo(OrderStatus to) { return NEXT.getOrDefault(this, Set.of()).contains(to); }
+record MenuItem(String name, long pricePaise, boolean veg) {}
+
+class Restaurant {
+    private final String name;
+    private final Map<String, MenuItem> menu = new LinkedHashMap<>();
+    private boolean open = true;
+
+    Restaurant(String name, List<MenuItem> items) {
+        this.name = name;
+        items.forEach(i -> menu.put(i.name(), i));
+    }
+    String getName()               { return name; }
+    boolean isOpen()               { return open; }
+    void setOpen(boolean open)     { this.open = open; }
+    MenuItem item(String itemName) {
+        MenuItem i = menu.get(itemName);
+        if (i == null) throw new IllegalArgumentException("Not on the menu: " + itemName);
+        return i;
+    }
 }
 ```
 
-### Design decisions & trade-offs
+### OrderStatus: the state machine
 
-**1. Transition table vs. full State classes.** A transition map on an enum is compact and easy to audit. Full State classes pay off when each state has *behaviour* (cancellation refunds, allowed edits). A common answer is the enum for legality plus a `RefundPolicy` keyed by state.
+```java
+enum OrderStatus {
+    PLACED, ACCEPTED, PREPARING, READY, PICKED_UP, DELIVERED, CANCELLED;
 
-**2. When to assign the agent.** Assigning at `PLACED` wastes agent time if the restaurant is slow. Assigning at `READY` makes the customer wait. Assign when `remainingPrepTime ≈ agentTravelTime`. That's a Strategy, and it's the trade-off interviewers want discussed.
+    private static final Map<OrderStatus, Set<OrderStatus>> NEXT = Map.of(
+            PLACED,    EnumSet.of(ACCEPTED, CANCELLED),
+            ACCEPTED,  EnumSet.of(PREPARING, CANCELLED),
+            PREPARING, EnumSet.of(READY),
+            READY,     EnumSet.of(PICKED_UP),
+            PICKED_UP, EnumSet.of(DELIVERED),
+            DELIVERED, EnumSet.noneOf(OrderStatus.class),
+            CANCELLED, EnumSet.noneOf(OrderStatus.class));
 
-**3. Price snapshot.** Copy price and name into `OrderItem`. Menu edits after ordering must not change the bill.
-
-**4. Observer for fan-out.** Each transition publishes `OrderStatusChanged`. Notifiers, ETA recompute and analytics subscribe independently.
-
-**5. Concurrency.** The restaurant's accept and the customer's cancel can race. Guard transitions with a conditional update (`compareAndSet` on status, or `UPDATE … WHERE status = :expected`), so only one wins.
-
-### Ownership, boundaries and invariants
-
-**Central design question:** An order coordinates restaurant, courier and payment states without pretending they are one atomic action.
-
-Restaurant owns menu versions; Cart holds selections; Order snapshots item names, options, prices and delivery address. RestaurantOrder records acceptance and preparation; Delivery records assignment and proof of delivery. FeePolicy and PaymentGateway are separate ports.
-
-**Correctness rule:** An accepted order retains the agreed price and items even when the live menu changes. A delivered order must not return to preparing because a late event arrives.
-
-```text
-orders(id,menu_version,total_minor,state,version); order_line(snapshot); delivery(order_id,courier_id,status); payment_attempt(id,status)
+    boolean canMoveTo(OrderStatus next) { return NEXT.get(this).contains(next); }
+}
 ```
 
-### End-to-end execution trace
+### Order and OrderLine
 
-Validate menu and service area; create price snapshot; authorize payment; ask restaurant to accept; capture according to policy; assign a courier; record pickup and delivery; handle cancellation/refund through explicit compensating operations.
+```java
+record OrderLine(MenuItem item, int qty) {
+    long totalPaise() { return item.pricePaise() * qty; }
+}
 
-### Concurrency and recovery walkthrough
+class Order {
+    private final String id;
+    private final String customer;
+    private final Restaurant restaurant;
+    private final List<OrderLine> lines;
+    private final long deliveryFeePaise;
+    private OrderStatus status = OrderStatus.PLACED;
+    private DeliveryPartner partner;
 
-A restaurant accepts while the customer cancels. Compare the order version and use cancellation rules for the resulting state. Deduplicate provider and courier events by event identity, not by matching message text.
+    Order(String id, String customer, Restaurant r, List<OrderLine> lines, long feePaise) {
+        this.id = id; this.customer = customer; this.restaurant = r;
+        this.lines = List.copyOf(lines); this.deliveryFeePaise = feePaise;
+    }
 
-### Policy choices and extension seams
+    long itemTotalPaise() { return lines.stream().mapToLong(OrderLine::totalPaise).sum(); }
+    long totalPaise()     { return itemTotalPaise() + deliveryFeePaise; }
 
-Separate payment, preparation and delivery state axes avoid one enormous enum with impossible combinations. A coordinator keeps legal combinations explicit. Observer-style notifications may update views but must not commit payment state.
+    void moveTo(OrderStatus next) {
+        if (!status.canMoveTo(next))
+            throw new IllegalStateException(status + " -> " + next + " is not allowed");
+        status = next;
+    }
 
-### Edge cases that change the design
+    String getId()                   { return id; }
+    String getCustomer()             { return customer; }
+    Restaurant getRestaurant()       { return restaurant; }
+    OrderStatus getStatus()          { return status; }
+    DeliveryPartner getPartner()     { return partner; }
+    void setPartner(DeliveryPartner p) { partner = p; }
+}
+```
 
-One unavailable menu item may require partial acceptance with customer approval. An address change after courier assignment affects fees and serviceability. No courier available is a recoverable dispatch problem, not evidence that food was never prepared.
+Money is kept in **paise** as `long` (₹320 = 32,000), so totals never have rounding errors.
 
-**Topic-specific cases:** Menu price changes do not alter an order; duplicate pickup ignored; cancel/accept race; partial item rejection; payment uncertainty; invalid address change.
+### DeliveryPartner and assignment
 
-### Further reading
+```java
+class DeliveryPartner {
+    private final String name;
+    private final double kmFromRestaurant;
+    private Order current;                                  // at most one active order
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+    DeliveryPartner(String name, double km) { this.name = name; this.kmFromRestaurant = km; }
+    String getName()      { return name; }
+    double distanceKm()   { return kmFromRestaurant; }
+    boolean isFree()      { return current == null; }
 
-### Work through retries and cancellation
+    /** Check-and-take in one step, so two orders can never get the same partner. */
+    synchronized boolean tryAssign(Order order) {
+        if (current != null) return false;
+        current = order;
+        return true;
+    }
+    synchronized void finish() { current = null; }
+}
 
-The same restaurant acceptance event may arrive twice. Apply it once by decision identity and legal source state. An acceptance arriving after cancellation must not resurrect the order. Similarly, reassigning a courier should not create a second restaurant preparation request.
+interface AssignmentStrategy {
+    Optional<DeliveryPartner> pick(Order order, List<DeliveryPartner> partners);
+}
 
-Cancellation before preparation may be free; cancellation after food is prepared may have a charge. Put this rule in a cancellation policy using recorded milestones. Do not inspect a stale UI label and guess whether the kitchen has started.
+class NearestFreePartner implements AssignmentStrategy {
+    public Optional<DeliveryPartner> pick(Order order, List<DeliveryPartner> partners) {
+        return partners.stream()
+                .filter(DeliveryPartner::isFree)
+                .sorted(Comparator.comparingDouble(DeliveryPartner::distanceKm))
+                .filter(p -> p.tryAssign(order))            // first one we actually win
+                .findFirst();
+    }
+}
+```
 
-Keep network calls outside database locks. Record intent, call the provider, then record the result. If the process stops between those steps, resume using the original operation reference. A void and a refund are different actions depending on whether money was only authorized or already captured.
+### FoodDeliveryService
 
-## 6. Interviewer follow-ups
+```java
+class FoodDeliveryService {
+    private final List<DeliveryPartner> partners;
+    private final AssignmentStrategy strategy;
+    private final Map<String, Order> orders = new HashMap<>();
+    private int nextId = 1;
 
-**Why snapshot the address?** Editing a profile after dispatch must not redirect an already accepted delivery without an explicit change operation.
+    FoodDeliveryService(List<DeliveryPartner> partners, AssignmentStrategy strategy) {
+        this.partners = partners; this.strategy = strategy;
+    }
 
-**Does a payment success mean restaurant acceptance?** No. Financial and fulfilment outcomes are separate.
+    Order placeOrder(String customer, Restaurant r, Map<String, Integer> cart) {
+        if (!r.isOpen()) throw new IllegalStateException(r.getName() + " is closed");
+        List<OrderLine> lines = cart.entrySet().stream()
+                .map(e -> new OrderLine(r.item(e.getKey()), e.getValue())).toList();
+        long itemTotal = lines.stream().mapToLong(OrderLine::totalPaise).sum();
+        long fee = itemTotal >= 49_900 ? 0 : 3_000;         // free delivery from Rs 499
+        Order o = new Order("ORD-" + nextId++, customer, r, lines, fee);
+        orders.put(o.getId(), o);
+        return o;
+    }
 
-## 7. Closing answer
+    void restaurantAccepts(Order o) {
+        o.moveTo(OrderStatus.ACCEPTED);
+        DeliveryPartner p = strategy.pick(o, partners)
+                .orElseThrow(() -> new IllegalStateException("No partner free; retry soon"));
+        o.setPartner(p);
+    }
 
-My order freezes accepted commercial terms and coordinates separate restaurant, financial and delivery states. Recorded milestones decide cancellation and compensation. Idempotent events advance only legal transitions, so duplicate acceptance or courier events cannot resurrect a cancelled order or repeat payment.
+    void startPreparing(Order o) { o.moveTo(OrderStatus.PREPARING); }
+    void foodReady(Order o)      { o.moveTo(OrderStatus.READY); }
+    void pickedUp(Order o)       { o.moveTo(OrderStatus.PICKED_UP); }
+
+    void delivered(Order o) {
+        o.moveTo(OrderStatus.DELIVERED);
+        o.getPartner().finish();
+    }
+
+    /** Customer cancel: full refund before cooking starts, otherwise refused. */
+    long cancel(Order o) {
+        o.moveTo(OrderStatus.CANCELLED);                    // throws once PREPARING
+        if (o.getPartner() != null) o.getPartner().finish();
+        return o.totalPaise();                              // refund amount
+    }
+}
+```
+
+### Worked example
+
+| Step | What happens | Result |
+| --- | --- | --- |
+| Asha orders 1 Chicken (₹320) + 1 Paneer Biryani (₹280) | Item total ₹600 ≥ ₹499 | Total ₹600, free delivery |
+| Meghana accepts | Nearest free partner: Ravi (0.8 km) beats Chetan (2.5 km) | Ravi assigned, now busy |
+| Bilal orders 1 Paneer Biryani | ₹280 + ₹30 delivery | Total ₹310 |
+| Meghana accepts Bilal's order | Ravi is busy | Chetan assigned |
+| Asha's order: picked up before cooking? | `ACCEPTED → PICKED_UP` not allowed | Refused |
+| Cooking starts, Asha tries to cancel | `PREPARING → CANCELLED` not allowed | Refused |
+| Ready → picked up → delivered | Legal moves | Delivered, Ravi free again |
+| Bilal cancels before cooking | `ACCEPTED → CANCELLED` allowed | Refund ₹310, Chetan free |
+
+### Edge cases
+
+| Case | Behaviour |
+| --- | --- |
+| Item not on the menu | `IllegalArgumentException` |
+| Restaurant closed | Order refused |
+| No partner free | Accept fails with "retry soon" (a real system would queue it) |
+| Skipping a status | `moveTo` throws |
+
+## Step 5: The assignment algorithm: two orders, one partner
+
+Meghana accepts Asha's and Bilal's orders at the same moment, on two threads.
+
+1. Thread A sees Ravi is free and nearest.
+2. Thread B also sees Ravi is free and nearest.
+3. Both assign Ravi. He now has two orders – and one customer waits forever.
+
+The fix is to **check and take in one step**. `tryAssign` is `synchronized`: it sets Ravi's current order only if he has none, and returns whether it won. The strategy walks partners from nearest to farthest and keeps the first one it actually wins, so Thread B simply moves on to Chetan.
+
+![Animation: two orders are accepted at the same moment and both see Ravi as the nearest free partner; Asha's order wins tryAssign and gets Ravi; Bilal's order fails on Ravi, moves to the next nearest partner and gets Chetan.](learning-figures/lld-8-assign.gif)
+
+> **⚠️ Common mistake**
+> Checking `isFree()` and then assigning in a separate step. Another thread can take the partner between the two lines. The check and the update must be one atomic operation.
+
+> **🎯 In the interview**
+> With many servers, `synchronized` is not enough. Use a conditional database update – `UPDATE partner SET order_id = ? WHERE id = ? AND order_id IS NULL` – and treat "0 rows" as "try the next partner".
+
+## Step 6: Deep dives
+
+### A new assignment rule
+
+Add a class `BestRatedNearby implements AssignmentStrategy` and pass it to the service. Nothing else changes – that's the point of the Strategy pattern.
+
+### Payments and refunds
+
+A `Payment` record per order (amount, method, status). `cancel` returns the refund amount; a `PaymentService` issues the refund. After cooking starts, support can still issue a partial refund manually.
+
+### Live tracking and notifications
+
+Each `moveTo` can publish an event ("order ORD-1 is READY"). Notification and tracking services subscribe (Observer pattern) – the order class doesn't need to know about SMS or maps.
+
+### Batching orders
+
+To let a partner carry two orders from the same restaurant, change "one current order" to "a small list with a limit", and let the strategy prefer partners already heading to that restaurant.
+
+## Interviewer follow-ups
+
+**Why an enum with a transition table, not the State pattern?** The statuses have no behaviour of their own – only rules about what comes next. A table is shorter and easy to read. If each status had different behaviour, the State pattern would fit.
+
+**What if no partner is free?** Keep the order accepted and retry assignment every few seconds, or put it in a queue that partners pull from when they finish.
+
+**How do you handle the restaurant rejecting an order?** Add `PLACED → REJECTED` and refund in full.
+
+**Where does the delivery fee rule live?** In one place in the service. If it grows (surge, distance), move it into a `PricingPolicy` strategy.
+
+## Wrap up
+
+We modelled restaurants, menus and orders, enforced the order's life cycle with one transition table, and assigned partners with an atomic check-and-take behind a strategy.
+
+> **📝 Key takeaways**
+> - One transition table makes illegal status jumps impossible.
+> - Cancellation rules fall out of the state machine.
+> - Assign a partner with an atomic check-and-take; in a database, a conditional update.
+> - Strategy for assignment rules; events for tracking and notifications.
+
+## Going deeper (optional)
+
+The complete, runnable code is [FoodDeliveryDemo.java](reference-code/learning/kb/fooddelivery/FoodDeliveryDemo.java). It replays the worked example and checks every result.
+
+The production version records payment, kitchen and delivery facts separately, so the status the customer sees is a summary of several independently recorded events, and refunds never invent a delivery.
+
+[![A visible order status summarizes several independently recorded facts.](lessons/lld-8-flow.svg)](lessons/lld-8-flow.svg)
+
+## Closing answer
+
+"I model a Restaurant with MenuItems, and an Order with OrderLines, a status and a DeliveryPartner. The OrderStatus enum holds the legal transitions – placed, accepted, preparing, ready, picked up, delivered, and cancelled only before preparing – and every change goes through `moveTo`, so illegal jumps and late cancellations are refused. Money is in paise; delivery is free from ₹499. When the restaurant accepts, an AssignmentStrategy picks the nearest free partner using an atomic check-and-take, so two orders can never get the same rider; across servers that becomes a conditional database update. New assignment rules are new strategies, and status changes publish events for tracking and notifications."
 
 === LLD 9 ===
 N|svc|LibraryService|220|0|180|rect
@@ -1169,163 +1365,314 @@ The production-depth version records every change as an immutable journal entry,
 "I'd model User, Expense and Split, with split types as strategies – equal, exact and percent – that always return shares adding up exactly to the total in whole paise, giving leftover paise by a fixed rule. `ExpenseService` records an expense and updates a pairwise `BalanceSheet`; every entry is written both ways, so balances always sum to zero. A payment is just an entry in the other direction. To settle up, a greedy simplifier matches the biggest debtor with the biggest creditor using two heaps – at most n − 1 payments, though not always the theoretical minimum. Edits are reversals plus new expenses, so history stays explainable."
 
 === LLD 11 ===
-N|n0|VendingMachine|0|0|200|rect
-N|n1|VendSession|250|0|200|rect
-N|n2|Recipe|500|0|200|rect
-N|n3|Inventory|0|110|200|rect
-N|n4|ChangePlanner|250|110|200|rect
-N|n5|DispenserPort|500|110|200|rect
-N|n6|PaymentPort|0|220|200|rect
-E|n0|n1|owns
-E|n1|n2|selects
-E|n2|n3|reserves from
-E|n1|n4|reserves change
-E|n1|n5|dispenses through
-E|n1|n6|collects through
+N|user|User|0|0|100|rect
+N|machine|CoffeeMachine|160|0|160|rect
+N|inv|Inventory|380|0|130|cylinder
+N|coins|CoinBox|380|130|130|cylinder
+N|brew|Brew + change|160|130|150|rect
+N|refund|Refund coins|0|130|140|rect
+E|user|machine|select, insert
+E|machine|inv|enough milk?
+E|machine|coins|plan change
+E|machine|brew|both OK
+E|machine|refund|either fails
 ---
 ## Problem
 
-Design a coffee vending machine that serves espresso, cappuccino, latte and so on. Each drink consumes ingredients (water, milk, beans, sugar). The machine takes payment, checks inventory, brews, returns change and reports low stock. It tests **State** (machine modes), **Factory** (beverages from recipes) and inventory consistency.
+Design the software for a coffee vending machine in an office. It serves Espresso (₹30), Cappuccino (₹60) and Latte (₹70). Each drink uses coffee, water and sometimes milk. People pay with coins and get change back.
+
+Asha picks a Cappuccino and inserts ₹70. The machine must make sure it has the milk **and** the ₹10 change *before* it keeps her money and brews – a half-served customer is the bug everyone remembers.
 
 ## Requirements
 
-**Functional**
-- Show the menu with prices. Only drinks with enough ingredients are selectable.
-- Accept coins, notes or card. Return change or refund on cancel or failure.
-- Deduct ingredients and dispense. A technician can refill and go into maintenance mode.
-- Alert when an ingredient drops below a threshold.
+- Show drinks with prices; a drink is unavailable if any ingredient is short.
+- Accept coins (₹1, 2, 5, 10, 20); return change.
+- Brew only if both the ingredients and the change are available; otherwise refund.
+- Let the user cancel and get their coins back.
+- Staff can refill ingredients and coins; adding a new drink should be easy.
 
-**Non-functional**
-- One transaction at a time; button presses while dispensing are rejected cleanly.
-- Never keep money without dispensing: every failure path ends in a dispense or a refund.
-- New drinks, recipes and payment methods plug in without touching the core flow.
-- Recovers to a safe state after a power cut mid-transaction.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Which drinks, and what do they need?
 
-I implement one machine with a menu, ingredient stock, coins, cancellation and maintenance. `VendingMachine` serializes sessions; `Recipe` is immutable quantities; `Inventory` reserves resources; a `ChangePlanner` solves bounded coin selection. I keep device and payment results outside domain assumptions.
+**Interviewer:** Espresso, Cappuccino and Latte. Each has a recipe of coffee, water and milk.
 
-## 2. Vend algorithm and transitions
+**Candidate:** How do people pay?
 
-```text
-select(productId) -> price and recipe
-fund(sessionId,coin/payment) -> accepted credit
-vend(sessionId) -> COMPLETE | FAILED | DELIVERY_UNCERTAIN
-IDLE -> SELECTED -> FUNDED -> DISPENSING -> COMPLETE
+**Interviewer:** Coins only for now.
+
+**Candidate:** What if the machine can't give change?
+
+**Interviewer:** Don't serve, and give the coins back.
+
+**Candidate:** Can one machine serve two people at once?
+
+**Interviewer:** No, one user at a time.
+
+**Candidate:** Will new drinks be added later?
+
+**Interviewer:** Yes – a Mocha next month.
+
+> **🎯 In the interview**
+> The key question is "what if we can't give change?". It shows you're thinking about the order of operations, not just the classes.
+
+| Functional | Non-functional |
+| --- | --- |
+| Select, insert coins, brew, cancel | Never keep money without serving |
+| Change and refunds | New drinks without code changes |
+| Refill ingredients and coins | Clear, testable states |
+
+## Step 2: Identify the core objects
+
+- **Drink** – a name, a price and a recipe (ingredient → amount).
+- **Ingredient** – coffee, milk, water, sugar.
+- **Inventory** – how much of each ingredient is left.
+- **CoinBox** – how many coins of each value the machine holds; plans change.
+- **CoffeeMachine** – the state (idle or drink selected), the coins inserted, and the brew flow.
+- **Result** – what happened: served or not, coins returned, a message.
+
+[![Selected design: the user selects a drink and inserts coins; the machine checks the inventory for ingredients and the coin box for change; only if both are possible does it brew and return change, otherwise it refunds the inserted coins.](designs/lld-11.svg)](designs/lld-11.svg)
+
+> **⚖️ Design choice**
+> A drink is **data** (a recipe), not a subclass. A Mocha is a new `Drink` value with chocolate in its recipe – no new class, no new `if`.
+
+## Step 3: Design the classes
+
+### Drink and Ingredient
+
+A `Drink` record holds its price and recipe. Prices are whole rupees here because only coins are used; with digital payments, use paise.
+
+### Inventory
+
+Knows ingredient levels, answers `canMake(drink)` and `consume(drink)`.
+
+### CoinBox
+
+Holds coins by value. `planChange(amount)` works out which coins to give **without changing anything**; `pay(plan)` then removes them. Planning first is what lets us refuse safely.
+
+### CoffeeMachine
+
+Two states – `IDLE` and `DRINK_SELECTED` – and three actions: `select`, `insert`, `brew` (plus `cancel`).
+
+[![Class diagram: CoffeeMachine uses an Inventory and a CoinBox and has a State; a Drink has a recipe of Ingredients; brew returns a Result with the drink, the coins given back and a message.](learning-figures/lld-11-classes.svg)](learning-figures/lld-11-classes.svg)
+
+## Step 4: Write the code
+
+### Drink and Ingredient
+
+```java
+enum Ingredient { COFFEE_G, MILK_ML, WATER_ML, SUGAR_G }
+
+record Drink(String name, int priceRupees, Map<Ingredient, Integer> recipe) {
+    static final Drink ESPRESSO = new Drink("Espresso", 30,
+            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30));
+    static final Drink CAPPUCCINO = new Drink("Cappuccino", 60,
+            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30, Ingredient.MILK_ML, 120));
+    static final Drink LATTE = new Drink("Latte", 70,
+            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30, Ingredient.MILK_ML, 200));
+}
 ```
 
-Before DISPENSING I atomically reserve ingredients, a cup and change, then persist the vend identity. A ₹30 drink funded by ₹50 reserves ₹20 change before brewing. Known pre-brew failure refunds/releases untouched resources; after partial brewing I record consumed stock and waste, not a fictitious rollback. Device uncertainty blocks automatic repeat dispensing until reconciled. With 95 g beans, 1,000 ml water and 20 cups, a 10 g/150 ml recipe permits six servings. Maintenance rejects new sessions and records operator stock/cash adjustments without overwriting history.
-
-## 3. Final design diagram
-
-[![Design Coffee Vending Machine: VendingMachine owns VendSession; VendSession selects Recipe; Recipe reserves from Inventory; VendSession reserves change ChangePlanner; VendSession dispenses through DispenserPort; VendSession collects through PaymentPort](designs/lld-11.svg)](designs/lld-11.svg)
-
-The **recipe** describes ingredient quantities, **inventory** records available ingredients, and a **vend session** owns one customer's interaction. A state machine answers which actions are allowed at each stage: inserting money during maintenance must not accidentally start brewing.
-
-## 4. Critical operation: worked execution
-
-![Reserve ingredients and change before committing the physical action.](lessons/lld-11-flow.svg)
-
-*Reserve ingredients and change before committing the physical action.*
-
-![Physical evidence determines whether retry or refund is appropriate.](lessons/lld-11-failure.svg)
-
-*Physical evidence determines whether retry or refund is appropriate.*
-
-### Worked calculation and implementation
-
-A recipe requiring 10 g beans and 150 ml water allows `min(beans/10, water/150, cups)` servings. With 95 g beans, 1,000 ml water and 20 cups, water limits capacity to six drinks. Inventory checks must reserve the whole recipe together; separately decrementing beans and then discovering no cup leaves inconsistent stock.
-
-```text
-VendSession: IDLE -> SELECTED -> FUNDED -> DISPENSING -> COMPLETE
-Failures: SELECTED/FUNDED -> CANCELLED
-          DISPENSING -> DELIVERY_UNCERTAIN -> RECONCILIATION
-```
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Key abstractions
-
-| Type | Responsibility |
-|---|---|
-| `VendingMachine` | Context and facade; holds the current `MachineState` |
-| `MachineState` | `Idle`, `Selecting`, `PaymentPending`, `Dispensing`, `Maintenance` |
-| `Beverage` / `Recipe` | name, price, `Map<Ingredient, Integer>` quantities |
-| `BeverageFactory` | `create(type)` builds a beverage from the recipe registry |
-| `Inventory` | `hasEnough(recipe)`, `deduct(recipe)` (atomic), `refill` |
-| `PaymentHandler` | Strategy: `CoinPayment`, `CardPayment`; change calculation |
-| `InventoryObserver` | Low-stock alert |
+### Inventory
 
 ```java
 class Inventory {
     private final Map<Ingredient, Integer> stock = new EnumMap<>(Ingredient.class);
-    synchronized boolean tryDeduct(Recipe r) {
-        if (!r.needs().entrySet().stream().allMatch(e -> stock.get(e.getKey()) >= e.getValue())) return false;
-        r.needs().forEach((ing, q) -> stock.merge(ing, -q, Integer::sum));
-        return true;
+
+    void refill(Ingredient i, int amount) { stock.merge(i, amount, Integer::sum); }
+    int level(Ingredient i)               { return stock.getOrDefault(i, 0); }
+
+    boolean canMake(Drink d) {
+        return d.recipe().entrySet().stream().allMatch(e -> level(e.getKey()) >= e.getValue());
+    }
+    void consume(Drink d) {
+        if (!canMake(d)) throw new IllegalStateException("Not enough for " + d.name());
+        d.recipe().forEach((i, amt) -> stock.merge(i, -amt, Integer::sum));
     }
 }
 ```
 
-### Design decisions & trade-offs
+### CoinBox
 
-**1. Recipes as data.** Don't make `Cappuccino extends Coffee` with hard-coded quantities. A recipe registry (loaded from config) plus a Factory means a new drink is a config entry. Use a Decorator only for user add-ons (extra shot, extra sugar).
+```java
+/** Coins the machine holds, largest first. */
+class CoinBox {
+    private final TreeMap<Integer, Integer> coins = new TreeMap<>(Comparator.reverseOrder());
 
-**2. Check and deduct atomically.** "Check, then deduct" as two calls races if two dispense paths exist. A single `tryDeduct` under a lock is all-or-nothing.
+    void add(int coin, int count) { coins.merge(coin, count, Integer::sum); }
+    int count(int coin)           { return coins.getOrDefault(coin, 0); }
 
-**3. When to deduct versus when to charge.** Order: confirm availability, collect payment, reserve and deduct ingredients, dispense. If dispensing fails, refund and restore ingredients. Never take money for a drink you can't make.
-
-**4. State pattern.** In `Maintenance`, selections are rejected. In `Dispensing`, cancel is rejected. Each state handles only its legal events.
-
-**5. Menu availability is derived.** Recompute which drinks are selectable from inventory after every deduct or refill, and push that to the display (Observer).
-
-### Ownership, boundaries and invariants
-
-**Central design question:** Inventory reservation, money acceptance and physical dispensing are separate observable steps.
-
-Machine owns SlotInventory and a VendSession. Product describes a SKU; Recipe or Selection maps it to ingredients when appropriate. PaymentAcceptor tracks tender; ChangePolicy selects available denominations; DispenserPort reports success or jam. RefundJournal records incomplete recovery.
-
-**Correctness rule:** Never decrement sellable stock twice for one vend request. Do not claim successful delivery before the hardware confirms it. Accepted money must end in purchase, change, refund or an explicit recoverable balance.
-
-```text
-slot(id,sku,available,reserved); vend(id,sku,price_minor,tender_minor,state); cash(denomination,count)
+    /** Plan change without touching the box; empty if exact change is impossible. */
+    Optional<Map<Integer, Integer>> planChange(int amount) {
+        Map<Integer, Integer> plan = new LinkedHashMap<>();
+        for (var e : coins.entrySet()) {
+            int use = Math.min(amount / e.getKey(), e.getValue());
+            if (use > 0) { plan.put(e.getKey(), use); amount -= use * e.getKey(); }
+        }
+        return amount == 0 ? Optional.of(plan) : Optional.empty();
+    }
+    void pay(Map<Integer, Integer> plan) {
+        plan.forEach((c, n) -> coins.merge(c, -n, Integer::sum));
+    }
+}
 ```
 
-### End-to-end execution trace
+### CoffeeMachine
 
-Select a product; validate stock and price; reserve stock; accept sufficient tender; verify change availability; journal the vend; dispense; on confirmation consume stock and return change; on jam reverse the reservation and initiate refund.
+```java
+enum State { IDLE, DRINK_SELECTED }
 
-### Concurrency and recovery walkthrough
+record Result(boolean served, String drink, Map<Integer, Integer> coinsBack, String msg) {}
 
-Two sessions select the last unit while an operator restocks. One inventory owner serializes reserve/commit/release; restocking must not overwrite reserved counts. Network payment callbacks use the vend operation ID.
+class CoffeeMachine {
+    private final Inventory inventory;
+    private final CoinBox coinBox;
+    private State state = State.IDLE;
+    private Drink selected;
+    private final Map<Integer, Integer> inserted = new LinkedHashMap<>();
 
-### Policy choices and extension seams
+    CoffeeMachine(Inventory inventory, CoinBox coinBox) {
+        this.inventory = inventory; this.coinBox = coinBox;
+    }
 
-State is helpful for selection/payment/dispense transitions. Different products can use Strategy for preparation. Do not let product factories control cash or mutate global inventory.
+    void select(Drink d) {
+        if (state != State.IDLE) throw new IllegalStateException("Finish or cancel first");
+        if (!inventory.canMake(d)) throw new IllegalStateException(d.name() + " unavailable");
+        selected = d; state = State.DRINK_SELECTED;
+    }
 
-### Edge cases that change the design
+    void insert(int coin) {
+        requireSelected();
+        if (!Set.of(1, 2, 5, 10, 20).contains(coin)) throw new IllegalArgumentException(
+                "Unknown coin: " + coin);
+        inserted.merge(coin, 1, Integer::sum);
+    }
 
-Enough total money does not imply the machine can make change. Power loss after dispensing needs journal reconciliation. A refund actuator can fail too, so expose an operator-review state instead of looping forever.
+    int paid() {
+        return inserted.entrySet().stream().mapToInt(e -> e.getKey() * e.getValue()).sum();
+    }
 
-**Topic-specific cases:** Last-item race; exact change; impossible change; jam; duplicate confirmation; refund failure; restart during dispense.
+    /** Check everything first; only then take the money and brew. */
+    Result brew() {
+        requireSelected();
+        int changeDue = paid() - selected.priceRupees();
+        if (changeDue < 0) return new Result(false, null, Map.of(), "Insert ₹" + -changeDue);
 
-### Further reading
+        inserted.forEach(coinBox::add);              // their coins can be used for change
+        Optional<Map<Integer, Integer>> change = coinBox.planChange(changeDue);
+        if (change.isEmpty() || !inventory.canMake(selected)) {
+            coinBox.pay(inserted);                   // give back exactly what they put in
+            return reset(new Result(false, null, Map.copyOf(inserted), "Refunded"));
+        }
+        coinBox.pay(change.get());
+        inventory.consume(selected);
+        return reset(new Result(true, selected.name(), change.get(), "Enjoy!"));
+    }
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+    Result cancel() {
+        requireSelected();
+        return reset(new Result(false, null, Map.copyOf(inserted), "Cancelled"));
+    }
 
-### Work through the important decisions
+    private void requireSelected() {
+        if (state != State.DRINK_SELECTED) throw new IllegalStateException("Select a drink");
+    }
 
-Coin selection is a bounded change problem: available denominations and counts matter. A ₹20 difference does not prove a ₹20 coin is present. Reserve a feasible change plan before consuming money, or show an exact-change policy before purchase.
+    private Result reset(Result r) {
+        inserted.clear(); selected = null; state = State.IDLE;
+        return r;
+    }
+    State getState() { return state; }
+}
+```
 
-Once hot water has entered a cup, cancelling cannot restore the original ingredients. Record consumed quantities and waste; do not “roll back” physical brewing by incrementing every ingredient counter. Maintenance mode should block new sessions and reconcile cash/stock under an operator identity.
+### Worked example
 
-## 6. Interviewer follow-ups
+The machine starts with 100 g coffee, 500 ml water, 300 ml milk and **no coins**.
 
-**Does a new drink require another machine state?** Usually no. A new recipe changes data; new physical behaviour may need a new dispenser strategy.
+| Step | Check | Result |
+| --- | --- | --- |
+| Asha: Cappuccino (₹60), inserts 20 + 20 + 20 + 10 | Change ₹10: her own ₹10 coin can be used | Served, ₹10 back, milk 300 → 180 ml |
+| Someone selects Latte (200 ml milk) | Only 180 ml left | "Latte unavailable" |
+| Bilal: Espresso (₹30), inserts 20 + 20 | Change ₹10: no ₹10 coin in the box | Not served, both ₹20 coins back, no coffee used |
+| Bilal again: inserts 20 + 10 | Exact money | Served |
+| Chetan selects Espresso, inserts ₹10, cancels | – | ₹10 back, machine idle |
 
-**Can a failed sensor mean zero delivery?** Not necessarily. Distinguish known none from unknown.
+### Edge cases
 
-## 7. Closing answer
+| Case | Behaviour |
+| --- | --- |
+| Not enough money | "Insert ₹X more"; coins stay in until cancel |
+| Unknown coin | Rejected |
+| Brew before selecting | Refused by the state check |
+| Ingredient runs out between select and brew | Checked again in `brew`; refund |
 
-I reserve a complete recipe and feasible change plan before vending. Session state distinguishes financial acceptance from physical delivery, and unknown dispense outcomes require evidence rather than an automatic second drink. Recipes are data; hardware and payment are explicit adapters.
+## Step 5: The brew algorithm: check everything, then commit
+
+The order of operations is the whole design:
+
+1. Is enough money inserted? If not, ask for more.
+2. Add the inserted coins to the box (they can be used for change).
+3. **Plan** the change without touching the box.
+4. Check the ingredients **again**.
+5. If either check fails: give back exactly the coins inserted. Nothing else has changed.
+6. Only now: pay out the change, consume the ingredients, brew.
+
+![Animation: Bilal selects an Espresso for 30 rupees and inserts two 20-rupee coins; the machine plans ten rupees of change, finds no ten-rupee coin, and returns both coins without using any coffee; he inserts 20 plus 10, which needs no change, and the espresso is served.](learning-figures/lld-11-brew.gif)
+
+> **⚠️ Common mistake**
+> Brewing first and calculating change afterwards. If change turns out to be impossible, the coffee is already in the cup and the money is already in the box – there is no clean way back.
+
+> **🎯 In the interview**
+> Real machines add one more step: the brewer can fail mid-way (a jam). Record "money taken, brewing" before starting, and on failure refund – physical evidence decides whether to retry or refund.
+
+## Step 6: Deep dives
+
+### Better change-making
+
+Greedy (largest coin first) works for Indian coin values when every coin is in stock. With limited coins it can fail even when change is possible – for example ₹6 from {5, 2, 2, 2}: greedy takes 5 and is stuck, but 2 + 2 + 2 works. A small dynamic-programming search over coin counts fixes this (see the ATM lesson, LLD-6).
+
+### More payment methods
+
+Introduce a `PaymentMethod` interface (coins, UPI, card). The machine asks it to `authorise(amount)` and later `capture` or `release` – the same check-then-commit idea.
+
+### The State pattern
+
+With only two states, an enum and a few checks is clearest. If you add states like `MAINTENANCE` or `OUT_OF_ORDER` with different behaviour for every action, move to the State pattern (as in the ATM lesson).
+
+### Low-stock alerts
+
+After each brew, if an ingredient drops below a threshold, notify staff (Observer). The machine can also hide drinks that can't be made.
+
+## Interviewer follow-ups
+
+**Why is Drink a record and not an abstract class with subclasses?** Drinks differ only in data – price and recipe. Subclasses would add classes without adding behaviour.
+
+**How would you add sugar levels?** A `Customisation` (sugar: 0–3 spoons) that adjusts the recipe for this order before the inventory check.
+
+**What if the power fails mid-brew?** Keep a small persistent log of the current transaction; on restart, refund if brewing didn't complete.
+
+**How do you test it?** Like the demo: set inventory and coins, run a sequence of actions and assert the results, the coins returned and the remaining stock.
+
+## Wrap up
+
+We modelled drinks as recipes, kept ingredients and coins in their own classes, and made brewing a check-everything-then-commit operation so nobody pays without being served.
+
+> **📝 Key takeaways**
+> - Drinks are data: price + recipe; new drinks need no new classes.
+> - Plan change without changing the coin box; refuse safely if impossible.
+> - Check ingredients and change before taking money or brewing.
+> - A simple enum state is enough until states gain different behaviour.
+
+## Going deeper (optional)
+
+The complete, runnable code is [CoffeeMachineDemo.java](reference-code/learning/kb/coffeemachine/CoffeeMachineDemo.java). It replays the worked example and checks every result.
+
+The production version reserves ingredients and change before committing the physical action, and uses evidence from the brewer to decide between retry and refund.
+
+[![Reserve ingredients and change before committing the physical action.](lessons/lld-11-flow.svg)](lessons/lld-11-flow.svg)
+
+## Closing answer
+
+"I model a Drink as a record with a price and a recipe of ingredients, so new drinks are just data. An Inventory tracks ingredient levels and a CoinBox tracks coins and plans change without changing anything. The CoffeeMachine has two states – idle and drink selected – and the brew operation checks everything before committing: enough money, a change plan that works with the coins available including the user's own, and enough ingredients. If any check fails, it returns exactly the coins inserted; only after all checks pass does it pay out change, consume ingredients and brew. Cancel refunds at any time before brewing. Greedy change can fail with limited coins, so a production machine would use a small search."
+

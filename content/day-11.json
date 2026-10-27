@@ -12,103 +12,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "VendingMachine",
+            "id": "user",
+            "label": "User",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 100,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "VendSession",
-            "x": 250,
+            "id": "machine",
+            "label": "CoffeeMachine",
+            "x": 160,
             "y": 0,
-            "w": 200,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Recipe",
-            "x": 500,
-            "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n3",
+            "id": "inv",
             "label": "Inventory",
+            "x": 380,
+            "y": 0,
+            "w": 130,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "coins",
+            "label": "CoinBox",
+            "x": 380,
+            "y": 130,
+            "w": 130,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "brew",
+            "label": "Brew + change",
+            "x": 160,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "refund",
+            "label": "Refund coins",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "ChangePlanner",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "DispenserPort",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "PaymentPort",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "owns"
+            "from": "user",
+            "to": "machine",
+            "label": "select, insert"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "selects"
+            "from": "machine",
+            "to": "inv",
+            "label": "enough milk?"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "reserves from"
+            "from": "machine",
+            "to": "coins",
+            "label": "plan change"
           },
           {
-            "from": "n1",
-            "to": "n4",
-            "label": "reserves change"
+            "from": "machine",
+            "to": "brew",
+            "label": "both OK"
           },
           {
-            "from": "n1",
-            "to": "n5",
-            "label": "dispenses through"
-          },
-          {
-            "from": "n1",
-            "to": "n6",
-            "label": "collects through"
+            "from": "machine",
+            "to": "refund",
+            "label": "either fails"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a coffee vending machine that serves espresso, cappuccino, latte and so on. Each drink consumes ingredients (water, milk, beans, sugar). The machine takes payment, checks inventory, brews, returns change and reports low stock. It tests **State** (machine modes), **Factory** (beverages from recipes) and inventory consistency.\n\n## Requirements\n\n**Functional**\n- Show the menu with prices. Only drinks with enough ingredients are selectable.\n- Accept coins, notes or card. Return change or refund on cancel or failure.\n- Deduct ingredients and dispense. A technician can refill and go into maintenance mode.\n- Alert when an ingredient drops below a threshold.\n\n**Non-functional**\n- One transaction at a time; button presses while dispensing are rejected cleanly.\n- Never keep money without dispensing: every failure path ends in a dispense or a refund.\n- New drinks, recipes and payment methods plug in without touching the core flow.\n- Recovers to a safe state after a power cut mid-transaction.\n\n## 1. Scope and chosen solution\n\nI implement one machine with a menu, ingredient stock, coins, cancellation and maintenance. `VendingMachine` serializes sessions; `Recipe` is immutable quantities; `Inventory` reserves resources; a `ChangePlanner` solves bounded coin selection. I keep device and payment results outside domain assumptions.\n\n## 2. Vend algorithm and transitions\n\n```text\nselect(productId) -> price and recipe\nfund(sessionId,coin/payment) -> accepted credit\nvend(sessionId) -> COMPLETE | FAILED | DELIVERY_UNCERTAIN\nIDLE -> SELECTED -> FUNDED -> DISPENSING -> COMPLETE\n```\n\nBefore DISPENSING I atomically reserve ingredients, a cup and change, then persist the vend identity. A ₹30 drink funded by ₹50 reserves ₹20 change before brewing. Known pre-brew failure refunds/releases untouched resources; after partial brewing I record consumed stock and waste, not a fictitious rollback. Device uncertainty blocks automatic repeat dispensing until reconciled. With 95 g beans, 1,000 ml water and 20 cups, a 10 g/150 ml recipe permits six servings. Maintenance rejects new sessions and records operator stock/cash adjustments without overwriting history.\n\n## 3. Final design diagram\n\n[![Design Coffee Vending Machine: VendingMachine owns VendSession; VendSession selects Recipe; Recipe reserves from Inventory; VendSession reserves change ChangePlanner; VendSession dispenses through DispenserPort; VendSession collects through PaymentPort](designs/lld-11.svg)](designs/lld-11.svg)\n\nThe **recipe** describes ingredient quantities, **inventory** records available ingredients, and a **vend session** owns one customer's interaction. A state machine answers which actions are allowed at each stage: inserting money during maintenance must not accidentally start brewing.\n\n## 4. Critical operation: worked execution\n\n![Reserve ingredients and change before committing the physical action.](lessons/lld-11-flow.svg)\n\n*Reserve ingredients and change before committing the physical action.*\n\n![Physical evidence determines whether retry or refund is appropriate.](lessons/lld-11-failure.svg)\n\n*Physical evidence determines whether retry or refund is appropriate.*\n\n### Worked calculation and implementation\n\nA recipe requiring 10 g beans and 150 ml water allows `min(beans/10, water/150, cups)` servings. With 95 g beans, 1,000 ml water and 20 cups, water limits capacity to six drinks. Inventory checks must reserve the whole recipe together; separately decrementing beans and then discovering no cup leaves inconsistent stock.\n\n```text\nVendSession: IDLE -> SELECTED -> FUNDED -> DISPENSING -> COMPLETE\nFailures: SELECTED/FUNDED -> CANCELLED\n          DISPENSING -> DELIVERY_UNCERTAIN -> RECONCILIATION\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `VendingMachine` | Context and facade; holds the current `MachineState` |\n| `MachineState` | `Idle`, `Selecting`, `PaymentPending`, `Dispensing`, `Maintenance` |\n| `Beverage` / `Recipe` | name, price, `Map<Ingredient, Integer>` quantities |\n| `BeverageFactory` | `create(type)` builds a beverage from the recipe registry |\n| `Inventory` | `hasEnough(recipe)`, `deduct(recipe)` (atomic), `refill` |\n| `PaymentHandler` | Strategy: `CoinPayment`, `CardPayment`; change calculation |\n| `InventoryObserver` | Low-stock alert |\n\n```java\nclass Inventory {\n    private final Map<Ingredient, Integer> stock = new EnumMap<>(Ingredient.class);\n    synchronized boolean tryDeduct(Recipe r) {\n        if (!r.needs().entrySet().stream().allMatch(e -> stock.get(e.getKey()) >= e.getValue())) return false;\n        r.needs().forEach((ing, q) -> stock.merge(ing, -q, Integer::sum));\n        return true;\n    }\n}\n```\n\n### Design decisions & trade-offs\n\n**1. Recipes as data.** Don't make `Cappuccino extends Coffee` with hard-coded quantities. A recipe registry (loaded from config) plus a Factory means a new drink is a config entry. Use a Decorator only for user add-ons (extra shot, extra sugar).\n\n**2. Check and deduct atomically.** \"Check, then deduct\" as two calls races if two dispense paths exist. A single `tryDeduct` under a lock is all-or-nothing.\n\n**3. When to deduct versus when to charge.** Order: confirm availability, collect payment, reserve and deduct ingredients, dispense. If dispensing fails, refund and restore ingredients. Never take money for a drink you can't make.\n\n**4. State pattern.** In `Maintenance`, selections are rejected. In `Dispensing`, cancel is rejected. Each state handles only its legal events.\n\n**5. Menu availability is derived.** Recompute which drinks are selectable from inventory after every deduct or refill, and push that to the display (Observer).\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Inventory reservation, money acceptance and physical dispensing are separate observable steps.\n\nMachine owns SlotInventory and a VendSession. Product describes a SKU; Recipe or Selection maps it to ingredients when appropriate. PaymentAcceptor tracks tender; ChangePolicy selects available denominations; DispenserPort reports success or jam. RefundJournal records incomplete recovery.\n\n**Correctness rule:** Never decrement sellable stock twice for one vend request. Do not claim successful delivery before the hardware confirms it. Accepted money must end in purchase, change, refund or an explicit recoverable balance.\n\n```text\nslot(id,sku,available,reserved); vend(id,sku,price_minor,tender_minor,state); cash(denomination,count)\n```\n\n### End-to-end execution trace\n\nSelect a product; validate stock and price; reserve stock; accept sufficient tender; verify change availability; journal the vend; dispense; on confirmation consume stock and return change; on jam reverse the reservation and initiate refund.\n\n### Concurrency and recovery walkthrough\n\nTwo sessions select the last unit while an operator restocks. One inventory owner serializes reserve/commit/release; restocking must not overwrite reserved counts. Network payment callbacks use the vend operation ID.\n\n### Policy choices and extension seams\n\nState is helpful for selection/payment/dispense transitions. Different products can use Strategy for preparation. Do not let product factories control cash or mutate global inventory.\n\n### Edge cases that change the design\n\nEnough total money does not imply the machine can make change. Power loss after dispensing needs journal reconciliation. A refund actuator can fail too, so expose an operator-review state instead of looping forever.\n\n**Topic-specific cases:** Last-item race; exact change; impossible change; jam; duplicate confirmation; refund failure; restart during dispense.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through the important decisions\n\nCoin selection is a bounded change problem: available denominations and counts matter. A ₹20 difference does not prove a ₹20 coin is present. Reserve a feasible change plan before consuming money, or show an exact-change policy before purchase.\n\nOnce hot water has entered a cup, cancelling cannot restore the original ingredients. Record consumed quantities and waste; do not “roll back” physical brewing by incrementing every ingredient counter. Maintenance mode should block new sessions and reconcile cash/stock under an operator identity.\n\n## 6. Interviewer follow-ups\n\n**Does a new drink require another machine state?** Usually no. A new recipe changes data; new physical behaviour may need a new dispenser strategy.\n\n**Can a failed sensor mean zero delivery?** Not necessarily. Distinguish known none from unknown.\n\n## 7. Closing answer\n\nI reserve a complete recipe and feasible change plan before vending. Session state distinguishes financial acceptance from physical delivery, and unknown dispense outcomes require evidence rather than an automatic second drink. Recipes are data; hardware and payment are explicit adapters.\n"
+      "markdown": "## Problem\n\nDesign the software for a coffee vending machine in an office. It serves Espresso (₹30), Cappuccino (₹60) and Latte (₹70). Each drink uses coffee, water and sometimes milk. People pay with coins and get change back.\n\nAsha picks a Cappuccino and inserts ₹70. The machine must make sure it has the milk **and** the ₹10 change *before* it keeps her money and brews – a half-served customer is the bug everyone remembers.\n\n## Requirements\n\n- Show drinks with prices; a drink is unavailable if any ingredient is short.\n- Accept coins (₹1, 2, 5, 10, 20); return change.\n- Brew only if both the ingredients and the change are available; otherwise refund.\n- Let the user cancel and get their coins back.\n- Staff can refill ingredients and coins; adding a new drink should be easy.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Which drinks, and what do they need?\n\n**Interviewer:** Espresso, Cappuccino and Latte. Each has a recipe of coffee, water and milk.\n\n**Candidate:** How do people pay?\n\n**Interviewer:** Coins only for now.\n\n**Candidate:** What if the machine can't give change?\n\n**Interviewer:** Don't serve, and give the coins back.\n\n**Candidate:** Can one machine serve two people at once?\n\n**Interviewer:** No, one user at a time.\n\n**Candidate:** Will new drinks be added later?\n\n**Interviewer:** Yes – a Mocha next month.\n\n> **🎯 In the interview**\n> The key question is \"what if we can't give change?\". It shows you're thinking about the order of operations, not just the classes.\n\n| Functional | Non-functional |\n| --- | --- |\n| Select, insert coins, brew, cancel | Never keep money without serving |\n| Change and refunds | New drinks without code changes |\n| Refill ingredients and coins | Clear, testable states |\n\n## Step 2: Identify the core objects\n\n- **Drink** – a name, a price and a recipe (ingredient → amount).\n- **Ingredient** – coffee, milk, water, sugar.\n- **Inventory** – how much of each ingredient is left.\n- **CoinBox** – how many coins of each value the machine holds; plans change.\n- **CoffeeMachine** – the state (idle or drink selected), the coins inserted, and the brew flow.\n- **Result** – what happened: served or not, coins returned, a message.\n\n[![Selected design: the user selects a drink and inserts coins; the machine checks the inventory for ingredients and the coin box for change; only if both are possible does it brew and return change, otherwise it refunds the inserted coins.](designs/lld-11.svg)](designs/lld-11.svg)\n\n> **⚖️ Design choice**\n> A drink is **data** (a recipe), not a subclass. A Mocha is a new `Drink` value with chocolate in its recipe – no new class, no new `if`.\n\n## Step 3: Design the classes\n\n### Drink and Ingredient\n\nA `Drink` record holds its price and recipe. Prices are whole rupees here because only coins are used; with digital payments, use paise.\n\n### Inventory\n\nKnows ingredient levels, answers `canMake(drink)` and `consume(drink)`.\n\n### CoinBox\n\nHolds coins by value. `planChange(amount)` works out which coins to give **without changing anything**; `pay(plan)` then removes them. Planning first is what lets us refuse safely.\n\n### CoffeeMachine\n\nTwo states – `IDLE` and `DRINK_SELECTED` – and three actions: `select`, `insert`, `brew` (plus `cancel`).\n\n[![Class diagram: CoffeeMachine uses an Inventory and a CoinBox and has a State; a Drink has a recipe of Ingredients; brew returns a Result with the drink, the coins given back and a message.](learning-figures/lld-11-classes.svg)](learning-figures/lld-11-classes.svg)\n\n## Step 4: Write the code\n\n### Drink and Ingredient\n\n```java\nenum Ingredient { COFFEE_G, MILK_ML, WATER_ML, SUGAR_G }\n\nrecord Drink(String name, int priceRupees, Map<Ingredient, Integer> recipe) {\n    static final Drink ESPRESSO = new Drink(\"Espresso\", 30,\n            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30));\n    static final Drink CAPPUCCINO = new Drink(\"Cappuccino\", 60,\n            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30, Ingredient.MILK_ML, 120));\n    static final Drink LATTE = new Drink(\"Latte\", 70,\n            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30, Ingredient.MILK_ML, 200));\n}\n```\n\n### Inventory\n\n```java\nclass Inventory {\n    private final Map<Ingredient, Integer> stock = new EnumMap<>(Ingredient.class);\n\n    void refill(Ingredient i, int amount) { stock.merge(i, amount, Integer::sum); }\n    int level(Ingredient i)               { return stock.getOrDefault(i, 0); }\n\n    boolean canMake(Drink d) {\n        return d.recipe().entrySet().stream().allMatch(e -> level(e.getKey()) >= e.getValue());\n    }\n    void consume(Drink d) {\n        if (!canMake(d)) throw new IllegalStateException(\"Not enough for \" + d.name());\n        d.recipe().forEach((i, amt) -> stock.merge(i, -amt, Integer::sum));\n    }\n}\n```\n\n### CoinBox\n\n```java\n/** Coins the machine holds, largest first. */\nclass CoinBox {\n    private final TreeMap<Integer, Integer> coins = new TreeMap<>(Comparator.reverseOrder());\n\n    void add(int coin, int count) { coins.merge(coin, count, Integer::sum); }\n    int count(int coin)           { return coins.getOrDefault(coin, 0); }\n\n    /** Plan change without touching the box; empty if exact change is impossible. */\n    Optional<Map<Integer, Integer>> planChange(int amount) {\n        Map<Integer, Integer> plan = new LinkedHashMap<>();\n        for (var e : coins.entrySet()) {\n            int use = Math.min(amount / e.getKey(), e.getValue());\n            if (use > 0) { plan.put(e.getKey(), use); amount -= use * e.getKey(); }\n        }\n        return amount == 0 ? Optional.of(plan) : Optional.empty();\n    }\n    void pay(Map<Integer, Integer> plan) {\n        plan.forEach((c, n) -> coins.merge(c, -n, Integer::sum));\n    }\n}\n```\n\n### CoffeeMachine\n\n```java\nenum State { IDLE, DRINK_SELECTED }\n\nrecord Result(boolean served, String drink, Map<Integer, Integer> coinsBack, String msg) {}\n\nclass CoffeeMachine {\n    private final Inventory inventory;\n    private final CoinBox coinBox;\n    private State state = State.IDLE;\n    private Drink selected;\n    private final Map<Integer, Integer> inserted = new LinkedHashMap<>();\n\n    CoffeeMachine(Inventory inventory, CoinBox coinBox) {\n        this.inventory = inventory; this.coinBox = coinBox;\n    }\n\n    void select(Drink d) {\n        if (state != State.IDLE) throw new IllegalStateException(\"Finish or cancel first\");\n        if (!inventory.canMake(d)) throw new IllegalStateException(d.name() + \" unavailable\");\n        selected = d; state = State.DRINK_SELECTED;\n    }\n\n    void insert(int coin) {\n        requireSelected();\n        if (!Set.of(1, 2, 5, 10, 20).contains(coin)) throw new IllegalArgumentException(\n                \"Unknown coin: \" + coin);\n        inserted.merge(coin, 1, Integer::sum);\n    }\n\n    int paid() {\n        return inserted.entrySet().stream().mapToInt(e -> e.getKey() * e.getValue()).sum();\n    }\n\n    /** Check everything first; only then take the money and brew. */\n    Result brew() {\n        requireSelected();\n        int changeDue = paid() - selected.priceRupees();\n        if (changeDue < 0) return new Result(false, null, Map.of(), \"Insert ₹\" + -changeDue);\n\n        inserted.forEach(coinBox::add);              // their coins can be used for change\n        Optional<Map<Integer, Integer>> change = coinBox.planChange(changeDue);\n        if (change.isEmpty() || !inventory.canMake(selected)) {\n            coinBox.pay(inserted);                   // give back exactly what they put in\n            return reset(new Result(false, null, Map.copyOf(inserted), \"Refunded\"));\n        }\n        coinBox.pay(change.get());\n        inventory.consume(selected);\n        return reset(new Result(true, selected.name(), change.get(), \"Enjoy!\"));\n    }\n\n    Result cancel() {\n        requireSelected();\n        return reset(new Result(false, null, Map.copyOf(inserted), \"Cancelled\"));\n    }\n\n    private void requireSelected() {\n        if (state != State.DRINK_SELECTED) throw new IllegalStateException(\"Select a drink\");\n    }\n\n    private Result reset(Result r) {\n        inserted.clear(); selected = null; state = State.IDLE;\n        return r;\n    }\n    State getState() { return state; }\n}\n```\n\n### Worked example\n\nThe machine starts with 100 g coffee, 500 ml water, 300 ml milk and **no coins**.\n\n| Step | Check | Result |\n| --- | --- | --- |\n| Asha: Cappuccino (₹60), inserts 20 + 20 + 20 + 10 | Change ₹10: her own ₹10 coin can be used | Served, ₹10 back, milk 300 → 180 ml |\n| Someone selects Latte (200 ml milk) | Only 180 ml left | \"Latte unavailable\" |\n| Bilal: Espresso (₹30), inserts 20 + 20 | Change ₹10: no ₹10 coin in the box | Not served, both ₹20 coins back, no coffee used |\n| Bilal again: inserts 20 + 10 | Exact money | Served |\n| Chetan selects Espresso, inserts ₹10, cancels | – | ₹10 back, machine idle |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Not enough money | \"Insert ₹X more\"; coins stay in until cancel |\n| Unknown coin | Rejected |\n| Brew before selecting | Refused by the state check |\n| Ingredient runs out between select and brew | Checked again in `brew`; refund |\n\n## Step 5: The brew algorithm: check everything, then commit\n\nThe order of operations is the whole design:\n\n1. Is enough money inserted? If not, ask for more.\n2. Add the inserted coins to the box (they can be used for change).\n3. **Plan** the change without touching the box.\n4. Check the ingredients **again**.\n5. If either check fails: give back exactly the coins inserted. Nothing else has changed.\n6. Only now: pay out the change, consume the ingredients, brew.\n\n![Animation: Bilal selects an Espresso for 30 rupees and inserts two 20-rupee coins; the machine plans ten rupees of change, finds no ten-rupee coin, and returns both coins without using any coffee; he inserts 20 plus 10, which needs no change, and the espresso is served.](learning-figures/lld-11-brew.gif)\n\n> **⚠️ Common mistake**\n> Brewing first and calculating change afterwards. If change turns out to be impossible, the coffee is already in the cup and the money is already in the box – there is no clean way back.\n\n> **🎯 In the interview**\n> Real machines add one more step: the brewer can fail mid-way (a jam). Record \"money taken, brewing\" before starting, and on failure refund – physical evidence decides whether to retry or refund.\n\n## Step 6: Deep dives\n\n### Better change-making\n\nGreedy (largest coin first) works for Indian coin values when every coin is in stock. With limited coins it can fail even when change is possible – for example ₹6 from {5, 2, 2, 2}: greedy takes 5 and is stuck, but 2 + 2 + 2 works. A small dynamic-programming search over coin counts fixes this (see the ATM lesson, LLD-6).\n\n### More payment methods\n\nIntroduce a `PaymentMethod` interface (coins, UPI, card). The machine asks it to `authorise(amount)` and later `capture` or `release` – the same check-then-commit idea.\n\n### The State pattern\n\nWith only two states, an enum and a few checks is clearest. If you add states like `MAINTENANCE` or `OUT_OF_ORDER` with different behaviour for every action, move to the State pattern (as in the ATM lesson).\n\n### Low-stock alerts\n\nAfter each brew, if an ingredient drops below a threshold, notify staff (Observer). The machine can also hide drinks that can't be made.\n\n## Interviewer follow-ups\n\n**Why is Drink a record and not an abstract class with subclasses?** Drinks differ only in data – price and recipe. Subclasses would add classes without adding behaviour.\n\n**How would you add sugar levels?** A `Customisation` (sugar: 0–3 spoons) that adjusts the recipe for this order before the inventory check.\n\n**What if the power fails mid-brew?** Keep a small persistent log of the current transaction; on restart, refund if brewing didn't complete.\n\n**How do you test it?** Like the demo: set inventory and coins, run a sequence of actions and assert the results, the coins returned and the remaining stock.\n\n## Wrap up\n\nWe modelled drinks as recipes, kept ingredients and coins in their own classes, and made brewing a check-everything-then-commit operation so nobody pays without being served.\n\n> **📝 Key takeaways**\n> - Drinks are data: price + recipe; new drinks need no new classes.\n> - Plan change without changing the coin box; refuse safely if impossible.\n> - Check ingredients and change before taking money or brewing.\n> - A simple enum state is enough until states gain different behaviour.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [CoffeeMachineDemo.java](reference-code/learning/kb/coffeemachine/CoffeeMachineDemo.java). It replays the worked example and checks every result.\n\nThe production version reserves ingredients and change before committing the physical action, and uses evidence from the brewer to decide between retry and refund.\n\n[![Reserve ingredients and change before committing the physical action.](lessons/lld-11-flow.svg)](lessons/lld-11-flow.svg)\n\n## Closing answer\n\n\"I model a Drink as a record with a price and a recipe of ingredients, so new drinks are just data. An Inventory tracks ingredient levels and a CoinBox tracks coins and plans change without changing anything. The CoffeeMachine has two states – idle and drink selected – and the brew operation checks everything before committing: enough money, a change plan that works with the coins available including the user's own, and enough ingredients. If any check fails, it returns exactly the coins inserted; only after all checks pass does it pay out change, consume ingredients and brew. Cancel refunds at any time before brewing. Greedy change can fail with limited coins, so a production machine would use a small search.\"\n"
     },
     {
       "category": "HLD",
