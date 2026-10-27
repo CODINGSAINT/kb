@@ -32,15 +32,47 @@ The API runs on many gateway servers, so the limit must be shared: a customer mu
 
 Out of scope: billing quotas, DDoS protection at the network layer.
 
-## 1. Clarify requirements and estimate the scale
+## Step 1: Clarify the requirements
 
-| Question to ask | Answer we choose | Why it matters |
-| --- | --- | --- |
-| Client-side or server-side limiter? | Server-side, at the API gateway. | Clients cannot be trusted to limit themselves. |
-| Limit by what? | API key + route, e.g. `key-42:search`. | Becomes the storage key. |
-| Hard limit or allow bursts? | Allow a burst, limit the average. | Points to the token bucket algorithm. |
-| What if the limiter's store is down? | Configurable per route: fail open (allow) for low-risk routes, fail closed (reject) for sensitive ones. | Must be decided, not left to chance. |
-| Exact counts needed? | Close enough; this protects capacity, it is not billing. | Allows simple, fast algorithms. |
+> **💡 Tip**
+> A rate limiter question is really "what exactly do we promise?". Pin that down before choosing an algorithm.
+
+**Candidate:** Where does the limiter run – in the client or on our side?
+
+**Interviewer:** On our side, before the API.
+
+**Candidate:** Do we limit by user, by API key or by IP?
+
+**Interviewer:** By API key, per route. Search might allow 100 requests a minute.
+
+**Candidate:** Should short bursts be allowed?
+
+**Interviewer:** Yes, a small burst is fine, but the average must stay under the limit.
+
+**Candidate:** We have many gateway servers. Should they share one limit?
+
+**Interviewer:** Yes. A customer must not get a fresh limit on every server.
+
+**Candidate:** What if the limiter's storage is down?
+
+**Interviewer:** Your call. Explain the trade-off.
+
+**Functional requirements**
+
+1. Limit requests per API key and route, using configurable rules.
+2. Reject excess requests with `429 Too Many Requests` and a retry hint.
+3. Allow short bursts while limiting the average rate.
+
+**Non-functional requirements**
+
+1. Adds only a few milliseconds per request.
+2. Shared across all gateway servers.
+3. A limiter outage must not take the whole API down.
+
+## Step 2: Estimate the scale
+
+> **💡 Tip**
+> Round the numbers. The goal is to learn what the numbers mean for the design, not to be precise.
 
 | Quantity | Calculation | Result |
 | --- | --- | --- |
@@ -48,17 +80,9 @@ Out of scope: billing quotas, DDoS protection at the network layer.
 | Memory per client-route | ~2 numbers + key ≈ 100 bytes | 1M clients × 3 routes × 100 B ≈ 300 MB |
 | Redis capacity | one node does ~100k simple ops/s | 1–2 shards, plus replicas |
 
-A 45-minute plan:
+What it means: 50,000 checks a second fits one or two Redis shards, and the state is small enough to keep entirely in memory.
 
-| Minutes | What you do |
-| --- | --- |
-| 0–8 | Requirements and estimates |
-| 8–20 | Algorithms and choosing one |
-| 20–30 | Where it runs and the high-level design |
-| 30–40 | Distributed counting, race conditions, failures |
-| 40–45 | Follow-ups |
-
-## 2. Choose the algorithm
+## Step 3: Choose the algorithm
 
 Know these five and when each fits:
 
@@ -69,6 +93,9 @@ Know these five and when each fits:
 | **Sliding window counter** | Blend this minute's and last minute's counts by overlap | Smooth, small memory | Approximate |
 | **Token bucket** | A bucket holds up to *C* tokens, refilled at *R* per second; each request spends one | Allows bursts, small memory, simple | Two parameters to tune |
 | **Leaky bucket** | Requests enter a queue that drains at a fixed rate | Very smooth output | Bursts wait or are dropped; adds a queue |
+
+> **⚖️ Design choice**
+> Token bucket: it allows short bursts, needs only two numbers per client, and is what large API providers describe using.
 
 **We choose the token bucket.** It is what AWS API Gateway and Stripe describe using, and it matches the requirement "allow bursts, limit the average".
 
@@ -105,7 +132,7 @@ class TokenBucket {
 
 This works perfectly inside one server. The rest of the design is about making it work across many.
 
-## 3. High-level design
+## Step 4: High-level design
 
 [![Selected design: the client calls the API gateway, which runs the limiter, performs an atomic check in Redis using a Lua script and forwards the request to the backend only if allowed; limits come from a rules config.](designs/hld-2.svg)](designs/hld-2.svg)
 
@@ -129,7 +156,7 @@ X-RateLimit-Remaining: 0
 
 [![A shared admission decision before the backend: an authenticated gateway uses a cached policy and a small script on the Redis primary for the subject and route; allowed requests are forwarded, exhausted quota returns 429, and an unavailable store follows the route's failure policy.](learning-figures/ratelimit-flow.svg)](learning-figures/ratelimit-flow.svg)
 
-## 4. Deep dive: counting across many servers
+## Step 5: Deep dive: counting across many servers
 
 **Why not keep a bucket in each gateway's memory?** With 10 gateways, each would allow 100 per minute – the client gets 1,000. The state must be shared, so we put it in Redis, which is fast (sub-millisecond) and in memory.
 
@@ -172,7 +199,7 @@ Two details worth saying:
 
 [![Expiry trap: a bucket with capacity 1000 refilling one token per second has only 60 tokens after 60 idle seconds; deleting it then would recreate it with 1000; the safe expiry waits until it would be full.](learning-figures/ratelimit-expiry.svg)](learning-figures/ratelimit-expiry.svg)
 
-## 5. Scaling and failure handling
+## Step 6: Scaling and failure handling
 
 **Scaling Redis.** Shard by key (Redis Cluster hashes keys to slots), so different clients live on different shards. All gateways send the same key to the same shard, so the count stays shared. Add replicas for failover, not for decisions – a replica may be slightly behind.
 
@@ -191,7 +218,7 @@ Set a tight timeout (a few milliseconds) on the Redis call so a slow limiter doe
 
 **Monitoring.** Track allowed vs rejected counts per route, Redis latency, and how often fail-open is used. A sudden spike of `429`s may mean a broken client or a too-tight rule.
 
-## 6. Interviewer follow-ups
+## Interviewer follow-ups
 
 **Why not a fixed window – it's simpler?** A client can send 100 at 0:59 and 100 at 1:00: 200 in two seconds. Token bucket bounds bursts by its capacity. Fixed window is acceptable when that edge burst does not matter.
 
@@ -207,13 +234,23 @@ Set a tight timeout (a few milliseconds) on the Redis call so a slow limiter doe
 
 **How do you change a limit without restarting?** Rules are in a config store; gateways reload them periodically. A new capacity applies on the next request.
 
-## 7. Going deeper (optional)
+## Wrap up
+
+We put a token-bucket limiter in the gateway, shared its state in Redis, and made the check atomic with a Lua script.
+
+> **📝 Key takeaways**
+> - Know the five algorithms; pick token bucket for bursts plus an average limit.
+> - Limit in the gateway, before the backend does any work.
+> - Share state in Redis and refill-check-spend atomically in one Lua script.
+> - Decide fail-open or fail-closed per route, with a tight timeout.
+
+## Going deeper (optional)
 
 The detailed version of this lesson covers what a token bucket does and does not promise (it is *not* "at most N in every rolling second"), clock and millisecond-rounding effects, policy versioning during rollouts, and what a Redis failover can lose with asynchronous replication.
 
 [Watch five tokens disappear and refill](learning-labs/index.html?topic=ratelimit), or read the runnable code: [TokenBucket.java](reference-code/learning/kb/ratelimit/TokenBucket.java), [RatelimitChecks.java](reference-code/learning/kb/ratelimit/RatelimitChecks.java), [RatelimitTrace.java](reference-code/learning/kb/ratelimit/RatelimitTrace.java) and the Redis script [token-bucket.lua](reference-code/learning/token-bucket.lua). For Redis scripting details see the [Redis EVAL documentation](https://redis.io/docs/latest/develop/interact/programmability/eval-intro/).
 
-## 8. Closing answer
+## Closing answer
 
 "I put the limiter in the API gateway so it rejects excess traffic before the backend. I use a token bucket per API key and route – it allows short bursts while limiting the average – storing just tokens and a timestamp. Because there are many gateways, the bucket lives in Redis, and the refill-check-spend runs as one atomic Lua script using Redis's clock, which removes the read-then-write race. Rejections return 429 with Retry-After. Redis is sharded by key; idle buckets expire only after they would be full. If Redis is unavailable, each route follows an explicit fail-open or fail-closed policy with a tight timeout."
 
@@ -253,15 +290,44 @@ The interview is about: how a key finds its machine, what happens when memory is
 
 Out of scope: persistence to disk, transactions across keys, pub/sub.
 
-## 1. Clarify requirements and estimate the scale
+## Step 1: Clarify the requirements
 
-| Question to ask | Answer we choose | Why it matters |
-| --- | --- | --- |
-| What do we cache? | Product cards, ~1 KB each. | Sizing. |
-| How stale may data be? | A few seconds is fine for display; checkout always reads the database. | Allows TTL + invalidation instead of strict consistency. |
-| Who loads data on a miss? | The application (cache-aside). | Keeps the cache simple. |
-| Eviction policy? | LRU. | Common default; mention LFU as an option. |
-| Replication? | One replica per shard. | Availability on node failure. |
+**Candidate:** What are we caching, and how big is each item?
+
+**Interviewer:** Product cards, about 1 KB each.
+
+**Candidate:** How stale can the data be?
+
+**Interviewer:** A few seconds is fine for display. Checkout always reads the database.
+
+**Candidate:** Who loads data on a miss – the cache or the application?
+
+**Interviewer:** Your choice.
+
+**Candidate:** What happens when memory is full?
+
+**Interviewer:** Evict something sensible.
+
+**Candidate:** Must the cache survive a machine failure?
+
+**Interviewer:** Losing some cached data is fine, but the cache must stay available.
+
+**Functional requirements**
+
+1. `get(key)`, `put(key, value, ttl)`, `delete(key)`.
+2. Entries expire after their TTL.
+3. When memory is full, evict the least recently used entries.
+
+**Non-functional requirements**
+
+1. About 1 ms per operation.
+2. 200,000 reads per second and ~20 GB of hot data, growing.
+3. Losing one machine does not take the cache down; the database stays the source of truth.
+
+## Step 2: Estimate the scale
+
+> **💡 Tip**
+> Round the numbers. The goal is to learn what the numbers mean for the design, not to be precise.
 
 | Quantity | Calculation | Result |
 | --- | --- | --- |
@@ -271,17 +337,9 @@ Out of scope: persistence to disk, transactions across keys, pub/sub.
 | Reads per shard | 200k / 4 | 50k/s – comfortable for one node |
 | Database load at 98% hit rate | 200k × 2% | 4,000 reads/s |
 
-A 45-minute plan:
+What it means: four primary shards with one replica each hold the data comfortably, and the database only sees about 2% of reads – as long as the cache stays up.
 
-| Minutes | What you do |
-| --- | --- |
-| 0–8 | Requirements and estimates |
-| 8–15 | API and single-node design (hash map + LRU) |
-| 15–25 | Distributing keys: consistent hashing |
-| 25–38 | Caching strategies, invalidation, replication |
-| 38–45 | Hot keys, stampedes, follow-ups |
-
-## 2. API and the single-node design
+## Step 3: API and the single-node design
 
 ```java
 interface Cache {
@@ -328,7 +386,7 @@ class LruCache<K, V> {
 
 Expired entries are removed **lazily** when read, plus a background sweep that samples keys (Redis does this) so memory does not fill with dead entries. Real caches bound by bytes, not entry count, but the idea is the same.
 
-## 3. High-level design
+## Step 4: High-level design
 
 [![Selected design: app servers call a cache client that maps each key to a shard using a hash ring built from the node list in a config service; shards keep data in memory with LRU; on a miss or a write the app goes to the database.](designs/hld-3.svg)](designs/hld-3.svg)
 
@@ -343,7 +401,7 @@ Expired entries are removed **lazily** when read, plus a background sweep that s
 
 [![Cache-aside flow: the app reads the cache; on a hit it returns the value; on a miss it reads the database and fills the cache with a TTL; on a write it updates the database and then deletes the cache key.](learning-figures/hld-3-cache-aside.svg)](learning-figures/hld-3-cache-aside.svg)
 
-## 4. Deep dive: which shard owns a key? (the routing algorithm)
+## Step 5: Deep dive: which shard owns a key? (the routing algorithm)
 
 **Naive: `hash(key) % N`.** Works until N changes. Going from 4 to 5 nodes changes the shard for about 80% of keys – nearly the whole cache misses at once and the database is flooded.
 
@@ -379,7 +437,7 @@ class HashRing {
 
 Redis Cluster uses a similar idea with a fixed 16,384 hash slots that are assigned to nodes; moving a slot moves only its keys.
 
-## 5. Deep dive: consistency, replication and hot spots
+## Step 6: Deep dive: consistency, replication and hot spots
 
 **Caching strategies** – know the names and the trade-offs:
 
@@ -389,6 +447,9 @@ Redis Cluster uses a similar idea with a fixed 16,384 hash slots that are assign
 | **Read-through** | Cache itself loads from DB on a miss | Hiding load logic | Cache needs DB access |
 | **Write-through** | Write to cache and DB together | Data read right after writing | Slower writes |
 | **Write-behind** | Write to cache, DB later | Very write-heavy data | Data loss if the cache dies |
+
+> **⚠️ Common mistake**
+> Updating the cache with the new value after a write. Two writers can update the cache in the opposite order to the database and leave the old value cached. Delete instead.
 
 **Why delete instead of update on write?** If two writers update the cache in a different order than the database, the cache can keep the older value forever. Deleting is safer; the TTL is the safety net if a delete is lost.
 
@@ -404,7 +465,7 @@ Redis Cluster uses a similar idea with a fixed 16,384 hash slots that are assign
 
 **Cache down?** Reads go to the database, but limit how many concurrent misses the database receives and shed the rest; a full cache outage would otherwise become a database outage.
 
-## 6. Interviewer follow-ups
+## Interviewer follow-ups
 
 **LRU or LFU?** LRU keeps recently used items – good for most workloads. LFU keeps frequently used items – better when a few items stay popular for a long time, and it resists one-off scans. Redis supports both.
 
@@ -418,7 +479,17 @@ Redis Cluster uses a similar idea with a fixed 16,384 hash slots that are assign
 
 **How is this different from a CDN?** A CDN caches HTTP responses at the network edge near users. This cache sits next to the application and stores data objects.
 
-## 7. Going deeper (optional)
+## Wrap up
+
+We built each node as a hash map with an LRU list, spread keys with consistent hashing, and used cache-aside with delete-on-write.
+
+> **📝 Key takeaways**
+> - One node = hash map + LRU list + TTL (lazy expiry plus a sampled sweep).
+> - Consistent hashing with virtual nodes moves only ~1/N of keys when a node changes.
+> - Cache-aside: read the cache, load on a miss, delete the key after a database write.
+> - Protect the database from stampedes with request coalescing and TTL jitter.
+
+## Going deeper (optional)
 
 The detailed version of this lesson tackles the subtle race behind "delete after write": a slow reader can fetch the old price, the writer deletes the cache, and then the slow reader writes the old price back. It fixes this with versioned fill tickets that invalidation retires, measures a hard staleness budget from *before* the database read, and explains how eviction must not "forget" an invalidation.
 
@@ -426,7 +497,7 @@ The detailed version of this lesson tackles the subtle race behind "delete after
 
 [Open the distributed-cache walkthrough](learning-labs/distributed-cache.html), or read the runnable Java: [BoundedCache.java](reference-code/learning/kb/cache/BoundedCache.java), [CacheChecks.java](reference-code/learning/kb/cache/CacheChecks.java) and [CacheTrace.java](reference-code/learning/kb/cache/CacheTrace.java).
 
-## 8. Closing answer
+## Closing answer
 
 "Each cache node is a hash map with an LRU list and TTLs, expiring entries lazily plus a sampled sweep. A client library maps keys to shards with consistent hashing and virtual nodes, so adding or removing a node moves only about 1/N of keys; a config service tracks membership. The application uses cache-aside: read the cache, load the database on a miss, and on writes update the database then delete the key. Each shard has an asynchronous replica for failover – the database remains the truth, so losing a few cached writes is fine. I protect the database from stampedes with request coalescing and TTL jitter, and handle hot keys with a local cache or replicated keys."
 
@@ -468,15 +539,44 @@ Many internal services trigger notifications. The system must deliver them throu
 
 Out of scope: building the providers themselves, in-app inbox UI, campaign management tools.
 
-## 1. Clarify requirements and estimate the scale
+## Step 1: Clarify the requirements
 
-| Question to ask | Answer we choose | Why it matters |
-| --- | --- | --- |
-| Which channels? | Push, SMS, email. | One queue and worker type per channel. |
-| Exactly-once delivery? | No. At-least-once to providers, with de-duplication to avoid obvious duplicates. | Providers and networks can time out after accepting. |
-| Who decides the message text? | Templates owned by the notification system. | Callers send data, not raw text. |
-| Can users opt out? | Yes, per channel and per category. | Check preferences before sending. |
-| Priorities? | High (OTP, security), normal (order updates), low (marketing). | Separate queues so marketing never delays an OTP. |
+**Candidate:** Which channels do we support?
+
+**Interviewer:** Push on iOS and Android, SMS and email.
+
+**Candidate:** Who sends notifications to us?
+
+**Interviewer:** Other internal services – orders, payments, marketing.
+
+**Candidate:** Must every notification arrive exactly once?
+
+**Interviewer:** None may be lost. A rare duplicate is acceptable.
+
+**Candidate:** Can users opt out?
+
+**Interviewer:** Yes, per channel and per category, and they can set quiet hours.
+
+**Candidate:** Are some notifications more urgent than others?
+
+**Interviewer:** Yes. An OTP must never wait behind a marketing campaign.
+
+**Functional requirements**
+
+1. Send push, SMS and email through one internal API, using templates.
+2. Respect user preferences and quiet hours.
+3. Support priorities and scheduled sends; track delivery status.
+
+**Non-functional requirements**
+
+1. 10M push, 5M email and 1M SMS a day, with big campaign bursts.
+2. No accepted notification is lost; retries must not spam users.
+3. OTPs arrive within seconds.
+
+## Step 2: Estimate the scale
+
+> **💡 Tip**
+> Round the numbers. The goal is to learn what the numbers mean for the design, not to be precise.
 
 | Quantity | Calculation | Result |
 | --- | --- | --- |
@@ -484,17 +584,9 @@ Out of scope: building the providers themselves, in-app inbox UI, campaign manag
 | Campaign burst | 5M emails in 30 min | ≈ 2,800/s for email |
 | Log storage | 16M × 500 B per day | ≈ 8 GB/day; keep 90 days ≈ 720 GB |
 
-A 45-minute plan:
+What it means: the average load is small, but campaigns create bursts. Queues are needed to absorb them, not bigger servers.
 
-| Minutes | What you do |
-| --- | --- |
-| 0–8 | Requirements and estimates |
-| 8–15 | API and data model |
-| 15–25 | High-level design with queues |
-| 25–38 | Reliability: retries, de-duplication, rate limits, priorities |
-| 38–45 | Scaling, monitoring, follow-ups |
-
-## 2. API and data model
+## Step 3: API and data model
 
 Internal services call one endpoint:
 
@@ -525,7 +617,7 @@ POST /v1/notifications
 | `notification` | id, eventId (unique), userId, template, data, createdAt |
 | `delivery` | notificationId, channel, status (QUEUED/SENT/FAILED/DELIVERED), attempts, providerMessageId |
 
-## 3. High-level design
+## Step 4: High-level design
 
 [![Selected design: business services call the notification service, which reads preferences and devices, records the notification and enqueues one message per channel; channel workers consume, deliver through APNs, FCM, SMS and email providers, and record status and retries.](designs/hld-4.svg)](designs/hld-4.svg)
 
@@ -548,7 +640,7 @@ Walk through "order 847 shipped" for user 42:
 
 [![Notification pipeline: an event is accepted once, preferences decide the channels, one message per channel goes to its own queue, workers render templates and call providers, and failures go back with backoff or to a dead-letter queue.](learning-figures/hld-4-pipeline.svg)](learning-figures/hld-4-pipeline.svg)
 
-## 4. Deep dive: reliability without spamming
+## Step 5: Deep dive: reliability without spamming
 
 **Don't lose notifications.** Save the notification and delivery rows **before** acknowledging the caller, and only remove a message from the queue after the worker has recorded the result. If a worker crashes mid-send, the message becomes visible again and another worker picks it up.
 
@@ -562,11 +654,14 @@ Walk through "order 847 shipped" for user 42:
 
 A rare duplicate "your order shipped" is acceptable; a lost OTP is worse. Say this trade-off out loud.
 
+> **⚖️ Design choice**
+> At-least-once delivery with de-duplication. A rare duplicate "order shipped" is acceptable; a lost OTP is not.
+
 **Rate limiting per user.** No user should get 30 marketing pushes a day. Keep a counter per user per category (token bucket in Redis) and drop or delay notifications over the cap. OTP and security messages bypass marketing limits.
 
 **Preferences and quiet hours.** Check them when the notification is accepted *and* again in the worker just before sending – the user may have opted out in between. During quiet hours, low-priority messages are rescheduled instead of sent.
 
-## 5. Scaling and operations
+## Step 6: Scaling and operations
 
 | Concern | Approach |
 | --- | --- |
@@ -580,7 +675,7 @@ A rare duplicate "your order shipped" is acceptable; a lost OTP is worse. Say th
 
 **Provider outage.** If SMS gateway A fails, workers can switch to a backup gateway B (keep two for critical channels like OTP).
 
-## 6. Interviewer follow-ups
+## Interviewer follow-ups
 
 **How do you get device tokens?** The mobile app registers with APNs or FCM on install, receives a token, and sends it to our backend, which stores it in `device`. Tokens change and expire; refresh them on app start and delete tokens the provider rejects.
 
@@ -594,7 +689,17 @@ A rare duplicate "your order shipped" is acceptable; a lost OTP is worse. Say th
 
 **What about users with many devices?** Send a push to each active device token. Remove tokens not seen for months.
 
-## 7. Going deeper (optional)
+## Wrap up
+
+We accepted notifications through one API, queued one message per channel and priority, and delivered through workers that retry safely.
+
+> **📝 Key takeaways**
+> - Return 202 after saving; deliver asynchronously.
+> - One queue per channel and priority: bursts are absorbed and OTPs never wait.
+> - Retry temporary failures with exponential backoff; dead-letter the rest.
+> - Event IDs, provider idempotency keys and per-user rate limits prevent spam.
+
+## Going deeper (optional)
 
 The detailed version of this lesson treats the hardest reliability cases precisely: the **transactional outbox** (the order database writes the event and an outbox row in one transaction, so "order shipped" can never be committed without its notification), worker **leases with epochs** so a slow old worker cannot overwrite a newer attempt, and what to do when a provider timed out **after** accepting a message (query by the same key rather than blindly resending).
 
@@ -604,7 +709,7 @@ The detailed version of this lesson treats the hardest reliability cases precise
 
 [Open the notification walkthrough](learning-labs/notification.html), or read the runnable Java: [DispatchEngine.java](reference-code/learning/kb/notification/DispatchEngine.java), [FakeProvider.java](reference-code/learning/kb/notification/FakeProvider.java), [NotificationChecks.java](reference-code/learning/kb/notification/NotificationChecks.java) and [NotificationTrace.java](reference-code/learning/kb/notification/NotificationTrace.java).
 
-## 8. Closing answer
+## Closing answer
 
 "Services call one notification API with an event ID, a template and data; it returns 202 after saving the notification. The service checks preferences and devices, then puts one message per channel and priority onto its own queue. Stateless workers render templates and call APNs, FCM, SMS and email providers, recording each result. Queues decouple callers, absorb campaign bursts and isolate channels so marketing never delays an OTP. Delivery is at-least-once: messages are acknowledged only after the result is recorded, failures retry with exponential backoff and jitter, permanent errors stop, and dead letters are kept. Event IDs, provider idempotency keys and status checks keep duplicates rare, and per-user rate limits and quiet hours prevent spam."
 
@@ -645,14 +750,47 @@ The core problem: a feed is read far more often than posts are written, and some
 
 Out of scope: comments and likes, ads, the ranking model itself, media storage and CDN details.
 
-## 1. Clarify requirements and estimate the scale
+## Step 1: Clarify the requirements
 
-| Question to ask | Answer we choose | Why it matters |
-| --- | --- | --- |
-| Chronological or ranked? | Chronological first; ranking as a follow-up. | Simpler merge and pagination. |
-| How fresh must the feed be? | A few seconds' delay is fine. | Allows asynchronous fanout. |
-| Average and maximum followers? | Average 200; celebrities up to 50 million. | Decides push vs pull. |
-| How far back can users scroll? | The latest ~500 posts are cached; older posts come from storage. | Bounds cache memory. |
+**Candidate:** Is the feed chronological or ranked?
+
+**Interviewer:** Start with newest first. Ranking is a follow-up.
+
+**Candidate:** How quickly must a new post appear in followers' feeds?
+
+**Interviewer:** A few seconds is fine.
+
+**Candidate:** How many followers does a typical user have?
+
+**Interviewer:** About 200 – but some celebrities have 50 million.
+
+**Candidate:** How far back can people scroll?
+
+**Interviewer:** Infinite scroll, but most people read only the latest few hundred posts.
+
+**Candidate:** Do we need likes, comments and ads?
+
+**Interviewer:** No, just posts, follows and the feed.
+
+> **🎯 In the interview**
+> The celebrity question is the heart of this problem. Ask it in your first five minutes.
+
+**Functional requirements**
+
+1. Publish a post.
+2. Follow and unfollow users.
+3. View a home feed, newest first, with infinite scroll.
+
+**Non-functional requirements**
+
+1. Feed loads in under 200 ms.
+2. 100 million daily users, about 10 feed loads each.
+3. Eventual consistency is fine: a post may take a few seconds to appear.
+
+## Step 2: Estimate the scale
+
+> **💡 Tip**
+> Round the numbers. The goal is to learn what the numbers mean for the design, not to be precise.
 
 | Quantity | Calculation | Result |
 | --- | --- | --- |
@@ -661,17 +799,9 @@ Out of scope: comments and likes, ads, the ranking model itself, media storage a
 | Fanout writes (push model) | 10M posts × 200 followers | 2 billion feed inserts/day ≈ 23k/s |
 | Feed cache | 100M users × 500 IDs × 8 bytes | ≈ 400 GB → a Redis cluster |
 
-A 45-minute plan:
+What it means: reads are 100 times more frequent than posts, so building feeds ahead of time (fanout) pays off – except for authors with millions of followers.
 
-| Minutes | What you do |
-| --- | --- |
-| 0–8 | Requirements and estimates |
-| 8–15 | APIs and data model |
-| 15–25 | High-level design: publish path and read path |
-| 25–38 | Deep dive: fanout on write vs read, celebrities |
-| 38–45 | Pagination, ranking, follow-ups |
-
-## 2. APIs and data model
+## Step 3: APIs and data model
 
 ```http
 POST /v1/posts              { "text": "Shipped my first Spring AI app!" }   -> 201 { "postId": "p6" }
@@ -690,7 +820,7 @@ GET  /v1/feed?limit=20&cursor=<opaque>                                     -> 20
 
 The feed cache stores **only post IDs**, not full posts. A post shared to 200 feeds is stored once; editing or deleting it does not require updating 200 copies.
 
-## 3. High-level design
+## Step 4: High-level design
 
 [![Selected design: the post service saves posts and emits a new-post event; fanout workers read followers from the follow graph and push the post ID into each follower's feed cache; the feed service reads IDs from the feed cache and hydrates them from the post store, adding celebrity posts on read.](designs/hld-5.svg)](designs/hld-5.svg)
 
@@ -708,7 +838,7 @@ The feed cache stores **only post IDs**, not full posts. A post shared to 200 fe
 
 [![Feed read path: the feed service reads post IDs from the user's precomputed feed list, merges recent posts from followed celebrities, fetches post bodies and author details in one batch, filters deleted or hidden posts, and returns a page with a cursor.](learning-figures/hld-5-read.svg)](learning-figures/hld-5-read.svg)
 
-## 4. Deep dive: the fanout algorithm – on write vs on read
+## Step 5: Deep dive: the fanout algorithm – on write vs on read
 
 | | **Fanout on write (push)** | **Fanout on read (pull)** |
 | --- | --- | --- |
@@ -743,11 +873,14 @@ public List<Post> getFeed(long userId, int limit, Cursor cursor) {
 }
 ```
 
+> **⚖️ Design choice**
+> Store only post IDs in feeds. A post shared to 200 feeds is stored once, and editing or deleting it changes one row.
+
 **Inactive users.** Skip fanout to users who have not logged in for 30 days; when they return, build their feed by pulling (a one-time cost).
 
 **Fanout workers** are stateless and read from a partitioned queue. A celebrity threshold keeps any single post's fanout bounded, so one post cannot clog the workers for everyone else.
 
-## 5. Pagination, ranking and failures
+## Step 6: Pagination, ranking and failures
 
 **Cursor pagination, not offsets.** `?page=2` breaks when new posts arrive – the user sees duplicates as everything shifts down. Use a cursor: "give me 20 posts with ID smaller than `p17`". Because IDs are time-sorted, new posts at the top do not disturb the next page.
 
@@ -763,7 +896,7 @@ public List<Post> getFeed(long userId, int limit, Cursor cursor) {
 - *Redis feed shard down*: rebuild that user's feed by pulling from followees (slower, but correct).
 - *Hot celebrity post*: millions of hydrations of the same post hit one cache key; replicate hot posts in a local in-process cache.
 
-## 6. Interviewer follow-ups
+## Interviewer follow-ups
 
 **Why not just query "posts from everyone I follow ORDER BY time" on every load?** At 50k feed loads per second, each joining hundreds of followees, the database cannot keep up. Precomputing feeds trades write work for fast reads.
 
@@ -777,7 +910,17 @@ public List<Post> getFeed(long userId, int limit, Cursor cursor) {
 
 **How would you add likes and comment counts?** Store counters separately and fetch them during hydration; they change too often to copy into feed entries.
 
-## 7. Going deeper (optional)
+## Wrap up
+
+We stored posts once, pushed post IDs into followers' feeds for normal authors, and pulled celebrity posts at read time.
+
+> **📝 Key takeaways**
+> - Fanout on write makes reads fast; fanout on read keeps writes cheap.
+> - Hybrid: push for normal authors, pull for celebrities.
+> - Feeds hold post IDs; hydrate and filter deleted posts at read time.
+> - Paginate with an ID cursor, not page numbers.
+
+## Going deeper (optional)
 
 The detailed version of this lesson handles feed **sessions**: freeze the sequence of candidate IDs when the user starts scrolling so pages never repeat or skip, while still checking current visibility for each post. It also shows why a page can legitimately be empty yet still return a next cursor (every candidate on it became hidden).
 
@@ -787,7 +930,7 @@ The detailed version of this lesson handles feed **sessions**: freeze the sequen
 
 [Open the news-feed walkthrough](learning-labs/news-feed.html), or read the runnable Java: [FeedEngine.java](reference-code/learning/kb/feed/FeedEngine.java), [FeedChecks.java](reference-code/learning/kb/feed/FeedChecks.java) and [FeedTrace.java](reference-code/learning/kb/feed/FeedTrace.java).
 
-## 8. Closing answer
+## Closing answer
 
 "Posts are stored once with time-sortable IDs. When a normal user posts, fanout workers push the post ID into each follower's feed list in Redis, trimmed to the latest 500. Celebrities are not fanned out; their recent posts are pulled and merged at read time – a hybrid that keeps both writes and reads bounded. The feed service reads IDs, merges celebrity posts, hydrates bodies and authors in one batch, filters deleted or hidden posts, and paginates with an ID cursor so new posts never shift pages. Feeds are caches: a lost feed is rebuilt by pulling, and fanout delay only makes posts appear a few seconds later."
 

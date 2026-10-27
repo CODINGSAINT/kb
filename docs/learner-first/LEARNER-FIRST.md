@@ -1,5 +1,7 @@
 # Learner-first article contract
 
+> Superseded on 27 Oct 2026 by [../course-style/STYLE-GUIDE.md](../course-style/STYLE-GUIDE.md). Kept for history.
+
 Adopted 27 October 2026 for the 19 completed references (LLD 4, 5, 6, 7, 9, 10, 16; HLD 1–5; AI 1, 2, 3, 4, 6, 7, 8).
 Use it for every new or revised reference. It supersedes the "complete production answer" emphasis in earlier reviews.
 

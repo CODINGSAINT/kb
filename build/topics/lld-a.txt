@@ -212,20 +212,22 @@ Check the rule with real numbers:
 
 ```java
 class ParkingLot {
-    private final List<ParkingSpot> spots;                      // sorted: smallest size, then lowest floor
+    // Sorted by size, then floor, so the first spot that fits is the best one.
+    private final List<ParkingSpot> spots;
     private final Map<String, Ticket> activeTickets = new HashMap<>();
     private final FeeStrategy feeStrategy;
     private int nextTicket = 1;
 
     ParkingLot(List<ParkingSpot> spots, FeeStrategy feeStrategy) {
         this.spots = new ArrayList<>(spots);
-        this.spots.sort(Comparator.comparing(ParkingSpot::getSize).thenComparing(ParkingSpot::getFloor));
+        this.spots.sort(Comparator.comparing(ParkingSpot::getSize)
+                                  .thenComparing(ParkingSpot::getFloor));
         this.feeStrategy = feeStrategy;
     }
 
     /** Called by an entry gate. Returns a ticket, or throws if no suitable spot is free. */
     synchronized Ticket parkVehicle(Vehicle vehicle, Instant now) {
-        for (ParkingSpot spot : spots) {                // smallest suitable spot first
+        for (ParkingSpot spot : spots) {
             if (spot.canFit(vehicle)) {
                 spot.park(vehicle);
                 Ticket ticket = new Ticket("T-" + nextTicket++, vehicle, spot, now);
@@ -233,13 +235,15 @@ class ParkingLot {
                 return ticket;
             }
         }
-        throw new IllegalStateException("Parking full for " + vehicle.getSize() + " vehicles");
+        throw new IllegalStateException("No free spot for a " + vehicle.getSize() + " vehicle");
     }
 
     /** Called by an exit gate. Frees the spot and returns the fee to pay. */
     synchronized long unparkVehicle(String ticketId, Instant now) {
         Ticket ticket = activeTickets.remove(ticketId);
-        if (ticket == null) throw new IllegalArgumentException("Unknown or already used ticket");
+        if (ticket == null) {
+            throw new IllegalArgumentException("Unknown or already used ticket");
+        }
         ticket.getSpot().free();
         return feeStrategy.calculateFee(ticket.getEntryTime(), now);
     }
@@ -713,29 +717,39 @@ The interesting part is not the catalogue. It is this: two people select the sam
 
 Out of scope: food add-ons, offers and coupons, reviews, admin screens for adding cinemas.
 
-## 1. Clarify the scope
+## Step 1: Clarify the requirements
 
-Spend the first few minutes agreeing on the rules. These are the answers we will design for:
+**Candidate:** Is a seat the same thing in every show?
 
-| Question to ask | Answer we choose | Why it matters |
-| --- | --- | --- |
-| Is a seat the same thing in every show? | No. Seat A7 in the 7 pm show and A7 in the 10 pm show are different things to sell. | We need a `ShowSeat` per show, not just a `Seat`. |
-| Can a booking partly succeed? | No. You get all the selected seats or none. | Seat checks must be all-or-nothing. |
-| How long is a seat held during payment? | 5 minutes. | We need an expiry time on a hold. |
-| Does every seat cost the same? | No, price depends on seat type and show. | Pricing is a rule that may change; keep it replaceable. |
-| One server or many? | Design for one service first, then explain the database version. | Interviewers usually start in memory, then ask "what about many servers?" |
+**Interviewer:** No. Seat A7 at 7 pm and seat A7 at 10 pm are sold separately.
 
-A good 45-minute plan for this problem:
+**Candidate:** Can a booking get only some of the seats the user picked?
 
-| Minutes | What you do |
+**Interviewer:** No. All the seats or none.
+
+**Candidate:** How long do we keep seats for a user while they pay?
+
+**Interviewer:** Five minutes. After that the seats go back on sale.
+
+**Candidate:** Does every seat cost the same?
+
+**Interviewer:** No. Price depends on the seat type and the show.
+
+**Candidate:** Should I design for one server first?
+
+**Interviewer:** Yes. Then tell me what changes with many servers.
+
+> **🎯 In the interview**
+> The first answer – "a seat is different in every show" – decides your most important class. Ask it early.
+
+| Functional | Non-functional |
 | --- | --- |
-| 0–5 | Requirements and the questions above |
-| 5–15 | Core classes and their relationships |
-| 15–30 | Code for `holdSeats` and `confirmBooking` |
-| 30–40 | Concurrency: how two users cannot get the same seat |
-| 40–45 | Patterns, extensions and follow-ups |
+| Browse movies, shows and the seat map | The same seat is never sold twice |
+| Hold up to 8 seats for 5 minutes | A booking gets all its seats or none |
+| Confirm after payment, release on failure or timeout | Pricing and payment providers are easy to change |
+| Cancel before the show | |
 
-## 2. Core classes
+## Step 2: Core classes
 
 Start from the nouns in the problem and keep only the ones that hold state or enforce a rule.
 
@@ -763,6 +777,9 @@ The most important modelling decision is **`ShowSeat`**. A `Seat` is furniture: 
 
 [![Class diagram: Cinema has Screens, Screen has Seats, Show links a Movie and a Screen and owns ShowSeats; Booking holds ShowSeats for a User; BookingService coordinates holds, payment and confirmation.](learning-figures/lld-4-classes.svg)](learning-figures/lld-4-classes.svg)
 
+> **⚖️ Design choice**
+> Status lives on `ShowSeat`, not on `Seat`. A7 can be booked for the 7 pm show and free for the 10 pm show at the same time.
+
 Two services do the work:
 
 - `CatalogService` answers browse questions: movies in a city, shows for a movie, the seat map for a show. It only reads.
@@ -772,13 +789,13 @@ Keeping writes in one place matters. If the seat-map screen could change a seat'
 
 [![Selected design: User calls BookingService, which locks one Show, holds its ShowSeats in a Booking and charges through PaymentService.](designs/lld-4.svg)](designs/lld-4.svg)
 
-## 3. The booking flow
+## Step 3: The booking flow
 
 Follow one user, Asha, booking two gold seats, A7 and A8, for the 7 pm show. Each costs ₹250.
 
 1. Asha opens the seat map. `CatalogService` returns every show seat with its status. A7 and A8 show as AVAILABLE.
-2. She taps Continue. `BookingService.holdSeats` checks both seats and marks both HELD for her booking for the next 5 minutes. It creates booking B1 with amount ₹500 and status PENDING.
-3. She pays. `confirmBooking` charges ₹500. On success it marks A7 and A8 BOOKED and B1 CONFIRMED.
+2. She taps Continue. `BookingService.holdSeats` checks both seats and marks both HELD for her booking for the next 5 minutes. It creates a PENDING booking for ₹500.
+3. She pays. `confirmBooking` charges ₹500. On success it marks A7 and A8 BOOKED and the booking CONFIRMED.
 4. If she closes the app instead, the hold expires after 5 minutes and both seats become AVAILABLE again.
 
 [![Flow: the user selects seats, holdSeats checks every seat then holds all of them, payment runs, and confirmation books the seats; if a seat is taken the hold fails, and if payment fails or the hold expires the seats are released.](learning-figures/lld-4-flow.svg)](learning-figures/lld-4-flow.svg)
@@ -858,16 +875,14 @@ public class BookingService {
 
 Read it in two halves. The loop only **checks**. If A8 is taken, we throw before touching A7, so nothing is half-held. Only when every seat passed do we **change** them all.
 
-## 4. The hard part: two users, same seats
+## Step 4: The hard part: two users, same seats
 
 Asha and Bilal both tap Continue on A7 and A8 at the same instant. Without protection, this can happen:
 
-| Time | Asha's request | Bilal's request |
-| --- | --- | --- |
-| t1 | Checks A7: available | |
-| t2 | | Checks A7: available |
-| t3 | Holds A7 | |
-| t4 | | Holds A7 – **double booking** |
+1. Asha's request checks A7: available.
+2. Bilal's request checks A7: still available.
+3. Asha's request holds A7.
+4. Bilal's request also holds A7 – **double booking**.
 
 This is a classic **check-then-act race**: the check and the change are separate steps, and another thread slips in between.
 
@@ -913,6 +928,9 @@ public Booking confirmBooking(String bookingId, PaymentDetails details) {
 
 Step 3 checks again because the world may have changed during payment. If the hold expired and another user took A7, Asha's late payment must not steal it back. We refund her instead. This one rule – **only confirm seats your booking still holds** – is what interviewers are looking for.
 
+> **⚠️ Common mistake**
+> Calling the payment provider while holding the show lock. Every other customer of that show would wait for the bank.
+
 ### What about many servers?
 
 `synchronized` only works inside one JVM. With several servers, the database must be the referee. Two common answers:
@@ -933,7 +951,7 @@ Run it inside a transaction and check the number of updated rows. If it is less 
 
 A distributed lock in Redis per seat is a common suggestion, but it is harder to get right for a multi-seat cart. The database answer is simpler to explain and to trust.
 
-## 5. Design patterns and extensibility
+## Step 5: Design patterns and extensibility
 
 Use patterns where they solve a real change, not to decorate the diagram.
 
@@ -962,7 +980,7 @@ class SeatTypePricing implements PricingStrategy {
 - *Waitlist for sold-out shows*: when seats are released, notify users waiting for that show (Observer).
 - *Different hold time for different cities*: make `HOLD_TIME` part of configuration or the `Show`.
 
-## 6. Interviewer follow-ups
+## Interviewer follow-ups
 
 **Why hold seats before payment instead of booking after payment?** Without a hold, two users can both pay for A7 and one must be refunded and disappointed. A short hold gives a clear promise: "these seats are yours for 5 minutes".
 
@@ -978,7 +996,17 @@ class SeatTypePricing implements PricingStrategy {
 
 **Isn't `synchronized` slow?** The critical section only touches at most 8 seats in memory, so it lasts microseconds. The slow part, payment, is deliberately outside it.
 
-## 7. Going deeper (optional)
+## Wrap up
+
+We modelled the catalogue (Movie, Cinema, Screen, Seat, Show), the sellable inventory (`ShowSeat`) and one writer (`BookingService`).
+
+> **📝 Key takeaways**
+> - A `ShowSeat` exists per seat per show – that is what you sell.
+> - Check all seats first, then hold all of them: all or nothing.
+> - A per-show lock stops two users holding the same seat; with many servers, use a conditional update or row locks.
+> - Pay outside the lock, then confirm only if the booking still holds its seats.
+
+## Going deeper (optional)
 
 You can pass most LLD rounds with sections 1–6. Senior interviews may push on the payment edge cases. The complete reference implementation explores them:
 
@@ -991,7 +1019,7 @@ You can pass most LLD rounds with sections 1–6. Senior interviews may push on 
 
 [Step through both arrival orders and a late payment](learning-labs/index.html?topic=booking), or read the runnable Java: [BookingService.java](reference-code/learning/kb/booking/BookingService.java), [BookingChecks.java](reference-code/learning/kb/booking/BookingChecks.java) and [BookingTrace.java](reference-code/learning/kb/booking/BookingTrace.java). The checks race forty callers for the same seats and verify that exactly one cart wins.
 
-## 8. Closing answer
+## Closing answer
 
 "I model the catalogue as Movie, Cinema, Screen, Seat and Show, and the sellable inventory as `ShowSeat` – one per seat per show. `BookingService` is the only writer. `holdSeats` checks every requested seat and then holds all of them under a per-show lock, so a booking gets all its seats or none and two users can never hold the same seat. Holds expire after 5 minutes. Payment runs outside the lock; confirmation checks again that the booking still holds its seats, otherwise it refunds. With many servers, the same all-or-nothing rule moves into a database transaction using a conditional update or row locks. Pricing and payment providers are strategies, and notifications are observers."
 
@@ -1025,27 +1053,35 @@ The ATM is a favourite LLD question because the machine behaves differently depe
 
 Out of scope: deposits, transfers, PIN change, receipts, multiple currencies.
 
-## 1. Clarify the scope
+## Step 1: Clarify the requirements
 
-| Question to ask | Answer we choose | Why it matters |
-| --- | --- | --- |
-| Who knows the balance and checks the PIN? | The bank. The ATM never stores balances or PINs. | The ATM talks to a `BankService` interface. |
-| Which operations? | Balance inquiry and withdrawal. | Keeps the state machine small; deposits are a follow-up. |
-| How many customers at once? | One card session per machine. | No need for complex locking inside the ATM. |
-| What if the machine cannot make the exact amount? | Reject before contacting the bank. | Check note availability first. |
-| What if cash fails to come out after the debit? | Reverse the debit. | We need an explicit failure path. |
+**Candidate:** Who checks the PIN and keeps the balance – the ATM or the bank?
 
-A 45-minute plan:
+**Interviewer:** The bank. The ATM never stores either.
 
-| Minutes | What you do |
+**Candidate:** Which operations do we need?
+
+**Interviewer:** Balance and cash withdrawal.
+
+**Candidate:** What happens after wrong PINs?
+
+**Interviewer:** Three wrong PINs end the session.
+
+**Candidate:** Which notes does the machine hold?
+
+**Interviewer:** ₹500, ₹200 and ₹100. Withdrawals are multiples of ₹100, up to ₹20,000.
+
+**Candidate:** What if the cash fails to come out after the account is debited?
+
+**Interviewer:** The customer must not lose money.
+
+| Functional | Non-functional |
 | --- | --- |
-| 0–5 | Requirements and the questions above |
-| 5–15 | States of the machine, then classes |
-| 15–30 | State pattern code and the withdrawal flow |
-| 30–40 | Cash dispensing algorithm and failure handling |
-| 40–45 | Follow-ups |
+| Insert card, enter PIN, check balance, withdraw, eject | Never debit without dispensing, never dispense without debiting |
+| End the session after three wrong PINs | Impossible to withdraw before a correct PIN |
+| Dispense with ₹500/₹200/₹100 notes | Easy to add operations such as deposits |
 
-## 2. Start with the states
+## Step 2: Start with the states
 
 Before drawing classes, draw what the machine can be doing. This is the heart of the answer:
 
@@ -1059,9 +1095,12 @@ Before drawing classes, draw what the machine can be doing. This is the heart of
 | `HasCardState` | enter PIN, cancel | "Please enter your PIN first" |
 | `AuthenticatedState` | balance, withdraw, eject card | inserting another card is rejected |
 
+> **💡 Tip**
+> For any "machine" question – ATM, vending machine, elevator – draw the states before the classes. The states are the design.
+
 The naive version puts a big `switch (status)` in every method. Each new state then means editing every method. The **State pattern** gives each state its own class, and the ATM simply delegates to whichever state it is in.
 
-## 3. Core classes
+## Step 3: Core classes
 
 | Class | Responsibility |
 | --- | --- |
@@ -1077,7 +1116,7 @@ The naive version puts a big `switch (status)` in every method. Each new state t
 
 [![Selected design: the ATM context delegates to its current ATMState, reads card and PIN, asks the BankService to authenticate and debit, asks the CashDispenser to plan and dispense, and records each Transaction.](designs/lld-5.svg)](designs/lld-5.svg)
 
-## 4. The State pattern in code
+## Step 4: The State pattern in code
 
 ```java
 interface ATMState {
@@ -1153,7 +1192,7 @@ class HasCardState implements ATMState {
 
 Notice what happened: `withdraw` in `HasCardState` cannot reach the bank at all. The illegal action is impossible by construction, not prevented by an `if` that someone might forget.
 
-## 5. The withdrawal flow
+## Step 5: The withdrawal flow
 
 Inside `AuthenticatedState`, withdrawing ₹2,700 follows a careful order:
 
@@ -1194,6 +1233,9 @@ class AuthenticatedState implements ATMState {
 }
 ```
 
+> **⚠️ Common mistake**
+> Debiting first and checking notes later. If the machine cannot make the amount, you now need a reversal for a failure you could have predicted.
+
 The transaction ID passed to `debit` is reused by `reverse`, so the bank knows exactly which debit to undo.
 
 ### Planning the notes
@@ -1227,7 +1269,7 @@ For ₹2,700: 5 × ₹500 = ₹2,500, then 1 × ₹200 = ₹2,700. Done with 6 n
 
 Greedy is the expected first answer and works while the ₹100 cassette has notes. Be ready to say where it breaks (see follow-ups): it never "goes back" to try fewer large notes.
 
-## 6. Design patterns and extensibility
+## Step 6: Design patterns and extensibility
 
 | Pattern | Where | Why it helps |
 | --- | --- | --- |
@@ -1238,7 +1280,7 @@ Greedy is the expected first answer and works while the ₹100 cassette has note
 
 **Adding a new feature**, for example deposits: add `deposit(ATM, amount)` to `ATMState`, implement it in `AuthenticatedState`, and reject it in the others. Adding `OutOfServiceState` (cash empty or maintenance) only needs one new class and a transition into it.
 
-## 7. Interviewer follow-ups
+## Interviewer follow-ups
 
 **Why not store the PIN on the card or in the ATM?** Anyone who reads the card or the ATM's memory would learn it. The ATM sends the PIN (encrypted by the keypad hardware) to the bank, which checks it. The ATM only learns yes or no.
 
@@ -1254,7 +1296,17 @@ Greedy is the expected first answer and works while the ₹100 cassette has note
 
 **What if the network to the bank fails during a withdrawal?** Do not dispense. If the ATM does not know whether the debit happened, it records the transaction as uncertain and the bank's reconciliation decides; see the next section.
 
-## 8. Going deeper (optional)
+## Wrap up
+
+We designed the ATM around its states, kept PINs and balances at the bank, and ordered the withdrawal so money is never lost.
+
+> **📝 Key takeaways**
+> - Draw the states first; implement them with the State pattern.
+> - The bank owns PINs and balances behind a `BankService` interface.
+> - Withdraw in this order: validate, plan notes, debit, dispense, reverse on failure.
+> - Greedy note planning is the first answer; know the case where it fails.
+
+## Going deeper (optional)
 
 Real ATMs face a harder problem: a reply that never arrives. If the dispenser times out, did the customer get zero notes, two notes or all of them? The full reference design handles this carefully:
 
@@ -1266,7 +1318,7 @@ Real ATMs face a harder problem: a reply that never arrives. If the dispenser ti
 
 [Open the ATM walkthrough](learning-labs/atm.html) to follow these states, or read the runnable Java: [Atm.java](reference-code/learning/kb/atm/Atm.java), [DemoPorts.java](reference-code/learning/kb/atm/DemoPorts.java), [AtmDemo.java](reference-code/learning/kb/atm/AtmDemo.java) and [AtmChecks.java](reference-code/learning/kb/atm/AtmChecks.java). The reference uses $20 and $50 notes on purpose, because that is where a greedy plan fails.
 
-## 9. Closing answer
+## Closing answer
 
 "I model the ATM with the State pattern: Idle, HasCard and Authenticated, each in its own class, and the `ATM` delegates every action to the current state. That makes illegal actions, like withdrawing before entering a PIN, impossible by design. The bank owns PINs and balances behind a `BankService` interface. A withdrawal validates the amount, plans the notes first, asks the bank to debit atomically, dispenses, and reverses the debit with the same transaction ID if dispensing fails. Greedy note planning works for ₹500/₹200/₹100; for other denominations I would use an exact search. New operations or an out-of-service state are added as new state methods or classes."
 
@@ -1301,32 +1353,40 @@ The key question hides in the dates: two customers must never be promised the sa
 
 Out of scope: one-way rentals between branches, insurance and add-ons, driver licence verification, payment gateway details.
 
-## 1. Clarify the scope
+## Step 1: Clarify the requirements
 
-| Question to ask | Answer we choose | Why it matters |
-| --- | --- | --- |
-| Do we reserve a car type or a specific car? | A specific car, chosen by the system. | Availability becomes a per-car calendar check. |
-| Same branch for pickup and return? | Yes. | One-way rentals need cars to move between branches; skip it. |
-| What happens between two rentals? | A one-hour cleaning buffer. | The buffer must be part of the overlap check. |
-| How are late returns handled? | Charge per started late hour. | Pricing needs the actual return time, not just the booked one. |
-| How many staff or apps reserve at once? | Several at the same time. | Reserving needs protection against two people taking the same slot. |
+**Candidate:** Does the customer reserve a car type or a specific car?
 
-A 45-minute plan:
+**Interviewer:** They search by type. The system can assign a specific car.
 
-| Minutes | What you do |
+**Candidate:** Do customers return to the same branch?
+
+**Interviewer:** Yes, same branch for now.
+
+**Candidate:** Is there a gap between two rentals of the same car?
+
+**Interviewer:** One hour for cleaning.
+
+**Candidate:** How do we charge?
+
+**Interviewer:** ₹1,800 for each started day, plus ₹200 for each started hour late.
+
+**Candidate:** Can two staff members book cars at the same time?
+
+**Interviewer:** Yes, several bookings can happen together.
+
+| Functional | Non-functional |
 | --- | --- |
-| 0–5 | Requirements and the questions above |
-| 5–15 | Classes and statuses |
-| 15–25 | Availability check (interval overlap) |
-| 25–35 | Reserve, pickup, return and pricing code |
-| 35–45 | Concurrency, patterns and follow-ups |
+| Search by branch, type and dates | The same car is never promised twice for overlapping times |
+| Reserve, pick up, return, cancel | Pricing rules are easy to change |
+| Charge per started day plus late hours | Fast search even for big fleets |
 
-## 2. Core classes
+## Step 2: Core classes
 
 | Class | What it represents | Key fields |
 | --- | --- | --- |
 | `Branch` | A rental location | id, name, city, vehicles |
-| `Vehicle` | One physical car | id ("CAR17"), registration, `VehicleType`, `VehicleStatus` |
+| `Vehicle` | One physical car | id, registration ("KA-01-MJ-4521"), `VehicleType`, `VehicleStatus` |
 | `Customer` | The person renting | id, name, licenceNumber |
 | `Reservation` | A booking of one vehicle for one time range | id, customer, vehicle, start, end, `ReservationStatus`, pickedUpAt, returnedAt |
 | `Invoice` | What the customer owes | reservationId, baseAmount, lateFee, total |
@@ -1343,18 +1403,19 @@ enum ReservationStatus { CONFIRMED, PICKED_UP, RETURNED, CANCELLED }
 
 **Do we need `Car`, `Suv` and `Hatchback` subclasses?** Only if they behave differently. Here they differ only by data (type and rate), so an enum is enough. If SUVs later needed a special deposit rule, that rule would go into a pricing or deposit strategy rather than a subclass.
 
-**Why keep `VehicleStatus` and reservations separate?** The status says what the car is doing *now* (on the road, in maintenance). Reservations say what is promised for the *future*. A car can be AVAILABLE today and fully booked next weekend.
+> **⚖️ Design choice**
+> Keep `VehicleStatus` and reservations separate. The status says what the car is doing *now*; reservations say what is promised for the *future*. A car can be AVAILABLE today and fully booked next weekend.
 
 [![Selected design: RentalService searches a Branch's vehicles, creates Reservations that book a vehicle's time slot, uses a PricingStrategy and produces an Invoice on return.](designs/lld-6.svg)](designs/lld-6.svg)
 
-## 3. The availability algorithm: an interval check
+## Step 3: The availability algorithm: an interval check
 
-Example: customer A books CAR17 from 09:00 to 11:00. With one hour of cleaning, the car is **blocked from 09:00 to 12:00**.
+Example: Asha books the car KA-01-MJ-4521 from 09:00 to 11:00. With one hour of cleaning, the car is **blocked from 09:00 to 12:00**.
 
-- Customer B asks for 11:00–14:00: it overlaps the blocked time, so CAR17 is not available.
-- Customer B asks for 12:00–15:00: it starts exactly when the block ends, so CAR17 is available.
+- Bilal asks for 11:00–14:00: it overlaps the blocked time, so the car is not available.
+- Bilal asks for 12:00–15:00: it starts exactly when the block ends, so the car is available.
 
-[![Timeline: A's rental from 09:00 to 11:00 plus cleaning until 12:00 blocks the car; a request starting at 11:00 overlaps and is rejected, a request starting at 12:00 is allowed.](learning-figures/lld-6-intervals.svg)](learning-figures/lld-6-intervals.svg)
+[![Timeline: Asha's rental from 09:00 to 11:00 plus cleaning until 12:00 blocks the car; a request starting at 11:00 overlaps and is rejected, a request starting at 12:00 is allowed.](learning-figures/lld-6-intervals.svg)](learning-figures/lld-6-intervals.svg)
 
 Two time ranges `[start, end)` overlap when **each starts before the other ends**:
 
@@ -1378,13 +1439,16 @@ class Reservation {
 }
 ```
 
+> **⚖️ Design choice**
+> Use half-open ranges `[start, end)`. A booking that ends at 12:00 and one that starts at 12:00 do not overlap.
+
 Three details interviewers check:
 
 - **Strict `isBefore`, not `<=`.** A 12:00 start touching a 12:00 end is allowed.
 - **Both conditions.** Checking only "does the new start fall inside the old booking?" misses a new booking that completely surrounds an old one.
 - **The buffer on both sides.** The new booking also needs its own cleaning time before the next existing booking.
 
-## 4. Reserve, pick up and return
+## Step 4: Reserve, pick up and return
 
 ```java
 public class RentalService {
@@ -1472,9 +1536,9 @@ class DailyRatePricing implements PricingStrategy {
 }
 ```
 
-Worked example: A booked 09:00–11:00 (one started day, ₹1,800) and returned at 12:10 (70 minutes late, two started hours, ₹400). Total ₹2,200. Money is kept in paise as a `long` so rounding never loses a rupee.
+Worked example: Asha booked 09:00–11:00 (one started day, ₹1,800) and returned at 12:10 (70 minutes late, two started hours, ₹400). Total ₹2,200. Money is kept in paise as a `long` so rounding never loses a rupee.
 
-## 5. Design patterns and extensibility
+## Step 5: Design patterns and extensibility
 
 | Pattern | Where | Why it helps |
 | --- | --- | --- |
@@ -1488,9 +1552,9 @@ Extensions to mention:
 - *Different cleaning times*: move `CLEANING` onto `VehicleType` (SUVs may need longer).
 - *Faster search for big fleets*: keep each car's reservations sorted by start time, or use an interval tree, instead of scanning all.
 
-## 6. Interviewer follow-ups
+## Interviewer follow-ups
 
-**A is late and B's pickup time arrives. What now?** B's reservation still exists, but CAR17 is RENTED, so pickup fails with "vehicle not ready". The system should offer B another available car of the same type (a new reserve call for that car). If none exists, cancel B's booking free of charge – the delay is not B's fault. A is charged the late fee.
+**Asha is late and Bilal's pickup time arrives. What now?** Bilal's reservation still exists, but the car is RENTED, so pickup fails with "vehicle not ready". Offer Bilal another available car of the same type. If none exists, cancel his booking free of charge – the delay is not his fault. Asha pays the late fee.
 
 **How do you prevent two staff members reserving the same car for the same time?** Check and insert in one critical section per vehicle. With a database, lock that vehicle's row (`SELECT ... FOR UPDATE`) while checking overlaps and inserting, or use a database exclusion constraint on the time range (PostgreSQL supports this). Both make the database the single referee.
 
@@ -1502,7 +1566,17 @@ Extensions to mention:
 
 **Where do time zones fit?** Store times as `Instant` (UTC). Convert to the branch's time zone only when displaying.
 
-## 7. Going deeper (optional)
+## Wrap up
+
+We modelled branches, vehicles, reservations and invoices, and made availability a simple interval-overlap check.
+
+> **📝 Key takeaways**
+> - Vehicle status is *now*; reservations are the *future*.
+> - Two ranges overlap when each starts before the other ends – include the cleaning buffer.
+> - Check and insert under one lock per vehicle (or a row lock in the database).
+> - Pricing is a Strategy: per started day plus per started late hour.
+
+## Going deeper (optional)
 
 The full reference design adds production details you can bring up in senior rounds:
 
@@ -1511,11 +1585,11 @@ The full reference design adds production details you can bring up in senior rou
 - **Old events**: a delayed "return" message for an old rental must not free a car that is now on a newer rental. Each event names the reservation it belongs to.
 - **Operator vs customer fault**: if the car is not ready because of a late return, the next customer is never charged a no-show fee.
 
-[![A's late return leaves CAR17 with R1 when B arrives; the return at 12:10 moves readiness to 13:10, B's reservation stays visible and is not charged a no-show fee.](learning-figures/lld-6-readiness.svg)](learning-figures/lld-6-readiness.svg)
+[![Asha's late return means the car is still out when Bilal arrives at noon; it comes back at 12:10, is ready at 13:10, and Bilal's booking stays visible and is not charged a no-show fee.](learning-figures/lld-6-readiness.svg)](learning-figures/lld-6-readiness.svg)
 
 [Open the rental timeline walkthrough](learning-labs/rental.html), or read the runnable Java: [Rental.java](reference-code/learning/kb/rental/Rental.java), [RentalDemo.java](reference-code/learning/kb/rental/RentalDemo.java) and [RentalChecks.java](reference-code/learning/kb/rental/RentalChecks.java).
 
-## 8. Closing answer
+## Closing answer
 
 "I model Branch, Vehicle, Customer, Reservation and Invoice, with a `RentalService` coordinating search, reserve, pickup, return and cancel. Vehicle status describes the car now; reservations describe the future. Availability is an interval-overlap check on half-open ranges that include a one-hour cleaning buffer. Reserving re-checks and inserts under a per-vehicle lock, or a row lock in the database, so two customers can never get the same slot. Pricing is a strategy that charges per started day plus per started late hour, in paise. A late return blocks the next pickup, so the system offers another car or a free cancellation."
 

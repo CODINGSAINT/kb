@@ -34,7 +34,7 @@ Purchase date: not stated.
 - Handle malformed or truncated output with one bounded retry.
 - Explain prompt-based format instructions vs provider-native JSON schema.
 
-## 1. The idea in plain words
+## Step 1: The idea in plain words
 
 **Structured output** means asking the model for data in a fixed shape – usually JSON matching a schema – and converting it into a Java object.
 
@@ -48,9 +48,10 @@ What it cannot do for you: guarantee the values are **true**. Valid JSON with a 
 
 > **schema → generate → parse → validate → use (or send for review)**
 
-**What interviewers usually ask:** how `entity()` works; `BeanOutputConverter`; returning lists; what happens when parsing fails; prompt-based vs native structured output; validating values.
+> **🎯 In the interview**
+> Interviewers usually ask: how `entity()` works; `BeanOutputConverter`; returning lists; what happens when parsing fails; prompt-based vs native structured output; validating values.
 
-## 2. Design the target type
+## Step 2: Design the target type
 
 ```java
 public record ExpenseDraft(
@@ -84,7 +85,7 @@ Expected result for receipt R17:
   "evidenceQuote": "Unit price INR 199.50; total INR 598.50." }
 ```
 
-## 3. In code with Spring AI
+## Step 3: In code with Spring AI
 
 ```java
 @Service
@@ -140,7 +141,7 @@ ExpenseDraft draft = converter.convert(jsonText);    // parse a reply yourself
 
 **Prompt-based vs native structured output.** By default Spring AI puts the schema in the prompt and hopes the model follows it – usually it does, but not always. Several providers (OpenAI, Gemini, Ollama and others) also offer a **native JSON-schema mode** that constrains generation to valid JSON for the schema, configured through that provider's chat options. Native mode reduces format errors; neither mode checks that the values are correct.
 
-## 4. Validate, then retry once on format errors
+## Step 4: Validate, then retry once on format errors
 
 Two different gates – the format contract and the business rules:
 
@@ -166,6 +167,9 @@ public static List<String> issues(ExpenseDraft d, String receiptText) {
 
 For R17: 199.50 × 3 = 598.50 ✓, merchant and quote appear in the text ✓ → the draft is ready for the employee to confirm. If the model had answered `total: 600.00`, the check fails and the form shows "please check the total".
 
+> **⚖️ Design choice**
+> Retry only format errors, and only once. Wrong values go to a human, because asking the model again may just produce a different wrong value.
+
 **Retry policy:**
 
 - **Parse error or truncated output** (finish reason `LENGTH`) → retry **once** with the same original receipt. Do not loop.
@@ -178,7 +182,7 @@ For R17: 199.50 × 3 = 598.50 ✓, merchant and quote appear in the text ✓ →
 
 [![At most one format retry, using the original source: only a format failure may request one new extraction; a second format failure ends as FAILED, and every converted result still goes through domain checks.](learning-figures/ai-8-bounded-repair.svg)](learning-figures/ai-8-bounded-repair.svg)
 
-## 5. Common mistakes
+## Step 5: Common mistakes
 
 | Mistake | Better |
 | --- | --- |
@@ -191,7 +195,7 @@ For R17: 199.50 × 3 = 598.50 ✓, merchant and quote appear in the text ✓ →
 
 **Evaluate** with a set of real receipts and their correct values: measure the share of fields that are exactly right, not just "valid JSON".
 
-## 6. Interviewer follow-ups
+## Interviewer follow-ups
 
 **How does `entity()` know the format?** It uses a `BeanOutputConverter` that generates a JSON schema from the class and appends format instructions to the prompt, then parses the reply with Jackson.
 
@@ -205,13 +209,23 @@ For R17: 199.50 × 3 = 598.50 ✓, merchant and quote appear in the text ✓ →
 
 **Can I use Bean Validation annotations?** Yes – put `@NotNull`, `@Positive` etc. on the record and call a `Validator` after parsing, alongside the cross-field rules like total = quantity × price.
 
-## 7. Going deeper (optional)
+## Wrap up
+
+Structured output turns model replies into Java objects; Spring AI handles the schema and parsing, and your code validates the values.
+
+> **📝 Key takeaways**
+> - Design the record: `BigDecimal` money, enums, nullable unknowns, evidence.
+> - `entity()` adds a JSON schema to the prompt and parses the reply.
+> - Parsing proves the shape; Java validation checks the values.
+> - One retry for format errors; human review for value errors.
+
+## Going deeper (optional)
 
 The detailed version uses a strict converter that rejects unknown or missing keys, bounds output size before parsing, keeps money exact end to end, shows why a stream carries pieces rather than independently valid records, and logs failures without leaking receipt contents.
 
 [Open the structured-output lab](learning-labs/structured-output.html), download the [complete offline project](reference-code/learning/spring-structured-output.zip), or read [StrictDraftConverter.java](reference-code/learning/spring-structured-output/src/main/java/kb/structured/StrictDraftConverter.java), [ReceiptExtractor.java](reference-code/learning/spring-structured-output/src/main/java/kb/structured/ReceiptExtractor.java) and the [tests](reference-code/learning/spring-structured-output/src/test/java/kb/structured/StructuredOutputTest.java). See the [Spring AI structured output reference](https://docs.spring.io/spring-ai/reference/api/structured-output-converter.html).
 
-## 8. Closing answer
+## Closing answer
 
 "I model the target as a Java record with `BigDecimal` money, enums for fixed choices, nullable fields for facts that may be missing, and an evidence quote. With Spring AI I call `chatClient.prompt()...call().entity(ExpenseDraft.class)`; a `BeanOutputConverter` adds a JSON schema to the prompt and parses the reply, and `responseEntity` gives me the finish reason and usage too. Parsing only proves the shape, so I validate business rules in Java – total equals quantity times price, merchant and quote appear in the receipt. A parse error or truncated output gets one retry with the original input; validation issues go to human review. Where the provider supports it, native JSON-schema mode reduces format errors, but validation stays."
 

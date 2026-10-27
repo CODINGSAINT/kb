@@ -85,20 +85,22 @@ class HourlyFeeStrategy implements FeeStrategy {
 
 // region:lot
 class ParkingLot {
-    private final List<ParkingSpot> spots;                      // sorted: smallest size, then lowest floor
+    // Sorted by size, then floor, so the first spot that fits is the best one.
+    private final List<ParkingSpot> spots;
     private final Map<String, Ticket> activeTickets = new HashMap<>();
     private final FeeStrategy feeStrategy;
     private int nextTicket = 1;
 
     ParkingLot(List<ParkingSpot> spots, FeeStrategy feeStrategy) {
         this.spots = new ArrayList<>(spots);
-        this.spots.sort(Comparator.comparing(ParkingSpot::getSize).thenComparing(ParkingSpot::getFloor));
+        this.spots.sort(Comparator.comparing(ParkingSpot::getSize)
+                                  .thenComparing(ParkingSpot::getFloor));
         this.feeStrategy = feeStrategy;
     }
 
     /** Called by an entry gate. Returns a ticket, or throws if no suitable spot is free. */
     synchronized Ticket parkVehicle(Vehicle vehicle, Instant now) {
-        for (ParkingSpot spot : spots) {                // smallest suitable spot first
+        for (ParkingSpot spot : spots) {
             if (spot.canFit(vehicle)) {
                 spot.park(vehicle);
                 Ticket ticket = new Ticket("T-" + nextTicket++, vehicle, spot, now);
@@ -106,13 +108,15 @@ class ParkingLot {
                 return ticket;
             }
         }
-        throw new IllegalStateException("Parking full for " + vehicle.getSize() + " vehicles");
+        throw new IllegalStateException("No free spot for a " + vehicle.getSize() + " vehicle");
     }
 
     /** Called by an exit gate. Frees the spot and returns the fee to pay. */
     synchronized long unparkVehicle(String ticketId, Instant now) {
         Ticket ticket = activeTickets.remove(ticketId);
-        if (ticket == null) throw new IllegalArgumentException("Unknown or already used ticket");
+        if (ticket == null) {
+            throw new IllegalArgumentException("Unknown or already used ticket");
+        }
         ticket.getSpot().free();
         return feeStrategy.calculateFee(ticket.getEntryTime(), now);
     }
