@@ -216,108 +216,81 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Host application",
+            "id": "host",
+            "label": "Host app (Spring AI)",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 190,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "client",
             "label": "MCP client",
             "x": 250,
             "y": 0,
-            "w": 200,
+            "w": 130,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Configured transport",
-            "x": 500,
+            "id": "server",
+            "label": "Orders MCP server",
+            "x": 440,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "MCP server",
-            "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "id": "svc",
+            "label": "Order service",
+            "x": 440,
+            "y": 130,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n4",
-            "label": "Tool and resource registry",
+            "id": "llm",
+            "label": "Model",
             "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Domain authority",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Validated observation",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 110,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "owns policy"
+            "from": "host",
+            "to": "client",
+            "label": "discover + call"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "authenticated session"
+            "from": "client",
+            "to": "server",
+            "label": "JSON-RPC (HTTP/stdio)"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "protocol messages"
+            "from": "server",
+            "to": "svc",
+            "label": "real query"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "advertises"
+            "from": "host",
+            "to": "llm",
+            "label": "tools as tool calls"
           },
           {
-            "from": "n3",
-            "to": "n5",
-            "label": "authorized calls"
-          },
-          {
-            "from": "n3",
-            "to": "n6",
-            "label": "bounded results"
-          },
-          {
-            "from": "n6",
-            "to": "n0",
-            "label": "external data"
+            "from": "server",
+            "to": "client",
+            "label": "result",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain the Model Context Protocol (MCP): an open standard for connecting AI applications to external tools and data through a common client-server protocol, instead of bespoke integrations per app. Cover its primitives (tools, resources, prompts), transports, how MCP clients and servers are built with Spring AI, and the security implications of remote tool ecosystems.\n\n## Requirements\n\n- The problem MCP solves (M apps × N integrations becomes M + N).\n- Roles: host/client and server. Primitives: **tools** (actions), **resources** (readable context), **prompts** (reusable templates).\n- Transports: stdio for local processes, Streamable HTTP for remote servers.\n- Spring AI MCP client and server starters, and exposing `@Tool` methods via an MCP server.\n- Security: auth, least privilege, tool poisoning, trust boundaries.\n\n## 1. Protocol answer and selected deployment\n\nThe host is the AI application, its MCP client manages a server connection, and the server advertises tools/resources/prompts. I use the versioned 2025-06-18 protocol concepts and a deliberately narrow `searchApprovedDocs` capability. Concrete Java SDK configuration is pinned separately to avoid mixing framework generations.\n\n## 2. Session and tool execution\n\n```text\nConfigured transport -> initialize compatible version/capabilities\n -> discover reviewed tools/resources -> propose scoped call\n -> validate schema/permission/budget -> invoke -> validate result\nsearchApprovedDocs({query,limit<=3}) -> sourceId,revision,excerpt\n```\n\nTenant scope comes from authenticated connection/application policy, never an arbitrary model-supplied tenant ID. Local process transport inherits a different process boundary from remote HTTP; neither grants universal computer access. Credentials are audience-scoped and not forwarded to arbitrary destinations. A changed schema or newly advertised tool is reevaluated under host policy, not automatically trusted.\n\nReturned excerpts carry source revisions and bounded bytes. An oversized result fails explicitly. A malicious descriptor asking to export secrets remains untrusted metadata; the host has not authorized that action. Reconnect restores the session under reviewed capabilities and deadlines. Standard transport interoperability does not make an external business action idempotent, so state-changing tools retain their own operation contracts.\n\n## 3. Final design diagram\n\n[![MCP / MCP Client/Server: Host application owns policy MCP client; MCP client authenticated session Configured transport; Configured transport protocol messages MCP server; MCP server advertises Tool and resource registry; MCP server authorized calls Domain authority; MCP server bounded results Validated observation; Validated observation external data Host application](designs/ai-15.svg)](designs/ai-15.svg)\n\nThe **host** is the application using model capabilities. A **client** manages a server connection. A **server** exposes selected capabilities. This chapter anchors protocol concepts to the versioned 2025-06-18 specification; use the chosen SDK/version contract for concrete Java configuration.\n\n## 4. Critical operation: worked execution\n\n![Discovery describes capabilities; host policy decides what may be used.](lessons/ai-15-flow.svg)\n\n*Discovery describes capabilities; host policy decides what may be used.*\n\n![Discovered metadata does not override host or user authority.](lessons/ai-15-failure.svg)\n\n*Discovered metadata does not override host or user authority.*\n\n### Build a narrow example\n\nExpose `searchApprovedDocs(query, limit)` returning document IDs, revisions and short excerpts. Derive tenant scope from the authenticated connection or application policy, not an arbitrary model-supplied tenant argument. Set maximum query size, result count and response bytes before integrating a real corpus.\n\n```text\nRequest: tool=searchApprovedDocs, args={query:\"transaction isolation\",limit:3}\nResponse: {sources:[{id:\"db-guide\",revision:4,excerpt:\"...\"}]}\nHost checks: connection identity, permitted tool, argument schema, result size\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** What does MCP standardize, and which responsibilities stay with the host application?\n\nMCP defines communication among hosts, clients and servers with capability negotiation and structured messages. Servers may expose tools, resources and prompts. MCP is a protocol boundary, not an agent planner, vector database or automatic authorization system. Transport/session behavior depends on the negotiated version.\n\n### Architecture and contracts\n\n```text\nHost authenticates/approves server -> client initializes capabilities -> list permitted tools/resources -> validate requested operation -> server execution -> bounded result -> host model context\n\nApplication contracts (design outline):\nServerIdentity(endpoint,allowedScopes); ToolDescriptor(name,inputSchema); ToolCall(id,name,args); Result(content,isError)\n```\n\nSpring AI MCP integration can adapt protocol tools to model tools. Select matching client/server starter and SDK documentation for the pinned release; keep the underlying service independently testable.\n\n### Worked reasoning and capacity example\n\nA model context containing 200 large tool schemas can waste thousands of tokens. Expose a task-relevant authorized subset and cap result sizes; protocol standardization does not remove model context limits.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord ApprovedServer(java.net.URI endpoint, java.util.Set<String> scopes) {}\nrecord Call(String tool, String operationId, String jsonArguments) {}\n// Negotiate protocol capabilities, then validate schema and authorize each call.\n// Do not forward another resource audience's credential to this server.\n```\n\n### Design decisions and alternatives\n\nPin the protocol revision and SDK versions in an implementation. Use trusted server registration, least privilege and explicit tenant boundaries. Keep local stdio process execution and remote HTTP authentication risks distinct.\n\n### Failure scenario and safe recovery\n\nA server changes a tool description to instruct the host to upload private files. Treat descriptors/results as untrusted data; the host authorization policy, not returned prose, decides permitted resources and destinations.\n\n### Security, privacy and provenance\n\nOAuth tokens for one audience must not be forwarded to a different resource merely because a tool requests it. A connection is not blanket authorization for every future action.\n\n\n**Verification criteria:** Protocol conformance, scope enforcement, resource isolation, cancellation, error propagation and result bounds. Inspect the actual negotiated capabilities rather than assuming every server supports every feature.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through deployment trust\n\nA local process transport and a remote HTTP transport have different credential, process and network boundaries. Do not send tokens intended for one resource to an arbitrary downstream server. Server discovery, reconnect and capability changes need application policy; previously reviewed descriptors may change after an upgrade.\n\nSpring AI can integrate MCP clients/servers, but SDK/module APIs change across releases. Keep protocol concepts separate from a runnable configuration and verify the exact dependency family before presenting code as executable. A standard wire format does not make every tool idempotent or every server safe.\n\n## 6. Interviewer follow-ups\n\n**Does MCP grant a server access to the whole computer?** No. Actual process credentials, exposed capabilities and host controls determine access.\n\n**Is tool output an instruction?** It is external data that may contain hostile instructions; application authority remains separate.\n\n## 7. Closing answer\n\nMCP standardizes capability discovery and invocation, not trust or permission. I choose a scoped documentation-search server, validate compatibility and bounded schemas, and keep identity/egress/action policy in the host and domain service. Discovered text and results cannot override user authority.\n"
+      "markdown": "## Problem\n\nYour company has five AI apps – a support assistant, an IDE helper, an HR bot and two internal agents. Each one needs to read Jira tickets, query the order service and search Confluence. Today every app writes its own tool code for every system: 5 apps × 3 systems = 15 integrations, all slightly different.\n\nThe **Model Context Protocol (MCP)** is an open standard that fixes this: wrap each system once as an **MCP server**, and any MCP-capable app (Claude Desktop, IDEs, your Spring AI apps) can use it.\n\n## Requirements\n\n- Explain what MCP is and the problem it solves.\n- Explain hosts, clients and servers, and what a server offers: tools, resources and prompts.\n- Explain transports (stdio and HTTP) and the connect-and-discover flow.\n- Expose and consume MCP tools with Spring AI.\n- Keep control: authentication, which tools are allowed, and user approval.\n\n## Step 1: The idea in plain words\n\nMCP is like **USB-C for AI apps**. Before USB-C, every device had its own cable. With one standard plug, any charger works with any phone. MCP is a standard \"plug\" between AI applications and tools or data.\n\n| Term | Plain meaning |\n| --- | --- |\n| **Host** | The AI application the user works in (Claude Desktop, an IDE, your Spring Boot app). |\n| **MCP client** | The part of the host that talks to one MCP server. |\n| **MCP server** | A small program that exposes a system (Jira, orders, files) in the MCP format. |\n| **Tools** | Actions the model can call (`get_order`, `create_ticket`). |\n| **Resources** | Data the app can read (files, records) by URI. |\n| **Prompts** | Reusable prompt templates offered by the server. |\n| **Transport** | How messages travel: **stdio** (local process) or **HTTP** (remote server). Messages are JSON-RPC. |\n\n```text\nWithout MCP: 5 apps × 3 systems = 15 custom integrations\nWith MCP:    3 MCP servers + 5 apps that speak MCP = 8 pieces\n```\n\n> **🎯 In the interview**\n> Interviewers usually ask: what MCP is and why it exists; how it relates to tool calling; host vs client vs server; tools vs resources; how you secure it.\n\n## Step 2: How MCP connects an app to a tool: the execution flow\n\n[![Selected design: the Spring AI host application uses an MCP client to discover and call tools on the orders MCP server over JSON-RPC; the server queries the real order service; the host offers the discovered tools to the model as ordinary tool calls.](designs/ai-15.svg)](designs/ai-15.svg)\n\n1. **Connect:** the host starts or connects to the MCP server (stdio for a local process, HTTP for a remote one).\n2. **Initialise:** client and server exchange versions and capabilities.\n3. **Discover:** the client asks `tools/list`; the server returns tool names, descriptions and JSON schemas.\n4. **Offer to the model:** the host passes these tools to the LLM, exactly like normal tool calling (AI-13).\n5. **Call:** when the model asks for `get_order(5521)`, the client sends `tools/call` to the server.\n6. **Result:** the server runs it against the real system and returns the result to the host, which gives it to the model.\n\n![Animation: the support assistant's MCP client connects to the orders MCP server, initialises, lists its tools and receives get_order and cancel_order; the model asks for get_order with order 5521; the client sends a tools/call, the server queries the order service and returns the status to the model.](learning-figures/ai-15-flow.gif)\n\n> **⚖️ Design choice**\n> MCP standardises **how tools are described and called**. It does not decide **whether** a call is allowed – the host and the server still authenticate users and enforce permissions.\n\n## Step 3: In code with Spring AI\n\n**Exposing an MCP server** (the orders team, once) with `spring-ai-starter-mcp-server-webmvc`:\n\n```java\n@Service\npublic class OrderMcpTools {\n    private final OrderService orders;\n\n    public OrderMcpTools(OrderService orders) { this.orders = orders; }\n\n    @Tool(description = \"Get the status of an order by order number\")\n    public OrderStatus getOrder(@ToolParam(description = \"Order number\") String orderId) {\n        return orders.statusForCaller(orderId);   // checks the authenticated caller's access\n    }\n}\n\n@Configuration\nclass McpServerConfig {\n    @Bean\n    ToolCallbackProvider orderTools(OrderMcpTools tools) {\n        return MethodToolCallbackProvider.builder().toolObjects(tools).build();\n    }\n}\n```\n\n```properties\nspring.ai.mcp.server.name=orders-mcp\nspring.ai.mcp.server.version=1.0.0\n```\n\n**Consuming MCP servers** in any Spring AI app with `spring-ai-starter-mcp-client`:\n\n```properties\nspring.ai.mcp.client.streamable-http.connections.orders.url=https://orders-mcp.internal\nspring.ai.mcp.client.stdio.connections.files.command=npx\nspring.ai.mcp.client.stdio.connections.files.args=-y,@modelcontextprotocol/server-filesystem,/data/docs\n```\n\n```java\n@Service\npublic class SupportAssistant {\n    private final ChatClient chatClient;\n\n    public SupportAssistant(ChatClient.Builder builder, ToolCallbackProvider mcpTools) {\n        this.chatClient = builder\n                .defaultToolCallbacks(mcpTools)       // every tool discovered from MCP servers\n                .build();\n    }\n\n    public String ask(String question) {\n        return chatClient.prompt().user(question).call().content();\n    }\n}\n```\n\nThe client starter connects to each configured server, discovers its tools, and exposes them as a `ToolCallbackProvider` – after that, they behave like local `@Tool` methods.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Connecting to any MCP server you find | Allow-list trusted servers; review what each exposes |\n| Exposing every discovered tool to the model | Filter to the tools this app needs |\n| Trusting tool descriptions | A malicious server can hide instructions in descriptions; review and pin servers |\n| Server runs with an all-powerful service account | Act as the calling user, or with least privilege |\n| Destructive tools with no approval | Require user confirmation for writes |\n\n> **⚠️ Common mistake**\n> Thinking \"it's MCP, so it's safe\". MCP is a protocol, not a security layer. A server's metadata is untrusted input, and the server must still check who is calling.\n\n[![Discovered metadata does not override host or user authority.](lessons/ai-15-failure.svg)](lessons/ai-15-failure.svg)\n\n## Step 5: Production concerns\n\n- **Authentication:** remote MCP servers use OAuth 2.1-style authorisation; pass the user's identity, not a shared super-token.\n- **Governance:** keep a registry of approved servers and versions; log every tool call with user, server, tool and result.\n- **Latency:** each MCP call is a network hop; keep servers close and responses small.\n- **Versioning:** tool schemas change; pin server versions and test before upgrading.\n- **Local vs remote:** stdio servers are great for developer tools on a laptop; shared business systems should be remote HTTP servers with proper auth.\n\n## Interviewer follow-ups\n\n**How is MCP different from tool calling?** Tool calling is how a model asks for an action. MCP is a standard way for apps to **discover and call** tools that live in separate servers. MCP tools end up as normal tool calls to the model.\n\n**How is MCP different from a REST API?** A REST API is for programmers; MCP adds descriptions and schemas designed for models, plus discovery, resources and prompts in one standard.\n\n**Tools vs resources?** Tools are actions the model chooses to call; resources are data the application (or user) chooses to attach as context.\n\n**Who created MCP?** Anthropic published it as an open standard in late 2024; it is now supported by many hosts and frameworks, including Spring AI.\n\n## Wrap up\n\nMCP standardises how AI apps discover and call tools in separate servers – build each integration once, use it from every MCP-capable app – while permissions stay with the host and server.\n\n> **📝 Key takeaways**\n> - Host → MCP client → MCP server; JSON-RPC over stdio or HTTP.\n> - Servers offer tools, resources and prompts; discovery returns schemas.\n> - Spring AI has starters for both MCP servers and clients.\n> - Allow-list servers, filter tools, authenticate users, approve writes.\n\n## Going deeper (optional)\n\nThe detailed version keeps discovery separate from authority: discovery says what a server *can* do; host policy decides what may be used, by whom.\n\n[![Discovery describes capabilities; host policy decides what may be used.](lessons/ai-15-flow.svg)](lessons/ai-15-flow.svg)\n\nFurther reading: [Model Context Protocol](https://modelcontextprotocol.io/) and [Spring AI – MCP](https://docs.spring.io/spring-ai/reference/api/mcp/mcp-overview.html).\n\n## Closing answer\n\n\"MCP is an open standard for connecting AI applications to tools and data – a USB-C for AI. A host application runs an MCP client per server; over stdio or HTTP they exchange JSON-RPC messages: initialise, list tools, call tools. Servers expose tools, resources and prompts with descriptions and schemas, so each system is integrated once and reused by every MCP-capable app. In Spring AI, the server starter exposes `@Tool` methods through a `ToolCallbackProvider`, and the client starter discovers tools from configured servers and plugs them into ChatClient. MCP standardises the plumbing, not permissions: I allow-list servers, filter tools, authenticate the real user, and require approval for writes.\"\n"
     }
   ]
 }
