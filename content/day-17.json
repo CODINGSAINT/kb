@@ -12,103 +12,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "game",
             "label": "Game",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 110,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Board",
-            "x": 250,
-            "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n2",
-            "label": "Player",
-            "x": 500,
-            "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n3",
+            "id": "dice",
             "label": "Dice",
+            "x": 170,
+            "y": 0,
+            "w": 100,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "board",
+            "label": "Board + jumps",
+            "x": 330,
+            "y": 0,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "turns",
+            "label": "Turn queue",
+            "x": 330,
+            "y": 130,
+            "w": 130,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "move",
+            "label": "Move record",
+            "x": 170,
+            "y": 130,
+            "w": 130,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "win",
+            "label": "Winner on cell 100",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "TurnPolicy",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "JumpResolver",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "MoveHistory",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "uses"
+            "from": "game",
+            "to": "dice",
+            "label": "roll"
           },
           {
-            "from": "n0",
-            "to": "n2",
-            "label": "rotates"
+            "from": "game",
+            "to": "board",
+            "label": "afterJump(cell)"
           },
           {
-            "from": "n0",
-            "to": "n3",
-            "label": "rolls through"
+            "from": "game",
+            "to": "turns",
+            "label": "next player"
           },
           {
-            "from": "n0",
-            "to": "n4",
-            "label": "advances with"
+            "from": "game",
+            "to": "move",
+            "label": "record turn"
           },
           {
-            "from": "n1",
-            "to": "n5",
-            "label": "resolves jumps"
-          },
-          {
-            "from": "n0",
-            "to": "n6",
-            "label": "records"
+            "from": "game",
+            "to": "win",
+            "label": "exact landing"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign Snake & Ladder: N players take turns rolling dice and move along a board of 100 cells; snakes send you down, ladders send you up, and the first to reach 100 wins. Interviewers use it to test a **game-engine abstraction**: clean entities, configurable rules and **Strategy** for dice and rule variations.\n\n## Requirements\n\n**Functional**\n- Configurable board size, snakes and ladders (validated: no cycles, nothing starting at the end cell).\n- 2+ players in a turn queue. One or more dice.\n- Rule variants: exact roll needed to finish, extra turn on a 6, three 6s forfeits the turn.\n- Report each move and the winner. Optionally continue to rank all players.\n\n**Non-functional**\n- Deterministic and testable: dice and randomness are injectable (seeded).\n- Rule variants are configurable without changing the game loop.\n- The board is validated once at setup, not during play.\n\n## 1. Scope and chosen solution\n\nI choose a 100-square board, six-sided dice, exact landing to win, one jump per landing and first winner ends the game. No bonus turn for six in this ruleset. The board validates jump endpoints and direction; snakes descend and ladders ascend.\n\n## 2. Turn execution\n\n```text\nplayTurn(playerId):\n  verify active game and expected player\n  roll injected dice, require 1..6\n  candidate = position + roll\n  if candidate > 100: final = old position\n  else: final = jumpMap.getOrDefault(candidate,candidate)\n  commit roll, old/final position and winner or next player\n```\n\nAt 14 with roll 3 and ladder 17→38, final position is 38. At 97 with roll 5, it stays 97. One-jump resolution cannot loop even if arbitrary map data contains a cycle; I still reject invalid self-jumps and endpoints at construction. A chained-jump extension uses a visited set and rejects cycles. Concurrent turn calls serialize at Game, preventing two dice rolls for the same accepted turn/version. Expected dice value 3.5 does not equal net progress because jumps and overshoots alter movement.\n\n## 3. Final design diagram\n\n[![Design Snake & Ladder: Game uses Board; Game rotates Player; Game rolls through Dice; Game advances with TurnPolicy; Board resolves jumps JumpResolver; Game records MoveHistory](designs/lld-17.svg)](designs/lld-17.svg)\n\nThe **board** stores snakes and ladders, the **dice source** produces a roll, and the **game** owns turn order and player positions. Randomness is an input boundary, so tests should supply predetermined rolls rather than hope the right number appears.\n\n## 4. Critical operation: worked execution\n\n![The game applies movement policy before resolving a jump.](lessons/lld-17-flow.svg)\n\n*The game applies movement policy before resolving a jump.*\n\n![Validate jump chains or restrict the board to one jump per landing.](lessons/lld-17-failure.svg)\n\n*Validate jump chains or restrict the board to one jump per landing.*\n\n### Selected algorithm\n\n```java\n// Rule sketch: exact landing; an overshoot leaves the position unchanged.\nint advance(int current, int roll, int lastSquare) {\n    if (roll < 1 || roll > 6) throw new IllegalArgumentException();\n    int target = current + roll;\n    return target > lastSquare ? current : target;\n}\n```\n\nFor a board with six-sided dice, the expected single roll is `(1+2+3+4+5+6)/6 = 3.5`. That is not the expected net movement once snakes, ladders and overshoot rules apply. Avoid replacing the actual board process with this average when explaining game duration.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Game` | Turn loop, winner detection |\n| `Board` | size, `Map<Integer, Integer> jumps` (start → end) |\n| `Jump` (or `Snake`/`Ladder` subtypes) | start, end; a snake has end < start |\n| `Player` | name, position |\n| `Dice` (Strategy) | `StandardDice(count)`, `CrookedDice` (only even numbers), `FixedDice` for tests |\n| `RuleSet` | `ExactFinishRule`, `ExtraTurnOnSix`, `ThreeSixesForfeit` |\n| `BoardFactory` | Builds a board from config and validates it |\n\n```java\nint move(Player p, int roll) {\n    int target = p.position() + roll;\n    if (target > board.size()) return p.position();     // exact-finish rule\n    return board.jumps().getOrDefault(target, target);   // O(1) snake/ladder\n}\n```\n\n### Design decisions & trade-offs\n\n**1. Snakes and ladders are the same thing.** Both are a jump from `start` to `end`. One `Map<Integer, Integer>` handles both in O(1). Separate classes add nothing except display labels. This is a nice \"avoid needless inheritance\" point.\n\n**2. Dice as a Strategy.** It makes the game testable: inject `FixedDice(4, 2, 6)` to script a game. Variants (two dice, crooked dice) don't touch `Game`.\n\n**3. Rules as composable objects.** Rule toggles change between house variants. A list of `Rule` objects consulted in order (`afterRoll`, `canFinish`, `grantsExtraTurn`) keeps the turn loop stable.\n\n**4. Turn order.** Use a `Deque<Player>`: poll, play, offer back (unless they finished or forfeit). With an extra-turn rule, re-offer to the front.\n\n**5. Board validation.** Reject jumps that start at 1 or 100, jumps that land on another jump's start (chains), and two jumps from the same cell. Fail at construction, not mid-game.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Make game rules explicit, especially overshoot and whether special squares chain.\n\nBoard maps starting squares to Jump targets; Game owns Players and current turn. Dice is an injected source of bounded values. MovePolicy handles exact-finish rules; TurnPolicy handles extra turns. Randomness is a dependency so tests can be deterministic.\n\n**Correctness rule:** Player positions stay within board bounds, every jump target is valid, and terminal games stop accepting moves. A malformed jump cycle cannot cause an infinite turn.\n\n```text\ngame(id,board_size,current_player,version); player(id,position); jump(from_square,to_square); turn(id,roll,result)\n```\n\n### End-to-end execution trace\n\nVerify current player; obtain a dice value from the configured dice; compute tentative square; apply overshoot policy; resolve the allowed snake/ladder behavior with a visited set if chaining is supported; commit the final position; declare victory or advance turn.\n\n### Concurrency and recovery walkthrough\n\nTwo roll commands for the same turn use different random values. A turn request ID and aggregate version prevent both from advancing the game; persist the chosen roll before returning success.\n\n### Policy choices and extension seams\n\nA map from square to destination is sufficient for snakes and ladders. Subclasses for every snake add little value. Strategy becomes useful for house rules, number of dice or finish behavior.\n\n### Edge cases that change the design\n\nReject jumps from or to invalid squares, duplicate jump origins and forbidden start/end cells. Decide whether landing on a ladder leads to another jump. Do not quietly hard-code a popular house rule as the only valid ruleset.\n\n**Topic-specific cases:** Deterministic dice; overshoot; exact finish; cycle detection; extra-turn rule; duplicate roll command; board configuration validation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through extension seams\n\nRepresent jumps as data `start -> end`; validate endpoints inside the board and forbid a zero-length jump. If the chosen rules allow at most one jump per turn, document that instead of accidentally chaining jumps because the implementation uses recursion.\n\nRules such as “roll six again” and “three sixes lose the turn” belong in a turn policy with an explicit roll history. They do not belong in the physical dice implementation. A replay log should store actual rolls and committed moves so results remain reproducible even if a random generator changes.\n\n## 6. Interviewer follow-ups\n\n**How do you test a ladder landing?** Inject a roll that reaches its starting square and assert the final destination.\n\n**Should a winner keep receiving turns?** No. Define whether the game ends at first victory or ranks all players, then enforce that terminal policy.\n\n## 7. Closing answer\n\nI make board jumps data and inject dice results, while Game owns deterministic turn transitions. Exact-landing and one-jump-per-landing are explicit policies. A move log records actual rolls, so tests and replay do not depend on randomness.\n"
+      "markdown": "## Problem\n\nDesign the game Snake & Ladder. Two or more players take turns rolling a die and moving along a board of 100 cells. Landing at the foot of a ladder takes you up; landing on a snake's head takes you down. The first player to land exactly on 100 wins.\n\nIt's a favourite interview warm-up because it is small enough to finish – and it still tests clean classes, a testable random element, and rules such as \"what if a ladder ends on a snake?\".\n\n## Requirements\n\n- A board of N cells (usually 100) with snakes and ladders.\n- 2 or more players take turns in order; everyone starts off the board (cell 0).\n- Roll a die, move, follow at most one snake or ladder, then pass the turn.\n- You must land exactly on the last cell to win; overshooting means you stay put.\n- The game can be replayed and tested with fixed dice rolls.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** How many players and dice?\n\n**Interviewer:** Two to four players, one six-sided die.\n\n**Candidate:** Do you need an exact roll to finish?\n\n**Interviewer:** Yes. If you'd go past 100, you don't move.\n\n**Candidate:** Can a ladder end on a snake's head?\n\n**Interviewer:** Your call – explain it.\n\n**Candidate:** Does rolling a 6 give an extra turn?\n\n**Interviewer:** Not in the basic version. Mention how you'd add it.\n\n**Candidate:** Is it played by people or simulated?\n\n**Interviewer:** Both – we also run simulations to test board designs.\n\n> **🎯 In the interview**\n> Ask about exact-finish and chained jumps. They are the two rules people forget, and they shape the `Board` validation and the turn logic.\n\n| Functional | Non-functional |\n| --- | --- |\n| Board with snakes and ladders | Rules easy to change (extra turn on 6) |\n| Turns, moves, winner | Deterministic tests: dice can be fixed |\n| Exact finish | Invalid boards rejected at creation |\n\n## Step 2: Identify the core objects\n\n- **Board** – size and a map from start cell to end cell (snakes and ladders).\n- **Jump** – one snake or ladder: start and end.\n- **Dice** – an interface; `RandomDice` for real games, `FixedDice` for tests and replays.\n- **Player** – a name.\n- **Game** – positions, the turn order, the winner, and `playTurn()`.\n- **Move** – what happened in one turn: roll, from, to, and a note (\"ladder\", \"snake\", \"needs exact roll\").\n\n[![Selected design: the game asks the dice for a roll, moves the current player, asks the board whether the target cell starts a snake or ladder, records the move and passes the turn, or declares the winner on the last cell.](designs/lld-17.svg)](designs/lld-17.svg)\n\n> **⚖️ Design choice**\n> Snakes and ladders are the **same thing**: a jump from one cell to another. One `Jump` record and one map replace two class hierarchies – a snake simply has `end < start`.\n\n## Step 3: Design the classes\n\n### Board and Jump\n\nThe board validates jumps when it's created: on the board, not from the last cell, one jump per start cell, and no jump ending where another starts.\n\n### Dice\n\nAn interface with `roll()`. Injecting it is what makes the game testable.\n\n### Game, Player and Move\n\n`Game` keeps a queue of players for turn order and a map of positions. `playTurn` returns a `Move`, so the UI or a log can show exactly what happened.\n\n[![Class diagram: Game has a Board, a Dice and a queue of Players with positions, and returns a Move per turn; Board has Jumps; RandomDice and FixedDice implement Dice.](learning-figures/lld-17-classes.svg)](learning-figures/lld-17-classes.svg)\n\n## Step 4: Write the code\n\n### Board and Jump\n\n```java\n/** A snake (end below start) or a ladder (end above start). */\nrecord Jump(int start, int end) {\n    boolean isSnake() { return end < start; }\n}\n\nclass Board {\n    private final int size;\n    private final Map<Integer, Integer> jumps = new HashMap<>();\n\n    Board(int size, List<Jump> list) {\n        this.size = size;\n        for (Jump j : list) {\n            if (j.start() <= 1 || j.start() >= size || j.end() < 1 || j.end() > size)\n                throw new IllegalArgumentException(\"Jump off the board: \" + j);\n            if (jumps.putIfAbsent(j.start(), j.end()) != null)\n                throw new IllegalArgumentException(\"Two jumps start at \" + j.start());\n        }\n        for (Jump j : list)                                 // one jump per landing, no chains\n            if (jumps.containsKey(j.end()))\n                throw new IllegalArgumentException(\"Jump ends on another jump: \" + j);\n    }\n    int size()                   { return size; }\n    int afterJump(int cell)      { return jumps.getOrDefault(cell, cell); }\n}\n```\n\n### Dice\n\n```java\ninterface Dice { int roll(); }\n\nclass RandomDice implements Dice {\n    private final Random random = new Random();\n    public int roll() { return random.nextInt(6) + 1; }\n}\n\n/** For tests and replays: returns a fixed sequence of rolls. */\nclass FixedDice implements Dice {\n    private final Iterator<Integer> rolls;\n    FixedDice(Integer... rolls) { this.rolls = List.of(rolls).iterator(); }\n    public int roll() { return rolls.next(); }\n}\n```\n\n### Game\n\n```java\nrecord Player(String name) {}\n\nrecord Move(Player player, int roll, int from, int to, String note) {}\n\nclass Game {\n    private final Board board;\n    private final Dice dice;\n    private final Deque<Player> turns;\n    private final Map<Player, Integer> position = new HashMap<>();\n    private Player winner;\n\n    Game(Board board, Dice dice, List<Player> players) {\n        if (players.size() < 2) throw new IllegalArgumentException(\"Need at least 2 players\");\n        this.board = board; this.dice = dice; this.turns = new ArrayDeque<>(players);\n        players.forEach(p -> position.put(p, 0));           // everyone starts off the board\n    }\n\n    Move playTurn() {\n        if (winner != null) throw new IllegalStateException(winner.name() + \" already won\");\n        Player p = turns.pollFirst();\n        int roll = dice.roll(), from = position.get(p), target = from + roll;\n        String note;\n        int to;\n        if (target > board.size()) { to = from; note = \"needs exact roll\"; }\n        else {\n            to = board.afterJump(target);\n            note = to > target ? \"ladder\" : to < target ? \"snake\" : \"\";\n        }\n        position.put(p, to);\n        if (to == board.size()) winner = p; else turns.addLast(p);\n        return new Move(p, roll, from, to, note);\n    }\n\n    Optional<Player> winner() { return Optional.ofNullable(winner); }\n    int positionOf(Player p)  { return position.get(p); }\n}\n```\n\n### Worked example\n\nBoard of 100 with ladders 4→25 and 40→89, snakes 27→5 and 99→41. Rolls: 4, 6, 2, 1.\n\n| Turn | Player | Roll | Move | Note |\n| --- | --- | --- | --- | --- |\n| 1 | Asha | 4 | 0 → 4 → **25** | ladder |\n| 2 | Bilal | 6 | 0 → 6 | |\n| 3 | Asha | 2 | 25 → 27 → **5** | snake |\n| 4 | Bilal | 1 | 6 → 7 | |\n\nA quick game on a 10-cell board (ladder 3→8, snake 9→2), rolls 3, 2, 4, 1, 2:\n\n| Turn | Player | Roll | Move | Note |\n| --- | --- | --- | --- | --- |\n| 1 | Asha | 3 | 0 → 3 → 8 | ladder |\n| 2 | Bilal | 2 | 0 → 2 | |\n| 3 | Asha | 4 | 8 → 12? stays 8 | needs exact roll |\n| 4 | Bilal | 1 | 2 → 3 → 8 | ladder |\n| 5 | Asha | 2 | 8 → **10** | **Asha wins** |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Fewer than 2 players | Rejected |\n| Two players on the same cell | Allowed – no capturing |\n| Turn after the game ended | `IllegalStateException` |\n| Board with a jump from the last cell, or a chain | Rejected when the board is built |\n\n## Step 5: The tricky part: a jump that lands on a jump\n\nWhat if the ladder 3→8 ends on a snake's head at 8 (8→2)? Two possible rules:\n\n- **Follow the chain:** 3 → 8 → 2 → maybe another jump… With a careless board, 8→2 and 2→8 loop forever.\n- **One jump per landing:** only the first jump applies.\n\nOur `Board` avoids the question by **rejecting** a board where a jump ends on another jump's start. Rules about the board are checked once, when it's built, not on every turn.\n\n![Animation: a board is built with a ladder from 3 to 8 and a snake from 8 to 2; validation notices the ladder ends on the snake's head and rejects the board; a valid board is built instead and Asha's roll of 3 climbs the ladder to 8 and stops there.](learning-figures/lld-17-validate.gif)\n\n> **⚠️ Common mistake**\n> Using `new Random()` directly inside `Game`. You can't test \"Asha lands on the snake\" without controlling the die. Inject a `Dice` and use `FixedDice` in tests.\n\n> **🎯 In the interview**\n> If asked to support chains anyway, follow jumps with a limit (say 10) and validate at build time that following never revisits a cell – a small cycle check.\n\n## Step 6: Deep dives\n\n### Extra turn on a 6\n\nIn `playTurn`, if `roll == 6` and the player hasn't won, put them back at the **front** of the queue instead of the back. Limit it to three sixes in a row if you like.\n\n### Two dice, different dice\n\n`Dice` is an interface: `TwoDice` returns the sum of two rolls; a \"crooked\" dice for a test of probability is one more class.\n\n### More players and a UI\n\n`Move` records make it easy to animate each turn or print a log. Players can be humans or bots without changing `Game`.\n\n### Simulating board designs\n\nRun 100,000 games with `RandomDice` and record the number of turns per game – a quick way to check a board isn't too long or too short.\n\n## Interviewer follow-ups\n\n**Why one `Jump` instead of `Snake` and `Ladder` classes?** They have the same data and the same behaviour – move from one cell to another. Separate classes add code, not meaning.\n\n**Why a queue for turns?** Taking the first player and adding them to the back is exactly \"round robin\", and removing the winner is easy.\n\n**Where would you put the \"exact finish\" rule if it became optional?** In a small `FinishRule` strategy (exact, bounce back, or allow overshoot) that `Game` calls.\n\n**How do you make the game replayable?** Store the seed or the sequence of rolls; replaying with `FixedDice` gives the same game.\n\n## Wrap up\n\nA Board of validated jumps, an injected Dice, and a Game that moves players in a round-robin queue and records each Move – small, testable and easy to extend.\n\n> **📝 Key takeaways**\n> - Snakes and ladders are one concept: a jump.\n> - Validate the board once when it's built.\n> - Inject the dice so games can be tested and replayed.\n> - Turns are a queue; each turn returns a Move record.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [SnakeLadderDemo.java](reference-code/learning/kb/snakeladder/SnakeLadderDemo.java). It replays both worked examples and the board validations.\n\n[![The game applies movement policy before resolving a jump.](lessons/lld-17-flow.svg)](lessons/lld-17-flow.svg)\n\n## Closing answer\n\n\"I model a Board with a size and a map of jumps – snakes and ladders are the same Jump record, a snake just goes down. The board is validated when it's built: jumps must be on the board, not start on the last cell, have unique starts, and never end where another starts, so there are no chains or loops. Dice is an interface, with RandomDice for play and FixedDice for tests and replays. Game keeps a queue of players and their positions; each turn rolls, moves, stays put if the roll would overshoot the last cell, applies at most one jump, and either declares the winner or puts the player at the back of the queue. Each turn returns a Move record for the UI and logs.\"\n"
     },
     {
       "category": "HLD",
