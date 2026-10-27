@@ -1,0 +1,109 @@
+{
+  "source": "kb.shortener.ShortenerTrace (Java 21 local model)",
+  "scenarios": [
+    {
+      "id": "revocation",
+      "title": "Revocation races a late cache fill",
+      "summary": "Follow one old read across revocation. A bounded stale hit is allowed; copying the value never extends its original deadline.",
+      "steps": [
+        {
+          "title": "A read obtains an active snapshot",
+          "time": "t=0s",
+          "authority": "C0000003 · ACTIVE · version 1 · no expiry",
+          "cache": "No cached copy",
+          "response": "No redirect decision yet",
+          "explanation": "The authority returns version 1. Its permission ends at t=30, measured from this read's start. The response is deliberately held back to expose a race.",
+          "focus": "authority"
+        },
+        {
+          "title": "Owner commits revocation",
+          "time": "t=5s",
+          "authority": "C0000003 · REVOKED · version 2 · no expiry",
+          "cache": "No cached copy",
+          "response": "No redirect decision yet",
+          "explanation": "The authoritative mapping becomes revoked version 2. Invalidation removes a cache entry, but cannot cancel the old read already in flight.",
+          "focus": "authority"
+        },
+        {
+          "title": "The late version 1 fill arrives",
+          "time": "t=6s",
+          "authority": "C0000003 · REVOKED · version 2 · no expiry",
+          "cache": "ACTIVE · version 1 · serveUntil t=30",
+          "response": "302 redirect · cache · version 1",
+          "explanation": "install(oldRead) returned true. The selected bounded policy permits this old snapshot until its original t=30 deadline. It does not get a new t=36 deadline.",
+          "focus": "cache"
+        },
+        {
+          "title": "The bounded stale redirect is visible",
+          "time": "t=29s",
+          "authority": "C0000003 · REVOKED · version 2 · no expiry",
+          "cache": "ACTIVE · version 1 · serveUntil t=30",
+          "response": "302 redirect · cache · version 1",
+          "explanation": "At t=29 the original permission has not ended, so the service can still issue 302 from the stale cached mapping. This is the policy's accepted limitation.",
+          "focus": "response"
+        },
+        {
+          "title": "At equality the old permission ends",
+          "time": "t=30s",
+          "authority": "C0000003 · REVOKED · version 2 · no expiry",
+          "cache": "No cached copy",
+          "response": "410 gone · authority · version 2",
+          "explanation": "now equals serveUntil, so the old snapshot is rejected. A fresh authority read sees revoked version 2 and produces 410; no stale-on-error extension is allowed.",
+          "focus": "response"
+        },
+        {
+          "title": "Replaying the old fill cannot renew it",
+          "time": "t=31s",
+          "authority": "C0000003 · REVOKED · version 2 · no expiry",
+          "cache": "No cached copy",
+          "response": "410 gone · authority · version 2",
+          "explanation": "install(oldRead) now returned false. Cache insertion time never grants a fresh lease. A new request still sees 410.",
+          "focus": "cache"
+        }
+      ]
+    },
+    {
+      "id": "expiry",
+      "title": "Expiry shortens the same cache permission",
+      "summary": "A ten-second expiry wins over the thirty-second lease. Request replay returns the original create result without reviving the link.",
+      "steps": [
+        {
+          "title": "The first redirect caps its cache permission",
+          "time": "t=0s",
+          "authority": "A0000001 · ACTIVE · version 1 · expires t=10",
+          "cache": "ACTIVE · version 1 · serveUntil t=10",
+          "response": "302 redirect · authority · version 1",
+          "explanation": "The active link expires at t=10. min(t=30 lease, t=10 expiry) gives serveUntil t=10, so a cached permission cannot outlive the link.",
+          "focus": "authority"
+        },
+        {
+          "title": "Just before expiry, a cache hit redirects",
+          "time": "t=9s",
+          "authority": "A0000001 · ACTIVE · version 1 · expires t=10",
+          "cache": "ACTIVE · version 1 · serveUntil t=10",
+          "response": "302 redirect · cache · version 1",
+          "explanation": "At t=9 both now < expiresAt and now < serveUntil hold. The service issues 302 with no-store for the browser.",
+          "focus": "cache"
+        },
+        {
+          "title": "Exactly at expiry, redirecting stops",
+          "time": "t=10s",
+          "authority": "A0000001 · ACTIVE · version 1 · expires t=10",
+          "cache": "No cached copy",
+          "response": "410 gone · authority · version 1",
+          "explanation": "At t=10 the cache permission is unusable. The authoritative row still exists, but now < expiresAt is false, so the service returns 410. Cleanup timing is irrelevant.",
+          "focus": "response"
+        },
+        {
+          "title": "A lost create response replays without revival",
+          "time": "t=12s",
+          "authority": "A0000001 · ACTIVE · version 1 · expires t=10",
+          "cache": "No cached copy",
+          "response": "410 gone · authority · version 1",
+          "explanation": "The same request replays code A0000001 (replayed=true). It creates no new row and does not change expiry. Resolving it still returns 410.",
+          "focus": "response"
+        }
+      ]
+    }
+  ]
+}

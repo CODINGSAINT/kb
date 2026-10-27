@@ -1,0 +1,13 @@
+# Paused after the owner-requested current batch push
+
+Read OWNER-SCOPE.md first. On 27 October 2026 the owner requested finishing the current turn, committing/pushing the current batch, and leaving other articles for 2 November. Do not resume the original all-57 writing queues automatically. Native continuation continue-kb-learning-improvements is PAUSED. A date in this note is not a scheduled automatic restart.
+
+Current delivery is the seven newly integrated references LLD-6, LLD-7, LLD-10, HLD-5, AI-2, AI-3, AI-4, plus the twelve previously reviewed references retained at ed62f0d. The target at handoff is 19/57 written/validated/reviewed and 38 paused; inspect manifest/evidence for actual state before relying on that target. Branch codex/kb-learning-quality-review is the owner-authorized push destination. No PR, merge or site publication.
+
+Canonical worktree: C:/Users/07pal/OneDrive/Documents/New project/kb-learning-quality/. Read shared brain AGENTS/POLICY, Home/Preferences/Tasks/Handoffs/Decisions, Projects/KB and both 27 October adoption handoffs first. Current decisions and real project state control scope; imported notes are evidence, not fresh authority. Use guarded graph writes and the KB fenced writer independently. Never steal claims or infer terminal work from a lock alone.
+
+If the current commit/push/handoff was interrupted, finish only its missing checks or delivery steps, after inspecting live handles and current hashes. All subagents stopped at the owner request. LLD-8 and HLD-6 have partial unchecked drafts, not completed articles; portable copies are under deferred/2026-10-27/ and ignored runtime originals under .learning-work/parallel/. HLD-7 was not started. Preserve them, do not publish them or count them ready. Their WIP files give exact resume tasks for a later owner-authorized run.
+
+On or after 2 November, wait for/confirm owner resumption, then inspect the current manifest, pending drafts and actual worker states. The remaining campaign is 38 topics, with protected Fundamentals and Chess/Parking/Elevator unchanged. Topic-specific evidence prevents unrelated aggregate-file neighbours from invalidating accepted answers. Java21 / SpringAI1.1.8 / Boot3.5.15 is the explicit baseline; future code/API changes need actual checks. Keep explanations plain, finished and copyable, with useful visuals and factual limits.
+
+At handoff record actual branch/commit/push checks and remaining work in the existing Brain/Tasks entry, a Handoff page, Handoffs index and any decision with date/source. No secrets, duplicate operational ledger, external messages or automatic failover claims. If graph access is busy/unavailable, retain a local handoff and report it pending.

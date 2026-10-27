@@ -1,0 +1,3 @@
+# Deferred authoring checkpoint, not completed content
+
+Owner stopped new article work on 27 October; remaining work is for 2 November after authorization. LLD-8 Food Delivery has an uncompiled core and WIP only. HLD-6 Chat has a partial article/header, Java source and visuals, but no successful compile/check/trace export or integration review. Neither is in customer content or completed counts. HLD-7 was not started. These portable copies retain only authored source/WIP, without compiled output, credentials or runtime leases. Read each WIP before restoring into isolated staging; reconcile any later human edits, do not overwrite blindly.
