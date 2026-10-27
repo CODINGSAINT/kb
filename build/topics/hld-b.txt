@@ -1,346 +1,473 @@
 === HLD 9 ===
-N|n0|Location ingestion|0|0|200|rect
-N|n1|Geo candidate index|250|0|200|rect
-N|n2|Dispatch service|500|0|200|rect
-N|n3|Assignment authority|0|110|200|rect
-N|n4|Trip store|250|110|200|rect
-N|n5|Offer stream|500|110|200|rect
-N|n6|Rider and driver apps|0|220|200|rect
-E|n6|n0|location updates
-E|n0|n1|latest positions
-E|n2|n1|nearby search
-E|n2|n5|offers
-E|n5|n6|push
-E|n2|n3|claim
-E|n3|n4|trip ownership
+N|drv|Driver app|0|0|140|rect
+N|loc|Location service|200|0|170|rect
+N|geo|Geo index (Redis)|420|0|180|cylinder
+N|match|Matching service|420|130|180|rect
+N|trip|Trip store|200|130|150|cylinder
+N|rider|Rider app|0|130|140|rect
+E|drv|loc|GPS every 4 s
+E|loc|geo|update cell
+E|rider|match|request ride
+E|match|geo|nearby drivers
+E|match|trip|assign one driver
+E|match|drv|ride offer|dashed
 ---
 ## Problem
 
-Design Uber's backend for matching riders with nearby drivers in real time: ingest millions of driver location updates, find the best nearby available driver within seconds, handle offers and acceptance, track trips, and price dynamically. The focus is **geo-indexing**, **high-frequency location updates**, **matching** and **distributed consistency** (one driver, one trip).
+Design the backend that matches riders with drivers, like Uber or Ola. Asha opens the app at MG Road and asks for a ride. Within a few seconds, Ravi – a driver 600 m away – gets the request, accepts it, and Asha sees his car coming.
+
+Millions of drivers send their GPS location every few seconds. The system must find nearby drivers fast and make sure one driver is never given two riders.
 
 ## Requirements
 
-**Functional**
-- Drivers publish location every ~4 s while online. Riders request a ride and get an ETA and a price.
-- Match within a few seconds. The driver accepts or declines. Live tracking for both parties.
-- Trip lifecycle, fare calculation, payments.
+- Drivers send their location every 4 seconds while online.
+- A rider requests a ride; we find nearby available drivers and offer the ride.
+- A driver accepts or declines; the first acceptance wins.
+- One driver can never be assigned to two trips at once.
+- Match within a few seconds; works across many cities.
 
-**Non-functional**
-- Matching p99 < a few seconds. Location writes are high-volume but each one is cheap and short-lived.
-- A driver must never be double-assigned.
+## Step 1: Clarify the requirements
 
-**Scale:** 5M online drivers ÷ 4 s ≈ **1.25M location writes/s**. Ride requests are only ~10k/s, but each queries nearby drivers.
+> **💡 Tip**
+> The two hard parts are a fast "who is near me?" query and a safe "assign this driver" step. Steer your questions toward them.
 
-## 1. Scope and selected ownership
+**Candidate:** How many drivers are online at once?
 
-I support live driver availability, ride requests, matching and trip lifecycle. I choose a geo index for candidates and a transactional assignment authority for driver exclusivity. ETA ranking can use a routing service; straight-line distance only narrows candidates.
+**Interviewer:** About 5 million worldwide at peak.
 
-## 2. APIs and state
+**Candidate:** How often do they send location?
 
-```text
-PUT /drivers/{id}/location {sessionId,seq,point,accuracy,observedAt}
-POST /trips {pickup,destination,requestId}
-POST /offers/{id}/accept -> assigned | expired | conflict
-Assignment: driverId UNIQUE(active), tripId UNIQUE(active), lease/version
-Location: driverId,sessionId,seq,point,lastSeen
-```
+**Interviewer:** Every 4 seconds.
 
-Ingestion validates identity and monotonic session sequence, conditionally updates latest location and cell membership, then expires stale observations. Dispatch scores fresh eligible candidates and sends bounded offers. Acceptance claims the driver/trip pair atomically, and returns the existing result on a true retry. Driver migration between cells may temporarily duplicate search entries but never assignment authority. One million drivers at four-second cadence generates 250,000 updates/s; that drives partitioning and adaptive cadence. Trip events persist separately from location observations; offer timeout and dispatcher crash are recovered using original identities and pending state.
+**Candidate:** Do we offer a ride to one driver at a time or to several?
 
-## 3. Final design diagram
+**Interviewer:** Your choice – explain the trade-off.
 
-[![Uber: Rider and driver apps location updates Location ingestion; Location ingestion latest positions Geo candidate index; Dispatch service nearby search Geo candidate index; Dispatch service offers Offer stream; Offer stream push Rider and driver apps; Dispatch service claim Assignment authority; Assignment authority trip ownership Trip store](designs/hld-9.svg)](designs/hld-9.svg)
+**Candidate:** Are pricing, payments and ETA prediction in scope?
 
-A **location index** supports nearby candidates. A **trip owner** serializes trip changes. A **driver availability record** prevents conflicting assignments. Geographic partitioning reduces search scope, but riders and drivers cross cell and region boundaries.
+**Interviewer:** No. Location, matching and assignment.
 
-## 4. Critical operation: worked execution
+**Candidate:** How fresh must locations be?
 
-![The fast location index proposes drivers; assignment establishes ownership.](lessons/hld-9-flow.svg)
+**Interviewer:** A few seconds old is fine.
 
-*The fast location index proposes drivers; assignment establishes ownership.*
+**Functional requirements**
 
-![Movement must not create duplicate assignment authority.](lessons/hld-9-failure.svg)
+1. Ingest driver locations.
+2. Find nearby available drivers for a ride request.
+3. Offer, accept and assign a driver; track the trip state.
 
-*Movement must not create duplicate assignment authority.*
+**Non-functional requirements**
 
-### Calculate freshness and load
+1. Match in under a few seconds.
+2. Never double-assign a driver; never lose a confirmed trip.
+3. 5 million drivers, scaling city by city.
 
-One million active drivers sending every four seconds produces 250,000 location updates/s. Sending every second quadruples ingest load without guaranteeing four times better pickup decisions. Choose cadence using motion, battery, network and freshness requirements. Index recent observations with expiry rather than retaining every GPS point forever in the hot search store.
+## Step 2: Estimate the scale
 
-## 5. Detailed decisions, algorithms and failure behaviour
+> **💡 Tip**
+> Location updates dominate the traffic, and they are throwaway data. That tells you where to keep them.
 
-### Architecture
-
-- **Location service:** stateless ingest (WebSocket or UDP-ish) that updates an **in-memory geo index** sharded by region or cell. Latest position only; history goes asynchronously to Kafka for analytics and ETA models.
-- **Geo index:** a hexagonal grid (Uber's **H3**) or geohash. `cell → set of available drivers`. Nearby search queries the rider's cell plus k-ring neighbours and widens if needed.
-- **Matching (dispatch) service:** gets candidates, computes the real ETA (road network, not straight-line distance), picks the best, and **atomically reserves** the driver (CAS on driver state in Redis or the owning shard) before sending the offer.
-- **Trip service:** a durable state machine in a transactional DB, publishing events for tracking, notifications and billing.
-
-### Key design decisions & trade-offs
-
-**1. Geohash vs. quadtree vs. H3.** Geohash is simple string prefixes but has edge distortions and cells of unequal neighbour distance. A quadtree adapts to density but is harder to shard. **H3 hexagons** have uniform neighbour distances, which makes them good for k-ring search and surge zones.
-
-**2. Don't put 1.25M writes/s in a database.** Location is ephemeral: keep the latest position in memory (Redis GEO or custom sharded in-memory services) and replicate for failover. Losing a few seconds of positions is fine, because drivers will send the next update.
-
-**3. Sharding by geography.** City or region shards keep matching local and cache-friendly. Hot spots (an airport at a concert's end) need finer cells or dynamic splitting.
-
-**4. Reserving the driver.** Matching might pick the same driver for two riders concurrently. A CAS from `AVAILABLE` to `DISPATCHING` on the owning shard ensures one winner. Offer timeouts release the driver.
-
-**5. Batched matching.** Instead of greedily matching each request immediately, collect requests over a ~1–2 s window and solve a bipartite assignment that minimises total ETA. That gives better global outcomes and is what large platforms do.
-
-**6. Surge pricing.** Compute the supply/demand ratio per cell every minute from streaming counts, smooth it, and lock the quoted price for the rider for a few minutes.
-
-### Scope, guarantees and sizing assumptions
-
-**Correctness requirement:** A driver can own only one active ride; location search may be stale but assignment must be authoritative.
-
-Assume 1 million online drivers publishing every 5 seconds: 200,000 location updates/s. At 200 bytes/update, about 40 MB/s raw ingress. Nearby search returns a bounded candidate set, not every driver in a city.
-
-### API contracts and data ownership
+**Location updates**
 
 ```text
-POST /ride-requests; POST /offers/{id}/accept; stream /drivers/{id}/location with sequence and timestamp
+Online drivers         = 5 million
+Updates per second     = 5M / 4 s          = 1.25 million per second
+Size per update        ≈ 100 bytes
+Ingest                 ≈ 125 MB/s
 ```
+
+What it means: 1.25 million writes a second is too many for a normal database, but we only need each driver's **latest** location – an in-memory store fits.
+
+**Ride requests**
 
 ```text
-Logical records (outline, not complete DDL):
-driver_location(driver_id,cell,lat,lon,sequence,observed_at); availability(driver_id,active_trip,version); trip(id,status,offer_epoch)
-
-Primary access/partitioning boundary:
-geospatial cell for candidate discovery; driver_id/trip_id for authoritative assignment
+Trips per day          = 20 million
+Average                = 20M / 86,400 s    ≈ 230 per second (peak ~1,000)
 ```
 
-### Build the architecture in stages
+What it means: matching is much lower volume; it can afford careful, transactional work.
 
-**Stage 3 — Partition and isolate.** Partition around geospatial cell for candidate discovery; driver_id/trip_id for authoritative assignment. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+## Step 3: Define the API
 
-### Trace the critical request
+```http
+POST /v1/drivers/me/location    { "lat": 12.9756, "lng": 77.6050, "heading": 90 }   → 204
+PUT  /v1/drivers/me/status      { "status": "AVAILABLE" }                           → 204
 
-Ingest sequenced GPS samples; discard outdated samples; maintain cell indexes; query neighboring cells; rank viable candidates by estimated pickup cost; issue bounded offers; atomically claim driver and trip; then publish the assignment and start tracking.
+POST /v1/rides                  { "pickup": {...}, "drop": {...} }                   → 201 { "rideId": "...", "status": "SEARCHING" }
+POST /v1/offers/{offerId}/accept                                                    → 200 | 409 (already taken)
+GET  /v1/rides/{rideId}                                                             → status, driver, location
+```
 
-### Deep dive: the decision that changes this system
+Drivers usually send location over a persistent connection rather than one HTTP request each time; the payload is the same.
 
-Geohash/H3-like cells reduce search candidates but cell boundaries require neighbor expansion. Straight-line distance is a cheap first filter, not an ETA. Time-stamped location and TTL detect stale availability estimates; they do not replace the assignment transaction.
+> **🎯 In the interview**
+> Point out that `accept` can return 409. Two drivers may tap Accept on the same ride; only one can win.
 
-### Failure and race-condition walkthrough
+## Step 4: Define the data model
 
-Two matchers receive acceptance from the same driver for different trips. An authoritative compare-and-set rejects one, while an epoch rejects delayed offers. Retry dispatch without duplicating confirmed rides.
+| Store | Contents | Technology |
+| --- | --- | --- |
+| Driver locations | driverId → (lat, lng, cell, updatedAt); cell → drivers | Redis (geo commands or our own cell sets), in memory |
+| Driver status | driverId → AVAILABLE / OFFERED / ON_TRIP, currentTripId | Database row (or Redis) updated atomically |
+| Trips | rideId, riderId, driverId, status, pickup, drop, times | SQL, sharded by city |
+| Location history | trip route points | Append-only log, later cold storage |
 
-### Security, tenancy and lifecycle
+> **⚖️ Design choice**
+> Keep live locations only in memory. If Redis restarts, drivers resend within 4 seconds and the index rebuilds itself. Trips, which are money and promises, go in a durable database.
 
-### Trade-offs and a starting recommendation
+## Step 5: Draw the high-level design
 
-City/regional ownership limits latency and data movement; cross-border trips need handoff semantics. Matching quality improves with batch optimization but waiting too long harms rider latency.
+[![High-level design: driver apps send GPS every 4 seconds to the location service, which updates a geo index in Redis; a rider's request goes to the matching service, which asks the geo index for nearby drivers, sends a ride offer, and assigns exactly one driver in the trip store.](designs/hld-9.svg)](designs/hld-9.svg)
 
-Time-to-match, assignment conflicts, stale-location fraction, pickup ETA error, location ingest lag and driver/rider cancellation rate.
+**Location path**
 
-**Test matrix:** Hot city center, cell-boundary query, stale GPS, reordered updates, simultaneous acceptance, cancellation race and regional ownership handoff.
+1. Ravi's app sends his location every 4 seconds.
+2. The location service converts it to a map cell and updates Redis: Ravi's latest position and which cell he is in.
 
-### Follow-up questions with answers
+**Matching path**
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: A driver can own only one active ride; location search may be stale but assignment must be authoritative.
+1. Asha requests a ride. The matching service finds her cell and the neighbouring cells.
+2. It reads available drivers there and ranks them by estimated pickup time.
+3. It offers the ride to the best driver (Ravi) with a 10-second timeout.
+4. Ravi accepts. The service atomically sets Ravi from OFFERED to ON_TRIP for this ride and creates the trip.
+5. Asha's app shows Ravi and his live location.
 
-**What is the first scaling pressure to test?** Use the actual workload: Assume 1 million online drivers publishing every 5 seconds: 200,000 location updates/s. At 200 bytes/update, about 40 MB/s raw ingress. Nearby search returns a bounded candidate set, not every driver in a city.
+![Animation: Asha requests a ride; the matching service looks up her cell and its neighbours, finds Ravi 600 metres away and Chetan 1.2 kilometres away, offers the ride to Ravi, Ravi accepts, and the service atomically marks Ravi on trip and creates the trip.](learning-figures/hld-9-match.gif)
 
-**Which failure would invalidate the naive design?** Two matchers receive acceptance from the same driver for different trips. An authoritative compare-and-set rejects one, while an epoch rejects delayed offers. Retry dispatch without duplicating confirmed rides.
+## Step 6: Go deep
 
-**Why not introduce every distributed component immediately?** City/regional ownership limits latency and data movement; cross-border trips need handoff semantics. Matching quality improves with batch optimization but waiting too long harms rider latency.
+### Finding nearby drivers: the geo index
 
-**How would you demonstrate the design works?** Hot city center, cell-boundary query, stale GPS, reordered updates, simultaneous acceptance, cancellation race and regional ownership handoff. Keep the expected invariant and recovery outcome visible in the results.
+**Option 1: Scan all drivers and compute distances.**
 
-### Further reading
+- Good: trivial.
+- Problem: 5 million distance calculations per request – far too slow.
 
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+**Option 2: A database with latitude/longitude indexes.**
 
-### Work through stale data
+- Good: familiar.
+- Problem: two separate range indexes don't combine well, and the index churns with 1.25 million updates a second.
 
-A location event with sequence 108 must not be overwritten by delayed event 107. Compare sequence/time under the device-session policy; timestamps alone can be unreliable if the phone clock changes. A nearby driver with a stale last-seen time can be excluded or penalized before offering.
+**Option 3: Divide the map into cells (geohash, S2 or Uber's H3).**
 
-Assignment uses leases or transactions with explicit identities. If a dispatcher stops after claiming the driver but before replying, reconciliation must resolve the original assignment rather than making the driver permanently busy. Keep fare quotes, live trip tracking and financial settlement as distinct workflows.
+- Good: a driver belongs to one cell; "nearby" means "this cell plus its neighbours" – a few small set lookups.
+- Problem: cell size must be tuned: too large returns too many drivers, too small needs many neighbours.
 
-## 6. Interviewer follow-ups
+> **⚖️ Design choice**
+> Hexagonal cells (H3) of roughly 0.5–1 km across, stored in Redis as `cell → set of available drivers`. When Ravi moves into a new cell, remove him from the old set and add him to the new one.
 
-**Does a geohash give road ETA?** No. It narrows candidates; road routing and traffic estimate actual travel time.
+[![Geo cells: the city is divided into cells; Asha's request looks in her own cell and the ring of neighbouring cells, collects available drivers, and ranks them by estimated pickup time instead of straight-line distance.](learning-figures/hld-9-cells.svg)](learning-figures/hld-9-cells.svg)
 
-**Can a cache decide final driver exclusivity?** Only if it is explicitly the authoritative assignment system with appropriate durability/atomicity—not merely a search cache.
+### Assigning safely: one driver, one trip
 
-## 7. Closing answer
+Two problems can cause double assignment: two rides offered to Ravi at once, or two drivers accepting the same ride.
 
-Geographic indexing makes matching efficient but the assignment authority makes it correct. I reject stale position updates, keep offers expiring/versioned and serialize driver/trip claims. Geographic cell boundaries therefore do not become duplicate assignment boundaries.
+The fix is one atomic step on both records:
+
+```sql
+UPDATE drivers SET status = 'ON_TRIP', trip_id = :rideId
+ WHERE driver_id = :ravi AND status = 'OFFERED' AND offer_ride_id = :rideId;
+-- 1 row updated → Ravi is ours; 0 rows → offer expired or Ravi took another ride
+
+UPDATE rides SET status = 'ASSIGNED', driver_id = :ravi
+ WHERE ride_id = :rideId AND status = 'SEARCHING';
+-- both in one transaction (rides and drivers sharded by the same city)
+```
+
+> **⚠️ Common mistake**
+> Assigning straight from the geo index. The index is a fast, slightly stale *hint* of who is nearby. The driver's status row is the authority on who is free.
+
+### Offer one at a time, or broadcast?
+
+**One at a time:** fair and simple, but every decline adds 10 seconds. **Broadcast to three:** faster, but two drivers will often tap Accept and one gets a disappointing 409. Most systems offer to one or a small batch, ranked by pickup time.
+
+### Scaling by city
+
+Matching for Bengaluru never needs drivers in Mumbai. Shard the location index, the matching service and the trip database by city or region. Each city's load is independent and a problem in one city stays there.
+
+## Step 7: Find bottlenecks and failure points
+
+| What fails | What happens | How we handle it |
+| --- | --- | --- |
+| Redis node restarts | Location index empty | Drivers resend in 4 s; the index refills itself |
+| Driver's app loses network | Stale position, ride offered to a ghost | Ignore drivers not seen for 15 s; offers time out after 10 s |
+| Two drivers accept at once | Double assignment | Conditional update: only one succeeds, the other gets 409 |
+| New Year's Eve in one city | Requests spike | City-level sharding; surge pricing reduces demand |
+| Matching service crashes mid-offer | Ride stuck in SEARCHING | Offers have deadlines; a sweeper re-queues the ride |
+
+## Putting it together
+
+- **Location:** GPS every 4 s → cell → Redis sets, latest value only.
+- **Match:** own cell + neighbours → rank by pickup time → offer with timeout.
+- **Assign:** one conditional transaction marks the driver and the trip; sharded by city.
+
+## Interviewer follow-ups
+
+**Why not store location history in the same place?** History is append-only and needed later (billing, disputes); live location needs only the latest value. Different stores.
+
+**How do you compute pickup time?** Road distance and traffic from a routing service, not straight-line distance – a driver across a river may be 300 m away and 15 minutes by road.
+
+**How do you handle surge?** Count open requests and available drivers per cell every minute; raise the price where demand exceeds supply.
+
+**What about pooled rides?** Matching becomes an optimisation over several riders' routes; the same atomic assignment rule applies to each seat.
+
+## Wrap up
+
+We kept latest driver locations in an in-memory cell index for fast lookups, ranked nearby drivers, and assigned exactly one with a conditional transaction.
+
+> **📝 Key takeaways**
+> - Location updates are huge and disposable: keep only the latest, in memory.
+> - Cells (geohash, S2, H3) turn "nearby" into a few set lookups.
+> - The geo index is a hint; the driver's status row decides.
+> - Shard everything by city.
+
+## Going deeper (optional)
+
+The detailed version handles a driver moving between shards mid-offer and a slow old offer arriving after a newer one, using offer IDs and versions.
+
+[![The fast location index proposes drivers; assignment establishes ownership.](lessons/hld-9-flow.svg)](lessons/hld-9-flow.svg)
+
+Further reading: [Uber H3 hexagonal grid](https://h3geo.org/) and [Redis geospatial indexes](https://redis.io/docs/latest/develop/data-types/geospatial/).
+
+## Closing answer
+
+"Drivers send GPS every 4 seconds – about 1.25 million updates a second – so I keep only each driver's latest position in Redis, indexed by map cell using H3 or geohash. When Asha requests a ride, the matching service looks in her cell and its neighbours, ranks available drivers by estimated pickup time and offers the ride to the best one with a timeout. Acceptance is one conditional transaction: the driver moves from OFFERED to ON_TRIP only if still offered this ride, and the ride from SEARCHING to ASSIGNED. The geo index is a fast hint; the status row is the authority. Everything is sharded by city."
 
 === HLD 10 ===
-N|n0|Sync client|0|0|200|rect
-N|n1|Metadata service|250|0|200|rect
-N|n2|Version manifests|500|0|200|rect
-N|n3|Chunk object store|0|110|200|rect
-N|n4|Change log|250|110|200|rect
-N|n5|Access policy|500|110|200|rect
-N|n6|Garbage collector|0|220|200|rect
-E|n0|n1|conditional commit
-E|n1|n2|publishes
-E|n2|n3|references chunks
-E|n1|n4|records changes
-E|n0|n4|resumes cursor
-E|n1|n5|authorizes
-E|n6|n3|deletes unreferenced
+N|client|Sync client|0|0|140|rect
+N|meta|Metadata service|220|0|170|rect
+N|db|Versions + shares|440|0|170|cylinder
+N|chunks|Chunk store|0|130|140|cylinder
+N|log|Change log|220|130|140|cylinder
+N|other|Other devices|440|130|150|rect
+E|client|meta|missing chunks? commit
+E|client|chunks|upload new chunks
+E|meta|db|version 7
+E|meta|log|append change
+E|other|log|changes after cursor
+E|other|chunks|download chunks
 ---
 ## Problem
 
-Design Google Drive or Dropbox: users store files in the cloud, sync them across devices automatically, share with others and see version history. The key topics are **chunking and deduplication**, **metadata vs. blob separation**, **sync protocol** and **conflict resolution**.
+Design Google Drive or Dropbox. Asha saves a 200 MB presentation on her laptop. A minute later it appears on her phone, and her colleague Bilal, who has edit access, sees the new version too.
+
+When Asha changes one slide, the app should not upload all 200 MB again. And if Asha and Bilal edit the same file offline, neither person's work may be silently lost.
 
 ## Requirements
 
-**Functional**
-- Upload, download, delete and move files and folders. Files up to tens of GB.
-- Auto-sync changes across a user's devices within seconds. Share with permissions.
-- Version history and restore. Offline edits that sync later.
+- Upload, download and delete files and folders.
+- Sync changes automatically to all of a user's devices.
+- Share files and folders with view or edit permission.
+- Keep previous versions.
+- Upload only the changed parts of a large file; never lose an edit on conflict.
 
-**Non-functional**
-- Never lose data (11 nines durability). Efficient bandwidth: only changed parts upload.
-- Strong consistency for metadata (a folder listing must be correct after a move).
+## Step 1: Clarify the requirements
 
-**Scale:** 500M users × 15 GB average ≈ 7.5 EB logical, much less after dedup. Metadata covers billions of file rows. Sync requests: tens of thousands per second.
+> **💡 Tip**
+> Separate the file **bytes** from the file **metadata** (names, folders, versions). Almost every design decision follows from that split.
 
-## 1. Scope and chosen consistency
+**Candidate:** How large can files be?
 
-I support file upload, rename, version history, offline sync and permission-controlled download. I choose immutable chunk objects plus transactional metadata/version commits. A path is not file identity, and successful object upload alone does not publish a new version.
+**Interviewer:** Up to 50 GB.
 
-## 2. Sync protocol and model
+**Candidate:** How many users?
 
-```text
-POST /files/{id}/versions {baseVersion,chunkManifest,requestId} -> version | conflict
-PATCH /files/{id} {expectedVersion,name,parentId}
-GET /changes?cursor=... -> changes,nextCursor
-File: id,parent,name,ACL,currentVersion,deleted
-Manifest: fileId,version,chunkHashes,size; Change: seq,fileId,version,tombstone
-```
+**Interviewer:** 500 million users, 100 million daily active.
 
-Client uploads missing authorized chunks and submits a manifest against its base version. Metadata verifies chunk availability and permission, then atomically commits the version and change event. Concurrent edits from base 5 cannot silently overwrite version 6; I preserve a conflict copy or explicit merge result. A 100 MB file in 4 MB chunks needs about 25 chunks; fixed-boundary shifts can reduce deduplication. Deletion emits a tombstone retained for the offline horizon. Collection waits until no retained version or protected in-flight upload references a chunk. Hash knowledge alone never grants permission to reuse/download another tenant's data.
+**Candidate:** Do we need real-time co-editing like Google Docs?
 
-## 3. Final design diagram
+**Interviewer:** No – whole-file sync like Dropbox.
 
-[![Google Drive / Dropbox: Sync client conditional commit Metadata service; Metadata service publishes Version manifests; Version manifests references chunks Chunk object store; Metadata service records changes Change log; Sync client resumes cursor Change log; Metadata service authorizes Access policy; Garbage collector deletes unreferenced Chunk object store](designs/hld-10.svg)](designs/hld-10.svg)
+**Candidate:** What happens when two people change the same file?
 
-A **file ID** stays stable across renames. A **manifest** describes a content version's chunks. A **sync cursor** identifies metadata changes a device has seen. The blob store keeps bytes; the metadata service owns names, permissions and committed versions.
+**Interviewer:** Don't lose either change.
 
-## 4. Critical operation: worked execution
+**Candidate:** Should it work offline?
 
-![A new file version references verified chunks, not a half upload.](lessons/hld-10-flow.svg)
+**Interviewer:** Yes. Sync when the device reconnects.
 
-*A new file version references verified chunks, not a half upload.*
+**Functional requirements**
 
-![Preserve both user edits rather than silently overwriting one.](lessons/hld-10-failure.svg)
+1. Upload, download, delete, move files and folders.
+2. Sync across devices; share with view/edit permissions.
+3. Version history; conflict copies when edits clash.
 
-*Preserve both user edits rather than silently overwriting one.*
+**Non-functional requirements**
 
-### Calculate deduplication honestly
+1. Durability: never lose a file (11 nines, like S3).
+2. Sync changes within seconds to a minute.
+3. Save bandwidth: upload only changed chunks.
 
-A 100 MB file split into 4 MB chunks needs about 25 chunks. If one aligned chunk changes, uploading one new chunk can save bandwidth. Insertions can shift fixed boundaries and reduce reuse; content-defined chunking offers different costs. Hash equality supports deduplication, but access control must still prevent a user from claiming another tenant's bytes merely by guessing a hash.
+## Step 2: Estimate the scale
 
-## 5. Detailed decisions, algorithms and failure behaviour
+> **💡 Tip**
+> Estimate storage and the number of sync notifications; both are much larger than you might expect.
 
-### Architecture
-
-- **Client** watches the local file system, splits files into **chunks** (~4 MB, or content-defined chunking), hashes each one (SHA-256), and asks the server which hashes are new.
-- **Block service** uploads only missing chunks to **object storage**, keyed by hash. Identical chunks across users or versions are stored once (dedup).
-- **Metadata service** commits a new file version = an ordered list of chunk hashes, in a **transactional DB** (sharded by user or namespace): files, folders, versions, sharing ACLs and a per-namespace **journal** (change log with a monotonically increasing cursor).
-- **Notification service:** clients long-poll or keep a WebSocket. On change, they fetch journal entries after their cursor and download the needed chunks.
-
-### Key design decisions & trade-offs
-
-**1. Separate metadata and blobs.** Metadata needs transactions and fast listing. Blobs need cheap, durable bulk storage. Mixing them breaks both.
-
-**2. Chunking.** Fixed-size chunks are simple, but inserting one byte at the start shifts every chunk. **Content-defined chunking** (rolling hash, as in rsync or LBFS) keeps boundaries stable, so small edits upload one or two chunks.
-
-**3. Dedup trade-off.** Cross-user dedup saves huge storage, but it leaks information ("does anyone have this file?") and complicates deletion (reference counting and GC). Many systems dedup per user only.
-
-**4. Sync with a journal cursor.** Every change appends to the namespace journal. Clients store the last cursor, so sync is "give me changes after X". It's idempotent, resumable and works after being offline.
-
-**5. Conflicts.** Two devices edit the same file offline. The server accepts the first commit (based on version `v5`). The second commit, also based on `v5`, is a conflict, so keep both ("file (conflicted copy).docx"). Automatic merging is only possible for structured formats (Google Docs uses OT/CRDT for its own docs).
-
-**6. Durability.** Object storage replicated or erasure-coded across zones. Metadata DB with synchronous replicas and point-in-time backups.
-
-### Scope, guarantees and sizing assumptions
-
-**Correctness requirement:** A file revision references a complete immutable chunk list; concurrent edits cannot silently overwrite one another.
-
-Assume 10 million users x 20 metadata operations/day: 200 million/day, about 2,315/s. One million 100 MB uploads/day is 100 TB/day raw. Chunking permits resuming changed portions, but deduplication efficiency depends on real workloads.
-
-### API contracts and data ownership
+**Storage**
 
 ```text
-POST /upload-sessions; PUT signed chunk; POST /files/{id}/revisions with expectedVersion; GET /changes?cursor
+Users                  = 500 million
+Average stored         ≈ 10 GB per user
+Total                  = 500M × 10 GB     = 5 EB (before de-duplication)
 ```
+
+What it means: bytes go in object storage, split into chunks, and identical chunks are stored once.
+
+**Changes**
 
 ```text
-Logical records (outline, not complete DDL):
-file(id,parent_id,name,owner,current_revision,version); revision(id,file_id,chunk_manifest); change(sequence,tenant,entity,operation)
-
-Primary access/partitioning boundary:
-tenant_id + file_id for metadata; checksum plus storage namespace for chunk objects
+Daily active users     = 100 million
+File changes per user  ≈ 20 per day
+Changes                = 2 billion per day ≈ 23,000 per second
 ```
 
-### Build the architecture in stages
+What it means: the metadata database takes tens of thousands of writes a second and must be sharded, and devices must be told about changes efficiently.
 
-**Stage 3 — Partition and isolate.** Partition around tenant_id + file_id for metadata; checksum plus storage namespace for chunk objects. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+## Step 3: Define the API
 
-### Trace the critical request
+```http
+POST /v1/files/{fileId}/versions/start   { "chunks": ["sha256:ab12…", "sha256:9f3c…", …] }
+→ 200 { "missing": ["sha256:9f3c…"], "uploadUrls": { "sha256:9f3c…": "https://…" } }
 
-Detect changed chunks locally; upload missing chunks with checksums; verify ownership and object existence; atomically create a revision and advance file metadata using expected version; emit a durable change event; other devices reconcile through cursor-based delta listing.
+PUT  {uploadUrl}                          (raw chunk bytes, straight to object storage)
 
-### Deep dive: the decision that changes this system
+POST /v1/files/{fileId}/versions/commit  { "baseVersion": 6, "chunks": [ … ] }
+→ 201 { "version": 7 }   |   409 { "error": "CONFLICT", "currentVersion": 7 }
 
-Content-defined chunking resists boundary shifts better than fixed-size chunking but costs CPU and complexity. Deduplication across tenants can leak file existence and complicate encryption; prefer a defined tenant/security boundary.
+GET  /v1/changes?cursor=…                → list of changed files since cursor
+POST /v1/files/{fileId}/share            { "email": "bilal@…", "role": "EDITOR" }
+```
 
-### Failure and race-condition walkthrough
+The client lists the chunk hashes it has; the server says which ones it is missing. Only those are uploaded.
 
-Two devices edit offline from revision 7. The first commits revision 8; the second receives a conflict and preserves its work as a conflict copy or explicit merge. A last-writer-wins clock does not understand document intent.
+> **🎯 In the interview**
+> `baseVersion` on commit is the key detail. It says "I edited version 6". If the server is already at version 7, that is a conflict, not an overwrite.
 
-### Security, tenancy and lifecycle
+## Step 4: Define the data model
 
-### Trade-offs and a starting recommendation
+| Table | Key fields |
+| --- | --- |
+| `file` | fileId, ownerId, parentFolderId, name, latestVersion, deleted |
+| `file_version` | fileId, version, chunk list (ordered hashes), size, createdBy, createdAt |
+| `chunk` | hash → storage location, reference count |
+| `share` | fileId or folderId, userId, role (VIEWER / EDITOR) |
+| `change_log` | userId or namespace, sequence, fileId, change type |
 
-Metadata consistency matters more than immediate global propagation of every chunk. Store large bytes in object storage and small mutable indexes in a transactional store. Garbage collection needs retention and references from in-flight uploads.
+> **⚖️ Design choice**
+> Metadata in a sharded SQL database (by owner or namespace), because moves, renames and permissions need transactions. Chunks in object storage, addressed by their content hash.
 
-Sync convergence time, conflict rate, missing-object references, upload resume efficiency and change-log cursor lag.
+## Step 5: Draw the high-level design
 
-**Test matrix:** Interrupted upload, corrupted chunk, offline concurrent rename/edit, moved parent folder, shared-file permission revocation and orphan-chunk cleanup.
+[![High-level design: the sync client talks to the metadata service, which records version manifests and checks access policy; chunk bytes go to the chunk object store; every committed change is appended to a change log that other devices read; a garbage collector removes chunks no version uses.](designs/hld-10.svg)](designs/hld-10.svg)
 
-### Follow-up questions with answers
+**Asha saves the presentation**
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: A file revision references a complete immutable chunk list; concurrent edits cannot silently overwrite one another.
+1. Her sync client notices the change and splits the file into 4 MB chunks, hashing each one.
+2. It asks the metadata service which hashes are new. Only slide 12 changed, so only one chunk is missing.
+3. It uploads that one 4 MB chunk straight to object storage.
+4. It commits version 7 = the ordered list of chunk hashes, with `baseVersion 6`.
+5. The metadata service appends a change to the change log.
 
-**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million users x 20 metadata operations/day: 200 million/day, about 2,315/s. One million 100 MB uploads/day is 100 TB/day raw. Chunking permits resuming changed portions, but deduplication efficiency depends on real workloads.
+**Her phone and Bilal see it**
 
-**Which failure would invalidate the naive design?** Two devices edit offline from revision 7. The first commits revision 8; the second receives a conflict and preserves its work as a conflict copy or explicit merge. A last-writer-wins clock does not understand document intent.
+1. Their clients hold a long-poll (or push channel) on `/changes`.
+2. They learn "file X is now version 7", fetch the manifest, download only chunks they don't already have, and rebuild the file.
 
-**Why not introduce every distributed component immediately?** Metadata consistency matters more than immediate global propagation of every chunk. Store large bytes in object storage and small mutable indexes in a transactional store. Garbage collection needs retention and references from in-flight uploads.
+![Animation: Asha edits slide 12; the client splits the file into chunks and only one chunk hash is new; it uploads that one chunk, commits version 7, the change log records it, and her phone downloads just the changed chunk to rebuild the file.](learning-figures/hld-10-sync.gif)
 
-**How would you demonstrate the design works?** Interrupted upload, corrupted chunk, offline concurrent rename/edit, moved parent folder, shared-file permission revocation and orphan-chunk cleanup. Keep the expected invariant and recovery outcome visible in the results.
+## Step 6: Go deep
 
-### Further reading
+### Chunking and de-duplication
 
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+Splitting files into chunks gives three wins:
 
-### Work through deletion and recovery
+- **Delta sync:** change one slide, upload one chunk – not 200 MB.
+- **Resumable transfers:** a failed upload resumes at the next chunk.
+- **De-duplication:** the same chunk (a shared PDF, a common library) is stored once, however many users have it.
 
-Deletion should create a metadata tombstone visible to offline devices; immediately forgetting the file can let an old client resurrect it as new. Retain tombstones for a documented offline/recovery horizon. Garbage collection removes chunks only when no retained authorized version references them and in-flight uploads are considered.
+Fixed 4 MB chunks are simple. Inserting a byte at the start shifts every boundary, though, so some systems use **content-defined chunking**, where boundaries follow the content and survive insertions.
 
-Separate ACL changes from cached directory listings. A revoked user might retain downloaded local bytes, but future metadata/download access must follow current permissions. Versioned manifests also make rollback a new explicit pointer update rather than destructive replacement of history.
+### Conflicts: two edits to the same version
 
-## 6. Interviewer follow-ups
+**Option 1: Last writer wins.**
 
-**Does object-store upload success make a file visible?** Not until its manifest and metadata commit.
+- Good: simple.
+- Problem: Asha's or Bilal's work silently disappears.
 
-**Does rename require reuploading all bytes?** No. Stable identity and manifests separate naming from content.
+**Option 2: Lock the file while someone edits.**
 
-## 7. Closing answer
+- Good: no conflicts.
+- Problem: impossible offline, and a forgotten lock blocks everyone.
 
-Stable file IDs separate naming from content, and immutable manifests separate uploaded bytes from committed versions. Conditional base-version commits preserve conflicting offline edits. Tombstones and reference-aware garbage collection make deletion and recovery explicit across disconnected devices.
+**Option 3: Detect with versions; keep both.**
+
+- Good: nothing is lost; the user decides.
+- Problem: users occasionally see a "conflicted copy".
+
+> **⚖️ Design choice**
+> Detect with `baseVersion`. Bilal commits version 7 first. Asha's commit says "based on 6", so the server refuses it with 409, and her client saves her edit as `Deck (Asha's conflicted copy).pptx`. This is what Dropbox does.
+
+[![Conflict handling: Asha and Bilal both edit version 6 offline; Bilal commits first and becomes version 7; Asha's commit based on version 6 is rejected with a conflict, so her client saves her edit as a conflicted copy and both changes survive.](learning-figures/hld-10-conflict.svg)](learning-figures/hld-10-conflict.svg)
+
+> **⚠️ Common mistake**
+> Comparing modification timestamps to pick a winner. Device clocks are wrong, and "newer" does not mean "contains the other person's change".
+
+### Telling devices about changes
+
+Each user (or shared folder) has a change log with increasing sequence numbers. A device stores the last sequence it processed and asks "what changed after 8,451?". A long-poll or push notification wakes it when something new arrives, so it does not poll every few seconds.
+
+### Sharing and permissions
+
+Permissions are checked by the metadata service on every manifest read and every upload URL it hands out. Upload and download URLs are short-lived and signed, so a leaked link stops working quickly.
+
+## Step 7: Find bottlenecks and failure points
+
+| What fails | What happens | How we handle it |
+| --- | --- | --- |
+| Upload interrupted | Partial file | Chunks already uploaded are kept; the version is committed only when all exist |
+| Two offline edits | Conflict | `baseVersion` check; conflicted copy |
+| A very large shared folder | One change notifies thousands of devices | Change log per shared namespace; devices read it at their own pace |
+| Chunk no longer used | Storage leak | Reference counts plus a garbage collector that deletes after a grace period |
+| Metadata shard hot (one huge team) | Slow commits | Split by namespace; cache folder listings |
+
+## Putting it together
+
+- **Upload:** chunk and hash → upload only missing chunks → commit a version with `baseVersion`.
+- **Sync:** change log + long-poll → fetch manifest → download missing chunks.
+- **Safety:** conflicts become copies; chunks are de-duplicated and garbage-collected.
+
+## Interviewer follow-ups
+
+**Why not store the whole file in the database?** Databases are poor at huge blobs. Object storage is cheaper, more durable and serves bytes directly to clients.
+
+**How do you restore an old version?** Commit a new version whose chunk list equals the old one – no bytes move.
+
+**How do you handle deletes?** Mark the file deleted (trash) and keep its versions for 30 days; then drop references and let the garbage collector reclaim chunks.
+
+**Is de-duplication across users a privacy risk?** It can reveal that someone else has a file. Many services de-duplicate only within an account, or encrypt per user.
+
+## Wrap up
+
+We split files into hashed chunks in object storage, kept versions and permissions in a metadata database, and synced devices through a change log with conflict detection.
+
+> **📝 Key takeaways**
+> - Bytes in object storage, metadata in a transactional database.
+> - Content-hashed chunks give delta sync, resumable uploads and de-duplication.
+> - `baseVersion` turns concurrent edits into a conflicted copy, never a silent overwrite.
+> - Devices catch up from a change-log cursor.
+
+## Going deeper (optional)
+
+The detailed version verifies that every chunk in a manifest really exists before committing a version, so a half upload can never become the latest file.
+
+[![A new file version references verified chunks, not a half upload.](lessons/hld-10-flow.svg)](lessons/hld-10-flow.svg)
+
+Further reading: [Dropbox – Streaming file synchronization](https://dropbox.tech/infrastructure/streaming-file-synchronization) and [Amazon S3 data durability](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html).
+
+## Closing answer
+
+"I separate bytes from metadata. The client splits a file into 4 MB chunks and hashes each; the server says which hashes it lacks, and only those are uploaded straight to object storage with signed URLs. A version is an ordered list of chunk hashes, committed in a sharded SQL metadata service with the version it was based on. If someone else committed first, the commit is rejected and the client saves a conflicted copy, so no edit is lost. Every commit appends to a change log; other devices long-poll it, fetch the manifest and download only missing chunks. Chunks are de-duplicated and garbage-collected by reference count."
 
 === HLD 11 ===
 N|n0|Crawler frontier|0|0|200|rect

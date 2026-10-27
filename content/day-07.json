@@ -109,103 +109,100 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Upload service",
+            "id": "up",
+            "label": "Creator app",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Original object store",
-            "x": 250,
+            "id": "obj",
+            "label": "Object storage",
+            "x": 220,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n2",
-            "label": "Processing queue",
-            "x": 500,
+            "id": "proc",
+            "label": "Transcoding pipeline",
+            "x": 440,
             "y": 0,
-            "w": 200,
+            "w": 190,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Transcode workers",
+            "id": "meta",
+            "label": "Video metadata",
+            "x": 440,
+            "y": 130,
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "cdn",
+            "label": "CDN edges",
+            "x": 220,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "view",
+            "label": "Viewer player",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "Asset metadata",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "CDN",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Player",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "resumable chunks"
+            "from": "up",
+            "to": "obj",
+            "label": "resumable upload"
           },
           {
-            "from": "n0",
-            "to": "n2",
-            "label": "verified finalize"
+            "from": "obj",
+            "to": "proc",
+            "label": "upload done event"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "profile tasks"
+            "from": "proc",
+            "to": "obj",
+            "label": "segments + manifest"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "validated renditions"
+            "from": "proc",
+            "to": "meta",
+            "label": "mark READY"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "published manifest"
+            "from": "view",
+            "to": "meta",
+            "label": "get video"
           },
           {
-            "from": "n5",
-            "to": "n6",
-            "label": "segments"
+            "from": "view",
+            "to": "cdn",
+            "label": "stream segments"
+          },
+          {
+            "from": "cdn",
+            "to": "obj",
+            "label": "cache miss",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign YouTube: creators upload videos, which get transcoded into multiple resolutions and formats, and viewers worldwide stream them smoothly with adaptive bitrate. The discussion centres on the **upload and transcoding pipeline**, **object storage**, **CDN delivery** and the **metadata/view-count** systems.\n\n## Requirements\n\n**Functional**\n- Upload large videos (GBs) reliably, including resuming after a network drop.\n- Transcode to 144p–4K in several codecs. Generate thumbnails.\n- Stream with adaptive bitrate. Search, view counts, likes, comments.\n\n**Non-functional**\n- Playback starts in < 2 s, with minimal rebuffering, at global scale.\n- Uploads must never be lost. Processing can take minutes.\n\n**Scale:** 500 hours uploaded per minute ≈ 30k hours/hour. At ~1 GB per hour of raw video × ~3 for renditions, that's **≈ 2–3 PB of new storage per day**. Views of billions per day are served mostly by the CDN.\n\n## 1. Scope and chosen pipeline\n\nI support creator upload, asynchronous multi-bitrate preparation, public/private publication and adaptive playback. I choose direct resumable object uploads, a durable processing queue and independently retryable transcode tasks keyed by asset version/profile. Search/recommendation are downstream consumers, not prerequisites for serving a known video.\n\n## 2. API and asset model\n\n```text\nPOST /uploads -> uploadId, authorized chunk destinations\nPOST /uploads/{id}/finalize {size,checksum} -> assetId,PROCESSING\nGET /videos/{id}/playback -> authorized manifest and status\nAsset: id,owner,sourceVersion,state; Rendition UNIQUE(asset,version,profile)\n```\n\nFinalize verifies chunks/checksum and records processing intent once. Workers write temporary outputs, validate segments, then mark their rendition complete. Manifest publication is an atomic metadata/version switch referencing completed outputs. I may publish 720p while 1080p retries if the readiness policy allows it. A million viewers at 3 Mb/s imply 3 Tb/s, so media bypasses application servers via CDN. Failed uploads expire; deletion revokes metadata access and schedules source/rendition/cache lifecycle cleanup. Upload throughput, processing age, playback startup and rebuffer rate cover different failure stages.\n\n## 3. Final design diagram\n\n[![YouTube: Upload service resumable chunks Original object store; Upload service verified finalize Processing queue; Processing queue profile tasks Transcode workers; Transcode workers validated renditions Asset metadata; Asset metadata published manifest CDN; CDN segments Player](designs/hld-7.svg)](designs/hld-7.svg)\n\nAn **original asset** is the uploaded source. A **rendition** is an encoded version. A **manifest** lists segments and available variants. A **CDN** keeps content near viewers. I begin with one durable original and an asynchronous preparation pipeline.\n\n## 4. Critical operation: worked execution\n\n![Publication follows verified processing rather than mere upload completion.](lessons/hld-7-flow.svg)\n\n*Publication follows verified processing rather than mere upload completion.*\n\n![Track each processing task and publish only valid outputs.](lessons/hld-7-failure.svg)\n\n*Track each processing task and publish only valid outputs.*\n\n### Calculate the bottleneck\n\nOne million concurrent viewers averaging 3 Mb/s require 3 Tb/s of delivery bandwidth before overhead. That belongs on object/CDN delivery infrastructure rather than application servers proxying every segment. Ten minutes at 3 Mb/s is approximately 225 MB decimal, illustrating why watch time dominates storage/control-plane API payloads.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n**Upload path:**\n1. The client gets a **pre-signed, resumable upload URL** and uploads chunks directly to object storage (S3/GCS), bypassing app servers.\n2. Upload complete triggers an event, which enqueues a **transcode job** (DAG: split, then encode per resolution/codec in parallel, then package as HLS/DASH segments, plus thumbnails, content-ID scan).\n3. Workers write the segments to object storage, update the **metadata DB** (`video → status, renditions, manifest URL`), and the video becomes public.\n\n**Playback path:** the client fetches the manifest from the API, then the segments from the **CDN**. The player switches bitrate per segment based on measured bandwidth (ABR).\n\n### Key design decisions & trade-offs\n\n**1. Direct-to-storage uploads.** App servers never proxy video bytes. Resumable chunked upload (tus or S3 multipart) survives flaky mobile networks.\n\n**2. Parallel transcoding.** Split the video into GOP-aligned chunks and encode them in parallel across workers, then stitch. A 1-hour video finishes in minutes instead of hours. The queue plus idempotent jobs (keyed by `videoId + rendition`) allows safe retries.\n\n**3. Adaptive bitrate.** HLS/DASH segments (2–6 s) per rendition plus a manifest. Shorter segments adapt faster but mean more requests and less efficient caching.\n\n**4. CDN strategy.** Popular videos are cached at edge PoPs worldwide. The long tail is served from regional origin caches (most videos are rarely watched). Pre-warm the CDN for big launches.\n\n**5. Storage tiers.** Hot renditions on standard storage. Old, rarely watched videos move to cheaper tiers, and some renditions (4K of an unwatched video) can be dropped and regenerated on demand.\n\n**6. View counts.** Don't update a DB row per view. Stream view events to Kafka, aggregate (with dedup and fraud filtering) and flush periodically. Counts are eventually consistent.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A video becomes playable only when a committed manifest references verified output objects.\n\nAssume 100,000 uploads/day x 500 MB: 50 TB/day original ingress. A 10-minute title with six bitrates averaging a combined 12 Mb/s creates roughly 900 MB of encoded media. At 1 million viewers x 3 Mb/s, edge delivery is 3 Tb/s.\n\n### API contracts and data ownership\n\n```text\nPOST /uploads -> signed multipart destination; POST /uploads/{id}/complete; GET /videos/{id}/playback; GET /search\n```\n\n```text\nLogical records (outline, not complete DDL):\nvideo(id,owner,status,source_object,manifest_version); encode_job(video_id,profile,state); segment(checksum,object_key)\n\nPrimary access/partitioning boundary:\nvideo_id for metadata and workflow; content-addressed object keys for media segments\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around video_id for metadata and workflow; content-addressed object keys for media segments. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAuthorize upload quota; allocate multipart upload; verify completion/checksum; enqueue metadata-driven transcode jobs; scan and generate renditions/thumbnails; validate outputs; atomically publish a manifest version; deliver segments through CDN signed URLs.\n\n### Deep dive: the decision that changes this system\n\nAdaptive bitrate playback requests small segments based on bandwidth and buffer state. Metadata is a control plane; bulk bytes should not proxy through API servers. Idempotent rendition jobs write to versioned temporary prefixes and publish only after validation.\n\n### Failure and race-condition walkthrough\n\nAn encoder crashes after writing half a rendition. Its lease can expire and another worker retry, but incomplete prefixes are never made playable. Old CDN manifests need a controlled retirement window.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nPrecompute popular bitrates for predictable playback; just-in-time encoding saves unused storage but risks startup stalls. Content moderation and copyright handling are separate workflows with appeal/audit boundaries.\n\nUpload completion rate, time-to-playable, playback start time, rebuffer ratio, CDN hit ratio, encoding backlog and cost per viewing minute.\n\n**Test matrix:** Resume interrupted multipart upload, retry an encoder job, corrupt a segment checksum, simulate CDN miss storms, remove a video while manifests are cached.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A video becomes playable only when a committed manifest references verified output objects.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 100,000 uploads/day x 500 MB: 50 TB/day original ingress. A 10-minute title with six bitrates averaging a combined 12 Mb/s creates roughly 900 MB of encoded media. At 1 million viewers x 3 Mb/s, edge delivery is 3 Tb/s.\n\n**Which failure would invalidate the naive design?** An encoder crashes after writing half a rendition. Its lease can expire and another worker retry, but incomplete prefixes are never made playable. Old CDN manifests need a controlled retirement window.\n\n**Why not introduce every distributed component immediately?** Precompute popular bitrates for predictable playback; just-in-time encoding saves unused storage but risks startup stalls. Content moderation and copyright handling are separate workflows with appeal/audit boundaries.\n\n**How would you demonstrate the design works?** Resume interrupted multipart upload, retry an encoder job, corrupt a segment checksum, simulate CDN miss storms, remove a video while manifests are cached. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through retries and access\n\nTranscode job identity should include original asset version and encoding profile. Retrying a task may rewrite deterministic output paths or produce a new version, but must not publish partial files as completed segments. Upload finalization is idempotent and verifies all chunks; abandoned sessions need lifecycle cleanup.\n\nPrivate video access requires checking entitlements when issuing short-lived playback access, not merely hiding the video in search. CDN caching keys and signed URLs must preserve the chosen authorization boundary. Deletion requires original, renditions, manifests and CDN policy to be considered together.\n\n## 6. Interviewer follow-ups\n\n**Does adaptive bitrate mean changing the original video?** No. The player selects among prepared variants as conditions change.\n\n**Can a task acknowledgement prove playable output?** Only after validating its expected artifacts.\n\n## 7. Closing answer\n\nI separate resumable ingestion, idempotent media preparation and CDN playback. Publication references only verified versioned artifacts; incomplete transcodes never become playable output. Application APIs handle metadata and permissions while object/CDN infrastructure carries the video bandwidth.\n"
+      "markdown": "## Problem\n\nDesign YouTube. Asha uploads a 10-minute cooking video from her phone. A few minutes later, viewers can watch it in 240p on a slow train or in 1080p on a laptop, and the quality changes smoothly as their network changes.\n\nThe two hard parts are processing every upload into many formats, and serving billions of views without melting our servers.\n\n## Requirements\n\n- Creators upload videos (up to a few GB).\n- Videos are processed into several resolutions and become watchable within minutes.\n- Viewers stream with quality that adapts to their bandwidth.\n- Show title, views and a thumbnail; search and recommendations are out of scope.\n- Very read-heavy: far more watching than uploading.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> Split the system into an upload path and a watch path early. They have completely different scale and design.\n\n**Candidate:** What is the scale?\n\n**Interviewer:** 1 billion daily viewers, 500 hours of video uploaded every minute.\n\n**Candidate:** Which devices and network speeds?\n\n**Interviewer:** Everything from cheap phones on 3G to smart TVs.\n\n**Candidate:** How quickly must an upload be watchable?\n\n**Interviewer:** Within a few minutes is fine.\n\n**Candidate:** Do we need comments, likes, search?\n\n**Interviewer:** No. Upload, process and watch.\n\n**Candidate:** Can uploads resume after a network drop?\n\n**Interviewer:** Yes – people upload from phones.\n\n**Functional requirements**\n\n1. Upload a video, resumable.\n2. Process it into multiple resolutions and a thumbnail.\n3. Stream it with adaptive quality.\n\n**Non-functional requirements**\n\n1. Smooth playback worldwide: start in about 2 seconds, rarely buffer.\n2. Highly available watch path; uploads may take minutes to process.\n3. Storage and bandwidth cost matter more than anything else.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> For video, bandwidth is the number that decides the architecture.\n\n**Uploads and storage**\n\n```text\nUploaded             = 500 hours / minute = 720,000 hours / day\nStored per hour      ≈ 1 GB original + ~2 GB for all resolutions = 3 GB\nPer day              = 720,000 × 3 GB     ≈ 2 PB\n```\n\nWhat it means: storage grows by petabytes a day – only object storage (like S3 or GCS) works.\n\n**Watching**\n\n```text\nViews per day        = 1B users × 5 videos     = 5 billion\nAverage bitrate      ≈ 3 Mbps; average watch ≈ 5 minutes\nBandwidth            ≈ 5B × 5 min × 60 s × 3 Mb / 86,400 s ≈ 260 Tbps\n```\n\nWhat it means: no data centre can send this. Videos must be served from a **CDN** – servers close to viewers, inside ISPs.\n\n## Step 3: Define the API\n\n```http\nPOST /v1/uploads                       { \"title\": \"Masala dosa at home\", \"size\": 812000000 }\n→ 201 { \"videoId\": \"v-8Kq2\", \"uploadUrl\": \"https://upload.example.com/v-8Kq2?sig=...\" }\n\nPUT  {uploadUrl}  (chunks, with Content-Range – resumable)\n\nGET  /v1/videos/v-8Kq2      → 200 { \"title\": \"...\", \"status\": \"READY\", \"manifestUrl\": \"https://cdn.example.com/v-8Kq2/master.m3u8\" }\n```\n\nThe client uploads bytes straight to object storage with a short-lived signed URL, so our API servers never carry video bytes.\n\n> **🎯 In the interview**\n> Say clearly: API servers handle metadata only. Video bytes go phone → object storage on upload, and CDN → viewer on playback.\n\n## Step 4: Define the data model\n\n| Store | Contents | Technology |\n| --- | --- | --- |\n| Video metadata | videoId, owner, title, status (UPLOADING / PROCESSING / READY / FAILED), duration | SQL, sharded by videoId, plus a cache |\n| Original uploads | the raw file | Object storage |\n| Processed video | small segments per resolution + manifest files | Object storage, served through a CDN |\n| Processing jobs | videoId, task, status, attempts | A queue plus a job table |\n| View counts | videoId → count | Counters aggregated in batches |\n\n> **⚖️ Design choice**\n> Keep metadata in a database and bytes in object storage. Metadata is small and queried often; bytes are huge and only streamed.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: the creator uploads the original to object storage; a processing pipeline transcodes it into segments and manifests; the video becomes published in metadata; viewers fetch metadata from the API and stream segments from the CDN.](designs/hld-7.svg)](designs/hld-7.svg)\n\n**Upload path**\n\n1. Asha's app calls `POST /uploads` and gets a signed upload URL.\n2. The app uploads the file in chunks straight to object storage; a dropped connection resumes from the last chunk.\n3. Upload complete → an event goes on a queue; status becomes PROCESSING.\n4. Workers transcode the video into 240p, 480p, 720p and 1080p, cut it into 4-second segments, and create a thumbnail.\n5. When every required output is checked, status becomes READY.\n\n**Watch path**\n\n1. Bilal opens the video. The API returns metadata and the manifest URL.\n2. His player downloads the manifest from the CDN, then segments, choosing quality as it goes.\n3. The CDN serves popular segments from its cache; on a miss it fetches from object storage once.\n\n[![Processing pipeline: the uploaded original is split into chunks, each chunk is transcoded into several resolutions in parallel, the results are packaged into segments with a manifest, outputs are verified, and only then the video is marked ready.](learning-figures/hld-7-pipeline.svg)](learning-figures/hld-7-pipeline.svg)\n\n## Step 6: Go deep\n\n### Processing at scale: the transcoding algorithm\n\nTranscoding a 10-minute video to four resolutions on one machine can take longer than the video itself.\n\n**Option 1: One worker transcodes the whole file.**\n\n- Good: simple.\n- Problem: slow for long videos, and a crash at 95% means starting over.\n\n**Option 2: Split into chunks and transcode in parallel.**\n\n- Good: 60 chunks on 60 workers finish in about the time of one chunk; a failed chunk is retried alone.\n- Problem: needs a coordinator that tracks every chunk and joins the results.\n\n> **⚖️ Design choice**\n> Split the video into chunks at keyframes (about 10 seconds each), queue one task per chunk per resolution, and have a coordinator mark the video READY only when every task has succeeded. This is a small DAG of tasks: split → transcode (parallel) → package → thumbnail → publish.\n\n### Adaptive streaming\n\nEach resolution is cut into short segments, and a **manifest** lists them (HLS `.m3u8` or DASH `.mpd`). The player measures its download speed: on a fast network it fetches 1080p segments; when the train enters a tunnel it switches to 240p for the next segment. No server work is needed – it is all in the player.\n\n![Animation: a player fetches the manifest, starts with 480p segments, network speed rises so it switches to 1080p, then the train enters a tunnel and it drops to 240p for the next segment without stopping playback.](learning-figures/hld-7-abr.gif)\n\n### Serving through a CDN\n\nPopular videos are cached at the CDN edges. For the long tail of rarely watched videos, the edge fetches from object storage on demand. A new viral video gets pre-warmed into edges in the regions where it is trending.\n\n> **⚠️ Common mistake**\n> Streaming from your own application servers. At hundreds of terabits per second, only a CDN – ideally with servers inside ISPs, as YouTube and Netflix do – can carry the load.\n\n### Counting views\n\nWriting to a database row on every view would create a hot row for viral videos. Instead, count in memory or in a stream and add the totals every few seconds. The displayed count may lag slightly – that is fine.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| Upload drops at 70% | Asha would start again | Resumable chunked upload continues from the last chunk |\n| A transcode worker crashes | One chunk missing | The task returns to the queue and is retried; the video stays PROCESSING |\n| A corrupt or unsupported file | Processing can never succeed | After a few attempts mark FAILED and tell the creator |\n| A video goes viral | Origin gets hammered | CDN caches it; edges fetch each segment once |\n| A CDN region has problems | Buffering for viewers there | DNS / multi-CDN steers viewers to a healthy provider |\n\n## Putting it together\n\n- **Upload:** signed URL → object storage, resumable → queue → parallel chunk transcoding → verify → READY.\n- **Watch:** metadata from the API → manifest and segments from the CDN → the player adapts quality.\n- **Scale:** bytes never touch API servers; the CDN carries the bandwidth.\n\n## Interviewer follow-ups\n\n**How do you avoid duplicate uploads?** Hash the file (or its first chunks) and reuse existing processed outputs when the same content is uploaded again – a policy decision for copyright too.\n\n**How do you reduce storage cost?** Rarely watched videos keep fewer resolutions or move to colder storage; popular ones get more efficient codecs such as AV1, which cost more CPU once but save bandwidth on every view.\n\n**Live streaming?** Same segments-and-manifest idea, but segments are produced in real time and the manifest keeps growing; latency is a few seconds.\n\n**How do you show a thumbnail before processing ends?** Generate the thumbnail as an early, separate task so the video page is ready while higher resolutions are still processing.\n\n## Wrap up\n\nWe uploaded straight to object storage, transcoded chunks in parallel into segmented resolutions, and served them through a CDN with adaptive streaming.\n\n> **📝 Key takeaways**\n> - Upload and watch are two separate paths; API servers never carry video bytes.\n> - Chunked, parallel transcoding makes processing fast and retryable.\n> - Segments + a manifest let the player switch quality on the fly.\n> - The CDN is the design: bandwidth, not compute, is the bottleneck.\n\n## Going deeper (optional)\n\nThe detailed version tracks each processing task separately so a retried task cannot publish a half-written output, and adds content-moderation and copyright checks before publication.\n\n[![Publication follows verified processing rather than mere upload completion.](lessons/hld-7-flow.svg)](lessons/hld-7-flow.svg)\n\nFurther reading: [Apple HTTP Live Streaming (HLS)](https://developer.apple.com/streaming/) and the [Netflix Open Connect overview](https://openconnect.netflix.com/en/).\n\n## Closing answer\n\n\"I separate upload from watching. The app gets a signed URL and uploads the video in resumable chunks straight to object storage. An event starts a pipeline: the video is split at keyframes, each chunk is transcoded into several resolutions in parallel, packaged into short segments with an HLS or DASH manifest, verified, and only then marked ready. Metadata lives in a sharded database with a cache. Viewers get metadata from our API but stream segments from a CDN, and the player switches resolution segment by segment as bandwidth changes. Bandwidth, not compute, is the main cost, so the CDN is central.\"\n"
     },
     {
       "category": "AI",

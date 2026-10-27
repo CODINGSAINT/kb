@@ -104,108 +104,94 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "client",
             "label": "Sync client",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "meta",
             "label": "Metadata service",
-            "x": 250,
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Version manifests",
-            "x": 500,
+            "id": "db",
+            "label": "Versions + shares",
+            "x": 440,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
-            "label": "Chunk object store",
+            "id": "chunks",
+            "label": "Chunk store",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "y": 130,
+            "w": 140,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n4",
+            "id": "log",
             "label": "Change log",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "x": 220,
+            "y": 130,
+            "w": 140,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n5",
-            "label": "Access policy",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Garbage collector",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "id": "other",
+            "label": "Other devices",
+            "x": 440,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "conditional commit"
+            "from": "client",
+            "to": "meta",
+            "label": "missing chunks? commit"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "publishes"
+            "from": "client",
+            "to": "chunks",
+            "label": "upload new chunks"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "references chunks"
+            "from": "meta",
+            "to": "db",
+            "label": "version 7"
           },
           {
-            "from": "n1",
-            "to": "n4",
-            "label": "records changes"
+            "from": "meta",
+            "to": "log",
+            "label": "append change"
           },
           {
-            "from": "n0",
-            "to": "n4",
-            "label": "resumes cursor"
+            "from": "other",
+            "to": "log",
+            "label": "changes after cursor"
           },
           {
-            "from": "n1",
-            "to": "n5",
-            "label": "authorizes"
-          },
-          {
-            "from": "n6",
-            "to": "n3",
-            "label": "deletes unreferenced"
+            "from": "other",
+            "to": "chunks",
+            "label": "download chunks"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign Google Drive or Dropbox: users store files in the cloud, sync them across devices automatically, share with others and see version history. The key topics are **chunking and deduplication**, **metadata vs. blob separation**, **sync protocol** and **conflict resolution**.\n\n## Requirements\n\n**Functional**\n- Upload, download, delete and move files and folders. Files up to tens of GB.\n- Auto-sync changes across a user's devices within seconds. Share with permissions.\n- Version history and restore. Offline edits that sync later.\n\n**Non-functional**\n- Never lose data (11 nines durability). Efficient bandwidth: only changed parts upload.\n- Strong consistency for metadata (a folder listing must be correct after a move).\n\n**Scale:** 500M users × 15 GB average ≈ 7.5 EB logical, much less after dedup. Metadata covers billions of file rows. Sync requests: tens of thousands per second.\n\n## 1. Scope and chosen consistency\n\nI support file upload, rename, version history, offline sync and permission-controlled download. I choose immutable chunk objects plus transactional metadata/version commits. A path is not file identity, and successful object upload alone does not publish a new version.\n\n## 2. Sync protocol and model\n\n```text\nPOST /files/{id}/versions {baseVersion,chunkManifest,requestId} -> version | conflict\nPATCH /files/{id} {expectedVersion,name,parentId}\nGET /changes?cursor=... -> changes,nextCursor\nFile: id,parent,name,ACL,currentVersion,deleted\nManifest: fileId,version,chunkHashes,size; Change: seq,fileId,version,tombstone\n```\n\nClient uploads missing authorized chunks and submits a manifest against its base version. Metadata verifies chunk availability and permission, then atomically commits the version and change event. Concurrent edits from base 5 cannot silently overwrite version 6; I preserve a conflict copy or explicit merge result. A 100 MB file in 4 MB chunks needs about 25 chunks; fixed-boundary shifts can reduce deduplication. Deletion emits a tombstone retained for the offline horizon. Collection waits until no retained version or protected in-flight upload references a chunk. Hash knowledge alone never grants permission to reuse/download another tenant's data.\n\n## 3. Final design diagram\n\n[![Google Drive / Dropbox: Sync client conditional commit Metadata service; Metadata service publishes Version manifests; Version manifests references chunks Chunk object store; Metadata service records changes Change log; Sync client resumes cursor Change log; Metadata service authorizes Access policy; Garbage collector deletes unreferenced Chunk object store](designs/hld-10.svg)](designs/hld-10.svg)\n\nA **file ID** stays stable across renames. A **manifest** describes a content version's chunks. A **sync cursor** identifies metadata changes a device has seen. The blob store keeps bytes; the metadata service owns names, permissions and committed versions.\n\n## 4. Critical operation: worked execution\n\n![A new file version references verified chunks, not a half upload.](lessons/hld-10-flow.svg)\n\n*A new file version references verified chunks, not a half upload.*\n\n![Preserve both user edits rather than silently overwriting one.](lessons/hld-10-failure.svg)\n\n*Preserve both user edits rather than silently overwriting one.*\n\n### Calculate deduplication honestly\n\nA 100 MB file split into 4 MB chunks needs about 25 chunks. If one aligned chunk changes, uploading one new chunk can save bandwidth. Insertions can shift fixed boundaries and reduce reuse; content-defined chunking offers different costs. Hash equality supports deduplication, but access control must still prevent a user from claiming another tenant's bytes merely by guessing a hash.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n- **Client** watches the local file system, splits files into **chunks** (~4 MB, or content-defined chunking), hashes each one (SHA-256), and asks the server which hashes are new.\n- **Block service** uploads only missing chunks to **object storage**, keyed by hash. Identical chunks across users or versions are stored once (dedup).\n- **Metadata service** commits a new file version = an ordered list of chunk hashes, in a **transactional DB** (sharded by user or namespace): files, folders, versions, sharing ACLs and a per-namespace **journal** (change log with a monotonically increasing cursor).\n- **Notification service:** clients long-poll or keep a WebSocket. On change, they fetch journal entries after their cursor and download the needed chunks.\n\n### Key design decisions & trade-offs\n\n**1. Separate metadata and blobs.** Metadata needs transactions and fast listing. Blobs need cheap, durable bulk storage. Mixing them breaks both.\n\n**2. Chunking.** Fixed-size chunks are simple, but inserting one byte at the start shifts every chunk. **Content-defined chunking** (rolling hash, as in rsync or LBFS) keeps boundaries stable, so small edits upload one or two chunks.\n\n**3. Dedup trade-off.** Cross-user dedup saves huge storage, but it leaks information (\"does anyone have this file?\") and complicates deletion (reference counting and GC). Many systems dedup per user only.\n\n**4. Sync with a journal cursor.** Every change appends to the namespace journal. Clients store the last cursor, so sync is \"give me changes after X\". It's idempotent, resumable and works after being offline.\n\n**5. Conflicts.** Two devices edit the same file offline. The server accepts the first commit (based on version `v5`). The second commit, also based on `v5`, is a conflict, so keep both (\"file (conflicted copy).docx\"). Automatic merging is only possible for structured formats (Google Docs uses OT/CRDT for its own docs).\n\n**6. Durability.** Object storage replicated or erasure-coded across zones. Metadata DB with synchronous replicas and point-in-time backups.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A file revision references a complete immutable chunk list; concurrent edits cannot silently overwrite one another.\n\nAssume 10 million users x 20 metadata operations/day: 200 million/day, about 2,315/s. One million 100 MB uploads/day is 100 TB/day raw. Chunking permits resuming changed portions, but deduplication efficiency depends on real workloads.\n\n### API contracts and data ownership\n\n```text\nPOST /upload-sessions; PUT signed chunk; POST /files/{id}/revisions with expectedVersion; GET /changes?cursor\n```\n\n```text\nLogical records (outline, not complete DDL):\nfile(id,parent_id,name,owner,current_revision,version); revision(id,file_id,chunk_manifest); change(sequence,tenant,entity,operation)\n\nPrimary access/partitioning boundary:\ntenant_id + file_id for metadata; checksum plus storage namespace for chunk objects\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around tenant_id + file_id for metadata; checksum plus storage namespace for chunk objects. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nDetect changed chunks locally; upload missing chunks with checksums; verify ownership and object existence; atomically create a revision and advance file metadata using expected version; emit a durable change event; other devices reconcile through cursor-based delta listing.\n\n### Deep dive: the decision that changes this system\n\nContent-defined chunking resists boundary shifts better than fixed-size chunking but costs CPU and complexity. Deduplication across tenants can leak file existence and complicate encryption; prefer a defined tenant/security boundary.\n\n### Failure and race-condition walkthrough\n\nTwo devices edit offline from revision 7. The first commits revision 8; the second receives a conflict and preserves its work as a conflict copy or explicit merge. A last-writer-wins clock does not understand document intent.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nMetadata consistency matters more than immediate global propagation of every chunk. Store large bytes in object storage and small mutable indexes in a transactional store. Garbage collection needs retention and references from in-flight uploads.\n\nSync convergence time, conflict rate, missing-object references, upload resume efficiency and change-log cursor lag.\n\n**Test matrix:** Interrupted upload, corrupted chunk, offline concurrent rename/edit, moved parent folder, shared-file permission revocation and orphan-chunk cleanup.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A file revision references a complete immutable chunk list; concurrent edits cannot silently overwrite one another.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million users x 20 metadata operations/day: 200 million/day, about 2,315/s. One million 100 MB uploads/day is 100 TB/day raw. Chunking permits resuming changed portions, but deduplication efficiency depends on real workloads.\n\n**Which failure would invalidate the naive design?** Two devices edit offline from revision 7. The first commits revision 8; the second receives a conflict and preserves its work as a conflict copy or explicit merge. A last-writer-wins clock does not understand document intent.\n\n**Why not introduce every distributed component immediately?** Metadata consistency matters more than immediate global propagation of every chunk. Store large bytes in object storage and small mutable indexes in a transactional store. Garbage collection needs retention and references from in-flight uploads.\n\n**How would you demonstrate the design works?** Interrupted upload, corrupted chunk, offline concurrent rename/edit, moved parent folder, shared-file permission revocation and orphan-chunk cleanup. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through deletion and recovery\n\nDeletion should create a metadata tombstone visible to offline devices; immediately forgetting the file can let an old client resurrect it as new. Retain tombstones for a documented offline/recovery horizon. Garbage collection removes chunks only when no retained authorized version references them and in-flight uploads are considered.\n\nSeparate ACL changes from cached directory listings. A revoked user might retain downloaded local bytes, but future metadata/download access must follow current permissions. Versioned manifests also make rollback a new explicit pointer update rather than destructive replacement of history.\n\n## 6. Interviewer follow-ups\n\n**Does object-store upload success make a file visible?** Not until its manifest and metadata commit.\n\n**Does rename require reuploading all bytes?** No. Stable identity and manifests separate naming from content.\n\n## 7. Closing answer\n\nStable file IDs separate naming from content, and immutable manifests separate uploaded bytes from committed versions. Conditional base-version commits preserve conflicting offline edits. Tombstones and reference-aware garbage collection make deletion and recovery explicit across disconnected devices.\n"
+      "markdown": "## Problem\n\nDesign Google Drive or Dropbox. Asha saves a 200 MB presentation on her laptop. A minute later it appears on her phone, and her colleague Bilal, who has edit access, sees the new version too.\n\nWhen Asha changes one slide, the app should not upload all 200 MB again. And if Asha and Bilal edit the same file offline, neither person's work may be silently lost.\n\n## Requirements\n\n- Upload, download and delete files and folders.\n- Sync changes automatically to all of a user's devices.\n- Share files and folders with view or edit permission.\n- Keep previous versions.\n- Upload only the changed parts of a large file; never lose an edit on conflict.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> Separate the file **bytes** from the file **metadata** (names, folders, versions). Almost every design decision follows from that split.\n\n**Candidate:** How large can files be?\n\n**Interviewer:** Up to 50 GB.\n\n**Candidate:** How many users?\n\n**Interviewer:** 500 million users, 100 million daily active.\n\n**Candidate:** Do we need real-time co-editing like Google Docs?\n\n**Interviewer:** No – whole-file sync like Dropbox.\n\n**Candidate:** What happens when two people change the same file?\n\n**Interviewer:** Don't lose either change.\n\n**Candidate:** Should it work offline?\n\n**Interviewer:** Yes. Sync when the device reconnects.\n\n**Functional requirements**\n\n1. Upload, download, delete, move files and folders.\n2. Sync across devices; share with view/edit permissions.\n3. Version history; conflict copies when edits clash.\n\n**Non-functional requirements**\n\n1. Durability: never lose a file (11 nines, like S3).\n2. Sync changes within seconds to a minute.\n3. Save bandwidth: upload only changed chunks.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Estimate storage and the number of sync notifications; both are much larger than you might expect.\n\n**Storage**\n\n```text\nUsers                  = 500 million\nAverage stored         ≈ 10 GB per user\nTotal                  = 500M × 10 GB     = 5 EB (before de-duplication)\n```\n\nWhat it means: bytes go in object storage, split into chunks, and identical chunks are stored once.\n\n**Changes**\n\n```text\nDaily active users     = 100 million\nFile changes per user  ≈ 20 per day\nChanges                = 2 billion per day ≈ 23,000 per second\n```\n\nWhat it means: the metadata database takes tens of thousands of writes a second and must be sharded, and devices must be told about changes efficiently.\n\n## Step 3: Define the API\n\n```http\nPOST /v1/files/{fileId}/versions/start   { \"chunks\": [\"sha256:ab12…\", \"sha256:9f3c…\", …] }\n→ 200 { \"missing\": [\"sha256:9f3c…\"], \"uploadUrls\": { \"sha256:9f3c…\": \"https://…\" } }\n\nPUT  {uploadUrl}                          (raw chunk bytes, straight to object storage)\n\nPOST /v1/files/{fileId}/versions/commit  { \"baseVersion\": 6, \"chunks\": [ … ] }\n→ 201 { \"version\": 7 }   |   409 { \"error\": \"CONFLICT\", \"currentVersion\": 7 }\n\nGET  /v1/changes?cursor=…                → list of changed files since cursor\nPOST /v1/files/{fileId}/share            { \"email\": \"bilal@…\", \"role\": \"EDITOR\" }\n```\n\nThe client lists the chunk hashes it has; the server says which ones it is missing. Only those are uploaded.\n\n> **🎯 In the interview**\n> `baseVersion` on commit is the key detail. It says \"I edited version 6\". If the server is already at version 7, that is a conflict, not an overwrite.\n\n## Step 4: Define the data model\n\n| Table | Key fields |\n| --- | --- |\n| `file` | fileId, ownerId, parentFolderId, name, latestVersion, deleted |\n| `file_version` | fileId, version, chunk list (ordered hashes), size, createdBy, createdAt |\n| `chunk` | hash → storage location, reference count |\n| `share` | fileId or folderId, userId, role (VIEWER / EDITOR) |\n| `change_log` | userId or namespace, sequence, fileId, change type |\n\n> **⚖️ Design choice**\n> Metadata in a sharded SQL database (by owner or namespace), because moves, renames and permissions need transactions. Chunks in object storage, addressed by their content hash.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: the sync client talks to the metadata service, which records version manifests and checks access policy; chunk bytes go to the chunk object store; every committed change is appended to a change log that other devices read; a garbage collector removes chunks no version uses.](designs/hld-10.svg)](designs/hld-10.svg)\n\n**Asha saves the presentation**\n\n1. Her sync client notices the change and splits the file into 4 MB chunks, hashing each one.\n2. It asks the metadata service which hashes are new. Only slide 12 changed, so only one chunk is missing.\n3. It uploads that one 4 MB chunk straight to object storage.\n4. It commits version 7 = the ordered list of chunk hashes, with `baseVersion 6`.\n5. The metadata service appends a change to the change log.\n\n**Her phone and Bilal see it**\n\n1. Their clients hold a long-poll (or push channel) on `/changes`.\n2. They learn \"file X is now version 7\", fetch the manifest, download only chunks they don't already have, and rebuild the file.\n\n![Animation: Asha edits slide 12; the client splits the file into chunks and only one chunk hash is new; it uploads that one chunk, commits version 7, the change log records it, and her phone downloads just the changed chunk to rebuild the file.](learning-figures/hld-10-sync.gif)\n\n## Step 6: Go deep\n\n### Chunking and de-duplication\n\nSplitting files into chunks gives three wins:\n\n- **Delta sync:** change one slide, upload one chunk – not 200 MB.\n- **Resumable transfers:** a failed upload resumes at the next chunk.\n- **De-duplication:** the same chunk (a shared PDF, a common library) is stored once, however many users have it.\n\nFixed 4 MB chunks are simple. Inserting a byte at the start shifts every boundary, though, so some systems use **content-defined chunking**, where boundaries follow the content and survive insertions.\n\n### Conflicts: two edits to the same version\n\n**Option 1: Last writer wins.**\n\n- Good: simple.\n- Problem: Asha's or Bilal's work silently disappears.\n\n**Option 2: Lock the file while someone edits.**\n\n- Good: no conflicts.\n- Problem: impossible offline, and a forgotten lock blocks everyone.\n\n**Option 3: Detect with versions; keep both.**\n\n- Good: nothing is lost; the user decides.\n- Problem: users occasionally see a \"conflicted copy\".\n\n> **⚖️ Design choice**\n> Detect with `baseVersion`. Bilal commits version 7 first. Asha's commit says \"based on 6\", so the server refuses it with 409, and her client saves her edit as `Deck (Asha's conflicted copy).pptx`. This is what Dropbox does.\n\n[![Conflict handling: Asha and Bilal both edit version 6 offline; Bilal commits first and becomes version 7; Asha's commit based on version 6 is rejected with a conflict, so her client saves her edit as a conflicted copy and both changes survive.](learning-figures/hld-10-conflict.svg)](learning-figures/hld-10-conflict.svg)\n\n> **⚠️ Common mistake**\n> Comparing modification timestamps to pick a winner. Device clocks are wrong, and \"newer\" does not mean \"contains the other person's change\".\n\n### Telling devices about changes\n\nEach user (or shared folder) has a change log with increasing sequence numbers. A device stores the last sequence it processed and asks \"what changed after 8,451?\". A long-poll or push notification wakes it when something new arrives, so it does not poll every few seconds.\n\n### Sharing and permissions\n\nPermissions are checked by the metadata service on every manifest read and every upload URL it hands out. Upload and download URLs are short-lived and signed, so a leaked link stops working quickly.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| Upload interrupted | Partial file | Chunks already uploaded are kept; the version is committed only when all exist |\n| Two offline edits | Conflict | `baseVersion` check; conflicted copy |\n| A very large shared folder | One change notifies thousands of devices | Change log per shared namespace; devices read it at their own pace |\n| Chunk no longer used | Storage leak | Reference counts plus a garbage collector that deletes after a grace period |\n| Metadata shard hot (one huge team) | Slow commits | Split by namespace; cache folder listings |\n\n## Putting it together\n\n- **Upload:** chunk and hash → upload only missing chunks → commit a version with `baseVersion`.\n- **Sync:** change log + long-poll → fetch manifest → download missing chunks.\n- **Safety:** conflicts become copies; chunks are de-duplicated and garbage-collected.\n\n## Interviewer follow-ups\n\n**Why not store the whole file in the database?** Databases are poor at huge blobs. Object storage is cheaper, more durable and serves bytes directly to clients.\n\n**How do you restore an old version?** Commit a new version whose chunk list equals the old one – no bytes move.\n\n**How do you handle deletes?** Mark the file deleted (trash) and keep its versions for 30 days; then drop references and let the garbage collector reclaim chunks.\n\n**Is de-duplication across users a privacy risk?** It can reveal that someone else has a file. Many services de-duplicate only within an account, or encrypt per user.\n\n## Wrap up\n\nWe split files into hashed chunks in object storage, kept versions and permissions in a metadata database, and synced devices through a change log with conflict detection.\n\n> **📝 Key takeaways**\n> - Bytes in object storage, metadata in a transactional database.\n> - Content-hashed chunks give delta sync, resumable uploads and de-duplication.\n> - `baseVersion` turns concurrent edits into a conflicted copy, never a silent overwrite.\n> - Devices catch up from a change-log cursor.\n\n## Going deeper (optional)\n\nThe detailed version verifies that every chunk in a manifest really exists before committing a version, so a half upload can never become the latest file.\n\n[![A new file version references verified chunks, not a half upload.](lessons/hld-10-flow.svg)](lessons/hld-10-flow.svg)\n\nFurther reading: [Dropbox – Streaming file synchronization](https://dropbox.tech/infrastructure/streaming-file-synchronization) and [Amazon S3 data durability](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html).\n\n## Closing answer\n\n\"I separate bytes from metadata. The client splits a file into 4 MB chunks and hashes each; the server says which hashes it lacks, and only those are uploaded straight to object storage with signed URLs. A version is an ordered list of chunk hashes, committed in a sharded SQL metadata service with the version it was based on. If someone else committed first, the commit is rejected and the client saves a conflicted copy, so no edit is lost. Every commit appends to a change log; other devices long-poll it, fetch the manifest and download only missing chunks. Chunks are de-duplicated and garbage-collected by reference count.\"\n"
     },
     {
       "category": "AI",

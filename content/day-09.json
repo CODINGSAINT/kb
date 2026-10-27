@@ -109,108 +109,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Location ingestion",
+            "id": "drv",
+            "label": "Driver app",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Geo candidate index",
-            "x": 250,
+            "id": "loc",
+            "label": "Location service",
+            "x": 200,
             "y": 0,
-            "w": 200,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Dispatch service",
-            "x": 500,
+            "id": "geo",
+            "label": "Geo index (Redis)",
+            "x": 420,
             "y": 0,
-            "w": 200,
+            "w": 180,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "match",
+            "label": "Matching service",
+            "x": 420,
+            "y": 130,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Assignment authority",
-            "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
+            "id": "trip",
             "label": "Trip store",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "x": 200,
+            "y": 130,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n5",
-            "label": "Offer stream",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Rider and driver apps",
+            "id": "rider",
+            "label": "Rider app",
             "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n6",
-            "to": "n0",
-            "label": "location updates"
+            "from": "drv",
+            "to": "loc",
+            "label": "GPS every 4 s"
           },
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "latest positions"
+            "from": "loc",
+            "to": "geo",
+            "label": "update cell"
           },
           {
-            "from": "n2",
-            "to": "n1",
-            "label": "nearby search"
+            "from": "rider",
+            "to": "match",
+            "label": "request ride"
           },
           {
-            "from": "n2",
-            "to": "n5",
-            "label": "offers"
+            "from": "match",
+            "to": "geo",
+            "label": "nearby drivers"
           },
           {
-            "from": "n5",
-            "to": "n6",
-            "label": "push"
+            "from": "match",
+            "to": "trip",
+            "label": "assign one driver"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "claim"
-          },
-          {
-            "from": "n3",
-            "to": "n4",
-            "label": "trip ownership"
+            "from": "match",
+            "to": "drv",
+            "label": "ride offer",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign Uber's backend for matching riders with nearby drivers in real time: ingest millions of driver location updates, find the best nearby available driver within seconds, handle offers and acceptance, track trips, and price dynamically. The focus is **geo-indexing**, **high-frequency location updates**, **matching** and **distributed consistency** (one driver, one trip).\n\n## Requirements\n\n**Functional**\n- Drivers publish location every ~4 s while online. Riders request a ride and get an ETA and a price.\n- Match within a few seconds. The driver accepts or declines. Live tracking for both parties.\n- Trip lifecycle, fare calculation, payments.\n\n**Non-functional**\n- Matching p99 < a few seconds. Location writes are high-volume but each one is cheap and short-lived.\n- A driver must never be double-assigned.\n\n**Scale:** 5M online drivers ÷ 4 s ≈ **1.25M location writes/s**. Ride requests are only ~10k/s, but each queries nearby drivers.\n\n## 1. Scope and selected ownership\n\nI support live driver availability, ride requests, matching and trip lifecycle. I choose a geo index for candidates and a transactional assignment authority for driver exclusivity. ETA ranking can use a routing service; straight-line distance only narrows candidates.\n\n## 2. APIs and state\n\n```text\nPUT /drivers/{id}/location {sessionId,seq,point,accuracy,observedAt}\nPOST /trips {pickup,destination,requestId}\nPOST /offers/{id}/accept -> assigned | expired | conflict\nAssignment: driverId UNIQUE(active), tripId UNIQUE(active), lease/version\nLocation: driverId,sessionId,seq,point,lastSeen\n```\n\nIngestion validates identity and monotonic session sequence, conditionally updates latest location and cell membership, then expires stale observations. Dispatch scores fresh eligible candidates and sends bounded offers. Acceptance claims the driver/trip pair atomically, and returns the existing result on a true retry. Driver migration between cells may temporarily duplicate search entries but never assignment authority. One million drivers at four-second cadence generates 250,000 updates/s; that drives partitioning and adaptive cadence. Trip events persist separately from location observations; offer timeout and dispatcher crash are recovered using original identities and pending state.\n\n## 3. Final design diagram\n\n[![Uber: Rider and driver apps location updates Location ingestion; Location ingestion latest positions Geo candidate index; Dispatch service nearby search Geo candidate index; Dispatch service offers Offer stream; Offer stream push Rider and driver apps; Dispatch service claim Assignment authority; Assignment authority trip ownership Trip store](designs/hld-9.svg)](designs/hld-9.svg)\n\nA **location index** supports nearby candidates. A **trip owner** serializes trip changes. A **driver availability record** prevents conflicting assignments. Geographic partitioning reduces search scope, but riders and drivers cross cell and region boundaries.\n\n## 4. Critical operation: worked execution\n\n![The fast location index proposes drivers; assignment establishes ownership.](lessons/hld-9-flow.svg)\n\n*The fast location index proposes drivers; assignment establishes ownership.*\n\n![Movement must not create duplicate assignment authority.](lessons/hld-9-failure.svg)\n\n*Movement must not create duplicate assignment authority.*\n\n### Calculate freshness and load\n\nOne million active drivers sending every four seconds produces 250,000 location updates/s. Sending every second quadruples ingest load without guaranteeing four times better pickup decisions. Choose cadence using motion, battery, network and freshness requirements. Index recent observations with expiry rather than retaining every GPS point forever in the hot search store.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n- **Location service:** stateless ingest (WebSocket or UDP-ish) that updates an **in-memory geo index** sharded by region or cell. Latest position only; history goes asynchronously to Kafka for analytics and ETA models.\n- **Geo index:** a hexagonal grid (Uber's **H3**) or geohash. `cell → set of available drivers`. Nearby search queries the rider's cell plus k-ring neighbours and widens if needed.\n- **Matching (dispatch) service:** gets candidates, computes the real ETA (road network, not straight-line distance), picks the best, and **atomically reserves** the driver (CAS on driver state in Redis or the owning shard) before sending the offer.\n- **Trip service:** a durable state machine in a transactional DB, publishing events for tracking, notifications and billing.\n\n### Key design decisions & trade-offs\n\n**1. Geohash vs. quadtree vs. H3.** Geohash is simple string prefixes but has edge distortions and cells of unequal neighbour distance. A quadtree adapts to density but is harder to shard. **H3 hexagons** have uniform neighbour distances, which makes them good for k-ring search and surge zones.\n\n**2. Don't put 1.25M writes/s in a database.** Location is ephemeral: keep the latest position in memory (Redis GEO or custom sharded in-memory services) and replicate for failover. Losing a few seconds of positions is fine, because drivers will send the next update.\n\n**3. Sharding by geography.** City or region shards keep matching local and cache-friendly. Hot spots (an airport at a concert's end) need finer cells or dynamic splitting.\n\n**4. Reserving the driver.** Matching might pick the same driver for two riders concurrently. A CAS from `AVAILABLE` to `DISPATCHING` on the owning shard ensures one winner. Offer timeouts release the driver.\n\n**5. Batched matching.** Instead of greedily matching each request immediately, collect requests over a ~1–2 s window and solve a bipartite assignment that minimises total ETA. That gives better global outcomes and is what large platforms do.\n\n**6. Surge pricing.** Compute the supply/demand ratio per cell every minute from streaming counts, smooth it, and lock the quoted price for the rider for a few minutes.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A driver can own only one active ride; location search may be stale but assignment must be authoritative.\n\nAssume 1 million online drivers publishing every 5 seconds: 200,000 location updates/s. At 200 bytes/update, about 40 MB/s raw ingress. Nearby search returns a bounded candidate set, not every driver in a city.\n\n### API contracts and data ownership\n\n```text\nPOST /ride-requests; POST /offers/{id}/accept; stream /drivers/{id}/location with sequence and timestamp\n```\n\n```text\nLogical records (outline, not complete DDL):\ndriver_location(driver_id,cell,lat,lon,sequence,observed_at); availability(driver_id,active_trip,version); trip(id,status,offer_epoch)\n\nPrimary access/partitioning boundary:\ngeospatial cell for candidate discovery; driver_id/trip_id for authoritative assignment\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around geospatial cell for candidate discovery; driver_id/trip_id for authoritative assignment. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nIngest sequenced GPS samples; discard outdated samples; maintain cell indexes; query neighboring cells; rank viable candidates by estimated pickup cost; issue bounded offers; atomically claim driver and trip; then publish the assignment and start tracking.\n\n### Deep dive: the decision that changes this system\n\nGeohash/H3-like cells reduce search candidates but cell boundaries require neighbor expansion. Straight-line distance is a cheap first filter, not an ETA. Time-stamped location and TTL detect stale availability estimates; they do not replace the assignment transaction.\n\n### Failure and race-condition walkthrough\n\nTwo matchers receive acceptance from the same driver for different trips. An authoritative compare-and-set rejects one, while an epoch rejects delayed offers. Retry dispatch without duplicating confirmed rides.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nCity/regional ownership limits latency and data movement; cross-border trips need handoff semantics. Matching quality improves with batch optimization but waiting too long harms rider latency.\n\nTime-to-match, assignment conflicts, stale-location fraction, pickup ETA error, location ingest lag and driver/rider cancellation rate.\n\n**Test matrix:** Hot city center, cell-boundary query, stale GPS, reordered updates, simultaneous acceptance, cancellation race and regional ownership handoff.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A driver can own only one active ride; location search may be stale but assignment must be authoritative.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 1 million online drivers publishing every 5 seconds: 200,000 location updates/s. At 200 bytes/update, about 40 MB/s raw ingress. Nearby search returns a bounded candidate set, not every driver in a city.\n\n**Which failure would invalidate the naive design?** Two matchers receive acceptance from the same driver for different trips. An authoritative compare-and-set rejects one, while an epoch rejects delayed offers. Retry dispatch without duplicating confirmed rides.\n\n**Why not introduce every distributed component immediately?** City/regional ownership limits latency and data movement; cross-border trips need handoff semantics. Matching quality improves with batch optimization but waiting too long harms rider latency.\n\n**How would you demonstrate the design works?** Hot city center, cell-boundary query, stale GPS, reordered updates, simultaneous acceptance, cancellation race and regional ownership handoff. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through stale data\n\nA location event with sequence 108 must not be overwritten by delayed event 107. Compare sequence/time under the device-session policy; timestamps alone can be unreliable if the phone clock changes. A nearby driver with a stale last-seen time can be excluded or penalized before offering.\n\nAssignment uses leases or transactions with explicit identities. If a dispatcher stops after claiming the driver but before replying, reconciliation must resolve the original assignment rather than making the driver permanently busy. Keep fare quotes, live trip tracking and financial settlement as distinct workflows.\n\n## 6. Interviewer follow-ups\n\n**Does a geohash give road ETA?** No. It narrows candidates; road routing and traffic estimate actual travel time.\n\n**Can a cache decide final driver exclusivity?** Only if it is explicitly the authoritative assignment system with appropriate durability/atomicity—not merely a search cache.\n\n## 7. Closing answer\n\nGeographic indexing makes matching efficient but the assignment authority makes it correct. I reject stale position updates, keep offers expiring/versioned and serialize driver/trip claims. Geographic cell boundaries therefore do not become duplicate assignment boundaries.\n"
+      "markdown": "## Problem\n\nDesign the backend that matches riders with drivers, like Uber or Ola. Asha opens the app at MG Road and asks for a ride. Within a few seconds, Ravi – a driver 600 m away – gets the request, accepts it, and Asha sees his car coming.\n\nMillions of drivers send their GPS location every few seconds. The system must find nearby drivers fast and make sure one driver is never given two riders.\n\n## Requirements\n\n- Drivers send their location every 4 seconds while online.\n- A rider requests a ride; we find nearby available drivers and offer the ride.\n- A driver accepts or declines; the first acceptance wins.\n- One driver can never be assigned to two trips at once.\n- Match within a few seconds; works across many cities.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> The two hard parts are a fast \"who is near me?\" query and a safe \"assign this driver\" step. Steer your questions toward them.\n\n**Candidate:** How many drivers are online at once?\n\n**Interviewer:** About 5 million worldwide at peak.\n\n**Candidate:** How often do they send location?\n\n**Interviewer:** Every 4 seconds.\n\n**Candidate:** Do we offer a ride to one driver at a time or to several?\n\n**Interviewer:** Your choice – explain the trade-off.\n\n**Candidate:** Are pricing, payments and ETA prediction in scope?\n\n**Interviewer:** No. Location, matching and assignment.\n\n**Candidate:** How fresh must locations be?\n\n**Interviewer:** A few seconds old is fine.\n\n**Functional requirements**\n\n1. Ingest driver locations.\n2. Find nearby available drivers for a ride request.\n3. Offer, accept and assign a driver; track the trip state.\n\n**Non-functional requirements**\n\n1. Match in under a few seconds.\n2. Never double-assign a driver; never lose a confirmed trip.\n3. 5 million drivers, scaling city by city.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Location updates dominate the traffic, and they are throwaway data. That tells you where to keep them.\n\n**Location updates**\n\n```text\nOnline drivers         = 5 million\nUpdates per second     = 5M / 4 s          = 1.25 million per second\nSize per update        ≈ 100 bytes\nIngest                 ≈ 125 MB/s\n```\n\nWhat it means: 1.25 million writes a second is too many for a normal database, but we only need each driver's **latest** location – an in-memory store fits.\n\n**Ride requests**\n\n```text\nTrips per day          = 20 million\nAverage                = 20M / 86,400 s    ≈ 230 per second (peak ~1,000)\n```\n\nWhat it means: matching is much lower volume; it can afford careful, transactional work.\n\n## Step 3: Define the API\n\n```http\nPOST /v1/drivers/me/location    { \"lat\": 12.9756, \"lng\": 77.6050, \"heading\": 90 }   → 204\nPUT  /v1/drivers/me/status      { \"status\": \"AVAILABLE\" }                           → 204\n\nPOST /v1/rides                  { \"pickup\": {...}, \"drop\": {...} }                   → 201 { \"rideId\": \"...\", \"status\": \"SEARCHING\" }\nPOST /v1/offers/{offerId}/accept                                                    → 200 | 409 (already taken)\nGET  /v1/rides/{rideId}                                                             → status, driver, location\n```\n\nDrivers usually send location over a persistent connection rather than one HTTP request each time; the payload is the same.\n\n> **🎯 In the interview**\n> Point out that `accept` can return 409. Two drivers may tap Accept on the same ride; only one can win.\n\n## Step 4: Define the data model\n\n| Store | Contents | Technology |\n| --- | --- | --- |\n| Driver locations | driverId → (lat, lng, cell, updatedAt); cell → drivers | Redis (geo commands or our own cell sets), in memory |\n| Driver status | driverId → AVAILABLE / OFFERED / ON_TRIP, currentTripId | Database row (or Redis) updated atomically |\n| Trips | rideId, riderId, driverId, status, pickup, drop, times | SQL, sharded by city |\n| Location history | trip route points | Append-only log, later cold storage |\n\n> **⚖️ Design choice**\n> Keep live locations only in memory. If Redis restarts, drivers resend within 4 seconds and the index rebuilds itself. Trips, which are money and promises, go in a durable database.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: driver apps send GPS every 4 seconds to the location service, which updates a geo index in Redis; a rider's request goes to the matching service, which asks the geo index for nearby drivers, sends a ride offer, and assigns exactly one driver in the trip store.](designs/hld-9.svg)](designs/hld-9.svg)\n\n**Location path**\n\n1. Ravi's app sends his location every 4 seconds.\n2. The location service converts it to a map cell and updates Redis: Ravi's latest position and which cell he is in.\n\n**Matching path**\n\n1. Asha requests a ride. The matching service finds her cell and the neighbouring cells.\n2. It reads available drivers there and ranks them by estimated pickup time.\n3. It offers the ride to the best driver (Ravi) with a 10-second timeout.\n4. Ravi accepts. The service atomically sets Ravi from OFFERED to ON_TRIP for this ride and creates the trip.\n5. Asha's app shows Ravi and his live location.\n\n![Animation: Asha requests a ride; the matching service looks up her cell and its neighbours, finds Ravi 600 metres away and Chetan 1.2 kilometres away, offers the ride to Ravi, Ravi accepts, and the service atomically marks Ravi on trip and creates the trip.](learning-figures/hld-9-match.gif)\n\n## Step 6: Go deep\n\n### Finding nearby drivers: the geo index\n\n**Option 1: Scan all drivers and compute distances.**\n\n- Good: trivial.\n- Problem: 5 million distance calculations per request – far too slow.\n\n**Option 2: A database with latitude/longitude indexes.**\n\n- Good: familiar.\n- Problem: two separate range indexes don't combine well, and the index churns with 1.25 million updates a second.\n\n**Option 3: Divide the map into cells (geohash, S2 or Uber's H3).**\n\n- Good: a driver belongs to one cell; \"nearby\" means \"this cell plus its neighbours\" – a few small set lookups.\n- Problem: cell size must be tuned: too large returns too many drivers, too small needs many neighbours.\n\n> **⚖️ Design choice**\n> Hexagonal cells (H3) of roughly 0.5–1 km across, stored in Redis as `cell → set of available drivers`. When Ravi moves into a new cell, remove him from the old set and add him to the new one.\n\n[![Geo cells: the city is divided into cells; Asha's request looks in her own cell and the ring of neighbouring cells, collects available drivers, and ranks them by estimated pickup time instead of straight-line distance.](learning-figures/hld-9-cells.svg)](learning-figures/hld-9-cells.svg)\n\n### Assigning safely: one driver, one trip\n\nTwo problems can cause double assignment: two rides offered to Ravi at once, or two drivers accepting the same ride.\n\nThe fix is one atomic step on both records:\n\n```sql\nUPDATE drivers SET status = 'ON_TRIP', trip_id = :rideId\n WHERE driver_id = :ravi AND status = 'OFFERED' AND offer_ride_id = :rideId;\n-- 1 row updated → Ravi is ours; 0 rows → offer expired or Ravi took another ride\n\nUPDATE rides SET status = 'ASSIGNED', driver_id = :ravi\n WHERE ride_id = :rideId AND status = 'SEARCHING';\n-- both in one transaction (rides and drivers sharded by the same city)\n```\n\n> **⚠️ Common mistake**\n> Assigning straight from the geo index. The index is a fast, slightly stale *hint* of who is nearby. The driver's status row is the authority on who is free.\n\n### Offer one at a time, or broadcast?\n\n**One at a time:** fair and simple, but every decline adds 10 seconds. **Broadcast to three:** faster, but two drivers will often tap Accept and one gets a disappointing 409. Most systems offer to one or a small batch, ranked by pickup time.\n\n### Scaling by city\n\nMatching for Bengaluru never needs drivers in Mumbai. Shard the location index, the matching service and the trip database by city or region. Each city's load is independent and a problem in one city stays there.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| Redis node restarts | Location index empty | Drivers resend in 4 s; the index refills itself |\n| Driver's app loses network | Stale position, ride offered to a ghost | Ignore drivers not seen for 15 s; offers time out after 10 s |\n| Two drivers accept at once | Double assignment | Conditional update: only one succeeds, the other gets 409 |\n| New Year's Eve in one city | Requests spike | City-level sharding; surge pricing reduces demand |\n| Matching service crashes mid-offer | Ride stuck in SEARCHING | Offers have deadlines; a sweeper re-queues the ride |\n\n## Putting it together\n\n- **Location:** GPS every 4 s → cell → Redis sets, latest value only.\n- **Match:** own cell + neighbours → rank by pickup time → offer with timeout.\n- **Assign:** one conditional transaction marks the driver and the trip; sharded by city.\n\n## Interviewer follow-ups\n\n**Why not store location history in the same place?** History is append-only and needed later (billing, disputes); live location needs only the latest value. Different stores.\n\n**How do you compute pickup time?** Road distance and traffic from a routing service, not straight-line distance – a driver across a river may be 300 m away and 15 minutes by road.\n\n**How do you handle surge?** Count open requests and available drivers per cell every minute; raise the price where demand exceeds supply.\n\n**What about pooled rides?** Matching becomes an optimisation over several riders' routes; the same atomic assignment rule applies to each seat.\n\n## Wrap up\n\nWe kept latest driver locations in an in-memory cell index for fast lookups, ranked nearby drivers, and assigned exactly one with a conditional transaction.\n\n> **📝 Key takeaways**\n> - Location updates are huge and disposable: keep only the latest, in memory.\n> - Cells (geohash, S2, H3) turn \"nearby\" into a few set lookups.\n> - The geo index is a hint; the driver's status row decides.\n> - Shard everything by city.\n\n## Going deeper (optional)\n\nThe detailed version handles a driver moving between shards mid-offer and a slow old offer arriving after a newer one, using offer IDs and versions.\n\n[![The fast location index proposes drivers; assignment establishes ownership.](lessons/hld-9-flow.svg)](lessons/hld-9-flow.svg)\n\nFurther reading: [Uber H3 hexagonal grid](https://h3geo.org/) and [Redis geospatial indexes](https://redis.io/docs/latest/develop/data-types/geospatial/).\n\n## Closing answer\n\n\"Drivers send GPS every 4 seconds – about 1.25 million updates a second – so I keep only each driver's latest position in Redis, indexed by map cell using H3 or geohash. When Asha requests a ride, the matching service looks in her cell and its neighbours, ranks available drivers by estimated pickup time and offers the ride to the best one with a timeout. Acceptance is one conditional transaction: the driver moves from OFFERED to ON_TRIP only if still offered this ride, and the ride from SEARCHING to ASSIGNED. The geo index is a fast hint; the status row is the authority. Everything is sharded by city.\"\n"
     },
     {
       "category": "AI",
