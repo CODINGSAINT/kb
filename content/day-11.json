@@ -118,103 +118,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Crawler frontier",
+            "id": "front",
+            "label": "URL frontier",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Fetch and parse",
-            "x": 250,
+            "id": "fetch",
+            "label": "Fetch + parse",
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
+            "id": "docs",
             "label": "Document store",
-            "x": 500,
+            "x": 440,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
+            "id": "idx",
             "label": "Index builders",
-            "x": 0,
-            "y": 110,
-            "w": 200,
+            "x": 440,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
-            "label": "Index generations",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "id": "shards",
+            "label": "Index shards",
+            "x": 220,
+            "y": 130,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n5",
+            "id": "broker",
             "label": "Query broker",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Rank and snippets",
             "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "polite scheduling"
+            "from": "front",
+            "to": "fetch",
+            "label": "next URLs"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "canonical pages"
+            "from": "fetch",
+            "to": "front",
+            "label": "new links",
+            "dashed": true
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "build postings"
+            "from": "fetch",
+            "to": "docs",
+            "label": "pages"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "validated publish"
+            "from": "docs",
+            "to": "idx",
+            "label": "documents"
           },
           {
-            "from": "n5",
-            "to": "n4",
-            "label": "scatter query"
+            "from": "idx",
+            "to": "shards",
+            "label": "new generation"
           },
           {
-            "from": "n5",
-            "to": "n6",
-            "label": "merge results"
+            "from": "broker",
+            "to": "shards",
+            "label": "query all shards"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign web search like Google at a high level: crawl billions of pages, build an index, and answer keyword queries in ~100–200 ms with relevant ranked results. The building blocks are **crawling**, **inverted indexes**, **distributed search (scatter-gather)** and **ranking**.\n\n## Requirements\n\n**Functional**\n- Crawl the web politely, re-crawling pages according to how often they change.\n- Index text, titles, links. Answer free-text queries with ranked results and snippets.\n- Spelling correction and autocomplete (bonus).\n\n**Non-functional**\n- Query latency p99 ~200 ms. Huge read QPS (~100k/s). Freshness from minutes (news) to weeks.\n\n**Scale:** 50B pages × ~100 KB ≈ 5 PB raw. A compressed index is still hundreds of TB, so it must be **sharded** across thousands of machines.\n\n## 1. Scope and chosen architecture\n\nI support keyword web search with snippets and updates/deletions. I choose document-sharded inverted indexes and an offline crawl/index pipeline. Serving uses the last fully published generation while another builds. I exclude crawling private networks and do not fetch arbitrary pages synchronously for each search.\n\n## 2. Query and index contracts\n\n```text\nGET /search?q=...&cursor=... -> ranked document IDs, URLs, snippets, generation\nDocument: docId,canonicalUrl,contentHash,fetchedAt,deleted\nPosting: term -> sorted(docId,termFrequency,positions)\nGeneration: id,shardManifests,termStatistics,readyState\n```\n\nThe crawler canonicalizes URLs, obeys site/politeness policy and stores changed content. Builders tokenize, produce compressed postings and compatible statistics, validate each shard and publish one generation manifest. Query broker normalizes the query, scatters to serving shards, retrieves sufficiently many candidates, merges comparable scores and builds snippets from the corresponding source version. One billion documents with 500 distinct indexed terms create about 500 billion associations before compression. A failed shard build cannot replace part of a healthy generation. Recrawl cadence follows measured change; deletion tombstones reach serving generations and retained snippets under the lifecycle policy.\n\n## 3. Final design diagram\n\n[![Google Search: Crawler frontier polite scheduling Fetch and parse; Fetch and parse canonical pages Document store; Document store build postings Index builders; Index builders validated publish Index generations; Query broker scatter query Index generations; Query broker merge results Rank and snippets](designs/hld-11.svg)](designs/hld-11.svg)\n\nI begin with a thousand local documents and a deterministic tokenizer. Make search return document IDs and matched evidence before introducing web-scale crawling or machine-learned ranking.\n\n## 4. Critical operation: worked execution\n\n![Query serving reads a published index generation rather than crawling on demand.](lessons/hld-11-flow.svg)\n\n*Query serving reads a published index generation rather than crawling on demand.*\n\n![Versioned publication avoids exposing half-built posting lists.](lessons/hld-11-failure.svg)\n\n*Versioned publication avoids exposing half-built posting lists.*\n\n### Calculate and trace\n\nFor one billion documents with an assumed 500 distinct indexed terms each, there are roughly 500 billion term-document associations before compression. This is not the same as raw page bytes. Posting-list compression, document IDs and sharding determine actual index size.\n\nFor query `java lock`, retrieve each term's postings and intersect or combine them under the query policy. Rank candidates using signals such as term relevance and document quality. A snippet should come from the matching document version, not an unrelated cached revision.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n**Crawl:** a **URL frontier** (prioritised queues per host, for politeness and priority) feeds distributed **crawler** workers. They fetch (respecting robots.txt), deduplicate content (simhash), extract links back into the frontier, and store pages in a doc store.\n\n**Index:** batch plus incremental pipelines tokenise and normalise text and build an **inverted index**: `term → posting list [(docId, positions, tf)]`, sorted by docId and compressed (delta plus varint). Also compute static signals: PageRank, spam score, freshness.\n\n**Serve:** the index is **document-partitioned** into shards, each replicated. A query goes to a root aggregator, which scatters to every shard. Each shard returns its local top-k by a cheap score. The aggregator merges, then a re-ranker (ML) refines the top few hundred, and snippets come from a doc server.\n\n### Key design decisions & trade-offs\n\n**1. Document vs. term partitioning.** *Document-partitioned:* every shard holds the full index for a subset of docs, so a query hits all shards (fan-out). It's simple, load-balanced and tolerant: a missing shard just means slightly fewer results. *Term-partitioned:* a query only touches the shards for its terms, but multi-term intersections cross the network and hot terms create hotspots. Real engines use document partitioning.\n\n**2. Tail latency with fan-out.** With 1,000 shards, a p99 query sees the p99.9 of shards. Mitigations: replicas plus **hedged requests**, early termination (tiered indexes with the best docs first), and partial results under a deadline.\n\n**3. Ranking layers.** Lexical relevance (BM25), query-independent quality (PageRank), freshness, and learned ranking on the candidate set. Cheap-to-expensive cascades keep latency bounded.\n\n**4. Freshness.** A small, fast **real-time index** for recent and news pages, merged with the large batch index at query time.\n\n**5. Caching.** Query result caches catch the head (a large share of traffic is repeated queries). Posting-list caches handle hot terms.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A searchable document revision is associated with an index generation and canonical source identity.\n\nAssume 1 billion documents x 20 KB extracted text: 20 TB text before postings and replicas. At 10 million queries/day: about 116/s average, with explicit peak/skew headroom. Inverted-index size depends on term distribution, positions and compression.\n\n### API contracts and data ownership\n\n```text\nGET /search?q=...&cursor=...; crawler enqueue URL; document indexing update with revision\n```\n\n```text\nLogical records (outline, not complete DDL):\ndocument(id,url,canonical_url,revision,language); posting(term,doc_id,frequency,positions); crawl(url,next_fetch,etag)\n\nPrimary access/partitioning boundary:\nterm partitions or document shards for index; URL/document_id for crawl frontier and canonicalization\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around term partitions or document shards for index; URL/document_id for crawl frontier and canonicalization. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nMaintain a polite deduplicated frontier; fetch allowed pages; canonicalize and extract text; tokenize/normalize; build posting segments; merge and publish a consistent index generation; query fans out to index shards, merges top candidates and returns snippets.\n\n### Deep dive: the decision that changes this system\n\nAn inverted index maps terms to documents; positional postings support phrase queries. BM25-like lexical ranking provides a strong baseline before semantic reranking. Search is not a full table scan with wildcard LIKE. Freshness updates and deletions must reach all relevant replicas.\n\n### Failure and race-condition walkthrough\n\nA shard is slow or missing. Return clearly degraded results under a deadline rather than waiting forever, and record coverage so ranking evaluation can distinguish partial results. Index-generation mismatch can produce duplicates or stale snippets.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nDocument sharding scatters queries but localizes document updates; term sharding complicates multi-term joins. Web-scale crawling needs robots policy, rate limits and fetch isolation because URLs are untrusted network destinations.\n\nQuery p99, result relevance on labelled queries, index freshness, crawl error rate, shard coverage and indexing backlog.\n\n**Test matrix:** Phrase query, typo/empty query, crawler redirect loop, duplicate canonical URLs, deleted pages, shard deadline and index generation rollover.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A searchable document revision is associated with an index generation and canonical source identity.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 1 billion documents x 20 KB extracted text: 20 TB text before postings and replicas. At 10 million queries/day: about 116/s average, with explicit peak/skew headroom. Inverted-index size depends on term distribution, positions and compression.\n\n**Which failure would invalidate the naive design?** A shard is slow or missing. Return clearly degraded results under a deadline rather than waiting forever, and record coverage so ranking evaluation can distinguish partial results. Index-generation mismatch can produce duplicates or stale snippets.\n\n**Why not introduce every distributed component immediately?** Document sharding scatters queries but localizes document updates; term sharding complicates multi-term joins. Web-scale crawling needs robots policy, rate limits and fetch isolation because URLs are untrusted network destinations.\n\n**How would you demonstrate the design works?** Phrase query, typo/empty query, crawler redirect loop, duplicate canonical URLs, deleted pages, shard deadline and index generation rollover. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through freshness and abuse\n\nDifferent pages change at different rates. Recrawl scheduling allocates budget using observed changes, importance and site limits. Canonicalization avoids indexing trivial URL variants repeatedly, but aggressive rules can merge genuinely different pages. Crawler network access must resist private-address fetching and resource exhaustion.\n\nPartitioning by document keeps complete document metadata local but queries fan out. Partitioning by term changes query and update costs. Explain the selected access pattern before choosing a partition key. Spam, duplicate pages and deleted content need index-lifecycle handling, not only a ranking adjustment.\n\n## 6. Interviewer follow-ups\n\n**Does a crawler make search fast?** No. The prepared index does; crawling supplies input.\n\n**Is top-10 from each shard automatically global top-10?** Only under compatible scoring and sufficient local candidates; distributed ranking needs an explicit merge contract.\n\n## 7. Closing answer\n\nI separate crawl freshness, index construction and low-latency query serving. Versioned immutable index generations make publication recoverable; a document-sharded inverted index gives each shard comparable local candidates for broker merging. Ranking quality and source freshness are measured independently.\n"
+      "markdown": "## Problem\n\nDesign web search like Google, at a high level. Asha types **\"spring boot rate limiter\"** and, in about 200 ms, gets ten relevant pages with titles and short snippets – chosen from billions of pages on the web.\n\nSearch has two halves: an offline half that crawls the web and builds an index, and an online half that answers queries from that index very fast.\n\n## Requirements\n\n- Crawl billions of web pages and keep them reasonably fresh.\n- Build an index that maps words to the pages containing them.\n- Answer keyword queries with the top 10 results, titles and snippets, in about 200 ms.\n- Rank results by relevance and page quality.\n- Handle about 100,000 queries per second.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> Say up front that you will split the design into crawl → index → serve. Interviewers want to see that separation.\n\n**Candidate:** How many pages should we index?\n\n**Interviewer:** About 10 billion.\n\n**Candidate:** How fresh must results be?\n\n**Interviewer:** News within minutes would be nice; most pages within days or weeks is fine.\n\n**Candidate:** Query volume?\n\n**Interviewer:** About 100,000 queries a second at peak.\n\n**Candidate:** Do we need images, maps, ads, spelling correction?\n\n**Interviewer:** No. Plain web results.\n\n**Candidate:** How sophisticated should ranking be?\n\n**Interviewer:** Explain the main signals; no machine-learning deep dive.\n\n**Functional requirements**\n\n1. Crawl pages politely and repeatedly.\n2. Build an inverted index.\n3. Serve ranked top-10 results with snippets.\n\n**Non-functional requirements**\n\n1. Query latency about 200 ms.\n2. Always available; a slightly stale index is acceptable.\n3. Index billions of pages across thousands of machines.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Size the crawl and the index separately. They are different problems.\n\n**Crawling**\n\n```text\nPages                 = 10 billion\nRefresh every ~10 days → 1 billion pages per day ≈ 11,600 pages per second\nAverage page          ≈ 100 KB HTML → about 1.2 GB/s of downloads\n```\n\nWhat it means: crawling is a large distributed job with thousands of fetchers.\n\n**Index**\n\n```text\nText per page after cleaning   ≈ 10 KB\nRaw text                       = 10B × 10 KB  = 100 TB\nInverted index (compressed)    ≈ 30–50% of text ≈ 30–50 TB\n```\n\nWhat it means: the index does not fit on one machine; it must be split into shards, and each shard copied for query throughput.\n\n## Step 3: Define the API\n\n```http\nGET /v1/search?q=spring+boot+rate+limiter&page=1\n→ 200 {\n  \"results\": [\n    { \"url\": \"https://…\", \"title\": \"Rate limiting in Spring Boot…\", \"snippet\": \"…use a token bucket…\" }\n  ],\n  \"estimatedTotal\": 1840000\n}\n```\n\n> **🎯 In the interview**\n> The public API is tiny. The interesting design is behind it: how the index is built and how one query fans out to many machines.\n\n## Step 4: Define the data model\n\n| Store | Contents |\n| --- | --- |\n| URL frontier | URLs to fetch, priority, next fetch time, per-host queues |\n| Document store | url, fetched HTML/text, fetch time, content hash |\n| Inverted index (per shard) | term → posting list of (docId, positions, term frequency) |\n| Document metadata | docId → url, title, PageRank score, language |\n| Index generations | which index version each shard is currently serving |\n\n> **⚖️ Design choice**\n> Split the index **by document** (each shard holds all terms for a subset of pages). A query goes to every shard, each returns its own top results, and a broker merges them. This keeps shards independent and balanced.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: the crawler frontier feeds fetch-and-parse workers that store documents; index builders turn documents into index generations; the query broker sends each query to all index shards and the rank-and-snippets stage returns the top results.](designs/hld-11.svg)](designs/hld-11.svg)\n\n**Offline: crawl and index**\n\n1. The **frontier** holds URLs to fetch, ordered by priority and grouped by host.\n2. **Fetchers** download pages, respecting `robots.txt` and a polite rate per site.\n3. **Parsers** extract text, title and links; new links go back into the frontier.\n4. **Index builders** turn documents into posting lists and publish a new **index generation** to the shards.\n\n**Online: answer a query**\n\n1. Asha's query reaches a **broker**, which normalises it to terms: `spring`, `boot`, `rate`, `limiter`.\n2. The broker sends the query to every index shard (one replica of each).\n3. Each shard intersects the posting lists, scores matches and returns its top 10.\n4. The broker merges the shards' lists, picks the overall top 10, and fetches snippets.\n\n![Animation: a query is split into four terms; the broker fans it out to every index shard; each shard intersects posting lists and returns its own top ten; the broker merges them into one global top ten and adds snippets.](learning-figures/hld-11-query.gif)\n\n## Step 6: Go deep\n\n### The inverted index\n\nA book's index maps a word to page numbers. A search index does the same: each term points to a sorted list of the documents that contain it.\n\n```text\nspring   → [3, 17, 42, 108, 977, …]\nboot     → [17, 42, 300, 977, …]\nlimiter  → [42, 977, 5120, …]\n```\n\nFor \"spring boot limiter\", walk the sorted lists together and keep documents present in all of them: 42 and 977. Because the lists are sorted, this intersection is fast and needs no random access.\n\n[![Inverted index: documents are split into terms; each term maps to a sorted posting list of document IDs; a query intersects the posting lists of its terms and only the shared documents are scored.](learning-figures/hld-11-index.svg)](learning-figures/hld-11-index.svg)\n\n### Ranking: the scoring algorithm\n\nEach candidate document gets a score from several signals:\n\n- **Text relevance (BM25):** the query words appear often in this page and are rare across the web; title matches count more.\n- **Link authority (PageRank):** many good pages link to it.\n- **Freshness, language, location** and – at Google's scale – machine-learned models over hundreds of signals.\n\n### Crawling politely and efficiently\n\n**Option 1: A single global queue of URLs.**\n\n- Good: simple.\n- Problem: fetchers hammer one popular site, and important pages wait behind junk.\n\n**Option 2: A frontier with per-host queues and priorities.**\n\n- Good: one connection per host at a polite rate; important or fast-changing pages are fetched more often.\n- Problem: more bookkeeping.\n\n> **⚖️ Design choice**\n> Per-host queues with priorities. News front pages are revisited every few minutes; a rarely changing page every few weeks. Content hashes detect duplicate pages so they are indexed once.\n\n> **⚠️ Common mistake**\n> Updating the live index in place while queries read it. A query could see half of a shard's new data. Build a new index generation, then switch shards to it atomically.\n\n### Serving fast\n\nEvery shard has several replicas, so 100,000 queries a second are spread across copies. Popular queries (\"weather\", \"cricket score\") are cached at the broker. If one shard is slow, the broker can return results from the others rather than wait – slightly less complete, but on time.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| A site blocks or slows our crawler | Fetches fail | Respect robots.txt and back off per host |\n| Crawler traps (infinite calendars) | Endless URLs | Limit depth and URLs per host; detect patterns |\n| One index shard is slow | Every query waits for it | Replicas, hedged requests, and a time budget per shard |\n| Index build has a bug | Bad results everywhere | Validate a generation before switching; keep the previous one to roll back |\n| Popular query spike | Hot load | Result cache at the broker |\n\n## Putting it together\n\n- **Crawl:** prioritised, polite frontier → fetch → parse → new links.\n- **Index:** documents → posting lists → a new generation, switched atomically.\n- **Serve:** broker fans out to all shards → each scores its top 10 → merge → snippets.\n\n## Interviewer follow-ups\n\n**Why shard by document rather than by term?** With term sharding, a popular term's shard becomes a hotspot and multi-word queries must gather huge lists across machines. Document sharding keeps every shard's work similar.\n\n**How do you get news into results within minutes?** A small, frequently rebuilt \"fresh\" index alongside the big one; the broker queries both.\n\n**How do you handle typos?** A spelling-correction step before search, using query logs and edit distance.\n\n**How do you make the result page fast?** Cache popular queries, pre-compute snippets where possible, and stop waiting for slow shards after the time budget.\n\n## Wrap up\n\nWe crawled politely into a document store, built an inverted index in versioned generations, and answered queries by fanning out to all shards and merging their top results.\n\n> **📝 Key takeaways**\n> - Offline crawl and index; online serve. Keep them separate.\n> - An inverted index maps each term to a sorted list of documents.\n> - Shard by document; the broker merges each shard's top results.\n> - Rank with text relevance plus link authority and other signals.\n\n## Going deeper (optional)\n\nThe detailed version shows how index generations are published so no query ever sees a half-built posting list.\n\n[![Query serving reads a published index generation rather than crawling on demand.](lessons/hld-11-flow.svg)](lessons/hld-11-flow.svg)\n\nFurther reading: [Brin and Page – The Anatomy of a Large-Scale Hypertextual Web Search Engine](http://infolab.stanford.edu/~backrub/google.html) and [Google – How Search works](https://www.google.com/search/howsearchworks/).\n\n## Closing answer\n\n\"I split search into crawl, index and serve. A frontier with per-host queues and priorities feeds polite fetchers that respect robots.txt; parsers extract text and links, and new links go back into the frontier. Index builders turn documents into an inverted index – each term maps to a sorted posting list – sharded by document and published as versioned generations. At query time a broker sends the terms to every shard; each intersects posting lists, scores candidates with BM25, PageRank and other signals, and returns its top ten. The broker merges them, adds snippets and caches popular queries. Replicas and time budgets keep latency near 200 ms.\"\n"
     },
     {
       "category": "AI",

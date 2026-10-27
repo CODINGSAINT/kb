@@ -104,108 +104,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "api",
             "label": "Merchant API",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Payment intents",
-            "x": 250,
+            "id": "pay",
+            "label": "Payments (SQL)",
+            "x": 220,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n2",
+            "id": "adp",
             "label": "Provider adapter",
-            "x": 500,
+            "x": 440,
             "y": 0,
-            "w": 200,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Provider",
-            "x": 0,
-            "y": 110,
-            "w": 200,
+            "id": "prov",
+            "label": "Bank / UPI / cards",
+            "x": 440,
+            "y": 130,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
+            "id": "inbox",
             "label": "Webhook inbox",
-            "x": 250,
-            "y": 110,
-            "w": 200,
+            "x": 220,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n5",
-            "label": "Ledger",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Reconciliation",
+            "id": "ledger",
+            "label": "Ledger + recon",
             "x": 0,
-            "y": 220,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "y": 130,
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "idempotent intent"
+            "from": "api",
+            "to": "pay",
+            "label": "create (idempotent)"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "stable provider key"
+            "from": "pay",
+            "to": "adp",
+            "label": "attempt"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "authorize capture"
+            "from": "adp",
+            "to": "prov",
+            "label": "charge"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "verified evidence"
+            "from": "prov",
+            "to": "inbox",
+            "label": "callback"
           },
           {
-            "from": "n4",
-            "to": "n1",
-            "label": "legal transitions"
+            "from": "inbox",
+            "to": "ledger",
+            "label": "record result"
           },
           {
-            "from": "n1",
-            "to": "n5",
-            "label": "posts once"
-          },
-          {
-            "from": "n6",
-            "to": "n3",
-            "label": "queries settlement"
+            "from": "ledger",
+            "to": "prov",
+            "label": "nightly reconcile",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a payment system like Stripe's core or an internal payments platform: accept payments via cards, UPI and wallets through external payment service providers (PSPs), record every movement accurately, notify merchants, and reconcile with bank settlement files. Everything revolves around **correctness**: **idempotency**, **transactions/state machines**, **retries**, **webhooks** and **reconciliation**.\n\n## Requirements\n\n**Functional**\n- Create a payment (authorise, then capture), refunds (full or partial), payouts to merchants.\n- Merchant webhooks on status changes. Dashboard and reports.\n\n**Non-functional**\n- Never charge twice, never lose a transaction, a full audit trail.\n- Availability matters, but **correctness beats latency**. External PSPs are slow and unreliable.\n\n**Scale:** modest QPS compared with social apps (~1–10k TPS), but every request is high-value and multi-step.\n\n## 1. Scope and selected guarantees\n\nI support merchant payment intents, authorization/capture, refunds and reconciliation in a declared currency. I choose a payment-state database, immutable ledger and provider adapter. Internal transactions cannot roll back external collection, so unknown results remain explicit.\n\n## 2. APIs and transition authority\n\n```text\nPOST /payment-intents + Idempotency-Key {merchant,amount,currency} -> intent\nPOST /payment-intents/{id}/capture -> state\nPOST /refunds {refundId,paymentId,amount} -> state\nIntent UNIQUE(merchant,key): payloadHash,providerRef,state,version\nWebhookInbox UNIQUE(provider,eventId); Ledger UNIQUE(operation,account,entryKind)\n```\n\nI persist intent before calling the provider using a stable reference. Matching retries return the result; conflicting key reuse fails. The response or authenticated webhook enters a serialized legal transition and posts required ledger entries atomically with local state. A delayed PROCESSING event cannot downgrade CAPTURED. Timeout remains pending until query/settlement evidence resolves it. Refunds are separate bounded operations against captured refundable value. At 100,000 daily payments with 0.1% uncertain outcomes, 100 cases/day need a visible reconciliation process with age and amount exposure, not blind retries or hidden success assumptions.\n\n## 3. Final design diagram\n\n[![Payment System: Merchant API idempotent intent Payment intents; Payment intents stable provider key Provider adapter; Provider adapter authorize capture Provider; Provider verified evidence Webhook inbox; Webhook inbox legal transitions Payment intents; Payment intents posts once Ledger; Reconciliation queries settlement Provider](designs/hld-14.svg)](designs/hld-14.svg)\n\nA **payment intent** describes what should be collected. An **authorization** reserves funds; **capture** collects them under the provider protocol. A **ledger** records financial movements. A **webhook** is asynchronous evidence that may be duplicated or arrive out of order.\n\n## 4. Critical operation: worked execution\n\n![Operation identity remains stable across network uncertainty.](lessons/hld-14-flow.svg)\n\n*Operation identity remains stable across network uncertainty.*\n\n![An unknown result needs reconciliation before another charge.](lessons/hld-14-failure.svg)\n\n*An unknown result needs reconciliation before another charge.*\n\n### Calculate and reconcile\n\nIf 100,000 payments/day have a 0.1% unknown-outcome rate, that is 100 cases/day needing resolution—not a rounding error in reliability. Track their age and monetary exposure. For an internal ₹500 movement, signed ledger entries sum to zero once fees and clearing accounts are explicitly represented.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n1. `POST /payments` with an **Idempotency-Key**. The API stores the key plus a request hash atomically. Retries return the saved response.\n2. Create a payment record `CREATED`, call the PSP (with *its* idempotency key = our payment ID), and move to `AUTHORIZED / FAILED / PENDING_UNKNOWN`.\n3. PSP **webhooks** (and polling for unknowns) drive final states. Every money movement is written as **double-entry ledger** entries in the same DB transaction as the state change.\n4. An **outbox table** in the same transaction, then Kafka, then merchant webhooks (with retries plus signatures), analytics and notifications.\n5. A **reconciliation** job compares the internal ledger with PSP/bank settlement files daily and flags mismatches.\n\n### Key design decisions & trade-offs\n\n**1. Idempotency end to end.** Client to us (Idempotency-Key), us to PSP (payment ID as their key), PSP to us (dedupe webhooks by event ID). Every hop can be retried safely.\n\n**2. Unknown outcomes are normal.** A timeout to the PSP doesn't mean failure. Mark `PENDING_UNKNOWN`, never retry with a *new* charge, and resolve by status query or webhook. This is the most-probed point in interviews.\n\n**3. Double-entry ledger.** An immutable, append-only set of debits and credits summing to zero per transaction. Balances are derived. That makes audits, refunds (reverse entries) and reconciliation tractable.\n\n**4. Transactional outbox.** State change and event in one local transaction. A relay publishes to Kafka. That avoids the \"DB committed but event lost\" (or the reverse) dual-write problem.\n\n**5. SQL for the core.** Strong consistency and transactions (Postgres/MySQL, sharded by merchant or account). Analytics live in separate stores fed by events.\n\n**6. Webhooks to merchants.** At-least-once with exponential backoff, signed payloads, and event IDs merchants can dedupe on. Merchants must be able to fetch the current state too, so webhooks are hints rather than the source of truth.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A posted monetary transaction balances per currency, and its durable business identity prevents repeated external effects.\n\nAssume 10 million payment attempts/day: 116/s average; at 10x peak about 1,160/s. With six 300-byte ledger rows per successful payment, 10 million successes add about 18 GB logical ledger rows/day before indexes and replication.\n\n### API contracts and data ownership\n\n```text\nPOST /payments with amount,currency,merchant and idempotency key; GET /payments/{id}; signed webhook; POST /refunds\n```\n\n```text\nLogical records (outline, not complete DDL):\npayment(id,merchant,key,payload_hash,state); attempt(id,payment_id,provider_ref,state); ledger_tx(id); ledger_entry(tx_id,account,currency,delta_minor)\n\nPrimary access/partitioning boundary:\npayment_id for workflow; merchant + idempotency_key for deduplication; account_id for ledger ownership\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around payment_id for workflow; merchant + idempotency_key for deduplication; account_id for ledger ownership. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAuthenticate merchant; validate amount/currency; persist operation and intent; call provider with stable idempotency identity; classify authorized/captured/failed/unknown; commit balanced ledger entries when settlement policy requires; process signed callbacks and reconciliation statements; issue refunds as new operations.\n\n### Deep dive: the decision that changes this system\n\nA timeout is uncertainty, not a decline. Exactly-once effects require cooperation at every side-effect boundary; a Kafka transaction cannot force a card provider to accept a payment only once. Reconciliation compares independent provider statements with internal attempts and ledger entries.\n\n### Failure and race-condition walkthrough\n\nProvider captures but response and webhook are lost. Query by merchant reference or ingest settlement records; keep status unknown until resolved. Never blindly retry with a new payment identity.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nUse transactional local ledger writes and outbox delivery; avoid pretending a distributed transaction spans external providers. Strong auditability and safe handling of uncertainty matter more than shaving a cache lookup from a payment state query.\n\nKnown-outcome latency, duplicate charge count, unbalanced postings, unresolved payment age and reconciliation mismatch count; operational amounts are illustrative design assumptions.\n\n**Test matrix:** Double-submit, same key/different amount, concurrent debit, duplicate/out-of-order webhook, partial refund, missing provider result and ledger reconciliation after restart.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A posted monetary transaction balances per currency, and its durable business identity prevents repeated external effects.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million payment attempts/day: 116/s average; at 10x peak about 1,160/s. With six 300-byte ledger rows per successful payment, 10 million successes add about 18 GB logical ledger rows/day before indexes and replication.\n\n**Which failure would invalidate the naive design?** Provider captures but response and webhook are lost. Query by merchant reference or ingest settlement records; keep status unknown until resolved. Never blindly retry with a new payment identity.\n\n**Why not introduce every distributed component immediately?** Use transactional local ledger writes and outbox delivery; avoid pretending a distributed transaction spans external providers. Strong auditability and safe handling of uncertainty matter more than shaving a cache lookup from a payment state query.\n\n**How would you demonstrate the design works?** Double-submit, same key/different amount, concurrent debit, duplicate/out-of-order webhook, partial refund, missing provider result and ledger reconciliation after restart. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through boundaries\n\nThe same merchant key with another amount is a conflict, not a retry. Verify webhook authenticity, deduplicate event IDs and apply only legal transitions. A late “processing” event cannot downgrade a captured payment. A refund is a new operation referencing a captured payment; deleting the original ledger entry destroys auditability.\n\nDaily provider settlement files and internal ledger totals provide reconciliation beyond API responses. Separate card data handling from general application storage and follow the actual provider integration boundary. Educational examples here explain state and idempotency; they are not a complete payment compliance implementation.\n\n## 6. Interviewer follow-ups\n\n**Is exactly-once HTTP delivery required?** Networks cannot supply that simple promise; durable identities and state transitions establish effective once-only financial effects.\n\n**Does a failed database transaction undo provider capture?** No.\n\n## 7. Closing answer\n\nA payment is a durable business intent spanning unreliable transport. I preserve one operation identity across requests, reconcile unknown outcomes and post balanced ledger movements once. Verified asynchronous evidence can complete the intent, but duplicate or stale events cannot regress it or collect twice.\n"
+      "markdown": "## Problem\n\nDesign a payment system like Razorpay, Stripe or an internal payments platform. A shop's checkout calls our API to charge Asha ₹1,250 by card or UPI. We pass the request to a card network or bank, record the result, and later pay the money out to the shop.\n\nThe network between us and the bank is unreliable. A request can time out after the bank has already charged Asha. The design must never charge her twice and never lose track of money.\n\n## Requirements\n\n- Merchants create payments (cards, UPI, net banking) through one API.\n- Route each payment to the right provider (card processor, UPI switch, bank).\n- Report success or failure to the merchant; support refunds.\n- Never charge twice for one purchase, even with retries and timeouts.\n- Keep an exact record of every rupee (a ledger) and reconcile with providers daily.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> In payment interviews, correctness beats speed. Ask about retries, timeouts and money records before throughput.\n\n**Candidate:** Are we the payment gateway or a shop calling one?\n\n**Interviewer:** The gateway. Shops call us; we call banks and networks.\n\n**Candidate:** What volume?\n\n**Interviewer:** 10 million payments a day, peaks of 2,000 a second during sales.\n\n**Candidate:** Do we store card numbers?\n\n**Interviewer:** We must be PCI compliant; keep card data isolated.\n\n**Candidate:** How are results reported?\n\n**Interviewer:** Synchronously when possible, and by webhook.\n\n**Candidate:** What if a bank call times out?\n\n**Interviewer:** That's what I want you to design.\n\n**Functional requirements**\n\n1. Create, authorise and capture payments; refunds.\n2. Notify merchants by webhook.\n3. Double-entry ledger and daily reconciliation.\n\n**Non-functional requirements**\n\n1. Exactly one charge per purchase.\n2. No lost money: every movement recorded and reconciled.\n3. Highly available; a slow provider must not take down the API.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> The numbers here are modest. Say so – the design is driven by correctness, not size.\n\n```text\nPayments per day      = 10 million     → ~115/s average, 2,000/s at peak\nLedger entries        ≈ 4 per payment   → 40 million rows/day\nStorage per year      ≈ 40M × 365 × 200 bytes ≈ 3 TB\n```\n\nWhat it means: one well-sized SQL cluster (sharded by merchant later) handles this. Spend the effort on idempotency and reconciliation.\n\n## Step 3: Define the API\n\n```http\nPOST /v1/payments\nIdempotency-Key: order-5521-attempt\n{ \"amount\": 125000, \"currency\": \"INR\", \"method\": \"UPI\", \"merchantOrderId\": \"5521\" }\n→ 201 { \"paymentId\": \"pay_7Hc2\", \"status\": \"PROCESSING\" }\n\nGET  /v1/payments/pay_7Hc2              → { \"status\": \"SUCCEEDED\" }\nPOST /v1/payments/pay_7Hc2/refunds      { \"amount\": 125000 }\n\nWebhook to merchant: POST https://shop.example/hooks  { \"type\": \"payment.succeeded\", \"paymentId\": \"pay_7Hc2\" }\n```\n\nAmounts are integers in paise (125000 = ₹1,250) – never floating point.\n\n> **🎯 In the interview**\n> Explain the idempotency key: if the shop's server retries the same request, we return the same payment instead of creating a second charge.\n\n## Step 4: Define the data model\n\n| Table | Key fields |\n| --- | --- |\n| `payment` | paymentId, merchantId, idempotencyKey (unique per merchant), amount, method, status, providerRef |\n| `payment_attempt` | attemptId, paymentId, provider, request time, response, status |\n| `ledger_entry` | entryId, transactionId, account, debit/credit, amount |\n| `webhook_inbox` | provider event ID (unique), payload, processed |\n| `webhook_outbox` | event to send to the merchant, attempts |\n\n> **⚖️ Design choice**\n> SQL with strong transactions. Money needs constraints (unique idempotency keys, balanced ledger entries) more than it needs NoSQL scale.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: the merchant API creates payment intents; a provider adapter calls the bank or card network; provider callbacks arrive in a webhook inbox; results are written to a double-entry ledger; a daily reconciliation job compares the ledger with provider settlement files.](designs/hld-14.svg)](designs/hld-14.svg)\n\n**Paying ₹1,250**\n\n1. The shop calls `POST /payments` with an idempotency key. We save the payment as `CREATED` (or return the existing one for a repeated key).\n2. The router picks a provider (UPI switch) and records a `payment_attempt`, then calls it.\n3. The provider answers – or later sends a callback – with success or failure.\n4. In one transaction we set the payment to `SUCCEEDED` and write ledger entries.\n5. We notify the shop by webhook (from an outbox, retried until acknowledged).\n6. Each night we compare our records with the provider's settlement file.\n\n![Animation: the shop sends a payment request; the gateway saves it and calls the UPI provider; the call times out, so the payment is marked unknown instead of failed; the gateway asks the provider for the status, learns it succeeded, writes the ledger and notifies the shop once; the shop's retry with the same key returns the same payment.](learning-figures/hld-14-timeout.gif)\n\n## Step 6: Go deep\n\n### Never charging twice: idempotency end to end\n\nThere are two places a duplicate can happen:\n\n- **Shop → us:** the shop retries after a timeout. The unique `(merchantId, idempotencyKey)` returns the original payment.\n- **Us → provider:** we retry a bank call. We send our stable `attemptId` as the provider's reference, so the provider recognises the repeat.\n\n### The timeout: \"unknown\" is a real state\n\n**Option 1: Treat a timeout as failure.**\n\n- Good: simple.\n- Problem: the bank may have charged Asha. Her shop shows \"failed\", she pays again – charged twice.\n\n**Option 2: Retry immediately.**\n\n- Good: might succeed.\n- Problem: without a provider-side idempotency reference, the retry is a second charge.\n\n**Option 3: Mark the attempt UNKNOWN and find out.**\n\n- Good: no guess. Query the provider's status API, or wait for its callback.\n- Problem: the shop waits a little longer for a final answer.\n\n> **⚖️ Design choice**\n> Option 3. A timeout moves the payment to `PENDING_CONFIRMATION`. A status check (and the provider's callback) decides SUCCEEDED or FAILED. Only a confirmed failure allows a fresh attempt.\n\n[![Payment states: created, then processing with a provider attempt; success or failure is final; a timeout leads to an unknown state that is resolved by a status query or callback, never by guessing.](learning-figures/hld-14-states.svg)](learning-figures/hld-14-states.svg)\n\n> **⚠️ Common mistake**\n> Marking a payment FAILED because the HTTP call timed out. A timeout means \"I don't know\", and money systems must record not-knowing honestly.\n\n### Double-entry ledger\n\nEvery money movement is written as balanced entries – total debits equal total credits:\n\n```text\nPayment ₹1,250 succeeded:\n  debit   provider_receivable     125000\n  credit  merchant_payable        122500\n  credit  gateway_fee_revenue       2500\n```\n\nEntries are only appended, never updated. A refund adds new reversing entries. Balances are sums of entries, so they can always be audited.\n\n### Webhooks in both directions\n\n- **Incoming from providers:** store each event in an inbox with a unique provider event ID; processing twice is harmless.\n- **Outgoing to merchants:** write the event in the same transaction as the status change (outbox); a sender retries with backoff until the shop replies 2xx. Sign the webhook so the shop can verify it came from us.\n\n### Reconciliation\n\nEvery night, compare our ledger with each provider's settlement file. Mismatches – a payment the bank settled but we marked failed – become cases for automatic fixes or human review. This is the final safety net.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| Provider times out | Unknown if charged | PENDING_CONFIRMATION; status query and callback decide |\n| Shop retries the request | Possible double charge | Idempotency key returns the original payment |\n| Callback arrives twice | Double processing | Inbox with unique provider event ID |\n| One provider is down | Payments fail | Route to a healthy provider; circuit breaker |\n| Our record and the bank's disagree | Money mismatch | Daily reconciliation and repair |\n\n## Putting it together\n\n- **Create:** idempotency key → save → route to a provider with a stable attempt reference.\n- **Result:** success, failure or unknown; unknown is resolved by status checks and callbacks.\n- **Money:** append-only double-entry ledger, outbox webhooks, nightly reconciliation.\n\n## Interviewer follow-ups\n\n**Where do card numbers live?** In a separate, locked-down vault service (PCI scope). Everything else uses a token that stands for the card.\n\n**Authorise vs capture?** Authorise reserves the money on the card; capture takes it, for example when the order ships. Our state machine includes both.\n\n**How do refunds work?** A new refund record, a provider call with its own idempotency, and reversing ledger entries – never editing the original payment.\n\n**How do you pick a provider?** By method, success rate, cost and health; a router with circuit breakers moves traffic away from a failing one.\n\n## Wrap up\n\nWe made every request idempotent, treated timeouts as unknown until confirmed, recorded money in an append-only double-entry ledger, and reconciled daily.\n\n> **📝 Key takeaways**\n> - Idempotency keys from the merchant, stable references to the provider.\n> - A timeout is \"unknown\", never \"failed\".\n> - Double-entry, append-only ledger; refunds are new entries.\n> - Inbox/outbox for webhooks; nightly reconciliation catches the rest.\n\n## Going deeper (optional)\n\nThe detailed version keeps the operation identity stable across network uncertainty and reconciles before ever allowing a second charge.\n\n[![Operation identity remains stable across network uncertainty.](lessons/hld-14-flow.svg)](lessons/hld-14-flow.svg)\n\nFurther reading: [Stripe – Designing robust APIs with idempotency](https://stripe.com/blog/idempotency) and [NPCI – UPI](https://www.npci.org.in/what-we-do/upi/product-overview).\n\n## Closing answer\n\n\"Merchants create payments with an idempotency key, so a retried request returns the original payment. We save the payment, record an attempt with a stable reference, and call the provider through an adapter. Success and failure are final, but a timeout is recorded as unknown – we query the provider's status or wait for its callback, and only a confirmed failure allows another attempt. Results are written with balanced, append-only double-entry ledger entries in the same transaction as the status change, and merchant webhooks go out through an outbox with retries and signatures. Incoming callbacks are de-duplicated in an inbox, and a nightly reconciliation compares our ledger with provider settlement files.\"\n"
     },
     {
       "category": "AI",

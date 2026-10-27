@@ -118,103 +118,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Storefront and search",
+            "id": "store",
+            "label": "Storefront + search",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "cat",
+            "label": "Catalogue + index",
+            "x": 0,
+            "y": 130,
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "order",
             "label": "Order service",
-            "x": 250,
+            "x": 240,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Inventory authority",
-            "x": 500,
+            "id": "inv",
+            "label": "Inventory service",
+            "x": 470,
             "y": 0,
-            "w": 200,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
+            "id": "pay",
             "label": "Payment service",
-            "x": 0,
-            "y": 110,
-            "w": 200,
+            "x": 470,
+            "y": 130,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
-            "label": "Workflow outbox",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
+            "id": "ful",
             "label": "Fulfilment",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Catalogue store",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "x": 240,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "accepted checkout"
+            "from": "store",
+            "to": "cat",
+            "label": "read products"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "reserves units"
+            "from": "store",
+            "to": "order",
+            "label": "checkout"
           },
           {
-            "from": "n1",
-            "to": "n3",
-            "label": "authorizes"
+            "from": "order",
+            "to": "inv",
+            "label": "reserve stock"
           },
           {
-            "from": "n1",
-            "to": "n4",
-            "label": "commits progress"
+            "from": "order",
+            "to": "pay",
+            "label": "take payment"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "dispatches"
-          },
-          {
-            "from": "n0",
-            "to": "n6",
-            "label": "browses"
+            "from": "order",
+            "to": "ful",
+            "label": "order confirmed event"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign an Amazon-scale e-commerce platform: product catalogue and search, cart, checkout, order processing, inventory, payments and fulfilment, all built as cooperating services with traffic spikes like Prime Day. The interview focus is **service decomposition**, **data ownership**, **event-driven workflows (sagas)** and **inventory correctness**.\n\n## Requirements\n\n**Functional**\n- Browse and search products, product pages with price and availability, reviews.\n- Cart, checkout, payment, order tracking, cancellations, returns.\n- Sellers manage listings and stock.\n\n**Non-functional**\n- Browse is read-heavy with very low latency (cache and CDN friendly). Checkout must be correct (no overselling, no double charging).\n- Survive 10× flash spikes. High availability for browse even if ordering degrades.\n\n**Scale:** 300M products, 100M DAU, ~100k browse req/s, ~5k orders/s at peak.\n\n## 1. Scope and selected consistency\n\nI design catalogue browsing, cart checkout, stock reservation, payment and fulfilment. I choose authoritative inventory conditional updates and a persisted order workflow. Search is a projection; it cannot decide whether the last unit may be sold.\n\n## 2. Checkout contract and stock claim\n\n```text\nPOST /orders {checkoutId,quoteId,items,address} -> orderId,state\nStock PK(sku,warehouse): onHand,reserved,version\nReservation UNIQUE(orderId,lineId): quantity,expiry,state\nOrder: acceptedQuoteSnapshot,state,workflowVersion\nUPDATE stock SET reserved=reserved+:n\n WHERE sku=:sku AND warehouse=:w AND onHand-reserved>=:n;\n```\n\nThe inventory transaction combines that conditional change with one reservation record. If no row changes, allocation fails. Multi-line claims use one transaction where colocated, otherwise recorded partial progress and compensation. After successful reservations, payment authorization/capture follows policy; fulfilment begins only from the required states. Definitive payment rejection releases those reservations. An unknown capture is reconciled before assuming no money moved. With 100 units, 70 sold and 20 held, only ten remain; simultaneous requests cannot enlarge physical stock. Outbox events advance downstream work once effectively, while consumers still deduplicate repeated deliveries.\n\n## 3. Final design diagram\n\n[![Amazon E-Commerce: Storefront and search accepted checkout Order service; Order service reserves units Inventory authority; Order service authorizes Payment service; Order service commits progress Workflow outbox; Workflow outbox dispatches Fulfilment; Storefront and search browses Catalogue store](designs/hld-12.svg)](designs/hld-12.svg)\n\n**Available stock** is stock not already committed or held under the chosen policy. A **reservation** temporarily claims units. An **order** freezes accepted terms. A **saga** coordinates a multi-step workflow using recorded progress and explicit compensations when one database transaction cannot cover every service.\n\n## 4. Critical operation: worked execution\n\n![The order records progress while inventory and payment keep their own evidence.](lessons/hld-12-flow.svg)\n\n*The order records progress while inventory and payment keep their own evidence.*\n\n![Compensation releases the original reservation rather than inventing a new checkout.](lessons/hld-12-failure.svg)\n\n*Compensation releases the original reservation rather than inventing a new checkout.*\n\n### Calculate and protect stock\n\nIf 100 units exist, 70 are sold and 20 are validly held, availability is 10. A cached “100 in stock” badge may attract clicks but cannot authorize purchase. An authoritative conditional reservation must enforce the remaining quantity under contention.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\nServices own their data:\n- **Catalog** (document store) plus **Search** (Elasticsearch, fed by change events). Product pages are mostly served from cache and CDN.\n- **Pricing** and **Inventory** (strongly consistent per SKU per warehouse) are fetched separately, because they change often.\n- **Cart** in a KV store (DynamoDB or Redis), keyed by user, highly available.\n- **Order service** orchestrates checkout as a **saga**: create order (PENDING), reserve inventory, authorise payment, confirm, then emit `OrderPlaced` to Kafka.\n- **Fulfilment, notifications, analytics, recommendations** consume events asynchronously.\n\n### Key design decisions & trade-offs\n\n**1. Saga instead of a distributed transaction.** Each step has a compensation: payment fails, so release inventory; inventory fails, so cancel the order. Orchestration (a central order service) is easier to reason about; choreography (pure events) is more decoupled but harder to trace. Persist saga state so it survives crashes.\n\n**2. Inventory: no overselling.** A conditional decrement, `UPDATE stock SET qty = qty - :n WHERE sku=:s AND qty >= :n`, or a reservation table with TTL. For flash sales, **pre-allocate stock into tokens** in Redis (atomic `DECR`) and queue buyers, so the DB never sees the stampede.\n\n**3. Availability vs. consistency per domain.** The cart favours availability (Dynamo's original use case: always writable, merge on conflict). Payment and inventory favour consistency. Catalogue reads can be eventually consistent.\n\n**4. Idempotency everywhere.** Checkout carries an idempotency key. Retried \"place order\" calls return the same order. Payment calls use the order ID as the key.\n\n**5. Cache layers.** CDN for static and media, edge-cached product HTML fragments, Redis for hot product data. Price and stock are fetched live or with very short TTLs.\n\n**6. Spike readiness.** Autoscaling, load shedding, queue-based checkout (waiting room) for flash sales, and graceful degradation (hide recommendations before failing checkout).\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A confirmed order owns a price snapshot and a durable inventory/payment outcome, not a mutable cart total.\n\nAssume 1 million orders/day: 11.6/s average; a 100x sale peak is 1,157/s. Catalogue reads at 100:1 give about 116,000/s at that peak. One hot SKU may exhaust a single stock authority before overall capacity is reached.\n\n### API contracts and data ownership\n\n```text\nGET /products; POST /checkout with quoteId and request key; GET /orders/{id}; signed payment callback\n```\n\n```text\nLogical records (outline, not complete DDL):\norder(id,user,quote_version,status,total_minor); reservation(order_id,sku,warehouse,qty,expires_at); payment_attempt(id,provider_ref,status)\n\nPrimary access/partitioning boundary:\norder_id for orchestration; sku + warehouse for inventory; user + request_key for checkout\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around order_id for orchestration; sku + warehouse for inventory; user + request_key for checkout. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nValidate quote and address; reserve stock atomically; create pending order plus outbox; authorize payment; confirm or compensate reservation; orchestrate fulfillment; capture according to policy; publish status events with stable identities.\n\n### Deep dive: the decision that changes this system\n\nA checkout saga coordinates local transactions; it cannot atomically commit a remote card network call with inventory. An outbox closes the database-write/event-publish gap. Each compensating action is itself idempotent and may require retry/review.\n\n### Failure and race-condition walkthrough\n\nPayment succeeds but the client times out while inventory reservation expires. Reconcile by payment operation identity and apply the documented late-success policy; never charge again simply because the HTTP response was lost.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nCatalogue, recommendations and carts tolerate some stale views; final stock and payment ownership require stronger boundaries. Queueing flash-sale admissions protects inventory rather than scaling every component indiscriminately.\n\nCheckout completion, oversell count, unknown payment age, reservation leak count, reconciliation backlog and per-step saga latency.\n\n**Test matrix:** Hot SKU race, callback duplication, abandoned checkout, price update, warehouse partial failure, inventory release after payment rejection and partial shipment refund.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A confirmed order owns a price snapshot and a durable inventory/payment outcome, not a mutable cart total.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 1 million orders/day: 11.6/s average; a 100x sale peak is 1,157/s. Catalogue reads at 100:1 give about 116,000/s at that peak. One hot SKU may exhaust a single stock authority before overall capacity is reached.\n\n**Which failure would invalidate the naive design?** Payment succeeds but the client times out while inventory reservation expires. Reconcile by payment operation identity and apply the documented late-success policy; never charge again simply because the HTTP response was lost.\n\n**Why not introduce every distributed component immediately?** Catalogue, recommendations and carts tolerate some stale views; final stock and payment ownership require stronger boundaries. Queueing flash-sale admissions protects inventory rather than scaling every component indiscriminately.\n\n**How would you demonstrate the design works?** Hot SKU race, callback duplication, abandoned checkout, price update, warehouse partial failure, inventory release after payment rejection and partial shipment refund. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through delayed outcomes\n\nA payment timeout is different from a decline. Releasing stock immediately after an unknown capture may produce a paid but unfulfillable order. Keep the unresolved state, query the original payment reference and apply a documented expiry/refund policy.\n\nThe outbox connects committed order facts to downstream messages. Consumers still deduplicate by event identity. Search indexes and product recommendations can lag, while checkout rechecks authoritative price/availability. Splitting every noun into a service increases coordination costs; a modular transactional starting point can be easier to reason about.\n\n## 6. Interviewer follow-ups\n\n**Can payment and inventory always roll back together?** No. External payment is not part of the local database transaction.\n\n**Does queueing purchases prevent overselling?** Only if the consumer's ownership decision enforces stock correctly; a queue by itself is not a stock constraint.\n\n## 7. Closing answer\n\nBrowsing can lag, but checkout revalidates accepted price and claims stock authoritatively. I record order workflow progress and use stable payment/reservation identities to recover partial completion. This preserves the distinction between availability hints, accepted obligations and settled money.\n"
+      "markdown": "## Problem\n\nDesign an e-commerce platform like Amazon or Flipkart. Asha searches for \"running shoes\", adds a pair to her cart, pays ₹3,499 with UPI, and gets an order confirmation. Behind that one click, inventory, payment and shipping all have to agree.\n\nBrowsing is huge and read-heavy. Checkout is smaller but must be correct: no selling the last pair twice, no charging without an order.\n\n## Requirements\n\n- Browse and search a product catalogue.\n- Add to cart; the cart survives across devices.\n- Checkout: reserve stock, take payment, create the order.\n- Track the order through packing, shipping and delivery.\n- Survive sale-day spikes (10× normal traffic).\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> E-commerce is many systems. Agree early on which ones you will cover in depth – usually catalogue/search and checkout.\n\n**Candidate:** What should I focus on?\n\n**Interviewer:** The read path for browsing and the checkout flow.\n\n**Candidate:** What scale?\n\n**Interviewer:** 300 million users, 10 million orders a day, 100× more product views than orders.\n\n**Candidate:** Can we oversell?\n\n**Interviewer:** No. If the last pair sells, the next buyer must be told before paying.\n\n**Candidate:** Which payment methods?\n\n**Interviewer:** Cards and UPI through a payment gateway.\n\n**Candidate:** Is there a big sale event?\n\n**Interviewer:** Yes – on Big Billion Days traffic is 10× normal.\n\n**Functional requirements**\n\n1. Search and view products.\n2. Cart, checkout, payment.\n3. Order tracking.\n\n**Non-functional requirements**\n\n1. Product pages fast (under 200 ms) and always available.\n2. Checkout correct: no overselling, no paid order without stock.\n3. Handle 10× spikes.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Show that reads and checkouts differ by two orders of magnitude; they get different designs.\n\n```text\nOrders per day          = 10 million     → ~115/s average, ~1,500/s on sale peaks\nProduct page views      = 1 billion/day  → ~11,600/s average, ~120,000/s on sale peaks\nCatalogue               = 100 million products × 5 KB ≈ 500 GB\n```\n\nWhat it means: product pages must come from caches and a CDN; checkout is modest in volume but needs transactions.\n\n## Step 3: Define the API\n\n```http\nGET  /v1/search?q=running+shoes&page=1\nGET  /v1/products/{productId}\nPUT  /v1/cart/items/{productId}           { \"qty\": 1 }\nPOST /v1/checkout                         { \"cartId\": \"...\", \"addressId\": \"...\", \"paymentMethod\": \"UPI\" }\n     Idempotency-Key: 6c1e…\n→ 201 { \"orderId\": \"...\", \"status\": \"PENDING_PAYMENT\", \"payUrl\": \"...\" }\n→ 409 { \"error\": \"OUT_OF_STOCK\", \"items\": [\"...\"] }\nGET  /v1/orders/{orderId}\n```\n\n> **🎯 In the interview**\n> Mention the `Idempotency-Key` on checkout. If Asha's network drops after she taps Pay and the app retries, she must not get two orders.\n\n## Step 4: Define the data model\n\n| Service | Data | Technology |\n| --- | --- | --- |\n| Catalogue | productId, title, attributes, images, seller | Document store + search index (Elasticsearch) |\n| Price | productId, sellerId, price | Key-value, cached |\n| Cart | userId → items | Key-value (DynamoDB / Redis + persistence) |\n| Inventory | (productId, warehouse) → available, reserved | SQL, row per SKU per warehouse |\n| Orders | orderId, userId, lines, status, total | SQL, sharded by userId |\n| Payments | paymentId, orderId, amount, status | SQL |\n\n> **⚖️ Design choice**\n> Each service owns its own database. Catalogue data is denormalised for fast reads; inventory and orders live in SQL because they need transactions.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: the storefront and search read from the catalogue store; checkout goes to the order service, which reserves stock with the inventory service and takes payment through the payment service; a workflow outbox drives fulfilment once the order is paid.](designs/hld-12.svg)](designs/hld-12.svg)\n\n**Browsing (read path)**\n\n1. Product pages are served from CDN-cached HTML/JSON and a cache in front of the catalogue.\n2. Search queries go to Elasticsearch, which holds a denormalised copy of products, updated from catalogue change events.\n3. Price and \"in stock\" badges come from their own fast caches.\n\n**Checkout (write path)**\n\n1. The order service creates an order in `PENDING`.\n2. It asks inventory to **reserve** each item for 10 minutes.\n3. It sends Asha to pay ₹3,499 through the payment gateway.\n4. On payment success, the reservation becomes a sale and the order becomes `CONFIRMED`.\n5. Fulfilment picks it up: pack, ship, deliver.\n\n![Animation: Asha checks out; the order service creates a pending order and reserves the shoes for ten minutes; payment succeeds, so the reservation is confirmed and the order becomes confirmed; in a second run, payment fails, so the reservation is released and the order is cancelled.](learning-figures/hld-12-checkout.gif)\n\n## Step 6: Go deep\n\n### Checkout across services: the saga\n\nOrder, inventory and payment are separate services with separate databases, so one database transaction cannot cover them.\n\n**Option 1: A distributed transaction (two-phase commit).**\n\n- Good: all-or-nothing.\n- Problem: slow, fragile, and payment gateways do not take part in your 2PC.\n\n**Option 2: A saga – a sequence of local steps, each with an undo.**\n\n- Good: each step is a simple local transaction; failures run compensations.\n- Problem: there are visible in-between states (`PENDING_PAYMENT`) to handle.\n\n> **⚖️ Design choice**\n> An **orchestrated saga** run by the order service: reserve stock → take payment → confirm. If payment fails or times out, compensate by releasing the reservation and cancelling the order.\n\n[![Checkout saga: create a pending order, reserve inventory, take payment; on success confirm the reservation and the order; on payment failure release the reservation and cancel; on timeout check the payment status before deciding.](learning-figures/hld-12-saga.svg)](learning-figures/hld-12-saga.svg)\n\n### Not overselling\n\nReserving is one atomic, conditional update:\n\n```sql\nUPDATE inventory\n   SET available = available - 1, reserved = reserved + 1\n WHERE product_id = :shoe AND warehouse = 'BLR-1' AND available >= 1;\n-- 1 row → reserved; 0 rows → out of stock, tell Asha before she pays\n```\n\nReservations expire after 10 minutes, so an abandoned checkout returns the stock.\n\n> **⚠️ Common mistake**\n> Checking stock in the product page cache and treating it as truth. The badge can be seconds old. Only the inventory service's conditional update decides.\n\n### Sale-day spikes\n\n- Serve product pages almost entirely from CDN and caches.\n- Put a **waiting room** (queue) in front of checkout for the hottest deals, letting in a steady flow.\n- Split a hot item's stock into several inventory rows (\"buckets\") so many reservations don't fight over one row.\n\n### Reliable events between services\n\nWhen the order becomes `CONFIRMED`, fulfilment and email must hear about it exactly when it commits. Write the status change and an \"order confirmed\" event in the same transaction (an **outbox** table); a relay publishes the event to Kafka.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| Payment times out | We don't know if Asha paid | Keep the reservation, ask the gateway for status, decide then |\n| Asha retries checkout | Two orders | Idempotency key returns the first order |\n| Search index lags | New price shows late | Product page reads price from the price service; search is a hint |\n| Last item, many buyers | Contention on one row | Conditional update; bucketed stock; waiting room |\n| Fulfilment service down | Confirmed orders wait | Events stay in Kafka until it recovers |\n\n## Putting it together\n\n- **Browse:** CDN + caches + a denormalised search index.\n- **Checkout:** saga – reserve with a conditional update, pay, confirm; compensate on failure.\n- **Scale:** separate services and databases; outbox events; waiting room on sale days.\n\n## Interviewer follow-ups\n\n**Why reserve before payment instead of after?** So Asha is never charged for shoes that sold out. A reservation with a timeout holds stock briefly without blocking it forever.\n\n**How does search stay in sync with the catalogue?** Catalogue changes publish events; an indexer updates Elasticsearch within seconds.\n\n**How do you handle multiple sellers in one order?** Split the order into one shipment per seller or warehouse; each has its own fulfilment status.\n\n**What if payment succeeds after the reservation expired?** The confirm step finds the reservation gone; try to reserve again, and if stock is gone, refund automatically.\n\n## Wrap up\n\nWe served browsing from caches and a search index, and ran checkout as a saga with an atomic stock reservation, payment and compensation.\n\n> **📝 Key takeaways**\n> - Reads (browse) and writes (checkout) get different designs.\n> - Each service owns its data; a saga with compensations replaces a distributed transaction.\n> - A conditional update reserves stock; reservations expire.\n> - Idempotency keys and an outbox make retries and events safe.\n\n## Going deeper (optional)\n\nThe detailed version keeps each service's own evidence (reservation, payment attempt) so compensation releases exactly the original reservation.\n\n[![The order records progress while inventory and payment keep their own evidence.](lessons/hld-12-flow.svg)](lessons/hld-12-flow.svg)\n\nFurther reading: [Microservices.io – Saga pattern](https://microservices.io/patterns/data/saga.html) and [Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html).\n\n## Closing answer\n\n\"I split browsing from checkout. Product pages and search are served from a CDN, caches and an Elasticsearch index fed by catalogue events. Checkout is an orchestrated saga run by the order service: create a pending order with an idempotency key, reserve each item with a conditional update that fails if stock is gone, take payment through the gateway, then confirm. If payment fails, compensate by releasing the reservation and cancelling; if it times out, check the gateway before deciding. Reservations expire so abandoned carts return stock. Status changes publish events through an outbox to fulfilment. On sale days, a waiting room and bucketed stock protect the hot items.\"\n"
     },
     {
       "category": "AI",

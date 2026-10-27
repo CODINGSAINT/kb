@@ -1,171 +1,219 @@
 === HLD 15 ===
-N|n0|Schedule API|0|0|200|rect
-N|n1|Schedule store|250|0|200|rect
-N|n2|Due-time dispatcher|500|0|200|rect
-N|n3|Execution queue|0|110|200|rect
-N|n4|Workers|250|110|200|rect
-N|n5|Execution journal|500|110|200|rect
-N|n6|Fenced destination|0|220|200|rect
-E|n0|n1|defines
-E|n2|n1|finds due
-E|n2|n3|unique occurrence
-E|n3|n4|leased attempts
-E|n4|n5|checkpoints
-E|n4|n6|token writes
+N|api|Schedule API|0|0|150|rect
+N|db|Schedules by nextFireAt|220|0|210|cylinder
+N|disp|Dispatchers (leased)|480|0|190|rect
+N|q|Run queue|480|130|140|rect
+N|w|Workers|220|130|140|rect
+N|tgt|Target (dedup by run ID)|0|130|200|rect
+E|api|db|create / update
+E|disp|db|due now? create run
+E|disp|q|enqueue run
+E|q|w|take with lease
+E|w|tgt|call with Run-Id
+E|w|db|record outcome|dashed
 ---
 ## Problem
 
-Design a distributed job scheduler (like a cloud cron, Airflow's scheduler core, or Quartz at scale): users register one-off and recurring jobs; the system triggers them on time, runs them on a worker fleet, retries failures and ensures a job isn't run twice by accident. The key topics are **scheduling**, **workers and queues**, **leader election** and **retries/exactly-once semantics**.
+Design a distributed job scheduler – a cloud cron like AWS EventBridge Scheduler or the core of Airflow. Teams register jobs such as "every day at 2:00 send the sales report" or "in 30 minutes, cancel this unpaid order", and the system runs each one on time on a fleet of workers.
+
+With millions of schedules, no single machine can keep them all. And when a worker or scheduler crashes, jobs must still run – but a report must not be emailed twice.
 
 ## Requirements
 
-**Functional**
-- Create jobs: a cron expression or a one-time `runAt`, payload or command, timeout, retry policy, optional dependencies.
-- Execute on time (± a few seconds). Track runs (status, logs). Cancel or pause.
+- Register one-off jobs ("at 21:30") and recurring jobs (cron expressions).
+- Run each job close to its time (within a few seconds).
+- Retry failed runs with backoff; record every run's outcome.
+- Survive crashes of schedulers and workers without missing or duplicating runs.
+- Scale to tens of millions of schedules.
 
-**Non-functional**
-- Millions of jobs; tens of thousands firing per minute at peaks (on-the-hour spikes).
-- No missed runs when nodes die. Avoid duplicate runs (or make them harmless).
+## Step 1: Clarify the requirements
 
-## 1. Scope and selected execution model
+> **💡 Tip**
+> Ask what "run once" means. Exactly-once execution is impossible across machines; agree on at-least-once plus idempotent jobs.
 
-I support delayed/recurring jobs, retries, cancellation and worker recovery. I choose a durable schedule store, partitioned due-time dispatch and leased worker execution. Timezone, misfire and retry policies are persisted with the schedule.
+**Candidate:** How many schedules and how many runs?
 
-## 2. Claim and execute algorithm
+**Interviewer:** 50 million schedules, about 10,000 runs per second at peak – lots at midnight.
 
-```text
-Schedule: id,rule,zone,nextFire,misfirePolicy
-Execution UNIQUE(scheduleId,intendedFireTime): state,leaseOwner,leaseExpiry,fence
-Attempt: id,executionId,startedAt,result
-claim: conditional READY/expired -> RUNNING, increment fence
-complete: conditional matching owner/fence and live lease -> COMPLETED
-```
+**Candidate:** How precise must timing be?
 
-Dispatch inserts each intended occurrence once and enqueues its ID. A worker claims, checkpoints and executes using the occurrence identity and fencing token. A destination rejecting old tokens prevents a resumed expired worker from overwriting newer work; an email-like effect instead needs idempotency/reconciliation support. Three hundred jobs/s lasting two seconds need roughly 600 active slots under those assumptions. Retries retain execution identity but create new attempts and honor the original task deadline. Cancellation stops future claims and requests cooperative running cancellation; it does not erase a side effect already performed.
+**Interviewer:** Within a few seconds.
 
-## 3. Final design diagram
+**Candidate:** What does a job do?
 
-[![Distributed Job Scheduler: Schedule API defines Schedule store; Due-time dispatcher finds due Schedule store; Due-time dispatcher unique occurrence Execution queue; Execution queue leased attempts Workers; Workers checkpoints Execution journal; Workers token writes Fenced destination](designs/hld-15.svg)](designs/hld-15.svg)
+**Interviewer:** Call an HTTP endpoint or put a message on a queue.
 
-I start with a durable jobs table and leases. A **lease** expires after a bounded time so another worker can recover abandoned work. A **fencing token** increases with each ownership grant so an old worker can be rejected after losing its lease.
+**Candidate:** If the system is down for 5 minutes, should missed runs fire afterwards?
 
-## 4. Critical operation: worked execution
+**Interviewer:** Yes, by default – catch up once.
 
-![Schedule identity plus intended fire time deduplicates dispatch.](lessons/hld-15-flow.svg)
+**Candidate:** Can a job run twice?
 
-*Schedule identity plus intended fire time deduplicates dispatch.*
+**Interviewer:** Avoid it. The target may not be idempotent.
 
-![The side-effect boundary must reject stale fencing tokens.](lessons/hld-15-failure.svg)
+**Functional requirements**
 
-*The side-effect boundary must reject stale fencing tokens.*
+1. Create, update, pause and delete schedules.
+2. Fire each due run and deliver it to a worker.
+3. Retries with backoff; run history.
 
-### Calculate backlog
+**Non-functional requirements**
 
-At 100 jobs/s and a 5-second average runtime, nominal concurrency is about 500. If workers sustain only 80 completions/s, backlog grows 20/s. A larger polling batch does not fix insufficient execution capacity. Keep queue depth, oldest-ready age and running lease age separate.
+1. On time within seconds; no missed runs.
+2. Duplicates as rare as possible, and detectable by the target.
+3. Horizontally scalable; no single point of failure.
 
-## 5. Detailed decisions, algorithms and failure behaviour
+## Step 2: Estimate the scale
 
-### Architecture
-
-- **Job store** (SQL or a partitioned KV) with an index on `next_run_at`.
-- **Scheduler**: poll for due jobs (`next_run_at <= now`) in small batches, enqueue a *run* to a queue, and compute the next `next_run_at` (for cron) in the same transaction.
-- **Partitioning**: shard jobs by `jobId` hash across N scheduler partitions. Each partition is owned by one scheduler instance via **leader election / leases** (etcd, ZooKeeper, or a DB lease row). That gives horizontal scale without double-dispatch.
-- **Workers** pull runs from the queue, heartbeat while running, write results, and ack. Failed runs are retried with backoff, then go to a DLQ.
-- An optional **timing wheel** in memory holds jobs due in the next minute for precise firing.
-
-### Key design decisions & trade-offs
-
-**1. Claiming due jobs safely.** Multiple scheduler replicas could pick up the same row. Either use partition ownership via leases, or atomically claim with `UPDATE … SET status='ENQUEUED', owner=? WHERE id=? AND status='SCHEDULED'` / `SELECT … FOR UPDATE SKIP LOCKED`.
-
-**2. Exactly-once is a myth; aim for at-least-once plus idempotency.** A worker can finish the job and crash before acking, so the run is retried. Give each run a `runId` (jobId + scheduled time) that the job uses as an idempotency key.
-
-**3. Worker failure detection.** Workers renew a visibility timeout or heartbeat. If it expires, the run is re-queued. Pick the timeout from the job's expected duration plus margin; too short gives duplicates, too long delays recovery.
-
-**4. Thundering herd at :00.** Many cron jobs fire on the hour. Spread them with jitter when allowed, pre-fetch due jobs slightly early into the timing wheel, and autoscale workers on queue depth.
-
-**5. Missed runs after downtime.** Define a policy per job: run once to catch up, run all missed, or skip.
-
-**6. DAG dependencies.** For workflows, a run becomes ready only when its upstream runs succeed. Store dependencies and evaluate on completion events.
-
-### Scope, guarantees and sizing assumptions
-
-**Correctness requirement:** A schedule firing has a stable identity and stale workers cannot commit after lease ownership changes.
-
-Assume 10 million scheduled jobs distributed evenly over a day: 116 due/s. A million jobs scheduled at midnight create a burst orders of magnitude larger. With 1 KB metadata each, 10 GB raw metadata excludes run history.
-
-### API contracts and data ownership
+> **💡 Tip**
+> Average rates hide the midnight spike – everyone schedules "0 0 * * *".
 
 ```text
-POST /schedules with timezone and misfire policy; cancel schedule; GET /runs/{id}; worker claim/heartbeat/complete
+Schedules              = 50 million
+Runs per day           ≈ 200 million → ~2,300/s average
+Midnight spike         ≈ 10,000/s for a minute
+Run history            = 200M × 300 bytes ≈ 60 GB/day
 ```
 
-```text
-Logical records (outline, not complete DDL):
-schedule(id,next_at,zone,rule,misfire_policy); run(id,schedule_id,scheduled_at,state,lease_owner,lease_epoch,lease_until)
+What it means: finding due runs must be a cheap indexed query on "next fire time", spread across partitions; history needs a write-friendly store with retention.
 
-Primary access/partitioning boundary:
-due_time bucket for discovery; job_id/run_id for state and execution idempotency
+## Step 3: Define the API
+
+```http
+POST /v1/schedules
+{ "name": "daily-sales-report", "cron": "0 2 * * *", "timezone": "Asia/Kolkata",
+  "target": { "type": "HTTP", "url": "https://reports.internal/run" },
+  "retry": { "maxAttempts": 3, "backoff": "PT30S" } }
+→ 201 { "scheduleId": "sch_41f", "nextFireAt": "2026-10-28T02:00:00+05:30" }
+
+PATCH  /v1/schedules/sch_41f   { "paused": true }
+GET    /v1/schedules/sch_41f/runs
 ```
 
-### Build the architecture in stages
+Every run sends the target a header `Run-Id: sch_41f@2026-10-28T02:00+05:30` – the schedule plus its intended time.
 
-**Stage 3 — Partition and isolate.** Partition around due_time bucket for discovery; job_id/run_id for state and execution idempotency. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+> **🎯 In the interview**
+> That run ID is the trick that makes duplicates harmless: the target can ignore a second delivery with the same ID.
 
-### Trace the critical request
+## Step 4: Define the data model
 
-Persist schedule; find due buckets; atomically create/claim a unique firing; assign a worker lease and fencing epoch; execute with a run identity; heartbeat within a bounded lifetime; conditionally commit completion; compute next firing under the chosen recurrence policy.
+| Table | Key fields |
+| --- | --- |
+| `schedule` | scheduleId, cron or runAt, timezone, target, retry policy, paused, **nextFireAt**, partition |
+| `run` | runId (= scheduleId + fireTime, unique), status (QUEUED / RUNNING / SUCCEEDED / FAILED), attempt, workerId, leaseUntil |
 
-### Deep dive: the decision that changes this system
+Index: `(partition, nextFireAt)` so each dispatcher can ask "what in my partition is due now?".
 
-At-least-once execution is realistic when a worker may perform an effect and crash before recording success. The downstream operation needs the run idempotency key. A fencing epoch must be checked by the resource being modified, not merely logged by the scheduler.
+> **⚖️ Design choice**
+> Store schedules in a sharded SQL or Cassandra table with the `nextFireAt` index. The database is the source of truth; nothing important lives only in a scheduler's memory.
 
-### Failure and race-condition walkthrough
+## Step 5: Draw the high-level design
 
-A paused worker outlives its lease, another worker completes the run, then the old worker resumes. Reject stale completion and stale resource writes. A lock TTL without resource-side epoch validation does not solve this.
+[![High-level design: the schedule API stores schedules; due-time dispatchers, each owning some partitions, find runs whose time has come and put them on an execution queue; workers run them and record the outcome in the execution journal; the target checks the run ID so a repeated run has no extra effect.](designs/hld-15.svg)](designs/hld-15.svg)
 
-### Security, tenancy and lifecycle
+**Firing a run**
 
-### Trade-offs and a starting recommendation
+1. Every second, the dispatcher for partition 7 queries schedules with `nextFireAt <= now`.
+2. For each, in one transaction: insert the `run` row (`sch_41f@02:00`) and move `nextFireAt` to the next cron time.
+3. It puts the run on the execution queue.
+4. A worker takes it, marks it RUNNING with a lease, calls the target with the run ID, and records SUCCEEDED or FAILED.
+5. On failure, the run is re-queued with backoff until `maxAttempts`.
 
-Polling a small due-time range is simple; timing wheels reduce scheduling overhead but need durable recovery. Cron local times need policies for skipped/repeated daylight-saving instants and missed firings after outage.
+![Animation: at 02:00 the dispatcher finds the daily sales report due, creates its run and advances the next fire time to tomorrow in one transaction, queues it, and a worker calls the report service; the worker crashes, its lease expires, and another worker retries with the same run ID, which the report service recognises.](learning-figures/hld-15-fire.gif)
 
-Start lateness, successful completion, duplicate effects, oldest due job, lease churn and dead-letter age.
+## Step 6: Go deep
 
-**Test matrix:** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence.
+### Finding due jobs: the dispatch algorithm
 
-### Follow-up questions with answers
+**Option 1: One scheduler scans everything.**
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: A schedule firing has a stable identity and stale workers cannot commit after lease ownership changes.
+- Good: simple.
+- Problem: a single point of failure and a bottleneck at midnight.
 
-**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million scheduled jobs distributed evenly over a day: 116 due/s. A million jobs scheduled at midnight create a burst orders of magnitude larger. With 1 KB metadata each, 10 GB raw metadata excludes run history.
+**Option 2: Every scheduler scans everything.**
 
-**Which failure would invalidate the naive design?** A paused worker outlives its lease, another worker completes the run, then the old worker resumes. Reject stale completion and stale resource writes. A lock TTL without resource-side epoch validation does not solve this.
+- Good: no single point of failure.
+- Problem: every run fires several times.
 
-**Why not introduce every distributed component immediately?** Polling a small due-time range is simple; timing wheels reduce scheduling overhead but need durable recovery. Cron local times need policies for skipped/repeated daylight-saving instants and missed firings after outage.
+**Option 3: Partition schedules; each partition has one owner at a time.**
 
-**How would you demonstrate the design works?** Leader failover, duplicate tick, lease expiry, stale worker, long job, cancellation race, midnight burst and daylight-saving recurrence. Keep the expected invariant and recovery outcome visible in the results.
+- Good: work spreads across dispatchers; each schedule has one dispatcher.
+- Problem: needs leader election per partition (ZooKeeper, etcd or database leases).
 
-### Further reading
+> **⚖️ Design choice**
+> Option 3. Split schedules into, say, 1,024 partitions. Dispatchers take leases on partitions; if one dies, its leases expire and another dispatcher takes over. A time-ordered index per partition makes "what is due?" cheap.
 
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+### Not firing twice
 
-### Work through delivery semantics
+Even with one owner per partition, a dispatcher might pause (garbage collection) while its lease expires and a new owner fires the same run. Two defences:
 
-Most practical schedulers offer at-least-once attempts. Side effects need job-level idempotency or a destination that enforces fencing. A lease alone cannot stop a paused process from acting. Retries should preserve execution identity but create new attempt IDs.
+- The `run` table's unique `runId = scheduleId + fireTime`: a second insert fails, so the run is created once.
+- **Fencing tokens:** each lease has an increasing number; writes carrying an old token are rejected.
 
-Cron schedules need a timezone and a policy for missed/duplicated local times and downtime: skip, run once or catch up every occurrence. A poison job needs bounded retries and an inspectable final state; infinite immediate retry can starve useful work.
+[![Dispatcher failover: dispatcher A owns partition 7 with lease token 41, pauses and loses the lease; dispatcher B takes over with token 42 and fires the due run; when A wakes, its insert with token 41 is rejected and the unique run ID prevents a second run.](learning-figures/hld-15-fence.svg)](learning-figures/hld-15-fence.svg)
 
-## 6. Interviewer follow-ups
+### Workers crash mid-run
 
-**Is “job started” equivalent to completed?** No. Record attempts, heartbeat/checkpoint and final result.
+A RUNNING run has `leaseUntil`. Workers extend it while working. If a worker dies, the lease expires and the run returns to the queue. This means the target may be called twice for one run – which is why we send the run ID and ask targets to de-duplicate.
 
-**Can a scheduler promise one email merely by using a lock?** No. The email boundary must handle retries/uncertainty too.
+> **⚠️ Common mistake**
+> Promising exactly-once execution. A worker can finish the call and crash before recording success. The honest guarantee is at-least-once delivery with a stable run ID; the target makes the effect happen once.
 
-## 7. Closing answer
+### Cron, time zones and catch-up
 
-I separate schedules, occurrences and attempts. Unique occurrence identities avoid duplicate dispatch, leases recover abandoned execution and fencing/idempotency protects effects from stale workers. At-least-once attempts are explicit; exactly-once external effects require cooperation from the destination.
+Compute `nextFireAt` using the schedule's time zone (`Asia/Kolkata`), not the server's. Daylight-saving jumps in other zones can skip or repeat a local time – choose a rule and document it. After an outage, fire each missed run once (or skip, if the schedule says so) rather than replaying hundreds.
+
+### The midnight spike
+
+Spread load by adding small random jitter to schedules that allow it, and scale workers on queue depth. The queue absorbs the burst; dispatching stays fast because it only writes small run rows.
+
+## Step 7: Find bottlenecks and failure points
+
+| What fails | What happens | How we handle it |
+| --- | --- | --- |
+| A dispatcher dies | Its partitions stop firing | Leases expire; another dispatcher takes over within seconds |
+| A paused dispatcher wakes up | Could fire stale runs | Fencing tokens and unique run IDs reject it |
+| A worker dies mid-run | Run looks stuck | Lease expires; run is retried with the same run ID |
+| Target is down | Runs fail | Retry with backoff; after max attempts mark FAILED and alert |
+| Midnight spike | Queue grows | Workers autoscale on queue depth; optional jitter |
+
+## Putting it together
+
+- **Store:** schedules with `nextFireAt`, partitioned; runs with a unique run ID.
+- **Dispatch:** one leased owner per partition; create the run and advance the schedule in one transaction.
+- **Execute:** queue → workers with leases → retries; targets de-duplicate by run ID.
+
+## Interviewer follow-ups
+
+**How do you handle job dependencies, like Airflow DAGs?** A run completes and triggers its children; the scheduler tracks each DAG run's task states. The same leasing and run-ID rules apply.
+
+**How do you support "run every 5 seconds"?** It works, but 5-second schedules at scale are better served by a streaming or queue-based design.
+
+**How do you delete a schedule that is about to fire?** Mark it deleted in the same table; the dispatcher's transaction checks the flag, so it cannot fire after the delete commits.
+
+**Why not just use a delayed-message queue?** Great for one-off delays (SQS delay, RabbitMQ delayed exchange), but recurring cron rules, pausing and history need the schedule table.
+
+## Wrap up
+
+We partitioned schedules by `nextFireAt` with one leased dispatcher per partition, created each run once with a unique run ID, and delivered at least once to targets that de-duplicate.
+
+> **📝 Key takeaways**
+> - Index schedules by next fire time; partition them across dispatchers.
+> - Create the run and advance the schedule in one transaction.
+> - Leases plus fencing tokens stop old owners from acting.
+> - At-least-once execution + a stable run ID = an effect that happens once.
+
+## Going deeper (optional)
+
+The detailed version pushes fencing all the way to the side-effect boundary, so even a target call from a stale worker is rejected.
+
+[![Schedule identity plus intended fire time deduplicates dispatch.](lessons/hld-15-flow.svg)](lessons/hld-15-flow.svg)
+
+Further reading: [Martin Kleppmann – How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) and [Quartz clustering](https://www.quartz-scheduler.org/documentation/quartz-2.3.0/configuration/ConfigJDBCJobStoreClustering.html).
+
+## Closing answer
+
+"Schedules live in a partitioned table indexed by next fire time and time zone. Each partition has one dispatcher at a time, chosen by leases with fencing tokens. Every second a dispatcher finds due schedules and, in one transaction, inserts a run with a unique ID – the schedule plus its intended fire time – and advances the next fire time; the run goes on a queue. Workers take runs with a lease, call the target with the run ID and record the outcome, retrying with backoff. If a worker or dispatcher dies, leases expire and others take over. Delivery is at least once, and targets de-duplicate by run ID so the effect happens once."
 
 === HLD 16 ===
 N|n0|Application agents|0|0|200|rect

@@ -118,108 +118,94 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Sale waiting room",
+            "id": "wait",
+            "label": "Waiting room",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "api",
             "label": "Booking API",
-            "x": 250,
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Show-seat authority",
-            "x": 500,
+            "id": "seats",
+            "label": "Show-seat store",
+            "x": 440,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
-            "label": "Hold store",
+            "id": "cache",
+            "label": "Seat-map cache",
             "x": 0,
-            "y": 110,
-            "w": 200,
+            "y": 130,
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "pay",
+            "label": "Payment",
+            "x": 220,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
-            "label": "Payment workflow",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Ticket store",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Expiry and reconciliation",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "id": "exp",
+            "label": "Hold expiry job",
+            "x": 440,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "bounded admission"
+            "from": "wait",
+            "to": "api",
+            "label": "admit 500/s"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "atomic claims"
+            "from": "api",
+            "to": "cache",
+            "label": "seat map"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "token ownership"
+            "from": "api",
+            "to": "seats",
+            "label": "atomic hold"
           },
           {
-            "from": "n1",
-            "to": "n4",
-            "label": "payment intent"
+            "from": "api",
+            "to": "pay",
+            "label": "pay in 8 min"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "confirm owned seats"
+            "from": "pay",
+            "to": "seats",
+            "label": "confirm booking"
           },
           {
-            "from": "n6",
-            "to": "n3",
-            "label": "expires"
-          },
-          {
-            "from": "n6",
-            "to": "n4",
-            "label": "reconciles"
+            "from": "exp",
+            "to": "seats",
+            "label": "release expired"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign BookMyShow at the HLD level: millions of users browse shows across cities, and on popular releases tens of thousands compete for the same seats within seconds. The LLD covered seat locking in one process. Here: **distributed locking**, **inventory consistency**, **transactions with payment** and **concurrency under spikes**.\n\n## Requirements\n\n**Functional**\n- Browse movies, cinemas and shows by city. View a live seat map.\n- Hold seats for ~8 minutes, pay, confirm and issue a ticket. Release holds on timeout or failure.\n\n**Non-functional**\n- Zero double bookings. The seat map is near-real-time. Survive opening-day spikes (e.g. 1M users for one show).\n\n**Scale:** 10k cinemas × ~20 shows/day × 200 seats ≈ 40M seat-inventory rows per day. Browse traffic ~50k req/s. Booking writes ~5k/s at peak, concentrated on a few hot shows.\n\n## 1. Scope and selected architecture\n\nI sell reserved seats for high-demand shows. I choose per-show allocation partitions, cached maps and a bounded waiting room. The authoritative show-seat transaction owns all-seat holds; payment and ticket issuance use a recoverable workflow. Cached maps never grant ownership.\n\n## 2. Booking protocol\n\n```text\nPOST /shows/{id}/holds {requestId,seats} -> holdId,expiresAt,quotedTotal\nPOST /holds/{id}/payment -> paymentIntent\nGET /bookings/{id} -> pending | confirmed | compensationRequired\nShowSeat PK(showId,seatId): state,holdId,expiry,bookingId\nBooking UNIQUE(holdId); Payment UNIQUE(providerReference)\n```\n\nHold creation locks sorted seat rows, verifies every claim and commits one hold or nothing. Payment confirmation locks the same ownership, checks strict unexpired validity and creates the booking once. Cleanup only releases matching expired tokens. A payment after lost ownership creates a recorded refund/exception, never steals the seat. At 100,000 visitors polling every two seconds, reads reach 50,000/s for only 200 seats; cache refresh coalescing and admission protect the write authority. I monitor allocation conflicts, oldest pending payment, hold leakage and paid-without-booking cases rather than only successful HTTP responses.\n\n## 3. Final design diagram\n\n[![BookMyShow: Sale waiting room bounded admission Booking API; Booking API atomic claims Show-seat authority; Show-seat authority token ownership Hold store; Booking API payment intent Payment workflow; Payment workflow confirm owned seats Ticket store; Expiry and reconciliation expires Hold store; Expiry and reconciliation reconciles Payment workflow](designs/hld-13.svg)](designs/hld-13.svg)\n\nA **show-seat** is seat A7 for a specific screening. A **hold** grants temporary ownership. A **booking** confirms the purchase. The venue's static seat layout is reusable across shows; its availability is not.\n\n## 4. Critical operation: worked execution\n\n![Admission controls load; transaction conditions control correctness.](lessons/hld-13-flow.svg)\n\n*Admission controls load; transaction conditions control correctness.*\n\n![Payment success does not override a new seat owner.](lessons/hld-13-failure.svg)\n\n*Payment success does not override a new seat owner.*\n\n### Calculate contention\n\nIf 100,000 users refresh a 200-seat show every two seconds, reads are 50,000/s while only 200 seats can be sold. Cache maps and coalesce refreshes, but treat their availability display as approximate. The write path should not scale its promises beyond the physical 200 seats.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n- **Catalogue/search** (movies, cinemas, shows): read-heavy, cached, CDN for posters.\n- **Seat map service:** reads seat states from cache, with the DB as the source of truth.\n- **Hold:** `SET seat:{showId}:{seatId} userId NX PX 480000` for each requested seat in **Redis** (a Lua script makes multi-seat holds all-or-nothing).\n- **Booking service:** on payment success, verifies the holds are still owned by the user, then writes the booking in the **SQL DB** in one transaction with a **unique constraint on (showId, seatId)**. The DB is the final guard.\n- **Payment** via gateway with an idempotency key; the webhook confirms the booking.\n\n### Key design decisions & trade-offs\n\n**1. Two-layer protection.** Redis holds give fast, expiring, user-friendly locks. The DB unique constraint guarantees correctness even if Redis loses a key (failover). Never rely on the Redis lock alone for money.\n\n**2. Optimistic vs. pessimistic.** Pessimistic (`SELECT … FOR UPDATE` on seat rows) serialises contention in the DB and causes lock storms on hot shows. Optimistic (conditional update `WHERE status='AVAILABLE'`, or insert plus unique constraint) fails fast and lets the user pick another seat. Prefer optimistic plus Redis holds.\n\n**3. Hot shows and the waiting room.** For mega releases, put users in a **virtual queue** and admit them at a rate the booking path can handle. It's fairer and protects every downstream system.\n\n**4. Seat map freshness.** Push hold and release events via WebSocket or SSE to viewers of that show, or poll every few seconds. A stale map only causes a failed hold, never a double booking.\n\n**5. Payment edge cases.** The hold expired during a slow payment but the money was captured. Try to re-acquire the seats; if they're taken, auto-refund. Reconcile pending payments periodically.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** For each show-seat, one authoritative state transition determines who owns the hold or confirmed booking.\n\nAssume 50,000 seats released and 500,000 users arriving in a minute: 8,333 admission attempts/s before seat-map refreshes. If each polls every 5 seconds, 100,000 seat-map reads/s arise independently of purchases.\n\n### API contracts and data ownership\n\n```text\nGET /shows/{id}/seats; POST /holds with seats; POST /holds/{id}/confirm; DELETE /holds/{id}\n```\n\n```text\nLogical records (outline, not complete DDL):\nshow_seat(show_id,seat_id,state,hold_id,expires_at,version); booking(id,hold_id,payment_id,status)\n\nPrimary access/partitioning boundary:\nshow_id and seat_id for inventory; hold_id and booking_id for idempotency\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around show_id and seat_id for inventory; hold_id and booking_id for idempotency. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAdmit a bounded number of customers; serve cached seat maps as advisory; atomically acquire requested seats in stable order; return a server-expiry hold token; process payment outside inventory locks; confirm only the current unexpired hold; publish final state.\n\n### Deep dive: the decision that changes this system\n\nWaiting rooms and rate limits protect the transactional seat authority; they do not guarantee a seat. One popular show is a hot partition, so choose ownership by show or section while preserving atomic multi-seat operations. A lease expiry worker is cleanup, not the sole expiry check.\n\n### Failure and race-condition walkthrough\n\nThe first buyer pays after a hold expires and seats are sold again. Preserve the later owner and compensate/refund the earlier payment. A distributed lock without fencing can let a paused old worker overwrite a new owner.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nA single show leader simplifies serialization; sharding by section improves throughput but makes cross-section seat requests harder. Strong writes and stale maps are compatible if the product clearly treats maps as estimates.\n\nOversell must remain zero within the model; track hold latency, conflict rate, expired-hold age, admission queue time and payment reconciliation.\n\n**Test matrix:** Last-seat races, all-or-none group selection, hold expiry with payment callback, stale map, paused worker resumption and admission overload.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: For each show-seat, one authoritative state transition determines who owns the hold or confirmed booking.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 50,000 seats released and 500,000 users arriving in a minute: 8,333 admission attempts/s before seat-map refreshes. If each polls every 5 seconds, 100,000 seat-map reads/s arise independently of purchases.\n\n**Which failure would invalidate the naive design?** The first buyer pays after a hold expires and seats are sold again. Preserve the later owner and compensate/refund the earlier payment. A distributed lock without fencing can let a paused old worker overwrite a new owner.\n\n**Why not introduce every distributed component immediately?** A single show leader simplifies serialization; sharding by section improves throughput but makes cross-section seat requests harder. Strong writes and stale maps are compatible if the product clearly treats maps as estimates.\n\n**How would you demonstrate the design works?** Last-seat races, all-or-none group selection, hold expiry with payment callback, stale map, paused worker resumption and admission overload. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through expiry and recovery\n\nThe database condition checks ownership token and time. A background expiry job improves cleanup speed but is not the source of the validity rule. A stale expiry worker must not release a newer hold. Multi-seat selections need all-or-nothing ownership with stable lock order.\n\nPartition by show for local contention boundaries when appropriate; an exceptionally popular show is still a hot partition. Admission, request deduplication and bounded transactions reduce pressure without weakening seat ownership. Track payment-without-booking and booking-without-settlement as operational reconciliation queues.\n\n## 6. Interviewer follow-ups\n\n**Does a waiting-room token guarantee a ticket?** No. It grants a chance to attempt allocation under capacity limits.\n\n**Should map-cache failure make seats double-bookable?** No. The cache is not the ownership authority.\n\n## 7. Closing answer\n\nI handle sale overload before the booking transaction and seat correctness inside it. Token-owned expiring holds, ordered row locking and idempotent payment confirmation provide the complete sale boundary. A waiting-room grant is admission to attempt booking, not a promise of inventory.\n"
+      "markdown": "## Problem\n\nDesign BookMyShow at the system level. On a normal day, people browse movies in their city and book a few seats. On the morning a blockbuster opens bookings, 2 million fans arrive in the first ten minutes, all wanting the same few thousand seats.\n\nAsha picks seats F7 and F8 for the 9 pm show and has 8 minutes to pay. Nobody else may book those seats meanwhile, and if she doesn't pay, they must become free again.\n\n## Requirements\n\n- Browse movies, cinemas and shows by city and date.\n- View the seat map for a show and hold chosen seats for a few minutes.\n- Pay and confirm; release seats if payment doesn't finish.\n- Never sell one seat twice.\n- Survive opening-day spikes.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> This is a contention problem. Ask about the peak, not the average.\n\n**Candidate:** How many cities, cinemas and shows?\n\n**Interviewer:** 500 cities, 10,000 screens, about 50,000 shows a day.\n\n**Candidate:** What does a blockbuster opening look like?\n\n**Interviewer:** 2 million users in the first 10 minutes for about 3,000 shows.\n\n**Candidate:** How long can a user hold seats?\n\n**Interviewer:** 8 minutes.\n\n**Candidate:** Does the cinema also sell tickets at the counter?\n\n**Interviewer:** Yes, through our API.\n\n**Candidate:** Can the seat map be slightly stale?\n\n**Interviewer:** The map can lag a little, but the booking itself must be correct.\n\n**Functional requirements**\n\n1. Browse shows; view a seat map.\n2. Hold seats for 8 minutes; pay; confirm or release.\n3. Issue tickets.\n\n**Non-functional requirements**\n\n1. Never double-book a seat.\n2. Browsing always available, even during a spike.\n3. Opening-day peak of millions of users without falling over.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Compare the number of people with the number of seats. The gap is why you need a waiting room.\n\n```text\nNormal bookings        = 2 million tickets/day   → ~25/s average\nOpening morning        = 2 million users in 10 min ≈ 3,300 arrivals per second\nSeats available        = 3,000 shows × 250 seats  = 750,000 seats\nSeat-map reads         ≈ 10 per user               ≈ 33,000 per second\n```\n\nWhat it means: seat-map reads are the volume problem (cache them); seat holds are the correctness problem (do them atomically); and arrivals must be smoothed with a queue.\n\n## Step 3: Define the API\n\n```http\nGET  /v1/cities/{city}/movies?date=2026-11-14\nGET  /v1/shows/{showId}/seats                         → seat map with AVAILABLE / HELD / BOOKED\nPOST /v1/shows/{showId}/holds   { \"seats\": [\"F7\",\"F8\"] }\n→ 201 { \"holdId\": \"...\", \"expiresAt\": \"21:08:00\" }   |  409 { \"unavailable\": [\"F8\"] }\nPOST /v1/holds/{holdId}/pay                            → payment page\nGET  /v1/bookings/{bookingId}                          → tickets\n```\n\n> **🎯 In the interview**\n> Say the hold is all-or-nothing: Asha asked for two seats together, so if F8 is taken she gets neither and picks again.\n\n## Step 4: Define the data model\n\n| Store | Contents | Technology |\n| --- | --- | --- |\n| Catalogue | movies, cinemas, screens, shows, layouts | SQL + heavy caching |\n| Show seats | (showId, seatNo) → status, holdId, holdExpiresAt, bookingId, version | SQL, partitioned by showId |\n| Bookings | bookingId, user, show, seats, amount, status | SQL |\n| Seat-map cache | showId → compact seat map | Redis, refreshed on change |\n\n> **⚖️ Design choice**\n> Seat status lives in the database (one row per show-seat), partitioned by show. All seats of one show are in one partition, so a multi-seat hold is a single local transaction.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: a sale waiting room admits users at a steady rate to the booking API; the API holds seats atomically in the show-seat store with an expiry, sends the user to the payment workflow, issues tickets on success, and an expiry job releases unpaid holds.](designs/hld-13.svg)](designs/hld-13.svg)\n\n**Booking**\n\n1. On opening day, Asha first waits in the **waiting room**; she is let in when there is capacity.\n2. She opens the seat map (from cache) and selects F7, F8.\n3. The booking service tries to hold both seats in one transaction, with `holdExpiresAt = now + 8 min`.\n4. She pays ₹640. The payment callback confirms: seats become BOOKED and tickets are issued.\n5. If she abandons, the hold expires and the seats return to AVAILABLE.\n\n![Animation: Asha and Bilal both try to hold seat F8 at the same moment; Asha's conditional update succeeds and holds F7 and F8 until 21:08; Bilal's update finds F8 no longer available and he is asked to choose again; Asha pays and the seats become booked.](learning-figures/hld-13-hold.gif)\n\n## Step 6: Go deep\n\n### Holding seats without double-booking\n\n**Option 1: Check, then update in two steps.**\n\n- Good: easy to write.\n- Problem: Asha and Bilal both see F8 free and both update – a classic race.\n\n**Option 2: Pessimistic locks (`SELECT … FOR UPDATE`).**\n\n- Good: correct.\n- Problem: locks pile up under a spike and slow everyone.\n\n**Option 3: One conditional update per hold.**\n\n- Good: correct and short; the database does the check and the write together.\n- Problem: callers must handle \"0 rows changed\".\n\n> **⚖️ Design choice**\n> A single conditional update for all requested seats:\n\n```sql\nUPDATE show_seat\n   SET status = 'HELD', hold_id = :hold, hold_expires_at = :now + interval '8 minutes'\n WHERE show_id = :show AND seat_no IN ('F7','F8')\n   AND (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at < :now));\n-- 2 rows → hold succeeded; fewer → roll back and report which seats are taken\n```\n\nExpired holds are treated as free immediately, even before the cleanup job runs.\n\n### The waiting room\n\nLetting 3,300 people a second hit the booking service would overload the database and fail everyone. A **virtual queue** gives each arriving user a position and admits, say, 500 users a second. Users see \"You are number 41,230 – about 6 minutes\". The system stays fast for those inside.\n\n[![Opening-day traffic: two million arrivals enter a virtual waiting room, which admits a steady 500 users per second; admitted users read cached seat maps and make atomic holds; unpaid holds expire and seats return.](learning-figures/hld-13-waiting-room.svg)](learning-figures/hld-13-waiting-room.svg)\n\n### Payment and expiry together\n\nPayment may succeed just after the hold expired and Bilal grabbed the seat. The confirm step must therefore also be conditional: `status = 'HELD' AND hold_id = :asha`. If that fails, Asha's payment is refunded automatically.\n\n> **⚠️ Common mistake**\n> Using a Redis key with a TTL as the only record of a hold, while bookings live in SQL. Two stores can disagree – the key expires, the seat is resold, and Asha's late payment still books it. Keep one authority for seat state.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| 2 million users arrive at once | Database overload | Waiting room admits a steady rate |\n| Asha closes the app | Seats stuck as HELD | Holds expire after 8 minutes; treated as free once expired |\n| Payment succeeds after expiry | Seat may be resold | Conditional confirm; refund if lost |\n| Seat-map cache is stale | Asha picks a taken seat | The hold fails with 409 and the map refreshes |\n| Counter sales and app sales | Two channels race | Both use the same conditional update |\n\n## Putting it together\n\n- **Browse:** cached catalogue and seat maps.\n- **Book:** waiting room → atomic multi-seat hold with expiry → pay → conditional confirm.\n- **Safety:** one authority for seat state; expired holds count as free; late payments are refunded.\n\n## Interviewer follow-ups\n\n**Why partition by show?** All seats in one hold belong to one show, so the hold is a single-partition transaction. Shows are independent.\n\n**How do you show seats held by others?** The seat map marks them HELD (grey) until expiry; it refreshes every few seconds or on push.\n\n**What about seat-selection fairness for bots?** CAPTCHA and per-account limits at the waiting-room entrance.\n\n**How do you release expired holds?** A periodic job flips them back to AVAILABLE for the map; correctness already treats them as free.\n\n## Wrap up\n\nWe cached the read path, smoothed spikes with a waiting room, and held seats with one conditional update that expires automatically.\n\n> **📝 Key takeaways**\n> - Seat maps are a read problem; holds are a correctness problem.\n> - One conditional update holds all requested seats or none.\n> - Holds expire; expired holds count as free immediately.\n> - A waiting room protects the system on opening day.\n\n## Going deeper (optional)\n\nThe detailed version separates admission control from correctness: the waiting room limits load, while transaction conditions alone decide who owns a seat.\n\n[![Admission controls load; transaction conditions control correctness.](lessons/hld-13-flow.svg)](lessons/hld-13-flow.svg)\n\nFurther reading: [PostgreSQL – Transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html).\n\n## Closing answer\n\n\"Browsing and seat maps are served from caches. Seat state lives in a database row per show-seat, partitioned by show. When Asha selects F7 and F8, one conditional update holds both seats only if they are available or their previous hold has expired, setting an 8-minute expiry; if fewer rows change, the hold fails and she picks again. Payment confirms with another conditional update that checks her hold is still the owner; if not, she is refunded. Expired holds count as free immediately and a job tidies them. On opening day a virtual waiting room admits users at a steady rate so the booking path stays fast.\"\n"
     },
     {
       "category": "AI",
