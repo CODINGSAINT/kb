@@ -1,7 +1,8 @@
 // Verify that the three answers publish the implementation actually exercised by Java checks.
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const root=path.resolve(__dirname,'..'),read=p=>fs.readFileSync(path.join(root,p),'utf8').replace(/\r\n/g,'\n');
-const lessons=[['Chess',1,['legal','game','apply'],'chess'],['Parking',2,['enter','payment','exit'],'parking'],['Elevators',3,['look','tick','ownership'],'elevator']];
+// Parking (LLD-2) moved to the learner-first pilot on 27 Oct 2026; its advanced Parking.java stays downloadable below.
+const lessons=[['Chess',1,['legal','game','apply'],'chess'],['Elevators',3,['look','tick','ownership'],'elevator']];
 let excerpts=0;
 for(const [file,n,regions,prefix]of lessons){
   const topic=JSON.parse(read(`content/day-${String(n).padStart(2,'0')}.json`)).topics.find(t=>t.category==='LLD');

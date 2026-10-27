@@ -312,126 +312,197 @@ E|app|kafka|async click
 ---
 ## Problem
 
-Design a URL shortener like bit.ly or TinyURL. A user submits a long URL and gets a short one, such as `https://sho.rt/aZ3k9Qx`. Anyone who opens the short URL is redirected to the original page.
+Design a URL shortening service like TinyURL or bit.ly.
 
-It looks simple, which is why interviewers like it: the real discussion is how to generate unique short codes, how to make redirects fast at very high read traffic, and how the system grows.
+A user pastes a long link such as `https://www.example.com/courses/java/spring-boot/lesson-12?ref=newsletter` and gets back something short like `https://sho.rt/aZ3k9Qx`. Anyone who opens the short link is sent to the original page.
 
 ## Requirements
 
-**Functional**
+- Create a short link for a long URL, optionally with a custom alias and an expiry date.
+- Redirect a short link to the original URL, quickly.
+- Count clicks per link (nice to have).
+- Handle 100 million new links per month, with far more reads than writes.
 
-- Create a short URL for a long URL, optionally with a custom alias and an expiry date.
-- Redirect a short URL to the original URL.
-- (Nice to have) Basic click counts per link.
+## Step 1: Clarify the requirements
 
-**Non-functional**
+> **💡 Tip**
+> Do not start with servers or databases. Spend the first five minutes agreeing what the system must do and how big it is.
 
-- Very low redirect latency (target: under 50 ms inside our service).
-- High availability for redirects; a short link that stops working is a broken promise.
-- Short codes must be unique and not easy to guess one after another.
-- Scale: 100 million new URLs per month; reads are about 100 times writes.
+**Candidate:** Is this mostly reads or writes?
 
-Out of scope: user accounts UI, billing, QR codes, custom domains.
+**Interviewer:** Mostly reads. Assume 100 redirects for every link created.
 
-## 1. Clarify requirements and estimate the scale
+**Candidate:** How short should the link be? Can people choose their own?
 
-| Question to ask | Answer we choose | Why it matters |
-| --- | --- | --- |
-| Read:write ratio? | 100:1. | Design around a fast read path and caching. |
-| Can a link be deleted or edited? | It can be deleted (disabled) by its owner; destinations do not change. | Affects caching and the choice of redirect status code. |
-| How short must the code be? | 7 characters. | Decides the encoding and capacity. |
-| Same long URL twice – same code? | No, each request gets its own code. | No need to look up existing long URLs. |
-| How long do we keep links? | 5 years by default. | Storage estimate. |
+**Interviewer:** As short as is practical. Custom aliases are allowed.
 
-**Back-of-the-envelope numbers** (rounded for an interview):
+**Candidate:** Do links expire? Can the owner delete one?
 
-| Quantity | Calculation | Result |
-| --- | --- | --- |
-| Writes per second | 100M / (30 × 24 × 3600 s) | ≈ 40/s average, ~200/s peak |
-| Reads per second | 40 × 100 | ≈ 4,000/s average, ~20,000/s peak |
-| Links in 5 years | 100M × 12 × 5 | 6 billion |
-| Storage | 6B × 500 bytes | ≈ 3 TB (before replication) |
-| Code space with 7 Base62 chars | 62^7 | ≈ 3.5 trillion – plenty for 6 billion |
-| Cache for hot links | 20% of daily reads' links × 500 B | a few GB – fits in one Redis node |
+**Interviewer:** Optional expiry, and yes, owners can delete links.
 
-A 45-minute plan:
+**Candidate:** Do we need analytics?
 
-| Minutes | What you do |
-| --- | --- |
-| 0–8 | Requirements and estimates |
-| 8–15 | API and data model |
-| 15–25 | High-level design: create path and redirect path |
-| 25–40 | Deep dives: short-code generation, caching and redirects |
-| 40–45 | Scaling, failures, follow-ups |
+**Interviewer:** A click count per link is enough.
 
-## 2. API and data model
+**Functional requirements**
+
+1. Given a long URL, return a unique short URL.
+2. Opening the short URL redirects to the long URL.
+3. Users can pick a custom alias and an expiry date.
+4. Owners can delete a link.
+
+**Non-functional requirements**
+
+1. Redirects are fast: under 50 ms inside our system.
+2. Redirects are highly available – a broken short link is a broken promise.
+3. Short links are not easy to guess one after another.
+
+## Step 2: Estimate the scale
+
+> **💡 Tip**
+> The purpose of estimation is not precision. Round the numbers and say what each one means for the design.
+
+**Traffic**
+
+```text
+New links per second   = 100 million / month ÷ (30 × 24 × 3600 s)  ≈ 40 per second
+Redirects per second   = 40 × 100                                    ≈ 4,000 per second
+Peak (×5)              ≈ 200 writes/s and 20,000 redirects/s
+```
+
+What it means: reads dominate, so the read path must be cached.
+
+**Storage**
+
+```text
+Links in 5 years       = 100 million × 12 × 5   = 6 billion
+Size of one record     ≈ 500 bytes
+Total                  = 6 billion × 500 bytes  ≈ 3 TB
+```
+
+What it means: 3 TB fits a sharded database comfortably; it is not a "big data" problem.
+
+**Short code length**
+
+```text
+Characters available (Base62: a–z, A–Z, 0–9) = 62
+6 characters = 62^6 ≈ 57 billion  codes
+7 characters = 62^7 ≈ 3.5 trillion codes   ← plenty for 6 billion links
+```
+
+What it means: 7 characters is enough for many years.
+
+**Cache**
+
+```text
+20% of links get 80% of clicks.
+Daily redirects ≈ 350 million; caching the hottest 20% of them ≈ 70 million × 500 bytes ≈ 35 GB
+```
+
+What it means: the hot set fits in a small Redis cluster.
+
+## Step 3: Define the API
+
+**Create a short link**
 
 ```http
 POST /api/v1/urls
-Content-Type: application/json
-
-{ "longUrl": "https://example.com/very/long/path?x=1", "alias": null, "expiresAt": null }
+{
+  "longUrl": "https://www.example.com/courses/java/spring-boot/lesson-12?ref=newsletter",
+  "customAlias": null,
+  "expiresAt": "2027-01-01T00:00:00Z"
+}
 
 201 Created
-{ "shortUrl": "https://sho.rt/aZ3k9Qx", "code": "aZ3k9Qx" }
+{ "shortUrl": "https://sho.rt/aZ3k9Qx" }
 ```
+
+**Redirect**
 
 ```http
 GET /aZ3k9Qx
 
 302 Found
-Location: https://example.com/very/long/path?x=1
+Location: https://www.example.com/courses/java/spring-boot/lesson-12?ref=newsletter
 ```
 
-Errors: `400` for an invalid URL, `409` if the custom alias is taken, `404` for an unknown code, `410 Gone` for an expired or deleted link.
+**Delete**
 
-One table is enough:
-
-```sql
-CREATE TABLE url (
-    code        VARCHAR(16) PRIMARY KEY,   -- the short code or custom alias
-    long_url    TEXT        NOT NULL,
-    user_id     BIGINT,
-    created_at  TIMESTAMP   NOT NULL,
-    expires_at  TIMESTAMP,
-    is_active   BOOLEAN     NOT NULL DEFAULT TRUE
-);
+```http
+DELETE /api/v1/urls/aZ3k9Qx      → 204 No Content
 ```
 
-The primary key on `code` guarantees uniqueness, including custom aliases. Lookups are always by `code`, which is the access pattern that matters. A relational database is fine at this scale; a key-value store such as DynamoDB or Cassandra also fits well because every read is a single-key lookup.
+Errors: `400` invalid URL, `409` alias already taken, `404` unknown code, `410` expired or deleted.
 
-## 3. High-level design
+> **🎯 In the interview**
+> Mention rate limits on `POST`: one user should not be able to create millions of links a minute.
 
-[![Selected design: clients reach stateless URL service instances through a load balancer; the service reads codes from Redis, writes and reads misses from the URL database, takes ID blocks from a range allocator and sends click events asynchronously.](designs/hld-1.svg)](designs/hld-1.svg)
+## Step 4: Define the data model
 
-**Create path**
+One table holds everything we need:
 
-1. The client sends `POST /api/v1/urls`. The load balancer picks any service instance (they are stateless).
-2. The service validates the URL, gets the next unique ID, converts it to a 7-character Base62 code, and inserts the row.
-3. It returns the short URL.
+| Column | Type | Notes |
+| --- | --- | --- |
+| `short_code` | VARCHAR(16) | Primary key – the generated code or custom alias |
+| `long_url` | TEXT | The destination |
+| `user_id` | BIGINT | Owner, for deletion and listing |
+| `created_at` | TIMESTAMP | |
+| `expires_at` | TIMESTAMP | Optional |
+| `is_active` | BOOLEAN | False after deletion |
 
-**Redirect path**
+Every redirect is a lookup by `short_code`, so the primary key is exactly the index we need.
 
-1. The browser requests `GET /aZ3k9Qx`.
-2. The service looks up `aZ3k9Qx` in Redis. On a hit, it returns `302` immediately.
-3. On a miss, it reads the database, stores the result in Redis, and returns `302`.
-4. It sends a click event to a queue (Kafka) **without waiting**; analytics never slows down a redirect.
+> **⚖️ Design choice**
+> SQL or NoSQL? Both work. Each read is a single-key lookup, so a key-value store (DynamoDB, Cassandra) scales easily. PostgreSQL is also fine at 3 TB with sharding. Pick the one your team can run, and say why.
 
-[![Redirect path: the browser asks the URL service for a code; the service checks Redis, and on a miss reads the database and fills the cache; it returns 302 with the long URL and sends the click event to Kafka asynchronously.](learning-figures/hld-1-redirect.svg)](learning-figures/hld-1-redirect.svg)
+## Step 5: Draw the high-level design
 
-![Animation: a first redirect misses the cache, reads the database, fills Redis and returns 302; a second redirect for the same code is served directly from Redis; click events go to Kafka without blocking.](learning-figures/hld-1-redirect.gif)
+[![High-level design: clients reach stateless URL service instances through a load balancer; the service reads codes from Redis, writes and reads misses from the URL database, takes ID blocks from a range allocator and sends click events asynchronously to Kafka.](designs/hld-1.svg)](designs/hld-1.svg)
 
-## 4. Deep dive: generating short codes
+**Write path – creating a link**
 
-This is the heart of the interview. There are three common approaches:
+1. The client calls `POST /api/v1/urls`.
+2. The load balancer sends it to any URL service instance.
+3. The service validates the URL and generates a unique 7-character code.
+4. It saves the row in the database and returns the short URL.
 
-| Approach | How it works | Good | Watch out |
-| --- | --- | --- | --- |
-| **Hash the long URL** (MD5/SHA, take 7 chars) | `base62(md5(longUrl))[0..7]` | Stateless | Collisions are certain at billions of links; must check and retry. Same URL gives same code. |
-| **Counter + Base62** | A unique number, e.g. 125 → `"21"` in Base62 | No collisions, short codes | Needs a unique ID source; sequential codes are guessable |
-| **Random 7 chars** | Secure random Base62 string | Not guessable | Must insert-if-absent and retry on the rare collision |
+**Read path – opening a link**
 
-**Base62** uses `0-9`, `a-z`, `A-Z` – 62 URL-safe characters.
+1. The browser calls `GET /aZ3k9Qx`.
+2. The service looks for `aZ3k9Qx` in Redis. If found, it returns `302` straight away.
+3. If not, it reads the database, stores the result in Redis, and returns `302`.
+4. It sends a click event to Kafka without waiting for it.
+
+![Animation: the first visit misses Redis, reads the database, fills the cache and returns 302; the second visit is served straight from Redis; click events go to Kafka without blocking the redirect.](learning-figures/hld-1-redirect.gif)
+
+## Step 6: Go deep
+
+### How do we generate the short code?
+
+This is the question interviewers care about most.
+
+**Option 1: Hash the long URL.** Take MD5 of the URL, encode it in Base62 and keep the first 7 characters.
+
+- Good: no coordination between servers.
+- Problem: different URLs can produce the same 7 characters (a collision), so you must check and retry. And the same URL always gets the same code, so two users cannot have separate links with separate stats.
+
+**Option 2: A unique counter, encoded in Base62.** Each new link gets the next number: 1, 2, 3 … The number becomes the code.
+
+```text
+id = 11,157  →  Base62  →  "2TX"
+id = 3,521,614,606,207  →  "ZZZZZZZ"   (the largest 7-character code)
+```
+
+- Good: no collisions at all.
+- Problem: one shared counter becomes a bottleneck, and codes are guessable (`2TX`, `2TY`, `2TZ` …).
+
+**Option 3: Random 7 characters.** Generate a random Base62 string and insert it; if the database says the code already exists, try again.
+
+- Good: no coordination, not guessable.
+- Problem: an occasional retry. With 6 billion codes used out of 3.5 trillion, fewer than 1 in 500 inserts collide.
+
+> **⚖️ Design choice**
+> We use **Option 2 with ID ranges**. Each service instance asks a small allocator (ZooKeeper, a database row or Redis `INCRBY`) for a block of 1,000 IDs and hands them out locally. No collisions, almost no coordination. To stop guessing, we scramble each ID with a fixed reversible formula before encoding. Option 3 is an equally good answer – say which trade-off you prefer.
 
 ```java
 private static final String ALPHABET =
@@ -447,88 +518,77 @@ static String toBase62(long id) {
 }
 ```
 
-**Our choice: counter + Base62 with ID ranges.** One counter for every request would be a bottleneck, so each service instance asks a small **range allocator** (a database row, ZooKeeper, or Redis `INCRBY`) for a block of, say, 1,000 IDs at a time. It then hands out IDs from its block locally, with no network call. If an instance crashes, the unused part of its block is simply skipped – gaps are harmless.
+> **⚠️ Common mistake**
+> Checking "does this code exist?" with a `SELECT` and then inserting. Two servers can both see "no" and both insert. Let the primary key reject the duplicate instead.
 
-To make codes less guessable, scramble the number before encoding (for example multiply it by a large constant that shares no factor with 62^7 – odd and not a multiple of 31 – modulo 62^7; that maps every ID to a different code), or use the random approach:
+### 301 or 302?
 
-```java
-// random approach: let the database's primary key detect the rare collision
-for (int attempt = 0; attempt < 5; attempt++) {
-    String code = randomBase62(7);
-    if (repository.insertIfAbsent(code, longUrl)) {   // INSERT ... ON CONFLICT DO NOTHING
-        return code;
-    }
-}
-throw new ServiceUnavailableException("Could not allocate a code");
-```
+- **301 Moved Permanently** – browsers remember it and stop asking us. Less load, but we lose click counts and cannot reliably disable a link.
+- **302 Found** – every click comes back to us. A little more load, but analytics and deletion work.
 
-With 6 billion links in a 3.5 trillion space, a random code collides less than 0.2% of the time, so a retry is rare. Either approach is acceptable if you explain the trade-off; **never check "does this code exist?" with a separate SELECT before inserting** – two servers could both see "no" and both insert. Let the unique key decide.
+We return **302**, because we count clicks and allow deletion.
 
-**Custom aliases** go through the same insert. If the key already exists, return `409` instead of silently picking another alias.
+### Caching
 
-## 5. Deep dive: fast redirects, caching and scale
+Clicks follow a power law: a small number of links get most of the traffic. Cache-aside with Redis keeps them in memory.
 
-**301 or 302?**
+- Use LRU eviction and a TTL of about a day.
+- When a link is deleted, delete its cache entry too, so it stops working quickly.
 
-- `301 Moved Permanently`: browsers and proxies may cache it and stop asking us. Less load, but we lose click counts and cannot reliably disable the link.
-- `302 Found` (temporary): every visit comes back to us. Slightly more load, but analytics and deletion work.
+### Custom aliases and expiry
 
-Choose **302** (with `Cache-Control: no-store`) because we support deletion and click counts. Mention that a permanent-link product could pick 301.
+- A custom alias is inserted like any other code. If it already exists, return `409` – never silently pick a different one.
+- Expiry is checked on every redirect (`expires_at < now` → `410 Gone`). A nightly job removes old rows later; the check, not the job, is what makes expiry correct.
 
-**Caching.** Links follow a power law: a small set of links gets most of the clicks. Cache-aside with Redis and LRU eviction keeps hot links in memory. Use a TTL (say 24 hours) and **delete the cache entry when a link is disabled**, so a deleted link stops working quickly.
+### Click analytics
 
-**Scaling the pieces**
+The redirect sends a small event (`code`, `time`, `country`) to Kafka and returns immediately. A consumer counts clicks per link per minute and writes the totals to an analytics store. Counts are a few seconds behind, which is fine.
 
-| Component | How it scales |
-| --- | --- |
-| URL service | Stateless; add instances behind the load balancer. |
-| Redis | One node handles ~100k ops/s; add replicas for reads, or shard by code. |
-| Database | Read replicas for misses; at billions of rows shard by `code` (hash of the code picks the shard). |
-| Analytics | Kafka absorbs click bursts; consumers aggregate counts into a separate store. |
-| Global users | Deploy in several regions; a CDN or edge layer can serve the redirect close to the user. |
+## Step 7: Find bottlenecks and failure points
 
-**What happens when things fail?**
+| What fails | What happens | How we handle it |
+| --- | --- | --- |
+| Redis goes down | All redirects hit the database | Database read replicas, plus a limit on concurrent misses so the database is not flooded |
+| A service instance dies | Requests to it fail | Load balancer health checks remove it; its unused ID block is simply skipped |
+| Database primary fails | New links cannot be created for a moment | Promote a replica; cached redirects keep working |
+| Kafka is down | Click events cannot be sent | Redirects still work; some counts are lost or buffered |
+| One link goes viral | One hot key | Redis handles it; add a tiny in-process cache or serve it from a CDN edge |
 
-- *Redis down*: redirects fall back to the database. Protect the database with limits so a cache outage does not take it down too.
-- *A service instance dies*: the load balancer stops sending traffic to it; its unused ID block is skipped.
-- *Database primary fails*: promote a replica. Writes pause briefly; cached redirects keep working.
-- *Kafka down*: redirects still work; some click counts may be lost or buffered. That is acceptable for analytics.
+## Putting it together
 
-**Expiry** is checked on every redirect (`expires_at < now` → `410`). A background job deletes old rows later; the check, not the job, makes expiry correct.
+- **Create:** validate → take the next ID from the local block → scramble and Base62-encode → insert → return the short URL.
+- **Redirect:** Redis → (on a miss) database → check active and expiry → `302` → send click event.
+- **Scale:** stateless servers behind a load balancer, Redis for hot links, the database sharded by `short_code`, Kafka for analytics.
 
-## 6. Interviewer follow-ups
+> **📝 Key takeaways**
+> - Estimate first: 7 Base62 characters give 3.5 trillion codes – enough for 6 billion links.
+> - Generate codes without collisions (ID ranges) or with a safe retry (random + unique key).
+> - Return 302 when you need analytics and deletion.
+> - Reads dominate, so cache the hot links and keep analytics off the redirect path.
 
-**Why not use the hash of the URL as the code?** Seven characters of a hash will collide once you have billions of links, so you still need collision handling. And two users shortening the same URL would share a code, which breaks per-user analytics and deletion.
+## Interviewer follow-ups
 
-**How do you stop people enumerating all links?** Avoid plain sequential codes (scramble or randomize them), rate-limit requests per IP, and never treat a short link as secret – private pages must have their own authentication.
+**Why not use the hash of the URL as the code?** Seven characters of a hash will collide at billions of links, so you still need collision handling. And one long URL would always map to one code, which breaks per-user links and stats.
 
-**How do you prevent abuse (phishing links)?** Rate-limit creation per user, check destinations against a malware/phishing list, and allow fast takedown (disable plus cache delete).
+**How do you stop people guessing other links?** Scramble or randomise codes, rate-limit by IP, and treat short links as public: private pages need their own login.
 
-**Do we need the counter at all with random codes?** No. Random codes need no coordination, only the unique-key check. Counters avoid collisions entirely. Both are valid; say which trade-off you prefer.
+**How do you stop abuse such as phishing links?** Rate-limit creation per user, check destinations against a malware list, and allow quick takedown (deactivate plus delete from cache).
 
-**How would you count clicks accurately at huge scale?** Send click events to Kafka, aggregate per code per minute in a stream processor, and write the totals to an analytics database. Counts are near-real-time, not instant.
+**How would you serve users worldwide?** Run the service in several regions with a replicated database, and serve hot redirects from a CDN edge close to the user.
 
-**How do you handle a viral link that gets 1 million hits per minute?** It is one hot key. Redis handles it, but you can add a small in-process cache on each service instance for the hottest codes, or serve it from the CDN edge.
+## Going deeper (optional)
 
-**Why is the service stateless?** Any instance can handle any request, so scaling and failover are just "add or remove instances".
+The production-depth version covers idempotent creation (a retried `POST` returns the same link), a precise bound on how long a deleted link can keep working while cached, and what changes when the create transaction spans shards.
 
-## 7. Going deeper (optional)
+[![Create path in depth: an owner-scoped request key is checked; a new transaction inserts the unique code and the request result together; generated-code collisions retry while alias conflicts return 409.](learning-figures/hld-1-create.svg)](learning-figures/hld-1-create.svg)
 
-The earlier, longer version of this lesson explores production details you can bring up with a senior interviewer:
+[![Deleting versus a late cache fill: a cached copy keeps the deadline from its original database read, so a link deleted at second 5 stops redirecting by second 30 at the latest.](learning-figures/hld-1-revocation.svg)](learning-figures/hld-1-revocation.svg)
 
-- **Idempotent creation**: a retried `POST` with the same `Idempotency-Key` returns the same code instead of creating two links.
-- **Bounded revocation**: if a cached copy is allowed to live 30 seconds, a disabled link can still redirect for up to 30 seconds. A cache entry must keep the deadline from its original database read, not restart its TTL when it is written late.
-- **Sharding transactions**: once the idempotency record and the link row live on different shards, "insert both atomically" needs a new design.
+[Open the cache and expiry walkthrough](learning-labs/shortener.html), or read the runnable Java model: [Shortener.java](reference-code/learning/kb/shortener/Shortener.java) and [ShortenerChecks.java](reference-code/learning/kb/shortener/ShortenerChecks.java).
 
-[![Create path: an owner-scoped request key is checked; a new transaction inserts the unique code and the request result together; generated-code collisions retry while alias conflicts return 409.](learning-figures/hld-1-create.svg)](learning-figures/hld-1-create.svg)
+## Closing answer
 
-[![Revocation versus a late cache fill: a read at t=0 gets a deadline of t=30; revoking at t=5 and a late fill at t=6 do not extend it; at t=30 the old copy is refused.](learning-figures/hld-1-revocation.svg)](learning-figures/hld-1-revocation.svg)
-
-[Open the cache, expiry and revocation walkthrough](learning-labs/shortener.html). Read the runnable Java model: [Shortener.java](reference-code/learning/kb/shortener/Shortener.java), [ShortenerChecks.java](reference-code/learning/kb/shortener/ShortenerChecks.java) and [ShortenerTrace.java](reference-code/learning/kb/shortener/ShortenerTrace.java) (see the [HTTP redirect semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.4) for 301/302/307 details).
-
-## 8. Closing answer
-
-"The service is stateless behind a load balancer, with one `url` table keyed by short code and Redis in front of it. Codes are 7 Base62 characters – about 3.5 trillion combinations. I generate them from unique IDs handed out in blocks by a range allocator and scrambled so they are not guessable; random codes with a unique-key insert are an equally good option. Redirects return 302 so we can count clicks and disable links; hot links are served from Redis, misses from the database, and click events go to Kafka asynchronously. The database scales with read replicas and sharding by code, and every redirect checks expiry and the active flag."
+"I'd run stateless URL servers behind a load balancer with one table keyed by short code. At about 40 new links and 4,000 redirects a second, reads dominate, so Redis caches hot links in front of the database. Codes are 7 Base62 characters – 3.5 trillion combinations – generated from ID blocks handed out by a small allocator and scrambled so they can't be guessed. Random codes with a unique-key insert would also work. Redirects return 302 so we can count clicks and delete links. Click events go to Kafka asynchronously. The database scales with replicas and sharding by code, and every redirect checks expiry and the active flag."
 
 === AI 1 ===
 N|q|Question + sources|0|0|180|rect
