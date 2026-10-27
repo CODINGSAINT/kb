@@ -300,7 +300,26 @@ cd kb && npm install && npm start</code></pre>
     el.dataset.kbViewer = "";
     const v = toastui.Editor.factory({ el, viewer: true, usageStatistics: false, initialValue: md || "", theme: isDark() ? "dark" : "light" });
     state.editors.push(v);
+    decorateLesson(el);
     return v;
+  }
+  // Lesson typography: "> **💡 Tip**" style blockquotes become callout cards and
+  // "**Candidate:** / **Interviewer:**" paragraphs become a dialogue. Plain Markdown stays readable elsewhere.
+  const CALLOUTS = [["💡", "tip"], ["🎯", "interview"], ["⚖️", "choice"], ["⚠️", "mistake"], ["📝", "takeaway"]];
+  function decorateLesson(el) {
+    el.querySelectorAll("blockquote").forEach((q) => {
+      const head = q.querySelector("strong");
+      const text = head ? head.textContent.trim() : "";
+      const hit = CALLOUTS.find(([mark]) => text.startsWith(mark));
+      if (hit) { q.classList.add("callout", "callout-" + hit[1]); head.classList.add("callout-title"); }
+    });
+    el.querySelectorAll("p").forEach((p) => {
+      const first = p.firstElementChild;
+      if (!first || first.tagName !== "STRONG" || p.firstChild !== first) return;
+      const who = first.textContent.trim();
+      if (who === "Candidate:") p.classList.add("dialogue", "dialogue-candidate");
+      else if (who === "Interviewer:") p.classList.add("dialogue", "dialogue-interviewer");
+    });
   }
   function setSave(el, cls, msg) { el.className = "save-state " + (cls || ""); el.textContent = msg; }
   function stamp(iso) { try { return new Date(iso).toLocaleString(); } catch (e) { return iso; } }

@@ -45,8 +45,8 @@ for(let day=1;day<=20;day++){
     // A padded manuscript passed the previous 1,500-word gate. Verify the authored
     // teaching contract and duplication instead; this still needs editorial review.
     assert(words>=600,`${key}: unexpectedly abbreviated reference (${words} words)`);
-    assert(headings.some(h=>/^1\. /.test(h)),`${key}: missing chosen solution`);
-    assert(headings.some(h=>/^2\. /.test(h)),`${key}: missing concrete contracts`);
+    assert(headings.some(h=>/^(?:Step )?1[.:] /.test(h)),`${key}: missing chosen solution`);
+    assert(headings.some(h=>/^(?:Step )?2[.:] /.test(h)),`${key}: missing concrete contracts`);
     assert(headings.some(h=>/^(?:\d+\.\s*)?Interviewer follow-ups$/i.test(h)),`${key}: missing answered follow-ups`);
     assert(headings.some(h=>/^(?:\d+\.\s*)?Closing answer$/i.test(h)),`${key}: missing final position`);
     assert(!/Learn through a concrete example|Practise, then check your reasoning|\*\*Build:\*\*|\*\*Lab:\*\*/.test(reference),`${key}: tutorial assignment remains`);

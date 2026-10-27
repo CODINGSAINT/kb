@@ -1,369 +1,332 @@
 === LLD 2 ===
-N|n0|Lot|0|0|220|rect
-N|n1|AllocationPolicy|250|0|220|rect
-N|n2|Spot|500|0|220|rect
-N|n3|Session|0|110|220|rect
-N|n4|Tariff|250|110|220|rect
-N|n5|Attempt|500|110|220|rect
-N|n6|PaymentPort|0|220|220|rect
-E|n0|n1|selects through
-E|n0|n2|claims atomically
-E|n0|n3|owns visit
-E|n3|n4|entry snapshot
-E|n0|n5|records
-E|n0|n6|outside lock
+N|gate|Entry / exit gate|0|0|160|rect
+N|lot|ParkingLot|220|0|150|rect
+N|spot|ParkingSpot|440|0|150|rect
+N|vehicle|Vehicle|440|130|140|rect
+N|ticket|Ticket|220|130|140|rect
+N|fee|FeeStrategy|0|130|150|rect
+E|gate|lot|park / unpark
+E|lot|spot|finds a free spot
+E|spot|vehicle|holds
+E|lot|ticket|issues
+E|lot|fee|calculates fee
 ---
 ## Problem
 
-Design the software for a parking lot. A vehicle arrives, gets a suitable parking spot and receives a ticket. Before leaving, the driver pays the fee. The spot becomes available when the vehicle leaves.
+Design a parking lot system. Cars, motorcycles and trucks arrive at an entry gate, get a ticket and park in a suitable spot. When they leave, the exit gate calculates the fee from the ticket and frees the spot.
 
-The design must also handle ordinary problems: two cars arriving together, a payment screen being clicked twice, or a payment taking too long to respond.
+This is the most common warm-up question in low-level design interviews. The interviewer wants to see clean classes, sensible responsibilities, and how easily your design handles change.
 
 ## Requirements
 
-- Support motorcycles, cars and trucks across several floors.
-- Give each vehicle one suitable, available spot and one ticket.
-- Let several entry and exit gates use the same parking information.
-- Charge ₹40 for the first hour and ₹20 for each extra hour that has started.
-- Give the driver ten minutes to leave after a successful payment.
-- Keep earlier payments when calculating any extra amount due.
-- Handle repeated requests without issuing another ticket or charging again.
+- The lot has several floors. Each spot is small, medium or large.
+- Motorcycles, cars and trucks can park. A vehicle can use a spot of its size or bigger.
+- The entry gate issues a ticket; the exit gate charges a fee and frees the spot.
+- Fee: ₹40 for the first hour, ₹20 for every further hour that has started.
+- Several gates work at the same time.
 
-We will first solve this for one running Java application. The last section explains what changes when several servers share the work.
+## Step 1: Clarify the requirements
 
-## 1. Start with one car
+Never start drawing classes straight away. Spend a few minutes agreeing on scope. A short conversation might look like this:
 
-Imagine a car arriving at Gate A at 09:00. The lot gives it compact spot **C17** and ticket **S17**.
+**Candidate:** Which vehicles do we support?
 
-Those two IDs mean different things. C17 identifies a place in the building. S17 identifies this car's visit. Tomorrow another car can use C17, but it must get a different ticket.
+**Interviewer:** Motorcycles, cars and trucks.
 
-| What happens | What the software records |
+**Candidate:** Are spots sized? Can a car park in a large spot?
+
+**Interviewer:** Spots are small, medium or large. A vehicle can take a spot of its own size or bigger.
+
+**Candidate:** If several spots fit, which one do we give?
+
+**Interviewer:** Your choice. Explain it.
+
+**Candidate:** I'll give the smallest spot that fits, on the lowest floor. That keeps large spots free for trucks. How is the fee calculated?
+
+**Interviewer:** ₹40 for the first hour, then ₹20 for each hour that has started.
+
+**Candidate:** Do we need payments, reservations or a display board?
+
+**Interviewer:** Payment can be a simple step. Skip reservations. Mention the display board if you have time.
+
+> **🎯 In the interview**
+> Write the agreed requirements down. They become your checklist, and they stop the scope from growing while you design.
+
+From that conversation, the requirements are:
+
+| Functional | Non-functional |
 | --- | --- |
-| Car enters at 09:00 | S17 started at 09:00 and is using C17. |
-| Driver pays ₹40 at 09:59 | S17 has paid ₹40 and may leave before 10:09. |
-| Car leaves at 10:01 | Close S17 and make C17 available. |
-| Another car arrives | Create a new visit, even if it gets C17. |
+| Park a vehicle in the smallest suitable free spot | Two gates must never give out the same spot |
+| Issue a ticket at entry | Fee rules should be easy to change |
+| Calculate the fee and free the spot at exit | Adding a new vehicle or spot type should be easy |
+| Reject entry when no suitable spot is free | |
 
-[![Two entry gates share a parking lot with occupied, available and disabled bays; ticket S17 currently holds spot C17](lld-figures/parking-layout.svg)](lld-figures/parking-layout.svg)
+## Step 2: Identify the core objects
 
-The main rule is simple: **a spot stays occupied until the car leaves. Paying the fee does not free it.**
+Pick out the nouns from the requirements and keep the ones that hold data or rules:
 
-## 2. Give each class one clear job
+- **Vehicle** – what is parking: a motorcycle, a car or a truck.
+- **ParkingSpot** – one space in the lot, with a floor, a number and a size.
+- **Ticket** – proof of entry: which vehicle, which spot, and when it arrived.
+- **FeeStrategy** – the rule that turns parking time into a fee.
+- **ParkingLot** – the coordinator that the gates talk to.
 
-We need these objects:
+How they connect:
 
-| Class | Its job | Example |
+[![Selected design: entry and exit gates call ParkingLot; ParkingLot finds a free ParkingSpot that holds the Vehicle, issues a Ticket and asks the FeeStrategy for the fee.](designs/lld-2.svg)](designs/lld-2.svg)
+
+> **⚖️ Design choice**
+> Gates and display boards do not get their own copy of free spots. They all ask `ParkingLot`. One owner of the spot data means two gates can never disagree about which spots are free.
+
+## Step 3: Design the classes
+
+### Vehicle
+
+Every vehicle has a licence plate and a size. The three vehicle types differ only by size, so each subclass just reports its size.
+
+[![Class diagram: Vehicle is an abstract class with a licence plate and getSize(); Motorcycle returns SMALL, Car returns MEDIUM and Truck returns LARGE. Size is an enum of SMALL, MEDIUM and LARGE.](learning-figures/lld-2-vehicles.svg)](learning-figures/lld-2-vehicles.svg)
+
+> **⚖️ Design choice**
+> We use one `Size` enum for both vehicles and spots. "Can this vehicle fit?" becomes a simple comparison: the spot's size must be the same as, or bigger than, the vehicle's size.
+
+### ParkingSpot
+
+A spot knows its floor, number and size, and whether a vehicle is in it. It answers one question: *can this vehicle park here right now?*
+
+### Ticket
+
+A ticket records the vehicle, the spot and the entry time. The exit gate needs nothing else to calculate the fee.
+
+### FeeStrategy
+
+Pricing rules change often: weekend rates, monthly passes, airport pricing. So we put the rule behind an interface. `ParkingLot` only knows it can ask "what is the fee from this time to that time?"
+
+### ParkingLot
+
+`ParkingLot` is what the gates call. It has two main methods: `parkVehicle` and `unparkVehicle`. It keeps the spots and the tickets currently in use.
+
+Here is the complete picture:
+
+[![Complete class diagram: ParkingLot holds ParkingSpots, issues Tickets and uses a FeeStrategy, implemented by HourlyFeeStrategy. A Ticket references one Vehicle and one ParkingSpot. A ParkingSpot can hold one Vehicle. Motorcycle, Car and Truck extend Vehicle.](learning-figures/lld-2-classes.svg)](learning-figures/lld-2-classes.svg)
+
+## Step 4: Write the code
+
+### Vehicle
+
+```java
+enum Size { SMALL, MEDIUM, LARGE }   // order matters: a vehicle fits a spot of its size or bigger
+
+abstract class Vehicle {
+    private final String licensePlate;
+    protected Vehicle(String licensePlate) { this.licensePlate = licensePlate; }
+    String getLicensePlate() { return licensePlate; }
+    abstract Size getSize();
+}
+
+class Motorcycle extends Vehicle {
+    Motorcycle(String plate) { super(plate); }
+    Size getSize() { return Size.SMALL; }
+}
+
+class Car extends Vehicle {
+    Car(String plate) { super(plate); }
+    Size getSize() { return Size.MEDIUM; }
+}
+
+class Truck extends Vehicle {
+    Truck(String plate) { super(plate); }
+    Size getSize() { return Size.LARGE; }
+}
+```
+
+### ParkingSpot
+
+```java
+class ParkingSpot {
+    private final int floor;
+    private final int number;
+    private final Size size;
+    private Vehicle vehicle;            // null when the spot is free
+
+    ParkingSpot(int floor, int number, Size size) {
+        this.floor = floor; this.number = number; this.size = size;
+    }
+
+    boolean isFree()             { return vehicle == null; }
+    boolean canFit(Vehicle v)    { return isFree() && size.compareTo(v.getSize()) >= 0; }
+    void park(Vehicle v)         { vehicle = v; }
+    void free()                  { vehicle = null; }
+    Size getSize()               { return size; }
+    int getFloor()               { return floor; }
+    String label()               { return "Floor " + floor + ", spot " + number; }
+}
+```
+
+`canFit` uses the enum order: `MEDIUM.compareTo(SMALL)` is positive, so a motorcycle fits a medium spot. A truck does not fit a medium spot.
+
+### Ticket
+
+```java
+class Ticket {
+    private final String id;
+    private final Vehicle vehicle;
+    private final ParkingSpot spot;
+    private final Instant entryTime;
+
+    Ticket(String id, Vehicle vehicle, ParkingSpot spot, Instant entryTime) {
+        this.id = id; this.vehicle = vehicle; this.spot = spot; this.entryTime = entryTime;
+    }
+    String getId()          { return id; }
+    Vehicle getVehicle()    { return vehicle; }
+    ParkingSpot getSpot()   { return spot; }
+    Instant getEntryTime()  { return entryTime; }
+}
+```
+
+### FeeStrategy
+
+```java
+interface FeeStrategy {
+    long calculateFee(Instant entry, Instant exit);   // in rupees
+}
+
+/** ₹40 for the first hour (or part of it), ₹20 for every further hour that has started. */
+class HourlyFeeStrategy implements FeeStrategy {
+    public long calculateFee(Instant entry, Instant exit) {
+        long minutes = Duration.between(entry, exit).toMinutes();
+        long hours = Math.max(1, (minutes + 59) / 60);   // round up to whole hours, minimum 1
+        return 40 + (hours - 1) * 20;
+    }
+}
+```
+
+Check the rule with real numbers:
+
+| Time parked | Hours charged | Fee |
 | --- | --- | --- |
-| `Vehicle` | Identify the vehicle and its size. | Car CAR-17 |
-| `Spot` | Describe one physical parking space. | C17, floor 0, compact |
-| `Session` | Remember one visit: vehicle, spot, arrival, payment and exit. | Ticket S17 |
-| `Attempt` | Remember one attempt to collect money. | Payment P17 for ₹40 |
-| `Lot` | Keep these records together and handle entry, payment and exit. | The lot shared by both gates |
+| 50 minutes | 1 | ₹40 |
+| 1 hour 1 minute | 2 | ₹60 |
+| 2 hours 35 minutes | 3 | ₹80 |
 
-`Session` is the name used in the Java code for a parking visit. The ticket shows its ID. We keep the visit separate from the payment because a driver may need a second payment after staying longer.
-
-Three small interfaces cover rules that can change:
-
-- `AllocationPolicy` chooses a spot. Our rule uses the smallest suitable size first, then floor, location order and ID to break ties.
-- `Tariff` calculates the total fee. A visit keeps the rate it received on entry.
-- `PaymentPort` lets our code ask a payment service to collect money or check an earlier payment.
-
-An **interface** describes what a component can do. It lets us change a rule or payment service without rewriting the whole lot.
-
-[![Lot uses a spot-selection rule, records visits and payments, and calls a separate payment service](designs/lld-2.svg)](designs/lld-2.svg)
-
-The allocation rule accepts these combinations:
-
-| Vehicle | Suitable spots |
-| --- | --- |
-| Motorcycle | Motorcycle, compact or large |
-| Car | Compact or large |
-| Truck | Large |
-
-A car should normally get a compact spot before a large one. That leaves large spots for trucks. If the business later prefers the nearest floor instead, we change `AllocationPolicy`.
-
-The gates and display boards do not keep their own separate lists of free spots. They ask `Lot`. Otherwise Gate A could think C17 is free while Gate B has already given it away.
-
-## 3. Entry: choose a spot and reserve it together
-
-Gate A sends an entry request containing the vehicle and request ID **E17**. This ID identifies the action at the gate; S17 will identify the visit created by that action.
-
-The entry method does this:
-
-1. If E17 was already handled, return its existing ticket. If E17 is being reused for a different vehicle, reject it.
-2. Check that this vehicle is not already inside under another ticket.
-3. Find a suitable spot that is available and has not been disabled.
-4. Create S17 and record that C17 belongs to this visit.
-5. Return the ticket.
-
-Why must choosing and reserving happen together? Suppose C17 is the last compact spot. Both gates might read a display that says “one spot free.” If both choose C17 before either records its use, two cars receive the same space.
-
-A **lock** prevents this. Only one entry method at a time may choose and reserve a spot. The next method checks availability again after getting the lock.
-
-[![Gate A reserves the last suitable spot while Gate B waits, then Gate B checks the updated records instead of also assigning C17](lld-figures/parking-race.svg)](lld-figures/parking-race.svg)
-
-In Java, `synchronized` puts that lock around this method. These are the records it uses:
-
-- `entries`: entry request ID → visit ID, so a retry can find its ticket.
-- `sessions`: visit ID → visit details.
-- `occupancy`: spot ID → visit ID, so each occupied spot has a known owner.
-- `activeVehicles`: registration → visit ID, so one vehicle cannot enter twice.
+### ParkingLot
 
 ```java
-// source: Parking.java#enter
-        public synchronized SessionView enter(String entryKey, Vehicle vehicle) {
-            requireKey(entryKey);
-            Objects.requireNonNull(vehicle);
+class ParkingLot {
+    private final List<ParkingSpot> spots;                      // sorted: smallest size, then lowest floor
+    private final Map<String, Ticket> activeTickets = new HashMap<>();
+    private final FeeStrategy feeStrategy;
+    private int nextTicket = 1;
 
-            String previous = entries.get(entryKey);
-            if (previous != null) {
-                Session visit = session(previous);
-                if (!visit.vehicle.equals(vehicle)) {
-                    throw new IllegalArgumentException("Entry key payload conflict");
-                }
-                return visit.view();
-            }
-            if (activeVehicles.containsKey(vehicle.registration)) {
-                throw new IllegalStateException("Vehicle already inside");
-            }
+    ParkingLot(List<ParkingSpot> spots, FeeStrategy feeStrategy) {
+        this.spots = new ArrayList<>(spots);
+        this.spots.sort(Comparator.comparing(ParkingSpot::getSize).thenComparing(ParkingSpot::getFloor));
+        this.feeStrategy = feeStrategy;
+    }
 
-            List<Spot> free = spots.values().stream()
-                .filter(spot -> !disabled.contains(spot.id))
-                .filter(spot -> !occupancy.containsKey(spot.id))
-                .toList();
-            Spot spot = allocator.choose(vehicle, free);
-            if (!free.contains(spot) || !fits(vehicle.kind, spot.kind)) {
-                throw new IllegalStateException("Allocation policy returned invalid spot");
+    /** Called by an entry gate. Returns a ticket, or throws if no suitable spot is free. */
+    synchronized Ticket parkVehicle(Vehicle vehicle, Instant now) {
+        for (ParkingSpot spot : spots) {                // smallest suitable spot first
+            if (spot.canFit(vehicle)) {
+                spot.park(vehicle);
+                Ticket ticket = new Ticket("T-" + nextTicket++, vehicle, spot, now);
+                activeTickets.put(ticket.getId(), ticket);
+                return ticket;
             }
-
-            String id = Objects.requireNonNull(ids.get());
-            if (id.isBlank() || sessions.containsKey(id)) {
-                throw new IllegalStateException("Session identity collision");
-            }
-            Session visit = new Session(id, vehicle, spot, clock.instant(), tariff);
-            sessions.put(id, visit);
-            occupancy.put(spot.id, id);
-            activeVehicles.put(vehicle.registration, id);
-            entries.put(entryKey, id);
-            return visit.view();
         }
+        throw new IllegalStateException("Parking full for " + vehicle.getSize() + " vehicles");
+    }
+
+    /** Called by an exit gate. Frees the spot and returns the fee to pay. */
+    synchronized long unparkVehicle(String ticketId, Instant now) {
+        Ticket ticket = activeTickets.remove(ticketId);
+        if (ticket == null) throw new IllegalArgumentException("Unknown or already used ticket");
+        ticket.getSpot().free();
+        return feeStrategy.calculateFee(ticket.getEntryTime(), now);
+    }
+}
 ```
 
-The final line returns a `SessionView`: a copy of the details the caller may read. The caller cannot edit the lot's records through that response. The helper `requireKey` checks that the request ID is present; `allocator.choose` applies the selection rule described above.
+Try it with three vehicles arriving at 9:00 in a lot with one small, two medium and one large spot:
 
-Notice that all four records are updated before the method returns. Another gate cannot observe a reserved spot with no ticket behind it.
+```text
+KA-01-AB-1234 (car)        -> Floor 1, spot 2   (medium)
+KA-05-XY-9876 (motorcycle) -> Floor 1, spot 1   (small)
+MH-12-TR-4455 (truck)      -> Floor 2, spot 9   (large)
+```
 
-If the response is lost, Gate A retries **E17**. It receives **S17** again. It does not get another spot. A request ID is useful only if the gate reuses it for a retry; inventing a new ID each time loses that protection.
+The car leaves at 9:50 and pays ₹40. Its spot is free again for the next car.
 
-## 4. Payment: explain the amount, then collect it once
+## Step 5: Two gates at the same time
 
-Before charging, show the driver a quote. For S17 at 09:59, the amount due is ₹40.
+The lot has two entry gates. Two cars arrive together, and only one medium spot is left. Without protection, this can happen:
 
-The rule “each extra hour that has started” needs a precise meaning:
+1. Gate A checks the spot: free.
+2. Gate B checks the same spot: still free.
+3. Both gates park their car there.
 
-| Time parked | Fee |
-| --- | ---: |
-| Less than one hour | ₹40 |
-| Exactly one hour | ₹40 |
-| One hour and one second | ₹60 |
-| Two hours and 35 minutes | ₹80 |
+![Animation: two cars arrive at gates A and B when one medium spot is left; gate A enters parkVehicle first and takes the spot while gate B waits; gate B then finds no suitable spot and the driver is told the lot is full.](learning-figures/lld-2-gates.gif)
 
-An immediate exit still pays the first-hour minimum. The Java implementation handles even smaller time boundaries, but the business rule is the same.
+That is why `parkVehicle` and `unparkVehicle` are `synchronized`. Checking a spot and taking it happen as one step, so only one gate at a time can run them.
 
-Money is stored as whole **paise**, not a decimal number of rupees: ₹40 is 4,000 paise. That keeps the calculation exact.
+> **⚠️ Common mistake**
+> Locking only inside `ParkingSpot.park()` is not enough. The check (`canFit`) and the change (`park`) must be inside the same lock, or both gates can pass the check before either one parks.
 
-The payment call is `pay("S17", "P17", 4000)`. It means: “For visit S17, collect the approved 4,000 paise under payment ID P17.” If the current amount has changed, the method asks for a new approval before collecting it.
+> **🎯 In the interview**
+> If asked about several servers: `synchronized` only protects one JVM. With several servers, keep spots in a database and take a spot with one conditional update, such as `UPDATE spot SET vehicle = ? WHERE id = ? AND vehicle IS NULL`. If no row was updated, another gate got there first.
 
-### Do not make every gate wait for one card payment
+## Step 6: Deep dives
 
-A payment service may take several seconds to reply. The lot must still allow other vehicles to enter during that time.
+### Adding a new spot or vehicle type
 
-So payment has three steps:
+Suppose the lot adds electric-vehicle spots with chargers. Add an `EV` value or an `ElectricCar` class, and a rule for which spots it may use. `ParkingLot`, `Ticket` and the fee code do not change, because they only talk to `Vehicle`, `ParkingSpot` and `FeeStrategy`.
 
-1. Under the lot's lock, save P17 and mark the visit as awaiting its result.
-2. Release the lock and call the payment service using P17.
-3. Take the lock again and save the result. Add the payment to S17 only once.
+### Changing the price
 
-[![Payment records are updated under a short lock while the slow payment-service call runs outside it, allowing another gate to continue](lld-figures/parking-payment.svg)](lld-figures/parking-payment.svg)
-
-A repeated P17 request returns the saved attempt. It does not start another collection. The payment service must also use P17 to recognise a repeated call.
-
-### A slow response does not tell us whether money moved
-
-There are three useful outcomes:
-
-| Result | What we do |
-| --- | --- |
-| Confirmed | Add ₹40 to the visit's paid amount and give it an exit deadline. |
-| Definitely declined | Keep the car parked. The driver may start another payment. |
-| Unknown, for example after a timeout | Keep P17 unresolved and ask the service about P17. Do not start another charge. |
-
-Consider the last case. The bank may have collected ₹40 even though our application missed the reply. Immediately trying again with a new payment ID could collect another ₹40.
-
-Instead, `reconcile("P17")` asks what happened to the original payment. If it confirms collection, we record that result. If it still cannot tell us, the attempt stays unresolved. “We have not found the result yet” must not be treated as “definitely declined.”
-
-This repeat-safe behaviour is called **idempotency**. The name is less important than the promise: retrying the same action must not issue another ticket or collect another payment.
-
-## 5. Exit: use the payment, then release the right spot
-
-S17 was paid at 09:59. Its ten-minute exit period lasts until 10:09. If the car leaves at 10:01, it pays nothing more, even though the second parking hour has started.
-
-If the car is still there at 10:10, the exit period has expired. The total fee is now ₹60, but the visit has already paid ₹40:
-
-**Amount still due = ₹60 − ₹40 = ₹20.**
-
-After collecting that ₹20, the visit has paid ₹60 in total and gets a new ten-minute exit period. Retrying the old P17 payment must not renew its old deadline.
-
-[![A forty-rupee payment at 09:59 permits exit before 10:09; at 10:10 only twenty rupees more is due after crediting the earlier payment](lld-figures/parking-fees.svg)](lld-figures/parking-fees.svg)
-
-At exactly 10:09, the old period has ended. If it expires while the total fee is still covered by earlier payments, the system can grant a fresh period without asking the payment service to collect zero rupees.
-
-When the car leaves, a trusted gate event calls `confirmExit("S17", "X17")`. The method checks payment, deadline and spot ownership before closing the visit:
+Weekend pricing is a new class:
 
 ```java
-// source: Parking.java#exit
-        public synchronized SessionView confirmExit(String sessionId, String exitEventId) {
-            requireKey(exitEventId);
-            Session visit = session(sessionId);
-            String previous = exits.get(exitEventId);
-            if (previous != null && !previous.equals(sessionId)) {
-                throw new IllegalArgumentException("Exit event payload conflict");
-            }
-            if (visit.state == SessionState.CLOSED) {
-                return visit.view();
-            }
-            if (visit.state != SessionState.PAID || !clock.instant().isBefore(visit.exitBy)) {
-                throw new IllegalStateException("Payment or additional payment required");
-            }
-            if (!sessionId.equals(occupancy.get(visit.spot.id))) {
-                throw new IllegalStateException("Spot ownership mismatch");
-            }
-
-            occupancy.remove(visit.spot.id);
-            activeVehicles.remove(visit.vehicle.registration, sessionId);
-            visit.state = SessionState.CLOSED;
-            exits.put(exitEventId, sessionId);
-            return visit.view();
-        }
+class WeekendFeeStrategy implements FeeStrategy {
+    public long calculateFee(Instant entry, Instant exit) { /* flat ₹100 per day */ return 100; }
+}
 ```
 
-`exitEventId` identifies the gate event. It must not be reused for a different visit. The `occupancy` check also matters: it confirms that this ticket still owns this spot.
+Pass it to `ParkingLot` instead of `HourlyFeeStrategy`. No other code changes. This is the **Strategy pattern**.
 
-For example, suppose S17 has closed and C17 now holds a new visit, S18. A delayed exit message for S17 must not free C17 again. The method sees that S17 is already closed and returns its old result. S18 is left alone.
+### Finding a spot faster
 
-The car's registration is also removed from the active-vehicle list, so it may enter again on a later visit.
+`parkVehicle` scans the spot list: fine for a few hundred spots. For a lot with thousands of spots, keep a separate queue of free spots for each size. Taking a spot becomes "poll the small queue; if empty, poll the medium queue…", and freeing a spot adds it back to its queue. Both are O(1) instead of O(number of spots).
 
-## 6. Interviewer follow-ups
+### A display board
 
-### What if the gate fails after we issue a ticket?
+Each floor's board shows free spots by size. The board should *read* the count from `ParkingLot`, or be notified when a spot changes (the **Observer pattern**). It must never decide availability itself.
 
-Keep the ticket and reservation. Retry the same entry request instead of issuing another ticket. If the car never entered, an attendant can check the gate evidence and cancel the unused visit. A missing network reply alone is not enough evidence to free the spot.
+## Interviewer follow-ups
 
-### What if payment succeeds but the exit barrier does not open?
+**Why not one class per spot type, like `CompactSpot` and `LargeSpot`?** They would behave identically; only the size differs. An enum field is simpler. Use subclasses only when the behaviour differs, for example an EV spot that also starts a charging session.
 
-Keep the confirmed payment and the occupied spot. The gate can retry access for the same ticket, or an attendant can resolve the fault. If the exit period expires, the chosen business rule decides whether to extend it or charge a difference. A broken barrier must not erase the payment record.
+**What if a ticket is lost?** Find the active ticket by licence plate (add a map from plate to ticket) and charge a lost-ticket fee set by the business.
 
-### Why not keep just a `paid` flag on the ticket?
+**What if the driver pays but takes a long time to leave?** Common rule: after paying, the driver has 10–15 minutes to exit. Store the payment time on the ticket; if the exit is later than that, charge the extra time.
 
-A flag cannot tell us how much was paid, whether another payment is needed, or whether an earlier collection is still uncertain. S17 may already have paid ₹40 while a ₹20 top-up is pending. Separate payment attempts let us remember both facts.
+**What if the same ticket is used twice?** `unparkVehicle` removes the ticket from `activeTickets`. A second attempt finds nothing and is rejected.
 
-### What changes when we have several servers?
+**Is `ParkingLot` a Singleton?** There is one lot per application, so in Spring it would be a singleton bean. Avoid a hand-written static Singleton – it makes testing harder.
 
-`synchronized` protects threads using this `Lot` object. It does not lock another server's memory. Several servers need a shared database that checks and records the spot assignment together. The database must reject a second active claim for C17, even if both servers tried it at once.
+## Wrap up
 
-For recovery after a restart, save tickets, spot claims and payment attempts in that database. Save a payment ID before calling the payment service. On recovery, check unresolved IDs with the service instead of blindly charging again. The supplied Java example keeps records in memory; this database step is an extension.
+We designed a parking lot with five clear parts: `Vehicle`, `ParkingSpot`, `Ticket`, `FeeStrategy` and `ParkingLot`.
 
-### Where are the replaceable design patterns?
+> **📝 Key takeaways**
+> - One owner (`ParkingLot`) for spot data, so gates never disagree.
+> - One `Size` enum makes "does it fit?" a simple comparison.
+> - Fee rules sit behind `FeeStrategy`, so pricing changes need no other edits.
+> - Checking and taking a spot happen inside one lock; across servers, use a conditional database update.
 
-`AllocationPolicy` and `Tariff` use **Strategy**: each puts a changeable rule behind an interface. For example, “smallest suitable spot” can become “nearest suitable spot.” Neither change should rewrite entry, payment or exit. We do not need a separate subclass for every vehicle/spot combination.
+The complete, runnable code is in [ParkingLotDemo.java](reference-code/learning/kb/parking/ParkingLotDemo.java). It parks the three vehicles above, checks the fee table and rejects a reused ticket. For a production-depth version with payment retries and multi-gate recovery, see the [advanced Parking.java](reference-code/lld-three/Parking.java).
 
-### What does the complete payment method look like?
+## Closing answer
 
-The implementation below follows the three payment steps above. `Attempt` is the saved payment request. `finish` records its outcome once. A repeated key returns the saved result, and an unresolved attempt prevents a second collection under a new key.
-
-```java
-// source: Parking.java#payment
-        public PaymentView pay(String sessionId, String paymentKey, long approvedDueMinor) {
-            Attempt work;
-            synchronized (this) {
-                requireKey(paymentKey);
-                if (approvedDueMinor < 0) {
-                    throw new IllegalArgumentException("Negative approval");
-                }
-                Session visit = session(sessionId);
-                Attempt old = attempts.get(paymentKey);
-                if (old != null) {
-                    if (!old.sessionId.equals(sessionId) || old.amount != approvedDueMinor) {
-                        throw new IllegalArgumentException("Payment key payload conflict");
-                    }
-                    return old.view(); // A duplicate cannot start a second provider call.
-                }
-                if (visit.state == SessionState.CLOSED) {
-                    throw new IllegalStateException("Session closed");
-                }
-                if (visit.state == SessionState.PAYMENT_PENDING
-                        || visit.state == SessionState.PAYMENT_UNKNOWN) {
-                    throw new IllegalStateException("Resolve original payment first");
-                }
-                if (visit.state == SessionState.PAID && clock.instant().isBefore(visit.exitBy)) {
-                    if (approvedDueMinor != 0) {
-                        throw new IllegalStateException("Quote changed; approve the current amount");
-                    }
-                    Attempt covered = new Attempt(paymentKey, sessionId, quote(sessionId));
-                    covered.state = PaymentState.CONFIRMED;
-                    covered.reference = "ALREADY_COVERED";
-                    attempts.put(paymentKey, covered);
-                    return covered.view(); // Does not extend grace.
-                }
-
-                Quote current = quote(sessionId);
-                if (current.dueMinor != approvedDueMinor) {
-                    throw new IllegalStateException("Quote changed; approve the current amount");
-                }
-                work = new Attempt(paymentKey, sessionId, current);
-                attempts.put(paymentKey, work);
-                visit.activePayment = paymentKey;
-                visit.state = SessionState.PAYMENT_PENDING;
-                if (work.amount == 0) {
-                    return finish(paymentKey, new ProviderReply(
-                        PaymentState.CONFIRMED, "COVERED_BY_PRIOR_PAYMENTS"));
-                }
-            }
-
-            ProviderReply reply;
-            try {
-                reply = payments.charge(work.key, work.amount);
-            } catch (RuntimeException uncertain) {
-                reply = new ProviderReply(PaymentState.UNKNOWN, null);
-            }
-            return finish(work.key, reply); // The payment-service call held no lot lock.
-        }
-        public PaymentView reconcile(String paymentKey) {
-            synchronized (this) {
-                Attempt saved = attempt(paymentKey);
-                if (saved.state == PaymentState.CONFIRMED || saved.state == PaymentState.DECLINED) {
-                    return saved.view();
-                }
-            }
-            ProviderReply reply;
-            try {
-                reply = payments.lookup(paymentKey);
-            } catch (RuntimeException uncertain) {
-                reply = new ProviderReply(PaymentState.UNKNOWN, null);
-            }
-            return finish(paymentKey, reply);
-        }
-```
-
-For N spots, the simple entry implementation scans the available spots in O(N) time. That is a clear starting design for a small lot. If this becomes slow, keep searchable lists by spot type and floor. Updating those lists must still happen together with assigning or releasing a spot.
-
-## 7. Closing answer
-
-“I would give each visit its own ticket and make the lot responsible for assigning spots. Choosing a spot and recording its use happen under one lock, so two gates cannot promise the same space. Payments have their own IDs, so retries do not collect twice. We remember the amount already paid and free the spot only when that visit leaves. Different allocation and pricing rules fit behind small interfaces.”
-
-That is the complete path: **arrive → assign a spot → pay → leave → reuse the spot**. The extra checks protect the same path when requests repeat or devices fail.
-
-The [complete Java implementation](reference-code/lld-three/Parking.java) includes the helper classes and pricing calculation used by these code excerpts.
+"I'd model `Vehicle` with motorcycle, car and truck subclasses that report a size, and `ParkingSpot` with a floor, number and size. A vehicle fits a spot of its size or bigger. `ParkingLot` is the single coordinator the gates call: `parkVehicle` gives the smallest suitable spot on the lowest floor and returns a ticket, and `unparkVehicle` frees the spot and asks a `FeeStrategy` for the fee. Both methods are synchronized so two gates can't take the same spot; across servers I'd use a conditional database update. New vehicle types, spot types and pricing rules can all be added without changing the core."
 
 === LLD 3 ===
 N|n0|SystemController|0|0|220|rect
