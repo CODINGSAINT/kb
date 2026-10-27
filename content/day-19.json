@@ -118,103 +118,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Admission gateway",
+            "id": "wait",
+            "label": "Waiting room",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "res",
             "label": "Reservation service",
-            "x": 250,
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 190,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Inventory authority",
-            "x": 500,
+            "id": "inv",
+            "label": "Seats + section counters",
+            "x": 470,
             "y": 0,
-            "w": 200,
+            "w": 210,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "pay",
+            "label": "Payment",
+            "x": 470,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Payment workflow",
+            "id": "tix",
+            "label": "Ticket issuer (signed QR)",
+            "x": 220,
+            "y": 130,
+            "w": 210,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "gate",
+            "label": "Check-in service",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "Ticket issuer",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Check-in authority",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Reconciliation",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "bounded sale"
+            "from": "wait",
+            "to": "res",
+            "label": "admit"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "claims capacity"
+            "from": "res",
+            "to": "inv",
+            "label": "conditional hold"
           },
           {
-            "from": "n1",
-            "to": "n3",
-            "label": "records intent"
+            "from": "res",
+            "to": "pay",
+            "label": "checkout"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "confirmed entitlement"
+            "from": "pay",
+            "to": "tix",
+            "label": "issue tickets"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "redeemed once"
-          },
-          {
-            "from": "n6",
-            "to": "n3",
-            "label": "resolves uncertainty"
+            "from": "gate",
+            "to": "tix",
+            "label": "verify + use once"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a generic ticket or seat reservation platform (concerts, airlines, events, IRCTC-like) where inventory is scarce, demand spikes violently at sale open, and correctness is non-negotiable. Unlike HLD #13 (cinema seat maps), think of it as a reusable **inventory reservation engine** with **strong consistency**, **holds with expiry**, **transactions** and **fair admission under extreme load**.\n\n## Requirements\n\n**Functional**\n- Inventory types: assigned seats, or general admission (N identical tickets).\n- `hold(items, ttl)`, then `confirm(holdId, payment)` or `release`. Holds auto-expire.\n- Purchase limits per user, presale codes, waitlists.\n\n**Non-functional**\n- Never oversell. Never charge without a ticket.\n- Survive 1M+ users arriving at sale open for 50k tickets, and stay fair (no bot advantage).\n\n## 1. Scope and selected inventory model\n\nI support reserved-seat and general-admission events, payment, ticket reissue and check-in. I choose explicit inventory types behind one reservation contract and one ticket-state authority. QR signatures prove authenticity, not whether another disconnected scanner already consumed admission.\n\n## 2. APIs and invariants\n\n```text\nPOST /events/{id}/reservations {requestId,seats|quantity} -> hold\nPOST /tickets/{id}/check-in {scannerId,scanId} -> admitted | alreadyUsed | invalid\nInventory: capacity,sold,validHeld or per-seat owner\nTicket: id,reservationId,entitlementVersion,state,checkInEvidence\n```\n\nReservation atomically claims all selected seats or conditionally increments held quantity. For capacity 500, sold 420 and valid holds 60, only 20 remain. Confirmation converts that same reservation to sold and issues unique ticket entitlements. Check-in conditionally changes VALID to USED and stores scan evidence; concurrent scanners cannot both consume first entry. Reissue revokes the old version. Offline operation can validate signatures but must partition rights or accept/reconcile duplicate-use risk; I do not describe signature validation as globally exclusive consumption. Late payments and expired inventory follow a recorded compensation policy.\n\n## 3. Final design diagram\n\n[![Ticket / Seat Reservation System: Admission gateway bounded sale Reservation service; Reservation service claims capacity Inventory authority; Reservation service records intent Payment workflow; Payment workflow confirmed entitlement Ticket issuer; Ticket issuer redeemed once Check-in authority; Reconciliation resolves uncertainty Payment workflow](designs/hld-19.svg)](designs/hld-19.svg)\n\nA **reservation** owns inventory for a bounded interval. A **ticket** is the confirmed entitlement. A **check-in** consumes or records admission rights. Start by deciding whether identity, capacity or both are promised.\n\n## 4. Critical operation: worked execution\n\n![Ticket identity is issued from confirmed ownership and payment policy.](lessons/hld-19-flow.svg)\n\n*Ticket identity is issued from confirmed ownership and payment policy.*\n\n![A copied QR code must not create a second valid admission.](lessons/hld-19-failure.svg)\n\n*A copied QR code must not create a second valid admission.*\n\n### Calculate capacity\n\nFor 500 general-admission places, 420 confirmed and 60 active holds leave 20 reservable places. A request for 25 must fail as a whole unless partial fulfilment is explicitly offered. Expired holds are not valid inventory promises even if cleanup has not yet run.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n- **Edge plus waiting room:** a CDN-hosted queue page issues signed, ordered queue tokens and admits users at a controlled rate to the shop.\n- **Reservation service:** stateless API over a strongly consistent **inventory store** (sharded SQL or a single-region strongly consistent DB), partitioned by event.\n- **Holds:** rows `(eventId, itemId, status, holdId, expiresAt)`. A hold is a conditional update. A sweeper (or lazy expiry on read) releases expired holds.\n- **Checkout:** confirm moves holds to `SOLD` in one transaction after successful payment authorisation. Payment uses idempotency keys and is captured after confirmation.\n\n### Key design decisions & trade-offs\n\n**1. Conditional writes for consistency.**\n- Assigned seats: `UPDATE seats SET status='HELD', hold_id=? WHERE event=? AND seat IN (...) AND status='AVAILABLE'`. Success only if the affected row count equals the requested count, in one transaction (all-or-nothing).\n- General admission: a counter row `remaining`, with `UPDATE … SET remaining = remaining - n WHERE remaining >= n`. Hot row contention is a problem, so **split the counter into K sub-buckets** (e.g. 50 rows of 1,000) and pick randomly.\n\n**2. Hold TTL trade-off.** Long holds (15 min) are kind to users but lock inventory from others. Short holds (5 min) mean more expired checkouts. Extend the hold once the user is actively in payment.\n\n**3. Fairness and bots.** The waiting room (randomised or FIFO from sale open), per-account limits, CAPTCHA or device attestation, and verified-fan presales. Admission rate equals the measured checkout capacity.\n\n**4. Single-writer per hot event.** For extreme events, route all writes for one event to one partition or actor that processes reservations sequentially in memory with a durable log. That gives no lock contention and deterministic ordering.\n\n**5. Payment and inventory consistency.** Authorise, then confirm the inventory, then capture. If confirm fails, void the authorisation. Reconcile stuck states (hold expired after authorisation) with automatic voids or refunds.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** Inventory ownership remains exclusive through expiry, payment uncertainty and worker failover.\n\nAssume 200,000 users competing for 20,000 tickets in 60 seconds: 3,333 purchase intents/s before browsing traffic. Inventory contention concentrates on a few event sections, so aggregate QPS is insufficient for capacity planning.\n\n### API contracts and data ownership\n\n```text\nPOST /holds; POST /bookings with hold token and request key; GET booking status; cancellation/refund endpoint\n```\n\n```text\nLogical records (outline, not complete DDL):\ninventory(event,seat,state,owner_hold,version); hold(id,expires_at,state); booking(id,hold_id,payment_ref,state); outbox\n\nPrimary access/partitioning boundary:\nevent + section + seat or inventory_bucket; hold_id for exclusive ownership\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around event + section + seat or inventory_bucket; hold_id for exclusive ownership. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nThrottle admission; select authoritative inventory partition; conditionally reserve with hold ID and expiry; persist response identity; perform payment; confirm only if current hold still owns inventory; publish a ticket with unique redemption identity; handle cancellation by explicit policy.\n\n### Deep dive: the decision that changes this system\n\nFor general admission use an atomic remaining-capacity decrement plus hold ledger; for assigned seating use unique seat ownership. Both require expiry and late-payment rules. A ticket scanner also needs replay prevention and a policy for offline validation.\n\n### Failure and race-condition walkthrough\n\nA leader changes during a sale. The new owner must recover committed holds and reject stale epochs, rather than reconstruct availability from an eventually consistent cache. Never clear holds purely from a client countdown.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nGlobal strong consistency across regions increases coordination cost. Routing one event to a single write authority is often a better starting boundary; browsing and availability previews can be replicated.\n\nOversell count, confirmed-to-issued lag, hold leak age, conflict rate, admission delay and unresolved payment outcomes.\n\n**Test matrix:** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: Inventory ownership remains exclusive through expiry, payment uncertainty and worker failover.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 200,000 users competing for 20,000 tickets in 60 seconds: 3,333 purchase intents/s before browsing traffic. Inventory contention concentrates on a few event sections, so aggregate QPS is insufficient for capacity planning.\n\n**Which failure would invalidate the naive design?** A leader changes during a sale. The new owner must recover committed holds and reject stale epochs, rather than reconstruct availability from an eventually consistent cache. Never clear holds purely from a client countdown.\n\n**Why not introduce every distributed component immediately?** Global strong consistency across regions increases coordination cost. Routing one event to a single write authority is often a better starting boundary; browsing and availability previews can be replicated.\n\n**How would you demonstrate the design works?** Hold expiry versus payment, duplicate booking, leader failover, split-brain prevention, capacity conservation, cancellation resale and duplicate ticket scan. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through offline admission\n\nOffline scanners can verify signed ticket authenticity but cannot automatically know another disconnected scanner already admitted the same ticket. Choose a bounded offline policy, partition entrance rights or accept and reconcile duplicate-entry risk explicitly. Cryptographic signatures solve forgery, not shared mutable consumption state.\n\nReissuing a ticket after loss should revoke the old entitlement version. Transfers change authorized holder under policy without producing two live tickets. Seat ownership, payment disposition and admission evidence remain distinct even when the UI presents one booking summary.\n\n## 6. Interviewer follow-ups\n\n**Does a QR code prevent screenshots?** No. It encodes data; admission-state rules prevent reuse online.\n\n**Does releasing a hold cancel a captured payment?** No. Resolve the financial outcome separately.\n\n## 7. Closing answer\n\nI separate inventory reservation, paid entitlement and admission consumption. Reserved seats claim identities; general admission claims quantity. Online conditional check-in prevents copied QR codes being used twice, while offline scanning has a deliberately weaker, documented duplicate-use guarantee.\n"
+      "markdown": "## Problem\n\nDesign a generic ticket reservation platform used for concerts, flights, events and trains (like Ticketmaster or an IRCTC-style system). Organisers publish an event with limited inventory – numbered seats, or a count such as \"5,000 standing tickets\". Buyers reserve, pay and receive a ticket with a QR code that is scanned once at the gate.\n\nThis lesson builds on BookMyShow (HLD-13). The new parts are: two kinds of inventory, issuing tickets that can't be forged or reused, and serving many organisers on one platform.\n\n## Requirements\n\n- Organisers create events with seated or general-admission inventory.\n- Buyers hold tickets for a few minutes, pay, and receive tickets.\n- Never sell more than the inventory.\n- Issue tamper-proof tickets; each ticket admits exactly one person, once.\n- Handle on-sale spikes for popular events.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> \"Generic\" is the key word. Ask what kinds of inventory the platform must support.\n\n**Candidate:** Seated events, general admission, or both?\n\n**Interviewer:** Both. A stadium may have seated stands and a standing area.\n\n**Candidate:** How many tickets can one buyer take?\n\n**Interviewer:** Up to 6 per order.\n\n**Candidate:** How is entry checked?\n\n**Interviewer:** Gate staff scan a QR code with a phone app, sometimes offline.\n\n**Candidate:** What's the peak?\n\n**Interviewer:** A big concert: 1 million people for 60,000 tickets in the first minutes.\n\n**Candidate:** Can tickets be transferred?\n\n**Interviewer:** Yes, to another account, which must invalidate the old QR.\n\n**Functional requirements**\n\n1. Publish events with seated and general-admission inventory.\n2. Hold, pay, confirm; issue QR tickets; transfer.\n3. Check in at the gate exactly once.\n\n**Non-functional requirements**\n\n1. No overselling.\n2. Survive on-sale spikes fairly.\n3. Gate check-in works even with poor network.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> The interesting number is demand ÷ supply. A 16× ratio means most people will not get a ticket – fairness matters.\n\n```text\nArrivals at on-sale        = 1,000,000 in 10 minutes ≈ 1,700/s\nTickets                    = 60,000\nDemand / supply            ≈ 16×\nCheck-ins on event night   = 60,000 in 2 hours ≈ 8/s average, ~100/s peak at the gates\n```\n\nWhat it means: on-sale needs a waiting room and atomic inventory; check-in is small but must be correct.\n\n## Step 3: Define the API\n\n```http\nGET  /v1/events/{eventId}/inventory           → sections with seats or remaining counts\nPOST /v1/events/{eventId}/holds  { \"items\": [ { \"section\": \"Standing\", \"qty\": 2 } ] }\n→ 201 { \"holdId\": \"...\", \"expiresAt\": \"…\" }  |  409 SOLD_OUT\nPOST /v1/holds/{holdId}/checkout              → payment → order CONFIRMED\nGET  /v1/orders/{orderId}/tickets             → ticketId + QR per ticket\nPOST /v1/tickets/{ticketId}/transfer  { \"toUser\": \"bilal@…\" }\nPOST /v1/checkins  { \"ticketId\": \"...\", \"gate\": \"G3\" }  → 200 ADMITTED | 409 ALREADY_USED\n```\n\n> **🎯 In the interview**\n> One hold API covers both inventory kinds: a request names either specific seats or a quantity in a section.\n\n## Step 4: Define the data model\n\n| Table | Key fields |\n| --- | --- |\n| `seat` (seated sections) | eventId, seatId, status (AVAILABLE / HELD / SOLD), holdId, expiresAt |\n| `ga_section` (general admission) | eventId, section, capacity, sold, held |\n| `hold` | holdId, buyer, items, expiresAt, status |\n| `ticket` | ticketId, orderId, owner, seat or section, **version**, status (VALID / TRANSFERRED / USED / CANCELLED) |\n| `checkin` | ticketId (unique), gate, scannedAt |\n\n> **⚖️ Design choice**\n> Seated inventory is one row per seat; general admission is a counter per section. Both are updated with conditional writes in the same SQL database, partitioned by event.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: an admission gateway lets buyers in at a steady rate; the reservation service holds inventory through the inventory authority; the payment workflow confirms the order; the ticket issuer creates signed tickets; the check-in service verifies each ticket and admits it once.](designs/hld-19.svg)](designs/hld-19.svg)\n\n**Buying**\n\n1. The admission gateway (waiting room) admits Asha.\n2. She asks for 2 standing tickets. The inventory service atomically increases `held` if `sold + held + 2 ≤ capacity`.\n3. She pays. On success, `held -= 2, sold += 2`, and the order is confirmed.\n4. The ticket issuer creates 2 tickets, each with a **signed** QR code.\n\n**Entering**\n\n1. At gate G3, staff scan Asha's QR. The app checks the signature, then asks the check-in service to mark the ticket USED.\n2. A second scan of the same QR (a screenshot shared with a friend) returns ALREADY_USED.\n\n![Animation: Asha buys two standing tickets and receives two signed QR codes; she transfers one to Bilal, which issues a new version and cancels the old QR; at the gate Bilal's new QR is admitted, and a screenshot of the old QR is rejected.](learning-figures/hld-19-ticket.gif)\n\n## Step 6: Go deep\n\n### Two kinds of inventory\n\n**Seated:** a conditional update on the requested seat rows, all or nothing (as in HLD-13).\n\n**General admission:** a counter:\n\n```sql\nUPDATE ga_section\n   SET held = held + :qty\n WHERE event_id = :event AND section = 'Standing'\n   AND sold + held + :qty <= capacity;\n-- 1 row → held; 0 rows → sold out\n```\n\nFor a very hot section, split the capacity into several counter rows (\"buckets\", e.g. 10 × 500) and pick one at random, so thousands of buyers don't fight over one row.\n\n### Tamper-proof tickets\n\n**Option 1: QR contains just the ticket ID.**\n\n- Good: simple.\n- Problem: anyone can guess or forge IDs.\n\n**Option 2: QR contains the ticket ID, version and a digital signature.**\n\n- Good: the scanner verifies the signature with the platform's public key, even offline; changing any byte breaks it.\n- Problem: key management.\n\n> **⚖️ Design choice**\n> Signed QR codes (ticketId, eventId, version, signature). Transfer increases the version and issues a new QR; the old version is no longer valid.\n\n### Admitting each ticket exactly once\n\nThe check-in service inserts into `checkin` with `ticketId` as a unique key and checks `version` matches the current ticket. The first scan inserts; any later scan finds the row and returns ALREADY_USED.\n\n[![Gate check: the scanner verifies the QR signature; it checks the ticket version is current; it records the check-in with a unique ticket ID; the first scan is admitted, a repeated or old-version scan is refused.](learning-figures/hld-19-checkin.svg)](learning-figures/hld-19-checkin.svg)\n\n> **⚠️ Common mistake**\n> Treating a valid signature as \"may enter\". A signature proves we issued the QR, not that it hasn't been used or transferred. Use-once needs a server-side record.\n\n### Offline gates\n\nIf a gate loses network, the scanner verifies signatures locally and keeps a local list of scanned IDs, syncing when back online. Duplicates across different offline gates are possible, so venues usually keep one gate online or assign ticket ranges to gates.\n\n### Many organisers\n\nPartition data by event, and give each organiser quotas and isolated rate limits, so one mega on-sale cannot slow down small events.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| 1 million buyers at on-sale | Overload | Waiting room; bucketed counters |\n| Buyer abandons checkout | Inventory stuck | Holds expire and return stock |\n| Payment after hold expired | Possible oversell | Conditional confirm; refund if stock is gone |\n| Screenshot of a QR shared | Two people try to enter | Unique check-in record; second scan refused |\n| Transferred ticket's old QR | Seller tries to use it | Version check rejects old versions |\n\n## Putting it together\n\n- **Inventory:** seat rows or section counters, held with conditional updates, expiring holds.\n- **Tickets:** signed QR with a version; transfer issues a new version.\n- **Entry:** verify signature → check version → unique check-in record.\n\n## Interviewer follow-ups\n\n**How does an airline differ?** Airlines deliberately overbook based on no-show predictions, and a seat is per flight leg – a multi-leg trip must hold every leg or none.\n\n**How do you stop bots?** CAPTCHA and identity checks at the waiting room, per-account and per-card limits, and randomised queue positions for people who arrive before the sale opens.\n\n**How do you handle refunds and cancellations?** Mark the ticket CANCELLED, release inventory back to the section, and refund through the payment workflow.\n\n**How is resale handled?** The same as transfer: a new owner and version; the platform can cap resale prices.\n\n## Wrap up\n\nWe supported seated and general-admission inventory with conditional updates, issued signed and versioned tickets, and admitted each ticket exactly once at the gate.\n\n> **📝 Key takeaways**\n> - Seats are rows; general admission is a counter; both use conditional updates.\n> - Holds expire; confirmation re-checks the hold.\n> - A signature proves authenticity; a unique check-in record proves single use.\n> - Transfer bumps the ticket version so old QRs stop working.\n\n## Going deeper (optional)\n\nThe detailed version issues tickets only from confirmed ownership and payment policy, and reconciles orders, payments and tickets after failures.\n\n[![Ticket identity is issued from confirmed ownership and payment policy.](lessons/hld-19-flow.svg)](lessons/hld-19-flow.svg)\n\nFurther reading: [RFC 8032 – Ed25519 signatures](https://datatracker.ietf.org/doc/html/rfc8032).\n\n## Closing answer\n\n\"The platform supports seated inventory as one row per seat and general admission as a counter per section, partitioned by event. A waiting room admits buyers at a steady rate, and a hold is one conditional update – specific seats if all are available, or a quantity if sold plus held plus requested fits the capacity – with an expiry. Payment confirms the hold with another conditional check. Tickets carry a signed QR with a version, so scanners can verify them offline, and transfer issues a new version. At the gate, a unique check-in record admits each ticket once; a repeated or old-version scan is refused.\"\n"
     },
     {
       "category": "AI",
