@@ -201,103 +201,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Source registry",
+            "id": "src",
+            "label": "Document sources",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "emb",
             "label": "Embedding pipeline",
-            "x": 250,
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Versioned vector index",
-            "x": 500,
+            "id": "idx",
+            "label": "Vector index (HNSW)",
+            "x": 460,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 190,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
-            "label": "Metadata filters",
-            "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
+            "id": "q",
             "label": "Query service",
-            "x": 250,
-            "y": 110,
-            "w": 200,
+            "x": 460,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n5",
-            "label": "Document revisions",
-            "x": 500,
-            "y": 110,
-            "w": 200,
+            "id": "filt",
+            "label": "Metadata filters",
+            "x": 220,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n6",
+            "id": "life",
             "label": "Lifecycle worker",
             "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "authorized sources"
+            "from": "src",
+            "to": "emb",
+            "label": "new revisions"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "upserts"
+            "from": "emb",
+            "to": "idx",
+            "label": "chunks + vectors"
           },
           {
-            "from": "n3",
-            "to": "n2",
-            "label": "restricts candidates"
+            "from": "q",
+            "to": "idx",
+            "label": "nearest k"
           },
           {
-            "from": "n4",
-            "to": "n2",
-            "label": "nearest search"
+            "from": "filt",
+            "to": "q",
+            "label": "tenant, status"
           },
           {
-            "from": "n2",
-            "to": "n5",
-            "label": "resolves evidence"
-          },
-          {
-            "from": "n6",
-            "to": "n2",
-            "label": "retires chunks"
+            "from": "life",
+            "to": "idx",
+            "label": "delete old revisions"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain vector stores: what they add beyond storing arrays of floats (ANN indexes, metadata filtering, hybrid search, CRUD and scaling), how the main options compare (PGVector, Redis, Elasticsearch/OpenSearch, dedicated databases like Pinecone, Weaviate, Qdrant, Milvus), and how Spring AI's `VectorStore` abstraction and filter expressions work.\n\n## Requirements\n\n- Core operations: add, delete and similarity search with top-k, threshold and filters.\n- Index types (HNSW, IVF) and their trade-offs.\n- Metadata filtering and why it's essential (multi-tenancy, ACLs, freshness).\n- Choosing a store for an enterprise Java stack.\n- Spring AI `VectorStore`, `SearchRequest`, the portable filter expression DSL.\n\n## 1. Selected store contract\n\nI choose a database-backed vector index for an initially moderate corpus, with typed metadata and source revisions. Document/query embeddings use one compatible model version. Search filters enforce tenant and document permissions before evidence reaches generation.\n\n## 2. Records and update transaction boundary\n\n```text\nChunk: id,documentId,revision,tenant,permissionScope,text,embeddingModel,vector\nIndexGeneration: id,model,dimension,publishedAt,state\nsearch(scope,queryVector,k,generation) -> permitted chunk IDs and scores\npublishRevision(doc,newChunks): stage -> verify -> switch -> retire old chunks\n```\n\nAn update from chunks A/B/C to A/D must retire B and C explicitly; upsert alone leaves stale evidence. New embedding models build a separate generation, evaluate recall and switch query embedding/index together. Equal vector dimensions do not prove compatible spaces. One million 1,536-dimensional float32 vectors occupy 6.144 GB raw before text, metadata, index structures and replicas.\n\nI test filter placement using a deliberately nearest forbidden vector, not random separation. Approximate indexing settings are selected by measured recall/latency and operating capacity. Source deletion tombstones immediately suppress access under current policy, with asynchronous physical cleanup verified later. Backups and re-ingestion have different recovery times, so both index/source provenance and recovery expectations are documented.\n\n## 3. Final design diagram\n\n[![Vector Stores: Source registry authorized sources Embedding pipeline; Embedding pipeline upserts Versioned vector index; Metadata filters restricts candidates Versioned vector index; Query service nearest search Versioned vector index; Versioned vector index resolves evidence Document revisions; Lifecycle worker retires chunks Versioned vector index](designs/ai-10.svg)](designs/ai-10.svg)\n\nAn **index namespace** separates logical collections, a **metadata filter** constrains candidates, and a **document revision** tells you what was embedded. **Approximate search** improves speed by potentially missing some exact nearest neighbours; measure recall rather than assuming an index configuration is universally best.\n\n## 4. Critical operation: worked execution\n\n![Text, embedding model and permissions remain traceable together.](lessons/ai-10-flow.svg)\n\n*Text, embedding model and permissions remain traceable together.*\n\n![Upsert alone does not remove chunks that disappeared from a new revision.](lessons/ai-10-failure.svg)\n\n*Upsert alone does not remove chunks that disappeared from a new revision.*\n\n### Calculate and choose\n\nOne million vectors × 1,536 dimensions × four bytes is about 6.144 GB raw values. Index graph/list structures, stored text, metadata, replicas and write headroom add to that. If your documents are small and the corpus modest, an existing database with vector support may be simpler than a new distributed dependency.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** How should embeddings be indexed, filtered, updated and migrated in a real application?\n\nA vector store combines numerical vectors, metadata and an index. Exact search establishes a correctness baseline; approximate methods such as HNSW/IVF trade search recall, memory, build time and latency. The storage engine may also support lexical indexes; vectors are not a separate mandatory database category.\n\n### Architecture and contracts\n\n```text\nDocument revision -> stable chunk IDs -> batch embedding -> versioned index upsert -> filtered search -> source lookup; tombstones and reindex govern updates\n\nApplication contracts (design outline):\nIndexVersion(embeddingModel,dimension,chunkerVersion,metric); SearchRequest(query,tenant,filter,k); DocumentRevision\n```\n\nVectorStore accepts Documents and SearchRequest-like queries in the selected release. Keep store-specific configuration outside domain code; validate metadata filter behavior with integration tests.\n\n### Worked reasoning and capacity example\n\nFive million vectors x 1,536 x 4 bytes = 30.72 GB raw floats. HNSW graph links, metadata, original text, replicas and write buffers add to that. Capacity tests must include the chosen index configuration.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord IndexVersion(String embeddingModel, int dimensions, String chunkerVersion) {}\n// Refuse reads/writes when request and index versions are incompatible.\n// Build a replacement index before changing the live query encoder.\n```\n\n### Design decisions and alternatives\n\nI start with a store that fits operating skills and consistency needs. Use stable content/revision keys for repeatable ingestion; rebuild into a new collection when model/chunker changes. Swap an index alias after validation rather than mixing incompatible vectors.\n\n### Failure scenario and safe recovery\n\nDeletion removes source text but leaves indexed chunks retrievable. Tombstone or delete every related chunk and enforce source authorization/version checks on read; track cleanup completion.\n\n### Security, privacy and provenance\n\nTwo models with equal vector dimension are not interchangeable. Distance thresholds are metric/model dependent and must be calibrated on your corpus.\n\n\n**Verification criteria:** Recall@k, filtered recall, insert/update lag, deletion propagation, memory and query p99 under concurrent ingestion. Benchmark skewed tenants, not only uniform random vectors.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through filter correctness\n\nFiltering before candidate selection and filtering a small top-k afterward can produce different recall and security properties. A post-filter cannot repair a design that exposes forbidden text to another processing step. Test tenant/resource filters with intentionally nearest forbidden vectors, not merely random fixtures.\n\nChanging embedding models requires a versioned migration. Even equal-dimensional vectors can represent different spaces. Build a new index, test retrieval, switch query embedding and index together, and keep a rollback plan. Index backup and source re-ingestion are different recovery strategies with different time/cost.\n\n## 6. Interviewer follow-ups\n\n**Is vector distance comparable across arbitrary models?** No. Use a compatible model/index and calibrated task evaluation.\n\n**Does deleting a document row guarantee vector deletion?** Only if your lifecycle explicitly performs and verifies that propagation.\n\n## 7. Closing answer\n\nI treat the vector store as a versioned retrieval index with explicit source lifecycle. Model compatibility, permission filters, stale-chunk retirement and recall measurement determine correctness; selecting a vector database alone does not solve these responsibilities.\n"
+      "markdown": "## Problem\n\nYour RAG assistant now has 5 million document chunks, each with a 1,536-number embedding. A question must find the 5 most similar chunks in under 50 ms, but only among documents the user is allowed to see, and only from the current version of each document.\n\nStoring arrays of floats is easy. Searching millions of them fast, with filters, while documents keep changing – that is what a **vector store** is for.\n\n## Requirements\n\n- Explain what a vector store adds beyond \"a table of float arrays\".\n- Explain exact vs approximate nearest-neighbour (ANN) search, and HNSW.\n- Combine vector search with metadata filters and keyword search.\n- Keep the index in step with changing documents (updates and deletes).\n- Use Spring AI's `VectorStore` with PGvector, and choose between options.\n\n## Step 1: The idea in plain words\n\nA vector store is a database that answers one question very fast: **\"which stored vectors are closest to this one?\"** – plus \"…and match these filters\".\n\n| Term | Plain meaning |\n| --- | --- |\n| **Vector / embedding** | A list of numbers that represents meaning (AI-4). |\n| **Similarity** | How close two vectors are – usually cosine similarity. |\n| **k-NN** | Find the k nearest vectors. Exact k-NN compares against every vector. |\n| **ANN** | Approximate nearest neighbours: much faster, very slightly less accurate. |\n| **HNSW** | A popular ANN index: a layered graph you walk from far to near. |\n| **Metadata filter** | Conditions like `department == 'HR'` applied with the search. |\n\n> **🎯 In the interview**\n> Interviewers usually ask: why not just a normal database; what ANN and HNSW are; how filtering works; which vector store you would pick; how you keep it up to date.\n\n## Step 2: How a vector store finds neighbours fast\n\n[![Selected design: document sources feed an embedding pipeline that writes chunks into a versioned vector index; a query service searches the index with metadata filters; a lifecycle worker removes chunks of old document revisions.](designs/ai-10.svg)](designs/ai-10.svg)\n\n### Exact search is too slow at scale\n\n```text\nChunks                     = 5,000,000\nDimensions                 = 1,536\nWork per query (exact)     = 5M × 1,536 ≈ 7.7 billion multiply-adds\nMemory for vectors         = 5M × 1,536 × 4 bytes ≈ 30 GB\n```\n\nWhat it means: comparing against every vector takes seconds per query. We need an index that looks at only a small part of the data.\n\n### HNSW in one picture\n\nHNSW builds a graph where each vector links to its near neighbours, in several layers – a few long-distance links on top, many short ones at the bottom, like motorways, main roads and lanes.\n\n1. Start at an entry point on the top layer.\n2. Jump to whichever neighbour is closer to the query; repeat until no neighbour is closer.\n3. Drop to the next layer and continue with finer links.\n4. On the bottom layer, collect the closest k.\n\nInstead of 5 million comparisons, a query makes a few thousand – and usually finds 95–99% of the true top-k.\n\n![Animation: a query enters the top layer of an HNSW graph, hops along long links toward the region of similar vectors, drops to lower layers with shorter links, and finishes on the bottom layer by collecting the five nearest chunks after checking only a small part of the graph.](learning-figures/ai-10-hnsw.gif)\n\n### Tuning knobs\n\n| Knob | Higher means |\n| --- | --- |\n| `m` (links per node) | Better recall, more memory |\n| `ef_construction` | Better graph, slower indexing |\n| `ef_search` | Better recall, slower queries |\n\n## Step 3: In code with Spring AI\n\nSpring AI hides each product behind one `VectorStore` interface. With PostgreSQL + PGvector:\n\n```properties\nspring.ai.vectorstore.pgvector.index-type=HNSW\nspring.ai.vectorstore.pgvector.distance-type=COSINE_DISTANCE\nspring.ai.vectorstore.pgvector.dimensions=1536\nspring.ai.vectorstore.pgvector.initialize-schema=true\n```\n\n**Search with a metadata filter:**\n\n```java\nList<Document> results = vectorStore.similaritySearch(\n        SearchRequest.builder()\n                .query(\"paternity leave split\")\n                .topK(5)\n                .similarityThreshold(0.6)\n                .filterExpression(\"department == 'HR' && status == 'PUBLISHED'\")\n                .build());\n```\n\n**Replace a document's chunks when it changes:**\n\n```java\npublic void reindex(String docId, List<Document> newChunks) {\n    vectorStore.delete(\"docId == '\" + docId + \"'\");   // remove every chunk of the old revision\n    vectorStore.add(newChunks);                       // embeds and stores the new ones\n}\n```\n\nThe filter strings use Spring AI's portable filter language, translated to each store's own syntax (SQL `WHERE` for PGvector, metadata filters for Pinecone, and so on). In production, build filters with `FilterExpressionBuilder` rather than concatenating strings, and take values like `docId` only from trusted code.\n\n> **⚖️ Design choice**\n> **PGvector** when you already run PostgreSQL and have up to tens of millions of vectors: one database, transactions with your metadata, familiar operations. Move to a dedicated store (Milvus, Qdrant, Weaviate, Pinecone, Elasticsearch/OpenSearch) for hundreds of millions of vectors or heavy hybrid search.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Filtering after search (\"top 5, then remove forbidden\") | Filter during search – otherwise you may get 0 allowed results |\n| Upserting new chunks without deleting old ones | Delete by `docId` (or version) first; a shorter new revision leaves stale chunks |\n| Mixing embedding models in one index | One model per index; re-embed everything when you change models |\n| Ignoring keyword search | Hybrid search: vectors for meaning + BM25 for exact terms (error codes, names) |\n| Default index settings forever | Measure recall on real queries; tune `ef_search` |\n\n> **⚠️ Common mistake**\n> Storing vectors without the chunk text and metadata. When a result is wrong you can't see why, and you can't filter or cite. Keep text, source, version and access rules with every vector.\n\n[![Upsert alone does not remove chunks that disappeared from a new revision.](lessons/ai-10-failure.svg)](lessons/ai-10-failure.svg)\n\n## Step 5: Production concerns\n\n- **Memory:** HNSW indexes live mostly in RAM. 5M × 1,536 floats ≈ 30 GB plus graph links – size machines accordingly, or use smaller dimensions or quantisation.\n- **Recall testing:** compare ANN results with exact search on a sample of queries; aim for 95%+ recall@k.\n- **Freshness:** ingest changes as events; delete by document ID; re-embed in the background when switching models, then switch indexes atomically.\n- **Multi-tenancy:** a `tenantId` filter on every query, or a separate collection per large tenant.\n- **Cost:** storage and RAM grow with vectors × dimensions; embedding calls cost per token at ingestion.\n\n## Interviewer follow-ups\n\n**Why not just use PostgreSQL arrays?** You can store them, but without an ANN index every query scans every row. PGvector adds the vector type, distance operators and HNSW/IVFFlat indexes.\n\n**HNSW or IVFFlat?** HNSW gives better recall and speed at the cost of memory and slower builds; IVFFlat clusters vectors into lists and is lighter but needs training and tuning.\n\n**Cosine, dot product or Euclidean?** Use what the embedding model was trained for – usually cosine; for normalised vectors cosine and dot product rank the same.\n\n**How do you do hybrid search?** Run keyword (BM25) and vector search, then merge results, for example with reciprocal rank fusion, and optionally rerank.\n\n## Wrap up\n\nA vector store finds the nearest embeddings fast with an ANN index such as HNSW, applies metadata filters during the search, and must be kept in step with document changes.\n\n> **📝 Key takeaways**\n> - Exact search is too slow at millions of vectors; ANN (HNSW) trades a little recall for big speed.\n> - Filter during search, not after.\n> - Delete old chunks when documents change; one embedding model per index.\n> - PGvector is a good default; dedicated stores for very large scale.\n\n## Going deeper (optional)\n\nThe detailed version keeps text, embedding model and permissions traceable together for every vector, and runs a lifecycle worker that removes superseded revisions.\n\n[![Text, embedding model and permissions remain traceable together.](lessons/ai-10-flow.svg)](lessons/ai-10-flow.svg)\n\nFurther reading: [Spring AI – Vector databases](https://docs.spring.io/spring-ai/reference/api/vectordbs.html), [pgvector](https://github.com/pgvector/pgvector) and [the HNSW paper](https://arxiv.org/abs/1603.09320).\n\n## Closing answer\n\n\"A vector store answers 'which stored embeddings are closest to this one, matching these filters' quickly. Exact search over millions of 1,536-dimension vectors is billions of operations per query, so stores use approximate indexes like HNSW – a layered neighbour graph that finds 95–99% of the true top-k by checking a small fraction. Metadata filters for tenant, permissions and status are applied during the search. In Spring AI I use the `VectorStore` interface – PGvector with an HNSW index is a good default – with `SearchRequest` for top-k, threshold and filters. When a document changes I delete its old chunks by document ID before adding new ones, keep one embedding model per index, and measure recall against exact search.\"\n"
     }
   ]
 }

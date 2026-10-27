@@ -187,103 +187,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Document ingestion",
+            "id": "docs",
+            "label": "HR documents",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Versioned chunks",
-            "x": 250,
+            "id": "ingest",
+            "label": "Load, split, embed",
+            "x": 200,
             "y": 0,
-            "w": 200,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Scoped retrieval",
-            "x": 500,
+            "id": "vs",
+            "label": "Vector store",
+            "x": 420,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
-            "label": "Context budgeter",
+            "id": "q",
+            "label": "Question",
             "x": 0,
-            "y": 110,
-            "w": 200,
+            "y": 130,
+            "w": 130,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
-            "label": "ChatClient",
-            "x": 250,
-            "y": 110,
-            "w": 200,
+            "id": "ret",
+            "label": "Retrieve top 4",
+            "x": 200,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n5",
-            "label": "Citation validator",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Answer or abstention",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "id": "llm",
+            "label": "ChatClient answer",
+            "x": 420,
+            "y": 130,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "publishes"
+            "from": "docs",
+            "to": "ingest",
+            "label": "offline"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "searchable evidence"
+            "from": "ingest",
+            "to": "vs",
+            "label": "chunks + metadata"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "selected passages"
+            "from": "q",
+            "to": "ret",
+            "label": "embed question"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "bounded prompt"
+            "from": "ret",
+            "to": "vs",
+            "label": "similar chunks"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "structured claims"
-          },
-          {
-            "from": "n5",
-            "to": "n6",
-            "label": "validated result"
+            "from": "ret",
+            "to": "llm",
+            "label": "prompt with sources"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain Retrieval-Augmented Generation (RAG) end to end: why it exists, the ingestion pipeline (documents → chunks → embeddings → vector store) and the query pipeline (question → retrieve → augment prompt → generate with citations), with a minimal Spring AI implementation and its typical failure modes.\n\n## Requirements\n\n- Why RAG instead of fine-tuning for private and changing knowledge.\n- Ingestion: loading, cleaning, chunking, embedding, metadata, storage.\n- Query: embedding the question, top-k retrieval, prompt assembly, grounded generation.\n- Citations and \"I don't know\" behaviour. Failure modes and how to evaluate.\n\n## 1. Selected RAG solution\n\nI build a private-policy assistant without retraining weights for every policy update. Ingestion parses approved revisions, chunks meaningful sections and publishes a scoped retrieval index. At query time I authenticate, retrieve permitted candidates, select evidence within budget and ask for a cited answer. The model's general knowledge is not authoritative for the private policy.\n\n## 2. Answer contract and execution\n\n```text\nPOST /ask {question,conversationId} -> {answer,citations,abstained}\nCitation: sourceId,revision,chunkId\nExecution: authorize -> retrieve -> pack evidence -> generate -> validate\nNo supporting passage -> {answer:\"No approved evidence found\",abstained:true}\n```\n\nSource `leave:v3:c4` caps carry-over at five days. For “May I carry seven?”, the answer is no under that passage, citing it and identifying any unavailable exception policy. It does not invent an exception. The validator rejects citations outside retrieved authorized IDs and evaluates whether passages support claims; valid IDs alone do not prove entailment.\n\nWith 6,000 evidence tokens and 500-token chunks, fewer than twelve may fit after wrappers/metadata. I reserve output and instructions before selecting evidence. Evaluation separates source recall from supported-answer rate and includes absent answers, conflicting revisions, deleted sources and forbidden tenants. A retrieval miss is not repaired by pretending a better prompt can reconstruct private facts that were never supplied.\n\n## 3. Final design diagram\n\n[![RAG Fundamentals: Document ingestion publishes Versioned chunks; Versioned chunks searchable evidence Scoped retrieval; Scoped retrieval selected passages Context budgeter; Context budgeter bounded prompt ChatClient; ChatClient structured claims Citation validator; Citation validator validated result Answer or abstention](designs/ai-5.svg)](designs/ai-5.svg)\n\nAn **ingestion pipeline** prepares documents. A **retriever** selects evidence. A **grounded answer** is supported by that evidence. A **citation** points to a source; merely printing a valid source ID does not prove the source supports the sentence.\n\n## 4. Critical operation: worked execution\n\n![A query uses published source versions from the retrieval index.](lessons/ai-5-flow.svg)\n\n*A query uses published source versions from the retrieval index.*\n\n![When the answer is absent, fluent completion is not a recovery method.](lessons/ai-5-failure.svg)\n\n*When the answer is absent, fluent completion is not a recovery method.*\n\n### Trace one answer\n\nSource `leave-policy:v3:chunk4` says “Annual carry-over is capped at five days.” A question asks “Can I carry seven days?” A supported answer says no under that passage and cites it, while noting any missing exception policy. It must not invent an exception because seven sounds reasonable.\n\nWith 6,000 tokens available for evidence and chunks averaging 500 tokens, at most about 12 fit before citation wrappers and other overhead. Increasing top-k without budgeting can displace instructions or truncate important passages. Chunk boundaries should preserve meaning, not just count characters.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** How can an assistant answer private-document questions without training a model on every document update?\n\nRAG retrieves relevant authorized evidence at inference time and supplies it to a generator. Ingestion and query serving are different pipelines. Retrieval errors and generation errors must be diagnosed separately; a good model cannot cite an absent or forbidden source correctly.\n\n### Architecture and contracts\n\n```text\nVersioned source -> parse/chunk/embed -> index; question -> authorize -> retrieve/rerank -> budget context -> generate cited answer -> verify or abstain\n\nApplication contracts (design outline):\nQuestion(tenant,user,query); Evidence(chunkId,documentVersion,passage); GroundedAnswer(text,sourceIds,abstained)\n```\n\nUse Spring AI Document, EmbeddingModel and VectorStore behind application authorization. QuestionAnswerAdvisor can provide a simple RAG path; the application still owns filtering, source versioning and answer validation.\n\n### Worked reasoning and capacity example\n\nA 12,000-token input allowance minus 1,000 task instructions and 2,000 conversation leaves 9,000 tokens for evidence; eight 700-token chunks use 5,600, leaving room for question and metadata. The top-k setting must obey the token budget, not just a document count.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord Evidence(String id, String revision, String text) {}\nrecord GroundedAnswer(String text, java.util.List<String> sourceIds, boolean abstained) {}\n// Reject citations absent from the authorized Evidence list.\n// A citation ID must resolve to the exact revision used to answer.\n```\n\n### Design decisions and alternatives\n\nI start with a lexical/vector baseline and a small golden dataset. Add query rewriting or reranking only when observed failures justify the extra call and latency. Citation output needs evidence IDs from retrieved records rather than invented URLs.\n\n### Failure scenario and safe recovery\n\nA top-ranked document is obsolete or includes a prompt injection. Filter by tenant, ACL and revision policy; treat source text as evidence only; preserve citations to immutable revisions so answers remain auditable.\n\n### Security, privacy and provenance\n\nRAG does not inherently prevent hallucination. Retrieving more chunks can increase irrelevant context and reduce answer quality.\n\n\n**Verification criteria:** Measure retrieval recall, answer support, citation correctness, abstention behavior, authorization violations and freshness separately. A single similarity score cannot replace these checks.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through evaluation\n\nMeasure retrieval recall separately from answer support. If the right passage was never retrieved, changing the final prompt cannot reliably repair the missing evidence. If the passage was retrieved but the answer contradicts it, generation or context construction needs attention.\n\nStore document, chunk and revision IDs in the answer trace. On deletion or permission change, enforce current authorization at query time and remove stale index/cached evidence under the lifecycle policy. Treat retrieved text as untrusted data, including instructions embedded in documents.\n\n## 6. Interviewer follow-ups\n\n**Is RAG a guarantee against hallucination?** No. Retrieval and generation can both fail.\n\n**Does a citation ID prove support?** No. Check the cited passage actually entails the claim.\n\n## 7. Closing answer\n\nMy RAG answer separates ingestion from query serving, retrieves only authorized current evidence, and validates the final claim-to-source relation. Missing evidence becomes an explicit answer limitation. Retrieval recall and generation support are measured separately, so failures are fixed at their actual stage.\n"
+      "markdown": "## Problem\n\nYour company's HR team wants an assistant that answers employee questions from the HR policy documents. Asha asks: **\"How many days of paternity leave do I get, and can I split them?\"**\n\nA plain LLM has never seen your policies, so it will guess – confidently and wrongly. Retrieval-augmented generation (RAG) fixes this: find the relevant policy text first, then ask the model to answer only from it, with citations.\n\n## Requirements\n\n- Explain why RAG exists and when to use it instead of fine-tuning.\n- Explain ingestion: load documents, split them into chunks, embed and store them.\n- Explain the question path: retrieve relevant chunks, build the prompt, generate, cite.\n- Say \"I don't know\" when the documents don't contain the answer.\n- Build it with Spring AI 1.1.8 and a vector store.\n\n## Step 1: The idea in plain words\n\nRAG is an **open-book exam** for the model. Instead of answering from memory, it first gets the right pages from your documents, then writes the answer using those pages.\n\n| Term | Plain meaning |\n| --- | --- |\n| **Ingestion** | The offline job that prepares documents: load → split → embed → store. |\n| **Chunk** | A small piece of a document (a few paragraphs) that can be found and quoted. |\n| **Embedding** | A list of numbers that captures a chunk's meaning (see the Embeddings lesson, AI-4). |\n| **Vector store** | A database that finds chunks with embeddings close to the question's embedding. |\n| **Retrieval** | Finding the top few chunks for a question. |\n| **Grounding** | Telling the model to answer only from the retrieved chunks. |\n\nRAG has two pipelines: **ingestion** (once per document change) and **question answering** (once per question).\n\n> **🎯 In the interview**\n> Interviewers usually ask: why RAG instead of fine-tuning; how you chunk; how many chunks to retrieve; how you stop hallucination; how you evaluate a RAG system.\n\n## Step 2: How RAG answers a question: the retrieval algorithm\n\n[![Selected design: HR documents are loaded, split and embedded into a vector store offline; a question is embedded, the top four similar chunks are retrieved, and ChatClient answers from them with citations.](designs/ai-5.svg)](designs/ai-5.svg)\n\n**Ingestion (offline)**\n\n1. **Load** the HR policy PDFs and pages.\n2. **Split** them into chunks of about 500 tokens with a small overlap, keeping the section heading with each chunk.\n3. **Embed** each chunk and **store** it with metadata: document, section, version, who may read it.\n\n**Answering (per question)**\n\n1. **Embed** Asha's question.\n2. **Retrieve** the 4 most similar chunks she is allowed to see.\n3. **Build the prompt**: rules + the chunks (numbered as sources) + the question.\n4. **Generate** the answer with citations like [1].\n5. **Check** that cited sources exist; if nothing relevant was found, answer \"I couldn't find this in the HR policies\".\n\nA worked example – the retrieved chunks:\n\n```text\n[1] Leave Policy v4, §3.2: Employees get 15 working days of paternity leave.\n[2] Leave Policy v4, §3.3: Paternity leave can be taken in up to two blocks within 6 months of birth.\n[3] Travel Policy, §1: Economy class for flights under 4 hours.     (similar words, not relevant)\n```\n\nGood answer: *\"You get 15 working days of paternity leave [1], and you can split it into at most two blocks within 6 months of the birth [2].\"*\n\n![Animation: Asha's question is embedded; the vector store returns the paternity-leave sections and one irrelevant travel chunk; the prompt is built from the relevant chunks with numbered sources; the model answers with citations one and two; a question about a policy that does not exist returns an honest I-could-not-find-it answer.](learning-figures/ai-5-rag.gif)\n\n### RAG or fine-tuning?\n\n| Need | Use |\n| --- | --- |\n| Answer from facts that change (policies, docs, tickets) | **RAG** – update the documents, not the model |\n| Cite sources | **RAG** |\n| Respect per-user permissions | **RAG** – filter what is retrieved |\n| A consistent style or narrow format | Fine-tuning (or better prompts) |\n\n> **⚖️ Design choice**\n> RAG for the HR assistant. Policies change every quarter; with RAG you re-ingest a document and the next answer uses it.\n\n## Step 3: In code with Spring AI\n\n**Ingestion** with Spring AI's ETL classes:\n\n```java\n@Component\npublic class PolicyIngestion {\n    private final VectorStore vectorStore;\n\n    public PolicyIngestion(VectorStore vectorStore) { this.vectorStore = vectorStore; }\n\n    public void ingest(Resource pdf, String version) {\n        List<Document> pages = new TikaDocumentReader(pdf).read();     // load\n        List<Document> chunks = TokenTextSplitter.builder()\n                .withChunkSize(500).build().apply(pages);                 // split\n        chunks.forEach(c -> c.getMetadata().putAll(Map.of(\n                \"source\", pdf.getFilename(), \"version\", version, \"audience\", \"all-employees\")));\n        vectorStore.add(chunks);                                       // embed + store\n    }\n}\n```\n\n**Answering** with the `QuestionAnswerAdvisor`, which retrieves chunks and adds them to the prompt:\n\n```java\n@Service\npublic class HrAssistant {\n    private final ChatClient chatClient;\n\n    public HrAssistant(ChatClient.Builder builder, VectorStore vectorStore) {\n        this.chatClient = builder\n                .defaultSystem(\"\"\"\n                        Answer HR questions using only the provided context.\n                        Cite sources as [source, section]. If the context does not contain\n                        the answer, say: I couldn't find this in the HR policies.\"\"\")\n                .defaultAdvisors(QuestionAnswerAdvisor.builder(vectorStore)\n                        .searchRequest(SearchRequest.builder()\n                                .topK(4)\n                                .similarityThreshold(0.6)\n                                .build())\n                        .build())\n                .build();\n    }\n\n    public String ask(String question) {\n        return chatClient.prompt().user(question).call().content();\n    }\n}\n```\n\n- `topK(4)` – retrieve the 4 closest chunks.\n- `similarityThreshold(0.6)` – ignore chunks that are not similar enough, so an unrelated question retrieves nothing.\n- For per-user permissions, add a `filterExpression` (for example `\"audience == 'all-employees' || team == 'finance'\"`) built from the logged-in user, never from the question text.\n\nSpring AI also offers `RetrievalAugmentationAdvisor` for advanced pipelines (query rewriting, multiple retrievers) – see the Production RAG lesson, AI-11.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Chunks too large (whole documents) | ~300–800 tokens, split at headings, small overlap |\n| Chunks too small (single sentences) | Lose context; \"it\" no longer says what \"it\" is |\n| No metadata | Store source, section, version and access rules with every chunk |\n| Always passing top-k, however irrelevant | Use a similarity threshold; allow \"not found\" |\n| Filtering permissions after generation | Filter **before** retrieval, so forbidden text never reaches the model |\n| Re-ingesting without deleting old chunks | Delete the old version's chunks, or old rules keep being retrieved |\n\n> **⚠️ Common mistake**\n> Blaming the model for wrong answers when retrieval returned the wrong chunks. Always look at what was retrieved first – most RAG bugs are retrieval bugs.\n\n[![When the answer is absent, fluent completion is not a recovery method.](lessons/ai-5-failure.svg)](lessons/ai-5-failure.svg)\n\n## Step 5: Production concerns\n\n- **Evaluate retrieval and answers separately.** Keep 50–100 real questions with the expected source sections. Measure: did retrieval find the right section (recall@4)? Is the answer faithful to it and cited?\n- **Cost and latency:** embedding a question is cheap; the big cost is the chunks in the prompt. 4 chunks × 500 tokens = 2,000 input tokens per question.\n- **Freshness:** re-ingest when a document changes; store a version and delete superseded chunks.\n- **Security:** retrieved documents can contain prompt-injection text. Keep instructions in the system message and never give the model tools it doesn't need.\n\n## Interviewer follow-ups\n\n**How do you choose chunk size?** Start around 500 tokens with ~10% overlap, split on headings, then tune with your evaluation set – too large dilutes relevance, too small loses context.\n\n**How many chunks should you retrieve?** Usually 3–8. More gives more recall but more tokens, cost and distraction.\n\n**What if retrieval misses because the user's words differ from the document's?** Use hybrid search (keyword + vector), query rewriting, or a reranker (AI-11).\n\n**How do you handle permissions?** Store access metadata on each chunk and filter by the authenticated user's groups in the vector search.\n\n**How do you know the answer is grounded?** Require citations, check cited sources were actually retrieved, and evaluate faithfulness on a test set.\n\n## Wrap up\n\nRAG prepares documents once (load, split, embed, store) and, for each question, retrieves permitted chunks and asks the model to answer only from them, with citations.\n\n> **📝 Key takeaways**\n> - RAG = retrieve relevant chunks, then generate from them.\n> - Good chunks and metadata matter more than the model.\n> - Filter by permissions before retrieval; allow \"not found\".\n> - Evaluate retrieval and answer quality separately.\n\n## Going deeper (optional)\n\nThe detailed version versions every chunk so a question always uses the currently published policy, and budgets which chunks fit in the context window.\n\n[![A query uses published source versions from the retrieval index.](lessons/ai-5-flow.svg)](lessons/ai-5-flow.svg)\n\nFurther reading: [Spring AI – Retrieval Augmented Generation](https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html) and [Spring AI – ETL pipeline](https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html).\n\n## Closing answer\n\n\"RAG lets a model answer from our own documents. Offline, I load the documents, split them into chunks of a few hundred tokens at headings, embed them and store them in a vector store with metadata – source, section, version and who may read them. For each question, I embed it, retrieve the top four chunks the user is allowed to see above a similarity threshold, and put them in the prompt as numbered sources with instructions to answer only from them and cite. If nothing relevant is found, the assistant says so. In Spring AI that's the ETL classes plus `QuestionAnswerAdvisor`. I evaluate retrieval recall and answer faithfulness separately on a fixed question set.\"\n"
     }
   ]
 }

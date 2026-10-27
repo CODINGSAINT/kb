@@ -207,103 +207,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Authenticated principal",
+            "id": "user",
+            "label": "Logged-in user",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "conv",
             "label": "Conversation service",
-            "x": 250,
+            "x": 200,
             "y": 0,
-            "w": 200,
+            "w": 190,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
+            "id": "store",
             "label": "Message store",
-            "x": 500,
+            "x": 440,
             "y": 0,
-            "w": 200,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "sel",
+            "label": "Select last 20",
+            "x": 440,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Memory selector",
-            "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "Context budgeter",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
+            "id": "llm",
             "label": "ChatClient",
-            "x": 500,
-            "y": 110,
-            "w": 200,
+            "x": 200,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n6",
-            "label": "Turn journal",
+            "id": "save",
+            "label": "Save new turn",
             "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "owned scope"
+            "from": "user",
+            "to": "conv",
+            "label": "message + chat"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "ordered history"
+            "from": "conv",
+            "to": "store",
+            "label": "load history"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "selects messages"
+            "from": "store",
+            "to": "sel",
+            "label": "messages"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "token bound"
+            "from": "sel",
+            "to": "llm",
+            "label": "history + new message"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "request context"
+            "from": "llm",
+            "to": "save",
+            "label": "reply"
           },
           {
-            "from": "n5",
-            "to": "n6",
-            "label": "completed turn"
+            "from": "save",
+            "to": "store",
+            "label": "append",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain conversation memory for LLM apps: LLMs are stateless, so \"memory\" means deciding what past conversation (and long-term user facts) to send with each request. Cover Spring AI's `ChatMemory`, conversation IDs, persistence, window and summarisation strategies, and managing the context budget.\n\n## Requirements\n\n- Why the model \"forgets\", and where memory actually lives (your app).\n- Short-term (conversation) vs. long-term (user facts, preferences) memory.\n- Spring AI: `ChatMemory`, `MessageWindowChatMemory`, chat memory repositories (in-memory, JDBC, Cassandra, Neo4j), memory advisors.\n- Conversation IDs, multi-user isolation, persistence, retention.\n- Context-window management: windowing, summarisation, retrieval-based memory.\n\n## 1. Selected memory model\n\nI choose tenant/user/conversation-scoped message storage and serialized turns per conversation. Recent complete turns are selected by token budget, with optional versioned summaries for older discussion. The authoritative conversation record stays separate from the prompt window.\n\n## 2. Turn contract and consistency\n\n```text\nPOST /conversations/{id}/turns {requestId,expectedVersion,question}\n -> completedAnswer | conflict | denied | partialFailure\nConversation: tenantId,userId,id,version,retentionPolicy\nMessage: conversationId,sequence,role,content,state,requestId\n```\n\nI resolve the submitted ID against authenticated ownership, acquire the conversation turn lease/version, select bounded history and call the model. Final output and the committed turn are recorded once. Two tabs using version 7 cannot silently append unrelated answers based on the same old history; one conflicts or waits under the chosen serialization policy. A failed stream remains partial, not a successful assistant memory turn.\n\nTen 600-token turns consume roughly 6,000 tokens before instructions/evidence/output. I preserve coherent tool-call/result groups when pruning. Summaries can omit or distort constraints, so allergies, permissions and financial facts belong in typed authoritative state. Deletion invalidates messages, summaries, vectors and relevant caches, rather than only hiding the visible transcript.\n\n## 3. Final design diagram\n\n[![Conversation Memory: Authenticated principal owned scope Conversation service; Conversation service ordered history Message store; Message store selects messages Memory selector; Memory selector token bound Context budgeter; Context budgeter request context ChatClient; ChatClient completed turn Turn journal](designs/ai-9.svg)](designs/ai-9.svg)\n\nA **conversation ID** identifies stored history, a **memory window** selects retained messages, and a **summary** compresses older content with possible information loss. A user's ownership of the conversation must be verified independently of the ID they submit.\n\n## 4. Critical operation: worked execution\n\n![Only selected, owned history enters the model request.](lessons/ai-9-flow.svg)\n\n*Only selected, owned history enters the model request.*\n\n![Conversation scoping is a security decision before the model call.](lessons/ai-9-failure.svg)\n\n*Conversation scoping is a security decision before the model call.*\n\n### Work a context window\n\nTen turns averaging 600 tokens are about 6,000 tokens before system messages, evidence and output reserve. Keeping the last ten **messages** is not the same as the last ten **turns**, and neither directly limits tokens. Budget actual selected context and preserve complete tool-call/result pairs where required.\n\n```text\nStorage scope: tenantId + userId + conversationId\nRequest context: instructions + selected history + question + evidence\nPersisted turn: requestId + sequence + final output + state\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** How can a chat remember prior turns without leaking another user’s conversation or exhausting context?\n\nPersisted conversation history is application state. Each model request includes a selected view of it; provider-side caches do not replace this store. Window memory drops old turns; summaries compress them; retrieval can recover relevant past facts but adds ranking and privacy concerns.\n\n### Architecture and contracts\n\n```text\nAuthenticate conversation ownership -> append user turn -> select bounded history -> model/tool turns -> validate -> append final assistant turn\n\nApplication contracts (design outline):\nConversationKey(tenant,user,conversation); Message(role,body,sequence,toolCallId); MemoryPolicy(maxTokens,retention)\n```\n\nA chat-memory advisor can select and insert messages, but the application must authorize the conversation before invoking it. Use the API matching the pinned Spring AI baseline; newer session APIs have different names.\n\n### Worked reasoning and capacity example\n\nTwenty turns averaging 500 tokens each already consume 10,000 tokens before task instructions, retrieval and output allowance. Summaries should have their own budget and revision, not grow without bound.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord ConversationKey(String tenant, String user, String conversation) {}\ninterface ConversationRepository {\n  java.util.List<String> authorizedHistory(ConversationKey key, int maxTokens);\n}\n// Persist roles/tool-call relationships in the real message schema.\n```\n\n### Design decisions and alternatives\n\nKey memory by tenant plus authenticated user plus conversation, not a user-supplied conversation ID alone. Store raw history separately from derived summaries, with deletion and retention rules for each.\n\n### Failure scenario and safe recovery\n\nTwo tabs append to one conversation concurrently. Sequence or version the append, and build the response against a known history snapshot. A tool result must match the tool call that produced it; dropping one half creates invalid context.\n\n### Security, privacy and provenance\n\nA summary generated by an LLM can turn uncertainty into a false permanent fact. Keep provenance and allow users to correct retained information.\n\n\n**Verification criteria:** Measure cross-user leakage, retained facts, summary drift, context tokens and correctness after truncation. Use adversarial conversations that try to claim another tenant’s identity.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through concurrent turns\n\nTwo tabs send follow-ups to the same conversation simultaneously. Without sequencing, both can answer against the same old history and append in an arbitrary order. Serialize per conversation, use optimistic version checks or explicitly represent branching. Do not pretend arrival timestamps alone define user intent.\n\nA summary can accidentally omit an allergy, a constraint or a quoted negation. Keep critical application facts in typed authoritative state; do not entrust them only to a generated summary. Deletion must consider messages, summaries, vectors and caches under the retention policy.\n\n## 6. Interviewer follow-ups\n\n**Can a conversation ID supplied by the model establish ownership?** No. Resolve it against authenticated application identity.\n\n**Does pruning history change old stored messages?** It need not; prompt selection and storage retention are separate policies.\n\n## 7. Closing answer\n\nConversation memory is application-selected context, not model retraining. I enforce ownership before reading history, order concurrent turns explicitly and keep critical business facts out of lossy summaries. Retention/deletion covers every representation used by the application.\n"
+      "markdown": "## Problem\n\nAsha chats with your support assistant:\n\n> **Asha:** My order 5521 hasn't arrived.\n> **Assistant:** Sorry about that. It's with the courier and due tomorrow.\n> **Asha:** Can you change **its** delivery address?\n\nTo understand \"its\", the model must know about order 5521 from two messages ago. But an LLM remembers nothing between calls. \"Memory\" is something your application builds: deciding which past messages to send again with each request.\n\n## Requirements\n\n- Explain why LLMs are stateless and what chat memory really is.\n- Compare memory strategies: full history, sliding window, summary, and long-term retrieved memory.\n- Keep each user's conversations private and separate.\n- Fit memory into the context window and token budget.\n- Implement it with Spring AI's `ChatMemory` and `MessageChatMemoryAdvisor`.\n\n## Step 1: The idea in plain words\n\nAn LLM API call is like talking to someone with no short-term memory. Every time, you hand them a transcript of the conversation so far, and they reply to the whole transcript.\n\n| Term | Plain meaning |\n| --- | --- |\n| **Stateless** | The model keeps nothing between calls; each request must contain everything. |\n| **Chat memory** | Past messages your app stores and sends again. |\n| **Conversation ID** | The key that groups messages of one conversation (and one user). |\n| **Short-term memory** | Recent messages of this conversation. |\n| **Long-term memory** | Facts kept across conversations (e.g. \"prefers Hindi\"), retrieved when relevant. |\n\n> **🎯 In the interview**\n> Interviewers usually ask: are LLMs stateful; how chat apps remember; what happens when the conversation is longer than the context window; how you keep users' histories separate.\n\n## Step 2: How memory is added to a request: the execution flow\n\n[![Selected design: the authenticated user's conversation service loads messages from the message store; a memory selector keeps the recent turns that fit the token budget; ChatClient sends them with the new message; the reply is saved back as a new turn.](designs/ai-9.svg)](designs/ai-9.svg)\n\nFor every new message:\n\n1. Identify the **conversation** – from the logged-in user and the chat they opened, never from text in the message.\n2. **Load** past messages for that conversation.\n3. **Select** what fits: for example the last 10 messages.\n4. **Send** system prompt + selected history + new message.\n5. **Save** the new user message and the assistant's reply.\n\nWhat the model actually receives for Asha's third message:\n\n```text\nsystem:    You are a support assistant for ShopEasy...\nuser:      My order 5521 hasn't arrived.\nassistant: Sorry about that. It's with the courier and due tomorrow.\nuser:      Can you change its delivery address?\n```\n\nNow \"its\" clearly means order 5521.\n\n![Animation: Asha sends three messages; after each one the application saves the turn; for the third message it loads the earlier turns of the same conversation and sends them with the new question, so the model can resolve \"its\" to order 5521; a different user's conversation is never loaded.](learning-figures/ai-9-memory.gif)\n\n### Choosing a memory strategy\n\n**Option 1: Send the full history.**\n\n- Good: nothing forgotten.\n- Problem: grows without limit – slower, more expensive, and eventually exceeds the context window.\n\n**Option 2: Sliding window – the last N messages.**\n\n- Good: simple, bounded cost.\n- Problem: forgets anything older than N.\n\n**Option 3: Summary + recent messages.**\n\n- Good: keeps the gist of a long chat cheaply.\n- Problem: the summary can lose or distort details; it costs an extra model call.\n\n**Option 4: Long-term memory by retrieval.**\n\n- Good: remembers important facts across sessions by searching stored notes (like RAG over the user's history).\n- Problem: needs a policy for what to store, and users must be able to see and delete it.\n\n> **⚖️ Design choice**\n> For a support chat, a **sliding window of the last 20 messages** is enough. Add a summary only when conversations are long, and long-term memory only with clear user consent.\n\n## Step 3: In code with Spring AI\n\nSpring AI provides `ChatMemory` (what to keep), a `ChatMemoryRepository` (where to store it) and an advisor that adds memory to each request.\n\n```java\n@Configuration\nclass MemoryConfig {\n    @Bean\n    ChatMemory chatMemory(JdbcChatMemoryRepository repository) {   // stored in a database\n        return MessageWindowChatMemory.builder()\n                .chatMemoryRepository(repository)\n                .maxMessages(20)                                   // sliding window\n                .build();\n    }\n}\n```\n\n```java\n@Service\npublic class SupportChat {\n    private final ChatClient chatClient;\n\n    public SupportChat(ChatClient.Builder builder, ChatMemory chatMemory) {\n        this.chatClient = builder\n                .defaultSystem(\"You are a support assistant for ShopEasy.\")\n                .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())\n                .build();\n    }\n\n    public String reply(String userId, String chatId, String message) {\n        String conversationId = userId + \":\" + chatId;             // scoped to the user\n        return chatClient.prompt()\n                .user(message)\n                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))\n                .call()\n                .content();\n    }\n}\n```\n\n- `MessageWindowChatMemory` keeps the last 20 messages per conversation.\n- `JdbcChatMemoryRepository` stores them in a database, so memory survives restarts and works across many app instances. (`InMemoryChatMemoryRepository` is fine for demos.)\n- `MessageChatMemoryAdvisor` loads the history before the call and saves both messages after it.\n- `userId` comes from the authenticated session, not from the request body.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Keeping memory in a `HashMap` in one server | A shared repository (JDBC, Redis, Cassandra) – the next request may hit another instance |\n| Conversation ID taken from the client | Derive it from the authenticated user + their chat |\n| Unbounded history | Window, summary or token-based trimming |\n| Storing secrets or card numbers in memory | Redact before saving; set retention limits |\n| Treating memory as facts | The model's earlier replies can be wrong – re-check important facts against the system of record |\n\n> **⚠️ Common mistake**\n> Using a guessable conversation ID such as the chat number alone. Another user could send that ID and read Asha's history. Scope every lookup to the authenticated user.\n\n[![Conversation scoping is a security decision before the model call.](lessons/ai-9-failure.svg)](lessons/ai-9-failure.svg)\n\n## Step 5: Production concerns\n\n- **Token budget:** 20 messages × ~80 tokens = 1,600 tokens per request, paid every turn. Trim long messages and old tool outputs.\n- **Retention and privacy:** delete conversations after a set period; let users clear history.\n- **Summaries:** if you summarise, store the summary with the conversation and note it may be imperfect.\n- **Testing:** test that conversation A never sees B's messages, and that the window drops the oldest messages correctly.\n\n## Interviewer follow-ups\n\n**Does ChatGPT \"remember\" me?** Within a chat, the app resends history. Across chats, products add a separate long-term memory that stores facts and retrieves them – the model itself still learns nothing.\n\n**What happens when the history exceeds the context window?** The request fails or is truncated, so trim first: window, summarise older turns, or retrieve only relevant past messages.\n\n**Sliding window by messages or by tokens?** Tokens are more accurate – one pasted log can be 5,000 tokens. Many systems keep a token budget and drop the oldest messages until it fits.\n\n**How does memory interact with RAG?** Both add text to the prompt; they compete for the same token budget. Budget each part explicitly.\n\n## Wrap up\n\nLLMs are stateless; chat memory is your application storing past messages and choosing which to send again, scoped to the right user and kept within a budget.\n\n> **📝 Key takeaways**\n> - Every request must carry the history the model needs.\n> - Sliding window for most chats; summaries or retrieval for long ones.\n> - Store memory in a shared repository, keyed by an authenticated conversation ID.\n> - Budget tokens and set retention rules.\n\n## Going deeper (optional)\n\nThe detailed version selects only owned, relevant history into the request and journals each turn so a retry does not save the same message twice.\n\n[![Only selected, owned history enters the model request.](lessons/ai-9-flow.svg)](lessons/ai-9-flow.svg)\n\nFurther reading: [Spring AI – Chat Memory](https://docs.spring.io/spring-ai/reference/api/chat-memory.html).\n\n## Closing answer\n\n\"LLMs are stateless – each call must contain everything the model should consider – so chat memory is an application feature. For every message I derive the conversation ID from the authenticated user and their chat, load the stored history, keep what fits the budget – usually a sliding window of the last 20 messages, or a summary plus recent messages for long chats – send it with the new message, and save both sides afterwards. In Spring AI that's `MessageWindowChatMemory` with a JDBC repository and `MessageChatMemoryAdvisor`, passing the conversation ID as an advisor parameter. I keep memory in a shared store, redact sensitive data, set retention, and never trust a conversation ID from the client.\"\n"
     }
   ]
 }

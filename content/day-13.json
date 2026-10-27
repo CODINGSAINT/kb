@@ -215,108 +215,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "User request",
+            "id": "user",
+            "label": "Asha's question",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Model proposal",
-            "x": 250,
+            "id": "llm",
+            "label": "Model",
+            "x": 200,
             "y": 0,
-            "w": 200,
+            "w": 110,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Tool policy",
-            "x": 500,
+            "id": "app",
+            "label": "Spring AI tool loop",
+            "x": 360,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Authorized order service",
+            "id": "pol",
+            "label": "Check user owns order",
+            "x": 360,
+            "y": 130,
+            "w": 190,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "svc",
+            "label": "Order service + DB",
+            "x": 160,
+            "y": 130,
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "ans",
+            "label": "Final answer",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "Order database",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Typed tool result",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Final response",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 130,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "intent"
+            "from": "user",
+            "to": "llm",
+            "label": "question + tool list"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "name arguments"
+            "from": "llm",
+            "to": "app",
+            "label": "tool call JSON"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "allowed call"
+            "from": "app",
+            "to": "pol",
+            "label": "authorise"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "current facts"
+            "from": "pol",
+            "to": "svc",
+            "label": "run method"
           },
           {
-            "from": "n3",
-            "to": "n5",
-            "label": "minimal fields"
+            "from": "svc",
+            "to": "llm",
+            "label": "typed result",
+            "dashed": true
           },
           {
-            "from": "n5",
-            "to": "n1",
-            "label": "observation"
-          },
-          {
-            "from": "n1",
-            "to": "n6",
-            "label": "grounded explanation"
+            "from": "llm",
+            "to": "ans",
+            "label": "text"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain tool (function) calling: how an LLM requests the execution of your code with structured arguments, how the application runs the tool and feeds the result back, how Spring AI exposes Java methods as tools (`@Tool`, `ToolCallback`, `ToolContext`), and how to make tool use safe in an enterprise (authorisation, validation, side effects).\n\n## Requirements\n\n- The tool-calling loop: the model returns `tool_calls`, the app executes, a tool result message goes back, the model writes the final answer.\n- Defining tools in Spring AI: `@Tool` methods, `@ToolParam` descriptions, `.tools(...)` / `defaultTools`.\n- Passing hidden context (user identity) with `ToolContext`.\n- Read vs. write tools, confirmations, idempotency, errors and timeouts.\n- Security: least privilege, never trusting model-supplied arguments blindly.\n\n## 1. Selected tool and authority boundary\n\nI implement a read-only order-status assistant. The model sees a schema for `lookupOrder(orderId)` and can propose it; the application checks the current principal's access before the order service reads data. Identity is application-owned and is not an argument the model can override.\n\n## 2. Spring boundary and flow\n\n```java\nimport org.springframework.ai.tool.annotation.Tool;\nfinal class OrderTools {\n    private final AuthorizedOrderLookup orders;\n    OrderTools(AuthorizedOrderLookup orders) { this.orders = orders; }\n    @Tool(description=\"Read status of an order authorized for the current user\")\n    public OrderStatus lookupOrder(String orderId) {\n        return orders.lookupForCurrentPrincipal(orderId);\n    }\n}\n// Registered on the selected ChatClient request using .tools(orderTools).\n```\n\nThe service validates ID format, ownership, deadline and result bounds. O123 for its owner returns current status evidence; O999 belonging to someone else returns denial without private fields. A timeout is a typed unavailable result, not permission for the model to invent delivery status. Verified identity is explicitly propagated/bound in asynchronous execution rather than assuming thread-local security survives every boundary.\n\nA refund extension would use a separate tool with current eligibility, amount/currency checks, stable refund identity and the product's approval rule. Repeated invocation returns the recorded operation; provider uncertainty is reconciled before another effect. Tool results remain untrusted external data for instruction purposes and cannot expand the caller's authority.\n\n## 3. Final design diagram\n\n[![Tool Calling / Function Calling: User request intent Model proposal; Model proposal name arguments Tool policy; Tool policy allowed call Authorized order service; Authorized order service current facts Order database; Authorized order service minimal fields Typed tool result; Typed tool result observation Model proposal; Model proposal grounded explanation Final response](designs/ai-13.svg)](designs/ai-13.svg)\n\nI start with a read-only lookup. Do not expose a general SQL executor or arbitrary HTTP client when one narrow domain operation meets the need. A tool description improves selection; it is not an authorization rule.\n\n## 4. Critical operation: worked execution\n\n![Authenticated application identity governs access to model-proposed arguments.](lessons/ai-13-flow.svg)\n\n*Authenticated application identity governs access to model-proposed arguments.*\n\n![Resource authorization runs even when arguments look syntactically valid.](lessons/ai-13-failure.svg)\n\n*Resource authorization runs even when arguments look syntactically valid.*\n\n### Define the narrow boundary\n\n```java\nimport org.springframework.ai.tool.annotation.Tool;\n\n// Integration excerpt: authorizedOrders enforces identity outside model arguments.\nfinal class OrderTools {\n    private final AuthorizedOrderLookup authorizedOrders;\n    OrderTools(AuthorizedOrderLookup lookup) { this.authorizedOrders = lookup; }\n    @Tool(description = \"Read the current user's authorized order status\")\n    OrderStatus lookupOrder(String orderId) {\n        return authorizedOrders.lookupForCurrentPrincipal(orderId);\n    }\n}\n```\n\nThe model does not get to supply `isAdmin=true` or choose another principal. In asynchronous work, propagate or explicitly bind the verified principal through an application-owned context; do not rely on a thread-local surviving arbitrary executor changes.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** How can an assistant look up a live order without being allowed to act on arbitrary accounts?\n\nThe model proposes a tool name and arguments. The application validates schema, derives authenticated identity, authorizes the resource and executes the tool. Tool result text returns as untrusted data for a later model step; the model never becomes the security principal.\n\n### Architecture and contracts\n\n```text\nModel proposes call -> allow-list -> parse/validate -> authorize with server identity -> operation ledger -> execute -> bounded result -> model continuation\n\nApplication contracts (design outline):\nOrderLookup(orderId); ToolContext(tenant,user,requestId); ToolResult(status,data,errorCode)\n```\n\nSpring AI @Tool can expose a narrow method and .tools(instance) can register it for a request. Wrap it in application authorization and bound the result; never expose a generic SQL or shell execution tool to this assistant.\n\n### Worked reasoning and capacity example\n\nA loop with at most four model steps and two tools per step can still request eight side effects. Bound tool count, elapsed time, output bytes and spend independently, not just recursion depth.\n\n### Java and Spring AI implementation outline\n\n```java\nfinal class OrderTools {\n  private final AuthorizedOrders orders;\n  OrderTools(AuthorizedOrders orders) { this.orders = orders; }\n  @org.springframework.ai.tool.annotation.Tool(description=\"Read one authorized order status\")\n  String status(String orderId) { return orders.statusForCurrentPrincipal(orderId); }\n}\n// AuthorizedOrders is an application port, not a model-provided identity.\n```\n\n### Design decisions and alternatives\n\nI begin with read-only lookup tools. Side effects need operation IDs and a review/confirmation policy appropriate to the action. Descriptions should explain inputs and output semantics but cannot grant permissions.\n\n### Failure scenario and safe recovery\n\nA malicious user asks for another account’s order and provides a plausible userId argument. The tool ignores model-supplied identity and checks order ownership using the authenticated context.\n\n### Security, privacy and provenance\n\nA read-only label is descriptive metadata. Enforce read-only behavior in the implementation and database credentials.\n\n\n**Verification criteria:** Task success, correct tool selection, unauthorized attempts blocked, argument validity, duplicate effects and tool latency/error classification.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through write tools\n\nA refund tool needs stronger handling than a status lookup: validate amount, eligibility, current state, operation identity and required user review. Persist intent and reconcile provider uncertainty. A model retry after a lost response must not create another refund.\n\nLimit tool count, payload size and duration. Validate tool results before sending them back; external results can contain instructions and should remain data. For the pinned 1.1 API family, use its documented execution behaviour rather than copying a newer-version advisor loop without verification.\n\n## 6. Interviewer follow-ups\n\n**Does `@Tool` make a method safe?** No. It exposes a callable contract; domain authorization and validation remain necessary.\n\n**Should tools return raw database rows?** Return minimal typed data needed for the task, excluding secrets and unrelated personal fields.\n\n## 7. Closing answer\n\nTool calling separates language intent from deterministic execution. I expose a narrow authorized order lookup, validate every proposed call and return minimal typed evidence. Write tools add explicit eligibility, operation identity and review policy; model arguments never become permission.\n"
+      "markdown": "## Problem\n\nAsha asks the ShopEasy assistant: **\"Where is my order 5521, and can you cancel it if it hasn't shipped?\"**\n\nThe model doesn't know order statuses – they're in your order database – and it can't cancel anything by itself. **Tool calling** lets the model ask your application to run a specific Java method with specific arguments, then use the result in its answer.\n\n## Requirements\n\n- Explain how tool (function) calling works, step by step.\n- Describe tools well: name, description, typed parameters.\n- Implement tools with Spring AI's `@Tool` and pass them to `ChatClient`.\n- Authorise every tool call with the logged-in user, not with model-supplied text.\n- Handle errors, limits and actions that need confirmation.\n\n## Step 1: The idea in plain words\n\nThe model can't run code. But it can **reply with a request**: \"please call `getOrderStatus` with `orderId = 5521`\". Your app runs the method, sends back the result, and the model continues.\n\nThink of the model as a smart assistant on the phone who can't touch the computer. It tells you which screen to open and what to type; you do it and read the result back.\n\n| Term | Plain meaning |\n| --- | --- |\n| **Tool** | A function your app offers the model, with a name, description and parameter schema. |\n| **Tool call** | The model's structured request to run a tool with arguments (JSON). |\n| **Tool result** | What your app returns after running it. |\n| **Tool loop** | Call model → run tools → call model again, until it gives a final answer. |\n\n> **🎯 In the interview**\n> Interviewers usually ask: how tool calling works under the hood; who executes the tool; how the model chooses a tool; how you secure tools; tool calling vs RAG.\n\n## Step 2: How a tool call works: the execution loop\n\n[![Selected design: Asha's question and the tool list go to the model, which replies with a tool call; Spring AI's tool loop checks that the user owns the order, runs the order service method and returns a typed result, and the model writes the final answer.](designs/ai-13.svg)](designs/ai-13.svg)\n\n1. Your app sends the question **plus the list of tools** (names, descriptions, JSON schemas).\n2. The model replies not with text but with a tool call: `getOrderStatus({\"orderId\": \"5521\"})`.\n3. Your app checks the call is allowed, runs the Java method, and gets `{\"status\": \"PACKED\", \"shipped\": false}`.\n4. Your app sends the result back to the model.\n5. The model may call another tool – `cancelOrder({\"orderId\": \"5521\"})` – or write the final answer.\n6. Final answer: *\"Order 5521 is packed but not shipped yet, so I've cancelled it. You'll get a refund in 3–5 days.\"*\n\n![Animation: Asha asks about order 5521; the model proposes getOrderStatus; the application checks the order belongs to Asha and returns packed, not shipped; the model proposes cancelOrder; the application runs it after the policy check; the model writes the final answer.](learning-figures/ai-13-loop.gif)\n\n> **⚖️ Design choice**\n> The model **proposes**; your application **decides and executes**. Every tool call goes through the same permission checks as a button in your app would.\n\n## Step 3: In code with Spring AI\n\n**Define tools** as annotated methods:\n\n```java\n@Component\npublic class OrderTools {\n    private final OrderService orders;\n\n    public OrderTools(OrderService orders) { this.orders = orders; }\n\n    @Tool(description = \"Get the status of one of the current user's orders\")\n    public OrderStatus getOrderStatus(\n            @ToolParam(description = \"Order number, e.g. 5521\") String orderId,\n            ToolContext context) {\n        String userId = (String) context.getContext().get(\"userId\");   // from the session\n        return orders.statusFor(userId, orderId);    // throws if the order isn't the user's\n    }\n\n    @Tool(description = \"Cancel one of the current user's orders if it has not shipped\")\n    public CancelResult cancelOrder(@ToolParam(description = \"Order number\") String orderId,\n                                    ToolContext context) {\n        String userId = (String) context.getContext().get(\"userId\");\n        return orders.cancelIfNotShipped(userId, orderId);\n    }\n\n    public record OrderStatus(String orderId, String status, boolean shipped) {}\n    public record CancelResult(String orderId, boolean cancelled, String reason) {}\n}\n```\n\n**Use them in a call:**\n\n```java\nString answer = chatClient.prompt()\n        .user(\"Where is my order 5521, and cancel it if it hasn't shipped\")\n        .tools(orderTools)                                   // offer these tools\n        .toolContext(Map.of(\"userId\", currentUser.id()))     // trusted data, not shown to the model\n        .call()\n        .content();\n```\n\n- Spring AI builds the JSON schema from the method signature and descriptions.\n- It runs the **tool loop** for you: when the model asks for a tool, Spring AI calls the method and sends the result back.\n- `ToolContext` carries trusted values like the user ID; the model never sees or sets them.\n- Exceptions in a tool are turned into an error message for the model by default; you can customise this.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Tool takes `userId` as a parameter the model fills in | Get the user from `ToolContext` / the security context |\n| Vague descriptions (\"handles orders\") | Say exactly what it does, when to use it, and parameter formats |\n| One giant tool `runSql(query)` | Small, specific tools with typed parameters |\n| Dangerous actions run immediately | Ask the user to confirm refunds, payments, deletions |\n| Returning huge results | Return only the fields the model needs |\n| No limit on tool calls | Cap the number of tool calls per request |\n\n> **⚠️ Common mistake**\n> Trusting arguments because they are valid JSON. `{\"orderId\": \"7710\"}` is perfectly formed – and may be Bilal's order. Authorisation happens in your service, using the authenticated user.\n\n[![Resource authorization runs even when arguments look syntactically valid.](lessons/ai-13-failure.svg)](lessons/ai-13-failure.svg)\n\n## Step 5: Production concerns\n\n- **Confirmation for side effects:** let the model *prepare* an action (\"I can cancel order 5521 – shall I?\") and execute only after the user clicks Confirm.\n- **Idempotency:** a retried model turn can call `cancelOrder` twice; make the service idempotent.\n- **Latency and cost:** each tool round trip is another model call. Two tools = three model calls.\n- **Observability:** log tool name, arguments (redacted), result status and duration for every call.\n- **Testing:** test tools as plain Java; test the conversation with a fake model that emits specific tool calls.\n\n## Interviewer follow-ups\n\n**Who actually executes the tool?** Your application. The model only produces a structured request.\n\n**How does the model choose a tool?** From the names, descriptions and schemas you send, plus the conversation. Good descriptions matter a lot.\n\n**Tool calling vs RAG?** RAG adds documents before the call; tools let the model fetch live data or take actions during the call. Many assistants use both.\n\n**What if the model calls a tool that doesn't exist or with bad arguments?** Spring AI rejects unknown tools; validate arguments in your method and return a clear error so the model can correct itself.\n\n**How do you stop tool loops?** Cap the number of iterations and the total time; return a graceful message when the cap is hit.\n\n## Wrap up\n\nThe model proposes tool calls as structured JSON; your application authorises them with the real user, runs them, and returns typed results until the model can answer.\n\n> **📝 Key takeaways**\n> - Tools = name + description + schema; the model asks, your app executes.\n> - `@Tool` methods and `.tools(...)` in Spring AI; the tool loop is automatic.\n> - Take identity from `ToolContext`, never from model arguments.\n> - Confirm side effects, make them idempotent, and cap tool calls.\n\n## Going deeper (optional)\n\nThe detailed version shows the application's identity governing every model-proposed argument, and how typed results keep the model from misreading tool output.\n\n[![Authenticated application identity governs access to model-proposed arguments.](lessons/ai-13-flow.svg)](lessons/ai-13-flow.svg)\n\nFurther reading: [Spring AI – Tool calling](https://docs.spring.io/spring-ai/reference/api/tools.html).\n\n## Closing answer\n\n\"With tool calling, I send the model the question plus a list of tools – names, descriptions and JSON schemas. Instead of text, the model can reply with a tool call such as `getOrderStatus` with order 5521; my application validates and runs it, sends the result back, and the model either calls another tool or writes the final answer. In Spring AI I annotate methods with `@Tool` and `@ToolParam`, pass them with `.tools(...)`, and Spring AI runs the loop. The model only proposes: I take the user's identity from `ToolContext`, authorise every call in the service, ask for confirmation before side effects, make actions idempotent, and cap the number of tool calls.\"\n"
     }
   ]
 }

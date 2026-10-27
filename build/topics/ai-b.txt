@@ -230,709 +230,878 @@ The detailed version uses a strict converter that rejects unknown or missing key
 "I model the target as a Java record with `BigDecimal` money, enums for fixed choices, nullable fields for facts that may be missing, and an evidence quote. With Spring AI I call `chatClient.prompt()...call().entity(ExpenseDraft.class)`; a `BeanOutputConverter` adds a JSON schema to the prompt and parses the reply, and `responseEntity` gives me the finish reason and usage too. Parsing only proves the shape, so I validate business rules in Java – total equals quantity times price, merchant and quote appear in the receipt. A parse error or truncated output gets one retry with the original input; validation issues go to human review. Where the provider supports it, native JSON-schema mode reduces format errors, but validation stays."
 
 === AI 9 ===
-N|n0|Authenticated principal|0|0|200|rect
-N|n1|Conversation service|250|0|200|rect
-N|n2|Message store|500|0|200|rect
-N|n3|Memory selector|0|110|200|rect
-N|n4|Context budgeter|250|110|200|rect
-N|n5|ChatClient|500|110|200|rect
-N|n6|Turn journal|0|220|200|rect
-E|n0|n1|owned scope
-E|n1|n2|ordered history
-E|n2|n3|selects messages
-E|n3|n4|token bound
-E|n4|n5|request context
-E|n5|n6|completed turn
+N|user|Logged-in user|0|0|150|rect
+N|conv|Conversation service|200|0|190|rect
+N|store|Message store|440|0|150|cylinder
+N|sel|Select last 20|440|130|150|rect
+N|llm|ChatClient|200|130|140|rect
+N|save|Save new turn|0|130|140|rect
+E|user|conv|message + chat
+E|conv|store|load history
+E|store|sel|messages
+E|sel|llm|history + new message
+E|llm|save|reply
+E|save|store|append|dashed
 ---
 ## Problem
 
-Explain conversation memory for LLM apps: LLMs are stateless, so "memory" means deciding what past conversation (and long-term user facts) to send with each request. Cover Spring AI's `ChatMemory`, conversation IDs, persistence, window and summarisation strategies, and managing the context budget.
+Asha chats with your support assistant:
+
+> **Asha:** My order 5521 hasn't arrived.
+> **Assistant:** Sorry about that. It's with the courier and due tomorrow.
+> **Asha:** Can you change **its** delivery address?
+
+To understand "its", the model must know about order 5521 from two messages ago. But an LLM remembers nothing between calls. "Memory" is something your application builds: deciding which past messages to send again with each request.
 
 ## Requirements
 
-- Why the model "forgets", and where memory actually lives (your app).
-- Short-term (conversation) vs. long-term (user facts, preferences) memory.
-- Spring AI: `ChatMemory`, `MessageWindowChatMemory`, chat memory repositories (in-memory, JDBC, Cassandra, Neo4j), memory advisors.
-- Conversation IDs, multi-user isolation, persistence, retention.
-- Context-window management: windowing, summarisation, retrieval-based memory.
+- Explain why LLMs are stateless and what chat memory really is.
+- Compare memory strategies: full history, sliding window, summary, and long-term retrieved memory.
+- Keep each user's conversations private and separate.
+- Fit memory into the context window and token budget.
+- Implement it with Spring AI's `ChatMemory` and `MessageChatMemoryAdvisor`.
 
-## 1. Selected memory model
+## Step 1: The idea in plain words
 
-I choose tenant/user/conversation-scoped message storage and serialized turns per conversation. Recent complete turns are selected by token budget, with optional versioned summaries for older discussion. The authoritative conversation record stays separate from the prompt window.
+An LLM API call is like talking to someone with no short-term memory. Every time, you hand them a transcript of the conversation so far, and they reply to the whole transcript.
 
-## 2. Turn contract and consistency
+| Term | Plain meaning |
+| --- | --- |
+| **Stateless** | The model keeps nothing between calls; each request must contain everything. |
+| **Chat memory** | Past messages your app stores and sends again. |
+| **Conversation ID** | The key that groups messages of one conversation (and one user). |
+| **Short-term memory** | Recent messages of this conversation. |
+| **Long-term memory** | Facts kept across conversations (e.g. "prefers Hindi"), retrieved when relevant. |
 
-```text
-POST /conversations/{id}/turns {requestId,expectedVersion,question}
- -> completedAnswer | conflict | denied | partialFailure
-Conversation: tenantId,userId,id,version,retentionPolicy
-Message: conversationId,sequence,role,content,state,requestId
-```
+> **🎯 In the interview**
+> Interviewers usually ask: are LLMs stateful; how chat apps remember; what happens when the conversation is longer than the context window; how you keep users' histories separate.
 
-I resolve the submitted ID against authenticated ownership, acquire the conversation turn lease/version, select bounded history and call the model. Final output and the committed turn are recorded once. Two tabs using version 7 cannot silently append unrelated answers based on the same old history; one conflicts or waits under the chosen serialization policy. A failed stream remains partial, not a successful assistant memory turn.
+## Step 2: How memory is added to a request: the execution flow
 
-Ten 600-token turns consume roughly 6,000 tokens before instructions/evidence/output. I preserve coherent tool-call/result groups when pruning. Summaries can omit or distort constraints, so allergies, permissions and financial facts belong in typed authoritative state. Deletion invalidates messages, summaries, vectors and relevant caches, rather than only hiding the visible transcript.
+[![Selected design: the authenticated user's conversation service loads messages from the message store; a memory selector keeps the recent turns that fit the token budget; ChatClient sends them with the new message; the reply is saved back as a new turn.](designs/ai-9.svg)](designs/ai-9.svg)
 
-## 3. Final design diagram
+For every new message:
 
-[![Conversation Memory: Authenticated principal owned scope Conversation service; Conversation service ordered history Message store; Message store selects messages Memory selector; Memory selector token bound Context budgeter; Context budgeter request context ChatClient; ChatClient completed turn Turn journal](designs/ai-9.svg)](designs/ai-9.svg)
+1. Identify the **conversation** – from the logged-in user and the chat they opened, never from text in the message.
+2. **Load** past messages for that conversation.
+3. **Select** what fits: for example the last 10 messages.
+4. **Send** system prompt + selected history + new message.
+5. **Save** the new user message and the assistant's reply.
 
-A **conversation ID** identifies stored history, a **memory window** selects retained messages, and a **summary** compresses older content with possible information loss. A user's ownership of the conversation must be verified independently of the ID they submit.
-
-## 4. Critical operation: worked execution
-
-![Only selected, owned history enters the model request.](lessons/ai-9-flow.svg)
-
-*Only selected, owned history enters the model request.*
-
-![Conversation scoping is a security decision before the model call.](lessons/ai-9-failure.svg)
-
-*Conversation scoping is a security decision before the model call.*
-
-### Work a context window
-
-Ten turns averaging 600 tokens are about 6,000 tokens before system messages, evidence and output reserve. Keeping the last ten **messages** is not the same as the last ten **turns**, and neither directly limits tokens. Budget actual selected context and preserve complete tool-call/result pairs where required.
+What the model actually receives for Asha's third message:
 
 ```text
-Storage scope: tenantId + userId + conversationId
-Request context: instructions + selected history + question + evidence
-Persisted turn: requestId + sequence + final output + state
+system:    You are a support assistant for ShopEasy...
+user:      My order 5521 hasn't arrived.
+assistant: Sorry about that. It's with the courier and due tomorrow.
+user:      Can you change its delivery address?
 ```
 
-## 5. Detailed decisions, algorithms and failure behaviour
+Now "its" clearly means order 5521.
 
-### Mechanism and rationale
+![Animation: Asha sends three messages; after each one the application saves the turn; for the third message it loads the earlier turns of the same conversation and sends them with the new question, so the model can resolve "its" to order 5521; a different user's conversation is never loaded.](learning-figures/ai-9-memory.gif)
 
-**Design question:** How can a chat remember prior turns without leaking another user’s conversation or exhausting context?
+### Choosing a memory strategy
 
-Persisted conversation history is application state. Each model request includes a selected view of it; provider-side caches do not replace this store. Window memory drops old turns; summaries compress them; retrieval can recover relevant past facts but adds ranking and privacy concerns.
+**Option 1: Send the full history.**
 
-### Architecture and contracts
+- Good: nothing forgotten.
+- Problem: grows without limit – slower, more expensive, and eventually exceeds the context window.
 
-```text
-Authenticate conversation ownership -> append user turn -> select bounded history -> model/tool turns -> validate -> append final assistant turn
+**Option 2: Sliding window – the last N messages.**
 
-Application contracts (design outline):
-ConversationKey(tenant,user,conversation); Message(role,body,sequence,toolCallId); MemoryPolicy(maxTokens,retention)
-```
+- Good: simple, bounded cost.
+- Problem: forgets anything older than N.
 
-A chat-memory advisor can select and insert messages, but the application must authorize the conversation before invoking it. Use the API matching the pinned Spring AI baseline; newer session APIs have different names.
+**Option 3: Summary + recent messages.**
 
-### Worked reasoning and capacity example
+- Good: keeps the gist of a long chat cheaply.
+- Problem: the summary can lose or distort details; it costs an extra model call.
 
-Twenty turns averaging 500 tokens each already consume 10,000 tokens before task instructions, retrieval and output allowance. Summaries should have their own budget and revision, not grow without bound.
+**Option 4: Long-term memory by retrieval.**
 
-### Java and Spring AI implementation outline
+- Good: remembers important facts across sessions by searching stored notes (like RAG over the user's history).
+- Problem: needs a policy for what to store, and users must be able to see and delete it.
+
+> **⚖️ Design choice**
+> For a support chat, a **sliding window of the last 20 messages** is enough. Add a summary only when conversations are long, and long-term memory only with clear user consent.
+
+## Step 3: In code with Spring AI
+
+Spring AI provides `ChatMemory` (what to keep), a `ChatMemoryRepository` (where to store it) and an advisor that adds memory to each request.
 
 ```java
-record ConversationKey(String tenant, String user, String conversation) {}
-interface ConversationRepository {
-  java.util.List<String> authorizedHistory(ConversationKey key, int maxTokens);
+@Configuration
+class MemoryConfig {
+    @Bean
+    ChatMemory chatMemory(JdbcChatMemoryRepository repository) {   // stored in a database
+        return MessageWindowChatMemory.builder()
+                .chatMemoryRepository(repository)
+                .maxMessages(20)                                   // sliding window
+                .build();
+    }
 }
-// Persist roles/tool-call relationships in the real message schema.
 ```
 
-### Design decisions and alternatives
+```java
+@Service
+public class SupportChat {
+    private final ChatClient chatClient;
 
-Key memory by tenant plus authenticated user plus conversation, not a user-supplied conversation ID alone. Store raw history separately from derived summaries, with deletion and retention rules for each.
+    public SupportChat(ChatClient.Builder builder, ChatMemory chatMemory) {
+        this.chatClient = builder
+                .defaultSystem("You are a support assistant for ShopEasy.")
+                .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+                .build();
+    }
 
-### Failure scenario and safe recovery
+    public String reply(String userId, String chatId, String message) {
+        String conversationId = userId + ":" + chatId;             // scoped to the user
+        return chatClient.prompt()
+                .user(message)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+                .call()
+                .content();
+    }
+}
+```
 
-Two tabs append to one conversation concurrently. Sequence or version the append, and build the response against a known history snapshot. A tool result must match the tool call that produced it; dropping one half creates invalid context.
+- `MessageWindowChatMemory` keeps the last 20 messages per conversation.
+- `JdbcChatMemoryRepository` stores them in a database, so memory survives restarts and works across many app instances. (`InMemoryChatMemoryRepository` is fine for demos.)
+- `MessageChatMemoryAdvisor` loads the history before the call and saves both messages after it.
+- `userId` comes from the authenticated session, not from the request body.
 
-### Security, privacy and provenance
+## Step 4: Common mistakes
 
-A summary generated by an LLM can turn uncertainty into a false permanent fact. Keep provenance and allow users to correct retained information.
+| Mistake | Better |
+| --- | --- |
+| Keeping memory in a `HashMap` in one server | A shared repository (JDBC, Redis, Cassandra) – the next request may hit another instance |
+| Conversation ID taken from the client | Derive it from the authenticated user + their chat |
+| Unbounded history | Window, summary or token-based trimming |
+| Storing secrets or card numbers in memory | Redact before saving; set retention limits |
+| Treating memory as facts | The model's earlier replies can be wrong – re-check important facts against the system of record |
 
+> **⚠️ Common mistake**
+> Using a guessable conversation ID such as the chat number alone. Another user could send that ID and read Asha's history. Scope every lookup to the authenticated user.
 
-**Verification criteria:** Measure cross-user leakage, retained facts, summary drift, context tokens and correctness after truncation. Use adversarial conversations that try to claim another tenant’s identity.
+[![Conversation scoping is a security decision before the model call.](lessons/ai-9-failure.svg)](lessons/ai-9-failure.svg)
 
-### Further reading
+## Step 5: Production concerns
 
-- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
-- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
-- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
-- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+- **Token budget:** 20 messages × ~80 tokens = 1,600 tokens per request, paid every turn. Trim long messages and old tool outputs.
+- **Retention and privacy:** delete conversations after a set period; let users clear history.
+- **Summaries:** if you summarise, store the summary with the conversation and note it may be imperfect.
+- **Testing:** test that conversation A never sees B's messages, and that the window drops the oldest messages correctly.
 
-### Work through concurrent turns
+## Interviewer follow-ups
 
-Two tabs send follow-ups to the same conversation simultaneously. Without sequencing, both can answer against the same old history and append in an arbitrary order. Serialize per conversation, use optimistic version checks or explicitly represent branching. Do not pretend arrival timestamps alone define user intent.
+**Does ChatGPT "remember" me?** Within a chat, the app resends history. Across chats, products add a separate long-term memory that stores facts and retrieves them – the model itself still learns nothing.
 
-A summary can accidentally omit an allergy, a constraint or a quoted negation. Keep critical application facts in typed authoritative state; do not entrust them only to a generated summary. Deletion must consider messages, summaries, vectors and caches under the retention policy.
+**What happens when the history exceeds the context window?** The request fails or is truncated, so trim first: window, summarise older turns, or retrieve only relevant past messages.
 
-## 6. Interviewer follow-ups
+**Sliding window by messages or by tokens?** Tokens are more accurate – one pasted log can be 5,000 tokens. Many systems keep a token budget and drop the oldest messages until it fits.
 
-**Can a conversation ID supplied by the model establish ownership?** No. Resolve it against authenticated application identity.
+**How does memory interact with RAG?** Both add text to the prompt; they compete for the same token budget. Budget each part explicitly.
 
-**Does pruning history change old stored messages?** It need not; prompt selection and storage retention are separate policies.
+## Wrap up
 
-## 7. Closing answer
+LLMs are stateless; chat memory is your application storing past messages and choosing which to send again, scoped to the right user and kept within a budget.
 
-Conversation memory is application-selected context, not model retraining. I enforce ownership before reading history, order concurrent turns explicitly and keep critical business facts out of lossy summaries. Retention/deletion covers every representation used by the application.
+> **📝 Key takeaways**
+> - Every request must carry the history the model needs.
+> - Sliding window for most chats; summaries or retrieval for long ones.
+> - Store memory in a shared repository, keyed by an authenticated conversation ID.
+> - Budget tokens and set retention rules.
+
+## Going deeper (optional)
+
+The detailed version selects only owned, relevant history into the request and journals each turn so a retry does not save the same message twice.
+
+[![Only selected, owned history enters the model request.](lessons/ai-9-flow.svg)](lessons/ai-9-flow.svg)
+
+Further reading: [Spring AI – Chat Memory](https://docs.spring.io/spring-ai/reference/api/chat-memory.html).
+
+## Closing answer
+
+"LLMs are stateless – each call must contain everything the model should consider – so chat memory is an application feature. For every message I derive the conversation ID from the authenticated user and their chat, load the stored history, keep what fits the budget – usually a sliding window of the last 20 messages, or a summary plus recent messages for long chats – send it with the new message, and save both sides afterwards. In Spring AI that's `MessageWindowChatMemory` with a JDBC repository and `MessageChatMemoryAdvisor`, passing the conversation ID as an advisor parameter. I keep memory in a shared store, redact sensitive data, set retention, and never trust a conversation ID from the client."
 
 === AI 10 ===
-N|n0|Source registry|0|0|200|rect
-N|n1|Embedding pipeline|250|0|200|rect
-N|n2|Versioned vector index|500|0|200|rect
-N|n3|Metadata filters|0|110|200|rect
-N|n4|Query service|250|110|200|rect
-N|n5|Document revisions|500|110|200|rect
-N|n6|Lifecycle worker|0|220|200|rect
-E|n0|n1|authorized sources
-E|n1|n2|upserts
-E|n3|n2|restricts candidates
-E|n4|n2|nearest search
-E|n2|n5|resolves evidence
-E|n6|n2|retires chunks
+N|src|Document sources|0|0|160|rect
+N|emb|Embedding pipeline|220|0|180|rect
+N|idx|Vector index (HNSW)|460|0|190|cylinder
+N|q|Query service|460|130|150|rect
+N|filt|Metadata filters|220|130|160|rect
+N|life|Lifecycle worker|0|130|160|rect
+E|src|emb|new revisions
+E|emb|idx|chunks + vectors
+E|q|idx|nearest k
+E|filt|q|tenant, status
+E|life|idx|delete old revisions
 ---
 ## Problem
 
-Explain vector stores: what they add beyond storing arrays of floats (ANN indexes, metadata filtering, hybrid search, CRUD and scaling), how the main options compare (PGVector, Redis, Elasticsearch/OpenSearch, dedicated databases like Pinecone, Weaviate, Qdrant, Milvus), and how Spring AI's `VectorStore` abstraction and filter expressions work.
+Your RAG assistant now has 5 million document chunks, each with a 1,536-number embedding. A question must find the 5 most similar chunks in under 50 ms, but only among documents the user is allowed to see, and only from the current version of each document.
+
+Storing arrays of floats is easy. Searching millions of them fast, with filters, while documents keep changing – that is what a **vector store** is for.
 
 ## Requirements
 
-- Core operations: add, delete and similarity search with top-k, threshold and filters.
-- Index types (HNSW, IVF) and their trade-offs.
-- Metadata filtering and why it's essential (multi-tenancy, ACLs, freshness).
-- Choosing a store for an enterprise Java stack.
-- Spring AI `VectorStore`, `SearchRequest`, the portable filter expression DSL.
+- Explain what a vector store adds beyond "a table of float arrays".
+- Explain exact vs approximate nearest-neighbour (ANN) search, and HNSW.
+- Combine vector search with metadata filters and keyword search.
+- Keep the index in step with changing documents (updates and deletes).
+- Use Spring AI's `VectorStore` with PGvector, and choose between options.
 
-## 1. Selected store contract
+## Step 1: The idea in plain words
 
-I choose a database-backed vector index for an initially moderate corpus, with typed metadata and source revisions. Document/query embeddings use one compatible model version. Search filters enforce tenant and document permissions before evidence reaches generation.
+A vector store is a database that answers one question very fast: **"which stored vectors are closest to this one?"** – plus "…and match these filters".
 
-## 2. Records and update transaction boundary
+| Term | Plain meaning |
+| --- | --- |
+| **Vector / embedding** | A list of numbers that represents meaning (AI-4). |
+| **Similarity** | How close two vectors are – usually cosine similarity. |
+| **k-NN** | Find the k nearest vectors. Exact k-NN compares against every vector. |
+| **ANN** | Approximate nearest neighbours: much faster, very slightly less accurate. |
+| **HNSW** | A popular ANN index: a layered graph you walk from far to near. |
+| **Metadata filter** | Conditions like `department == 'HR'` applied with the search. |
 
-```text
-Chunk: id,documentId,revision,tenant,permissionScope,text,embeddingModel,vector
-IndexGeneration: id,model,dimension,publishedAt,state
-search(scope,queryVector,k,generation) -> permitted chunk IDs and scores
-publishRevision(doc,newChunks): stage -> verify -> switch -> retire old chunks
-```
+> **🎯 In the interview**
+> Interviewers usually ask: why not just a normal database; what ANN and HNSW are; how filtering works; which vector store you would pick; how you keep it up to date.
 
-An update from chunks A/B/C to A/D must retire B and C explicitly; upsert alone leaves stale evidence. New embedding models build a separate generation, evaluate recall and switch query embedding/index together. Equal vector dimensions do not prove compatible spaces. One million 1,536-dimensional float32 vectors occupy 6.144 GB raw before text, metadata, index structures and replicas.
+## Step 2: How a vector store finds neighbours fast
 
-I test filter placement using a deliberately nearest forbidden vector, not random separation. Approximate indexing settings are selected by measured recall/latency and operating capacity. Source deletion tombstones immediately suppress access under current policy, with asynchronous physical cleanup verified later. Backups and re-ingestion have different recovery times, so both index/source provenance and recovery expectations are documented.
+[![Selected design: document sources feed an embedding pipeline that writes chunks into a versioned vector index; a query service searches the index with metadata filters; a lifecycle worker removes chunks of old document revisions.](designs/ai-10.svg)](designs/ai-10.svg)
 
-## 3. Final design diagram
-
-[![Vector Stores: Source registry authorized sources Embedding pipeline; Embedding pipeline upserts Versioned vector index; Metadata filters restricts candidates Versioned vector index; Query service nearest search Versioned vector index; Versioned vector index resolves evidence Document revisions; Lifecycle worker retires chunks Versioned vector index](designs/ai-10.svg)](designs/ai-10.svg)
-
-An **index namespace** separates logical collections, a **metadata filter** constrains candidates, and a **document revision** tells you what was embedded. **Approximate search** improves speed by potentially missing some exact nearest neighbours; measure recall rather than assuming an index configuration is universally best.
-
-## 4. Critical operation: worked execution
-
-![Text, embedding model and permissions remain traceable together.](lessons/ai-10-flow.svg)
-
-*Text, embedding model and permissions remain traceable together.*
-
-![Upsert alone does not remove chunks that disappeared from a new revision.](lessons/ai-10-failure.svg)
-
-*Upsert alone does not remove chunks that disappeared from a new revision.*
-
-### Calculate and choose
-
-One million vectors × 1,536 dimensions × four bytes is about 6.144 GB raw values. Index graph/list structures, stored text, metadata, replicas and write headroom add to that. If your documents are small and the corpus modest, an existing database with vector support may be simpler than a new distributed dependency.
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Mechanism and rationale
-
-**Design question:** How should embeddings be indexed, filtered, updated and migrated in a real application?
-
-A vector store combines numerical vectors, metadata and an index. Exact search establishes a correctness baseline; approximate methods such as HNSW/IVF trade search recall, memory, build time and latency. The storage engine may also support lexical indexes; vectors are not a separate mandatory database category.
-
-### Architecture and contracts
+### Exact search is too slow at scale
 
 ```text
-Document revision -> stable chunk IDs -> batch embedding -> versioned index upsert -> filtered search -> source lookup; tombstones and reindex govern updates
-
-Application contracts (design outline):
-IndexVersion(embeddingModel,dimension,chunkerVersion,metric); SearchRequest(query,tenant,filter,k); DocumentRevision
+Chunks                     = 5,000,000
+Dimensions                 = 1,536
+Work per query (exact)     = 5M × 1,536 ≈ 7.7 billion multiply-adds
+Memory for vectors         = 5M × 1,536 × 4 bytes ≈ 30 GB
 ```
 
-VectorStore accepts Documents and SearchRequest-like queries in the selected release. Keep store-specific configuration outside domain code; validate metadata filter behavior with integration tests.
+What it means: comparing against every vector takes seconds per query. We need an index that looks at only a small part of the data.
 
-### Worked reasoning and capacity example
+### HNSW in one picture
 
-Five million vectors x 1,536 x 4 bytes = 30.72 GB raw floats. HNSW graph links, metadata, original text, replicas and write buffers add to that. Capacity tests must include the chosen index configuration.
+HNSW builds a graph where each vector links to its near neighbours, in several layers – a few long-distance links on top, many short ones at the bottom, like motorways, main roads and lanes.
 
-### Java and Spring AI implementation outline
+1. Start at an entry point on the top layer.
+2. Jump to whichever neighbour is closer to the query; repeat until no neighbour is closer.
+3. Drop to the next layer and continue with finer links.
+4. On the bottom layer, collect the closest k.
+
+Instead of 5 million comparisons, a query makes a few thousand – and usually finds 95–99% of the true top-k.
+
+![Animation: a query enters the top layer of an HNSW graph, hops along long links toward the region of similar vectors, drops to lower layers with shorter links, and finishes on the bottom layer by collecting the five nearest chunks after checking only a small part of the graph.](learning-figures/ai-10-hnsw.gif)
+
+### Tuning knobs
+
+| Knob | Higher means |
+| --- | --- |
+| `m` (links per node) | Better recall, more memory |
+| `ef_construction` | Better graph, slower indexing |
+| `ef_search` | Better recall, slower queries |
+
+## Step 3: In code with Spring AI
+
+Spring AI hides each product behind one `VectorStore` interface. With PostgreSQL + PGvector:
+
+```properties
+spring.ai.vectorstore.pgvector.index-type=HNSW
+spring.ai.vectorstore.pgvector.distance-type=COSINE_DISTANCE
+spring.ai.vectorstore.pgvector.dimensions=1536
+spring.ai.vectorstore.pgvector.initialize-schema=true
+```
+
+**Search with a metadata filter:**
 
 ```java
-record IndexVersion(String embeddingModel, int dimensions, String chunkerVersion) {}
-// Refuse reads/writes when request and index versions are incompatible.
-// Build a replacement index before changing the live query encoder.
+List<Document> results = vectorStore.similaritySearch(
+        SearchRequest.builder()
+                .query("paternity leave split")
+                .topK(5)
+                .similarityThreshold(0.6)
+                .filterExpression("department == 'HR' && status == 'PUBLISHED'")
+                .build());
 ```
 
-### Design decisions and alternatives
+**Replace a document's chunks when it changes:**
 
-I start with a store that fits operating skills and consistency needs. Use stable content/revision keys for repeatable ingestion; rebuild into a new collection when model/chunker changes. Swap an index alias after validation rather than mixing incompatible vectors.
+```java
+public void reindex(String docId, List<Document> newChunks) {
+    vectorStore.delete("docId == '" + docId + "'");   // remove every chunk of the old revision
+    vectorStore.add(newChunks);                       // embeds and stores the new ones
+}
+```
 
-### Failure scenario and safe recovery
+The filter strings use Spring AI's portable filter language, translated to each store's own syntax (SQL `WHERE` for PGvector, metadata filters for Pinecone, and so on). In production, build filters with `FilterExpressionBuilder` rather than concatenating strings, and take values like `docId` only from trusted code.
 
-Deletion removes source text but leaves indexed chunks retrievable. Tombstone or delete every related chunk and enforce source authorization/version checks on read; track cleanup completion.
+> **⚖️ Design choice**
+> **PGvector** when you already run PostgreSQL and have up to tens of millions of vectors: one database, transactions with your metadata, familiar operations. Move to a dedicated store (Milvus, Qdrant, Weaviate, Pinecone, Elasticsearch/OpenSearch) for hundreds of millions of vectors or heavy hybrid search.
 
-### Security, privacy and provenance
+## Step 4: Common mistakes
 
-Two models with equal vector dimension are not interchangeable. Distance thresholds are metric/model dependent and must be calibrated on your corpus.
+| Mistake | Better |
+| --- | --- |
+| Filtering after search ("top 5, then remove forbidden") | Filter during search – otherwise you may get 0 allowed results |
+| Upserting new chunks without deleting old ones | Delete by `docId` (or version) first; a shorter new revision leaves stale chunks |
+| Mixing embedding models in one index | One model per index; re-embed everything when you change models |
+| Ignoring keyword search | Hybrid search: vectors for meaning + BM25 for exact terms (error codes, names) |
+| Default index settings forever | Measure recall on real queries; tune `ef_search` |
 
+> **⚠️ Common mistake**
+> Storing vectors without the chunk text and metadata. When a result is wrong you can't see why, and you can't filter or cite. Keep text, source, version and access rules with every vector.
 
-**Verification criteria:** Recall@k, filtered recall, insert/update lag, deletion propagation, memory and query p99 under concurrent ingestion. Benchmark skewed tenants, not only uniform random vectors.
+[![Upsert alone does not remove chunks that disappeared from a new revision.](lessons/ai-10-failure.svg)](lessons/ai-10-failure.svg)
 
-### Further reading
+## Step 5: Production concerns
 
-- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
-- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
-- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
-- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+- **Memory:** HNSW indexes live mostly in RAM. 5M × 1,536 floats ≈ 30 GB plus graph links – size machines accordingly, or use smaller dimensions or quantisation.
+- **Recall testing:** compare ANN results with exact search on a sample of queries; aim for 95%+ recall@k.
+- **Freshness:** ingest changes as events; delete by document ID; re-embed in the background when switching models, then switch indexes atomically.
+- **Multi-tenancy:** a `tenantId` filter on every query, or a separate collection per large tenant.
+- **Cost:** storage and RAM grow with vectors × dimensions; embedding calls cost per token at ingestion.
 
-### Work through filter correctness
+## Interviewer follow-ups
 
-Filtering before candidate selection and filtering a small top-k afterward can produce different recall and security properties. A post-filter cannot repair a design that exposes forbidden text to another processing step. Test tenant/resource filters with intentionally nearest forbidden vectors, not merely random fixtures.
+**Why not just use PostgreSQL arrays?** You can store them, but without an ANN index every query scans every row. PGvector adds the vector type, distance operators and HNSW/IVFFlat indexes.
 
-Changing embedding models requires a versioned migration. Even equal-dimensional vectors can represent different spaces. Build a new index, test retrieval, switch query embedding and index together, and keep a rollback plan. Index backup and source re-ingestion are different recovery strategies with different time/cost.
+**HNSW or IVFFlat?** HNSW gives better recall and speed at the cost of memory and slower builds; IVFFlat clusters vectors into lists and is lighter but needs training and tuning.
 
-## 6. Interviewer follow-ups
+**Cosine, dot product or Euclidean?** Use what the embedding model was trained for – usually cosine; for normalised vectors cosine and dot product rank the same.
 
-**Is vector distance comparable across arbitrary models?** No. Use a compatible model/index and calibrated task evaluation.
+**How do you do hybrid search?** Run keyword (BM25) and vector search, then merge results, for example with reciprocal rank fusion, and optionally rerank.
 
-**Does deleting a document row guarantee vector deletion?** Only if your lifecycle explicitly performs and verifies that propagation.
+## Wrap up
 
-## 7. Closing answer
+A vector store finds the nearest embeddings fast with an ANN index such as HNSW, applies metadata filters during the search, and must be kept in step with document changes.
 
-I treat the vector store as a versioned retrieval index with explicit source lifecycle. Model compatibility, permission filters, stale-chunk retirement and recall measurement determine correctness; selecting a vector database alone does not solve these responsibilities.
+> **📝 Key takeaways**
+> - Exact search is too slow at millions of vectors; ANN (HNSW) trades a little recall for big speed.
+> - Filter during search, not after.
+> - Delete old chunks when documents change; one embedding model per index.
+> - PGvector is a good default; dedicated stores for very large scale.
+
+## Going deeper (optional)
+
+The detailed version keeps text, embedding model and permissions traceable together for every vector, and runs a lifecycle worker that removes superseded revisions.
+
+[![Text, embedding model and permissions remain traceable together.](lessons/ai-10-flow.svg)](lessons/ai-10-flow.svg)
+
+Further reading: [Spring AI – Vector databases](https://docs.spring.io/spring-ai/reference/api/vectordbs.html), [pgvector](https://github.com/pgvector/pgvector) and [the HNSW paper](https://arxiv.org/abs/1603.09320).
+
+## Closing answer
+
+"A vector store answers 'which stored embeddings are closest to this one, matching these filters' quickly. Exact search over millions of 1,536-dimension vectors is billions of operations per query, so stores use approximate indexes like HNSW – a layered neighbour graph that finds 95–99% of the true top-k by checking a small fraction. Metadata filters for tenant, permissions and status are applied during the search. In Spring AI I use the `VectorStore` interface – PGvector with an HNSW index is a good default – with `SearchRequest` for top-k, threshold and filters. When a document changes I delete its old chunks by document ID before adding new ones, keep one embedding model per index, and measure recall against exact search."
 
 === AI 11 ===
-N|n0|Source lifecycle|0|0|200|rect
-N|n1|Hybrid retriever|250|0|200|rect
-N|n2|Reranker|500|0|200|rect
-N|n3|Evidence packer|0|110|200|rect
-N|n4|Generation|250|110|200|rect
-N|n5|Claim validator|500|110|200|rect
-N|n6|Evaluation and traces|0|220|200|rect
-E|n0|n1|published scope
-E|n1|n2|candidates
-E|n2|n3|ranked passages
-E|n3|n4|bounded evidence
-E|n4|n5|claims citations
-E|n6|n1|measures recall
-E|n6|n5|measures support
+N|q|Question|0|0|120|rect
+N|rw|Rewrite query|170|0|150|rect
+N|hyb|Hybrid search|370|0|150|rect
+N|rr|Rerank top 30|370|130|150|rect
+N|gen|Answer + cite|170|130|150|rect
+N|ev|Traces + eval set|0|130|160|cylinder
+E|q|rw|user words
+E|rw|hyb|search query
+E|hyb|rr|candidates
+E|rr|gen|best 5
+E|gen|ev|trace every stage
 ---
 ## Problem
 
-Take RAG from demo to production: the techniques that move answer quality from "sometimes right" to dependable. That means smarter chunking with metadata, hybrid search, re-ranking, query rewriting and expansion, context compression, freshness and access control, and evaluation-driven tuning, plus how Spring AI's modular RAG components map onto them.
+Your HR RAG assistant (AI-5) works in the demo. In the pilot, people complain: "What's the WFH policy?" returns nothing because the documents say "remote work"; a question about error code `PAY-4012` finds unrelated pages; and some answers mix the 2024 and 2026 versions of a policy.
+
+Production RAG is the set of techniques that move a RAG system from "sometimes right" to dependable – and the measurements that prove it.
 
 ## Requirements
 
-- Advanced chunking (structure-aware, parent-child, contextual headers).
-- Hybrid lexical + semantic retrieval and rank fusion.
-- Re-ranking with cross-encoders or LLM rankers.
-- Query transformation: rewriting, multi-query, HyDE, conversational compression.
-- Operational concerns: incremental ingestion, dedup, ACLs, evals and monitoring.
+- Improve retrieval: query rewriting, hybrid search, reranking, better chunking and metadata.
+- Improve generation: good context packing, citations, and abstaining when evidence is missing.
+- Keep sources fresh and versioned.
+- Evaluate retrieval and answers with a test set; trace every request.
+- Implement with Spring AI's modular RAG components.
 
-## 1. Selected production pipeline
+## Step 1: The idea in plain words
 
-I choose hybrid retrieval, optional reranking, bounded evidence packing and a typed cited-answer validator. Every answer records source revisions, prompt/model/index versions and a request trace. Current authorization applies before exposure, while index cleanup can remain asynchronous within the lifecycle contract.
+A RAG answer can go wrong at three stages. Fix the stage that is failing – don't just swap the model.
 
-## 2. Execution and measurable acceptance
+| Stage | Typical failure | Fix |
+| --- | --- | --- |
+| **Find** | The right chunk isn't retrieved | Query rewriting, hybrid search, better chunking |
+| **Choose** | It's retrieved but ranked 9th, behind noise | Reranking, metadata filters |
+| **Answer** | The model ignores, mixes or invents | Tight prompt, citations, abstain, validation |
 
-```text
-Question -> authorize -> lexical/vector retrieval -> fuse/rerank
-         -> pack source spans -> generate -> validate citations/support
-Result: SUPPORTED | INSUFFICIENT_EVIDENCE | CONFLICTING_EVIDENCE | FAILURE
-Cache scope: tenant + permission/freshness + corpus/prompt/model versions
-```
+| Term | Plain meaning |
+| --- | --- |
+| **Query rewriting** | Turn the user's question into a better search query ("WFH" → "work from home remote work policy"). |
+| **Hybrid search** | Combine vector search (meaning) with keyword search (exact words). |
+| **Reranker** | A second model that scores each (question, chunk) pair more precisely. |
+| **Recall@k** | How often the right chunk is in the top k results. |
+| **Faithfulness** | Whether every claim in the answer is supported by the retrieved text. |
 
-For 100 answerable cases, retrieving relevant evidence for 85 gives recall 85%; 75 supported final answers give end-to-end success 75%, and conditional generation success 75/85≈88.2%. I also evaluate unanswerable questions; otherwise a system that fabricates every missing answer can look strong. Revoked/deleted sources and conflicting revisions form independent critical slices.
+> **🎯 In the interview**
+> Interviewers usually ask: how to improve a RAG system that gives poor answers; what hybrid search and reranking are; how to evaluate RAG; how to handle document updates.
 
-I change chunking, embedding model, fusion, reranking or prompting one at a time against that corpus. Increasing k can add contradictions and token cost, so it is accepted only if measured support improves. Failed queries retain inspectable candidate/selected source IDs without dumping confidential text into general logs. A cached answer is reused only when permission and evidence freshness still match; semantic question similarity does not establish that equivalence.
+## Step 2: The production RAG pipeline: execution step by step
 
-## 3. Final design diagram
+[![Selected design: the question is rewritten for search; hybrid search combines keyword and vector results; a reranker keeps the best five of thirty candidates; the model answers with citations; every stage is traced and checked against an evaluation set.](designs/ai-11.svg)](designs/ai-11.svg)
 
-[![Production RAG: Source lifecycle published scope Hybrid retriever; Hybrid retriever candidates Reranker; Reranker ranked passages Evidence packer; Evidence packer bounded evidence Generation; Generation claims citations Claim validator; Evaluation and traces measures recall Hybrid retriever; Evaluation and traces measures support Claim validator](designs/ai-11.svg)](designs/ai-11.svg)
+Follow "What's the WFH policy for new joiners?":
 
-**Recall@k** measures whether relevant evidence appears among retrieved candidates. A **reranker** reorders candidates with a more expensive relevance judgement. **Groundedness** evaluates whether the answer is supported by selected evidence. Improve the failing stage instead of blindly increasing every limit.
+1. **Rewrite:** "work from home remote work policy new employees probation".
+2. **Retrieve wide:** vector search top 20 + keyword (BM25) search top 20, filtered to `status = PUBLISHED` and the user's region.
+3. **Merge:** reciprocal rank fusion – chunks ranked high in either list rise.
+4. **Rerank:** a cross-encoder scores the 30 unique candidates against the question; keep the best 5.
+5. **Pack:** order them, add titles and versions, stay within ~3,000 tokens.
+6. **Generate:** answer only from the sources, cite each claim, say "not found" if needed.
+7. **Validate and trace:** check the citations exist; log every stage for evaluation.
 
-## 4. Critical operation: worked execution
+![Animation: the question about WFH finds nothing with plain vector search; query rewriting adds remote-work terms; hybrid search returns candidates from both keyword and vector search; the reranker moves the remote-work policy section to the top; the answer cites the 2026 policy only.](learning-figures/ai-11-pipeline.gif)
 
-![Each stage leaves evidence for diagnosis and versioned evaluation.](lessons/ai-11-flow.svg)
+### Worked numbers: does reranking help?
 
-*Each stage leaves evidence for diagnosis and versioned evaluation.*
-
-![Evidence lifecycle extends beyond the primary document store.](lessons/ai-11-failure.svg)
-
-*Evidence lifecycle extends beyond the primary document store.*
-
-### Trace and calculate quality
-
-On 100 answerable questions, relevant evidence may appear for 85. If 75 of those produce supported answers, retrieval recall is 85% while supported end-to-end success is 75% on that set. The conditional generation success is 75/85, about 88.2%. These diagnose different problems; one “accuracy” number hides them.
-
-Reserve a separate unanswerable set. A system that confidently answers every question can score well on answer-present cases while failing dangerously when evidence is missing. Evaluate abstention precision/recall and critical security failures separately.
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Mechanism and rationale
-
-**Design question:** What turns a successful RAG demo into a dependable multi-tenant documentation product?
-
-Production RAG is a lifecycle of ingestion, revisioning, retrieval, authorization, evaluation and operations. Hybrid search retrieves lexical and semantic candidates; reranking orders a small candidate set; context assembly removes duplicates and respects token budget.
-
-### Architecture and contracts
+On a test set of 100 HR questions with known correct sections:
 
 ```text
-Source connector -> revision/ACL capture -> parse/chunk/embed -> staged index -> retrieval -> authorization -> rerank -> citation generation -> support verification
-
-Application contracts (design outline):
-IngestRun(sourceRevision,chunkerVersion,indexVersion,status); AnswerTrace(queryId,evidenceIds,promptVersion,modelVersion)
+                         recall@5   answer correct
+Vector only               0.71         0.66
++ hybrid (BM25 + vector)  0.84         0.76
++ reranker (top 30 → 5)   0.91         0.84
 ```
 
-Use a simple QuestionAnswerAdvisor path as a baseline, then application-owned retrieval/reranking when policy requires it. Do not copy unversioned advisor constructors into a pinned build.
+What it means: most of the gain came from finding the right chunk, not from changing the model. (Illustrative numbers – measure on your own data.)
 
-### Worked reasoning and capacity example
+## Step 3: In code with Spring AI
 
-Assume 100 queries/s x 8 retrieved chunks x 600 tokens = 480,000 evidence tokens/s before history and output. Reranking all corpus chunks is impossible; first-stage retrieval must bound the candidate pool.
-
-### Java and Spring AI implementation outline
+Spring AI's `RetrievalAugmentationAdvisor` lets you plug in each stage:
 
 ```java
-record RetrievalTrace(String queryId, String indexVersion,
-    java.util.List<String> evidenceIds, String promptVersion) {}
-// Log identities and counts, not raw private passages by default.
+Advisor rag = RetrievalAugmentationAdvisor.builder()
+        .queryTransformers(RewriteQueryTransformer.builder()
+                .chatClientBuilder(chatClientBuilder)   // a small, cheap model is fine
+                .build())
+        .documentRetriever(VectorStoreDocumentRetriever.builder()
+                .vectorStore(vectorStore)
+                .topK(20)
+                .similarityThreshold(0.5)
+                .filterExpression(new FilterExpressionBuilder()
+                        .eq("status", "PUBLISHED").build())
+                .build())
+        .queryAugmenter(ContextualQueryAugmenter.builder()
+                .allowEmptyContext(false)        // no documents → a polite "I don't know"
+                .build())
+        .build();
+
+String answer = chatClient.prompt()
+        .advisors(rag)
+        .user("What's the WFH policy for new joiners?")
+        .call()
+        .content();
 ```
 
-### Design decisions and alternatives
+- `RewriteQueryTransformer` – rewrites the question for search.
+- `VectorStoreDocumentRetriever` – retrieves wide (20) with filters.
+- `ContextualQueryAugmenter` with `allowEmptyContext(false)` – if nothing is found, the model is told to say it doesn't know instead of guessing.
+- Hybrid search and reranking can be added as a custom `DocumentRetriever` (merging keyword and vector results) and a `DocumentPostProcessor` (calling a reranker), or by using a store with built-in hybrid search.
 
-Evaluate retrieval failures before adding a larger model. Track data freshness and ACL updates as first-class work. Cache keys include tenant, permitted corpus version, prompt/model version and query normalization.
+> **⚖️ Design choice**
+> Add one technique at a time and keep it only if the evaluation set improves. Hybrid search is usually the biggest single win for enterprise documents full of codes and product names.
 
-### Failure scenario and safe recovery
+## Step 4: Common mistakes
 
-A shared semantic answer cache serves a correct answer to a user lacking access to the supporting documents. Partition caches by authorization domain and verify access on hits; similarity alone is not a safe cache key.
+| Mistake | Better |
+| --- | --- |
+| Changing chunking, prompt and model together | One change at a time against a fixed test set |
+| Only judging final answers | Measure retrieval recall too – it tells you which stage failed |
+| Retrieving the top 3 directly | Retrieve wide (20–50), rerank to 3–5 |
+| Old and new policy versions both indexed | Index only the published version, or filter by version |
+| No traces | Log query, rewritten query, candidates, reranked list, prompt size and answer |
 
-### Security, privacy and provenance
+> **⚠️ Common mistake**
+> Increasing `topK` to 20 and sending all 20 chunks to the model. More context often makes answers worse – the right chunk gets lost among near-misses. Rerank and send fewer.
 
-A more complex pipeline can be harder to debug and less reliable. Keep a measurable baseline and change one retrieval/generation component at a time.
+[![Evidence lifecycle extends beyond the primary document store.](lessons/ai-11-failure.svg)](lessons/ai-11-failure.svg)
 
+## Step 5: Production concerns
 
-**Verification criteria:** Supported-answer rate, retrieval recall, citation correctness, abstention, p99 latency, indexing freshness and unauthorized evidence exposure. Slice metrics by tenant, language and document type.
+- **Evaluation set:** 100–300 real questions with expected sources and good answers, including "not in the documents" questions. Run it on every change.
+- **Metrics:** recall@k (retrieval), faithfulness and answer correctness (generation, scored by humans or an LLM judge calibrated against humans), abstain rate.
+- **Latency budget:** rewrite ~300 ms + search ~50 ms + rerank ~150 ms + generation ~1–2 s. Skip rewriting for short, clear queries.
+- **Freshness:** re-ingest on document change events; delete superseded versions; record which version each answer cited.
+- **Feedback:** thumbs up/down and "wrong source" buttons feed new test cases.
 
-### Further reading
+## Interviewer follow-ups
 
-- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
-- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
-- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
-- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+**Your RAG gives bad answers. What do you do first?** Look at traces: was the right chunk retrieved? If not, fix retrieval (chunking, hybrid, rewriting). If yes but the answer is wrong, fix the prompt or context packing.
 
-### Work through release changes
+**What is a reranker and why not use it for everything?** A cross-encoder reads the question and chunk together – more accurate but too slow for millions of chunks. Use cheap retrieval for candidates, then rerank a few dozen.
 
-Change one variable at a time: chunking, embedding model, hybrid weights, reranker or prompt. Version the corpus and expected evidence, then compare by topic, document age, language and answerability. A larger k increases latency/context and may add contradictory evidence; it is not an automatic quality improvement.
+**How do you handle multi-part questions?** Split them into sub-queries (query decomposition), retrieve for each, and combine the evidence.
 
-Cache keys need tenant, permission/freshness scope and relevant corpus/prompt/model versions. Similar questions are not sufficient grounds for sharing answers across users. Preserve source spans in traces so support review can inspect a claim without rerunning today's changed index.
+**How do you evaluate without humans labelling everything?** Start with a small human-labelled set, then use an LLM judge for faithfulness and relevancy, checking the judge against human labels.
 
-## 6. Interviewer follow-ups
+## Wrap up
 
-**Should generation be blamed when the source was never retrieved?** First diagnose retrieval; the generator cannot reliably cite missing evidence.
+Production RAG fixes each stage separately – rewrite and hybrid search to find, rerank to choose, a tight grounded prompt to answer – and proves each change with an evaluation set and traces.
 
-**Is a retrieval score a confidence score for the final answer?** No.
+> **📝 Key takeaways**
+> - Diagnose by stage: find, choose, answer.
+> - Hybrid search + reranking usually beat a bigger model.
+> - Abstain when evidence is missing.
+> - Evaluate retrieval and generation separately; trace every request.
 
-## 7. Closing answer
+## Going deeper (optional)
 
-Production RAG is a lifecycle and quality pipeline, not one vector lookup. I version sources and components, measure evidence recall separately from answer support, and enforce current permissions even when indexes or caches lag. Release decisions use critical-case gates and inspected regressions.
+The detailed version stores evidence for every stage so each failure can be diagnosed, and versions the evaluation set so comparisons stay fair.
+
+[![Each stage leaves evidence for diagnosis and versioned evaluation.](lessons/ai-11-flow.svg)](lessons/ai-11-flow.svg)
+
+Further reading: [Spring AI – Retrieval Augmented Generation (modular RAG)](https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html) and [Reciprocal Rank Fusion (Cormack et al.)](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf).
+
+## Closing answer
+
+"I treat RAG as a pipeline and fix the stage that fails. To find the right text I rewrite the query, run hybrid search – BM25 for exact terms like error codes plus vector search for meaning – with filters for published versions and permissions, and merge with reciprocal rank fusion. To choose, I retrieve wide and rerank with a cross-encoder down to about five chunks. To answer, I pack those chunks with titles and versions, require citations and let the model abstain when evidence is missing. In Spring AI that's `RetrievalAugmentationAdvisor` with a query transformer, a document retriever and a contextual augmenter. Every change is measured on a fixed evaluation set – recall@k and faithfulness – with traces for every stage."
 
 === AI 12 ===
-N|n0|Application policy|0|0|200|rect
-N|n1|Request context|250|0|200|rect
-N|n2|Memory advisor|500|0|200|rect
-N|n3|Retrieval advisor|0|110|200|rect
-N|n4|Final budget check|250|110|200|rect
-N|n5|ChatClient model call|500|110|200|rect
-N|n6|Response observation|0|220|200|rect
-E|n0|n1|verified identity
-E|n1|n2|owned conversation
-E|n2|n3|augmented request
-E|n3|n4|authorized evidence
-E|n4|n5|bounded prompt
-E|n5|n6|result and metadata
+N|req|Request|0|0|110|rect
+N|pii|PII mask (0)|160|0|140|rect
+N|mem|Memory (100)|340|0|140|rect
+N|rag|RAG (200)|520|0|120|rect
+N|log|Logger (1000)|520|130|140|rect
+N|llm|Model call|340|130|130|rect
+E|req|pii|in
+E|pii|mem|in
+E|mem|rag|in
+E|rag|log|in
+E|log|llm|final prompt
+E|llm|req|response back in reverse|dashed
 ---
 ## Problem
 
-Explain Spring AI advisors, the interceptor or middleware chain around every `ChatClient` call: how they modify requests and responses, how ordering works, the built-in advisors (memory, RAG, logging, safeguards), and how to write custom advisors for concerns like PII redaction, auditing, caching and guardrails.
+Your Spring AI support assistant now needs, on **every** call: chat memory, RAG retrieval, masking of phone numbers before text leaves the company, logging of token usage, and a check that blocks banned topics.
+
+You could paste that code around each `chatClient.prompt()` call – and forget it somewhere. Spring AI **advisors** let you write each concern once and plug it into every call, like servlet filters or Spring interceptors.
 
 ## Requirements
 
-- The advisor concept (Chain of Responsibility / around-advice) and the request → model → response flow.
-- Built-ins: `MessageChatMemoryAdvisor`, `PromptChatMemoryAdvisor`, `QuestionAnswerAdvisor`, `RetrievalAugmentationAdvisor`, `SimpleLoggerAdvisor`, `SafeGuardAdvisor`.
-- Ordering via `getOrder()`, and sharing data between advisors via the advisor context.
-- Writing custom `CallAdvisor` / `StreamAdvisor` implementations.
+- Explain what an advisor is and where it sits in a `ChatClient` call.
+- Explain advisor order: who runs first on the way in and on the way out.
+- Use built-in advisors: memory, RAG, logging, safeguard.
+- Write a custom advisor (PII masking and token logging).
+- Avoid common mistakes with ordering and budgets.
 
-## 1. Selected advisor composition
+## Step 1: The idea in plain words
 
-I use the pinned Spring AI 1.1 family to compose memory, authorized retrieval and observation around one ChatClient boundary. Application code resolves principal/conversation before advisor execution. Each component receives immutable request-scoped policy; singleton advisors do not hold mutable per-user state.
+An advisor is **middleware around the model call**. Each advisor gets the request, can change it, passes it on, then gets the response and can change or record it.
 
-## 2. Ordering and request contract
+| Term | Plain meaning |
+| --- | --- |
+| **Advisor** | A component that wraps every `ChatClient` call. |
+| **Chain** | The ordered list of advisors; the last link calls the model. |
+| **Order** | A number; lower runs earlier on the way in and later on the way out. |
+| **Advise context** | A map shared by advisors during one call (e.g. conversation ID). |
+| **CallAdvisor / StreamAdvisor** | The interfaces for normal and streaming calls. |
 
-```text
-ApplicationContext: principal,ownedConversation,evidenceScope,remainingBudget
-Effective order: memory selection -> scoped retrieval -> final context check
-                -> model -> output validation/telemetry
-Memory output: bounded messages; retrieval output: source IDs/revisions/spans
-```
+An everyday picture: airport security. Your bag passes several checkpoints in a fixed order on the way in; on the way back, the same checkpoints are passed in reverse.
 
-I configure and verify ordering using the selected API's ordering contract rather than assuming registration order is always execution order. The final budget check matters because a prior 4,000-token check becomes obsolete if memory adds 3,000 and retrieval adds 8,000 later. Token contributions are attributed to their components.
+> **🎯 In the interview**
+> Interviewers usually ask: what advisors are for; how ordering works; which built-in advisors exist; how you would write one for logging, PII masking or guardrails.
 
-The same advisor chain is tested with two concurrent users and distinguishable history/evidence. Any cross-request state fails isolation. Retry re-entry cannot duplicate memory writes or business effects; completed-turn persistence stays in the application workflow. Observation records versions, latency and usage with redaction, not unrestricted prompt bodies. This composition reduces duplicated endpoint integration while keeping ownership and failure transitions visible.
+## Step 2: How a call flows through advisors: the execution order
 
-## 3. Final design diagram
+[![Selected design: a request passes through the PII mask, memory, RAG and logger advisors in order of their numbers before the model call; the response travels back through the same advisors in reverse order.](designs/ai-12.svg)](designs/ai-12.svg)
 
-[![Spring AI Advisors: Application policy verified identity Request context; Request context owned conversation Memory advisor; Memory advisor augmented request Retrieval advisor; Retrieval advisor authorized evidence Final budget check; Final budget check bounded prompt ChatClient model call; ChatClient model call result and metadata Response observation](designs/ai-12.svg)](designs/ai-12.svg)
+With advisors ordered **PII mask (order 0) → memory (100) → RAG (200) → logger (1000)**, one call goes like this:
 
-Advisors are integration middleware, not permission to hide business decisions in invisible interceptors. Their order, state scope and error behaviour need to be visible in the application's design. This chapter uses the pinned Spring AI 1.1 family; later versions may change chain/tool integration.
+**Way in (lowest order first)**
 
-## 4. Critical operation: worked execution
+1. **PII mask** replaces `98450 12345` with `[PHONE]` in the user message.
+2. **Memory** adds the last 20 messages of this conversation.
+3. **RAG** retrieves policy chunks and appends them to the user message.
+4. **Logger** logs the final prompt; the chain calls the model.
 
-![Understand what each advisor receives and contributes.](lessons/ai-12-flow.svg)
+**Way out (reverse order)**
 
-*Understand what each advisor receives and contributes.*
+1. **Logger** records the response and token usage.
+2. **RAG** attaches the retrieved documents to the response metadata.
+3. **Memory** saves the user message and the reply.
+4. **PII mask** could restore or check the output.
 
-![Inspect the final prompt context and filter boundaries, not just individual components.](lessons/ai-12-failure.svg)
+![Animation: a request passes through the PII mask, memory, retrieval and logging advisors in order, reaches the model, and the response travels back through the same advisors in reverse order, with memory saving the turn on the way out.](learning-figures/ai-12-chain.gif)
 
-*Inspect the final prompt context and filter boundaries, not just individual components.*
+> **⚖️ Design choice**
+> Mask PII **before** memory and RAG, so masked text is what gets stored and searched. Put logging **last** on the way in, so it logs the final prompt that is actually sent.
 
-### Build a chain you can explain
+## Step 3: In code with Spring AI
 
-Write an input/output table before adding advisors: memory receives an owned conversation identity and returns selected messages; retrieval receives an authorized query and returns versioned passages; telemetry records metadata with redacted content. Avoid keeping request-specific mutable data on a singleton advisor instance.
-
-```text
-Request context:
-  principal: application-owned, never model-generated
-  conversation: resolved and authorized before memory lookup
-  evidence: source IDs and current access scope
-  budget: remaining tokens and deadline after all augmentation
-```
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Mechanism and rationale
-
-**Design question:** Where should cross-cutting prompt transformations live without making their order invisible?
-
-Advisors wrap the model interaction and can transform requests and responses. Their order determines whether logging sees raw or redacted text, whether memory precedes retrieval and which errors are visible. A call path and a streaming path may have different contracts.
-
-### Architecture and contracts
-
-```text
-Authorization before client -> redaction/budget policy -> memory/context enrichment -> model/tool execution -> output validation -> redacted observations
-
-Application contracts (design outline):
-AdvisorPolicy(order,requestTransform,responseTransform); RequestContext(tenant,traceId,budget); ValidatedResponse
-```
-
-Use the CallAdvisor/StreamAdvisor interfaces for the selected release and call the next chain exactly as its contract requires. Interface signatures are version-sensitive; the manuscript distinguishes conceptual sequence from compilable example code.
-
-### Worked reasoning and capacity example
-
-Three sequential enrichment calls at 100 ms each add at least 300 ms before the model begins. Parallelize only truly independent authorized work; do not hide this latency behind an innocuous advisor name.
-
-### Java and Spring AI implementation outline
+**Built-in advisors on a client:**
 
 ```java
-// Conceptual chain; adapt actual interfaces to the pinned Spring AI release.
-// authorize -> bound/redact -> retrieve/memory -> model -> validate -> observe
-// Tests must verify both request and response order, including exceptions.
+ChatClient chatClient = builder
+        .defaultSystem("You are ShopEasy's support assistant.")
+        .defaultAdvisors(
+                new PiiMaskingAdvisor(0),
+                MessageChatMemoryAdvisor.builder(chatMemory).order(100).build(),
+                QuestionAnswerAdvisor.builder(vectorStore).order(200).build(),
+                new SafeGuardAdvisor(List.of("salary of", "home address of")),
+                new SimpleLoggerAdvisor())
+        .build();
 ```
 
-### Design decisions and alternatives
+- `MessageChatMemoryAdvisor` – adds and saves conversation history (AI-9).
+- `QuestionAnswerAdvisor` – retrieves chunks from a vector store (AI-5).
+- `SafeGuardAdvisor` – blocks requests containing listed sensitive words.
+- `SimpleLoggerAdvisor` – logs requests and responses at DEBUG.
 
-Use advisors for reusable integration concerns, not as a substitute for domain-service authorization. Document chain order and state ownership. Keep request context immutable or narrowly scoped so concurrent calls cannot contaminate each other.
+**A custom advisor** that masks phone numbers and logs token usage:
 
-### Failure scenario and safe recovery
+```java
+public class PiiMaskingAdvisor implements CallAdvisor {
+    private static final Pattern PHONE = Pattern.compile("\\b\\d{5}\\s?\\d{5}\\b");
+    private static final Logger log = LoggerFactory.getLogger(PiiMaskingAdvisor.class);
+    private final int order;
 
-A debug logger is ordered before redaction and captures private evidence. Tests should assert log fields and chain ordering, not merely that the model returns a string.
+    public PiiMaskingAdvisor(int order) { this.order = order; }
 
-### Security, privacy and provenance
+    @Override
+    public ChatClientResponse adviseCall(ChatClientRequest request, CallAdvisorChain chain) {
+        Prompt masked = request.prompt().augmentUserMessage(u ->
+                u.mutate().text(PHONE.matcher(u.getText()).replaceAll("[PHONE]")).build());
+        ChatClientResponse response = chain.nextCall(request.mutate().prompt(masked).build());
 
-Retries wrapped around the entire advisor chain may repeat retrieval, memory writes or tool effects. Assign retry ownership deliberately.
+        var usage = response.chatResponse().getMetadata().getUsage();
+        log.info("tokens in={} out={}", usage.getPromptTokens(), usage.getCompletionTokens());
+        return response;
+    }
 
+    @Override public String getName() { return "pii-masking"; }
+    @Override public int getOrder() { return order; }
+}
+```
 
-**Verification criteria:** Order correctness, exception propagation, stream cancellation, context isolation and redaction coverage. Record advisor latency in traces without raw sensitive content.
+- `chain.nextCall(...)` passes the (changed) request to the next advisor; without it, the model is never called.
+- For streaming calls, implement `StreamAdvisor` as well.
+- Per-call values go through the advise context: `.advisors(a -> a.param(ChatMemory.CONVERSATION_ID, id))`.
 
-### Further reading
+## Step 4: Common mistakes
 
-- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
-- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
-- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
-- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+| Mistake | Better |
+| --- | --- |
+| Forgetting `getOrder()` meaning | Lower = earlier on the way in, later on the way out; write the intended order down |
+| Logging before masking | Mask first, then memory/RAG, log last |
+| Doing slow I/O in many advisors | Each advisor adds latency; measure the chain |
+| Memory + RAG with no budget | Both add tokens; check the final prompt size before the model call |
+| Business logic in advisors | Advisors are for cross-cutting concerns; keep domain rules in services |
+| Implementing only `CallAdvisor` | Streaming calls skip it; implement `StreamAdvisor` too if you stream |
 
-### Work through hidden costs
+> **⚠️ Common mistake**
+> Assuming each advisor is safe on its own. Memory adds 1,600 tokens, RAG adds 3,000, and together they overflow the budget. Inspect the **final** prompt, not just each component.
 
-If memory adds 3,000 tokens and retrieval adds 8,000 after an earlier 4,000-token budget check, that check no longer protects a 12,000-token limit with output reserve. Validate the assembled prompt near the final model boundary. Record which component contributed tokens so tuning is explainable.
+[![Inspect the final prompt context and filter boundaries, not just individual components.](lessons/ai-12-failure.svg)](lessons/ai-12-failure.svg)
 
-Retries can re-enter parts of a chain depending on the API. Memory writes or external side effects should not repeat blindly. Test ordering with spies/stubs and a known request, then inspect the actual assembled evidence and final result. The repository's general API compile check does not establish every advisor configuration's runtime behaviour.
+## Step 5: Production concerns
 
-## 6. Interviewer follow-ups
+- **Observability:** Spring AI emits Micrometer observations for ChatClient and advisor calls; you can see time spent per advisor in traces.
+- **Budget check:** a final advisor just before the model can count tokens and trim memory or RAG content if the prompt is too large.
+- **Testing:** unit-test custom advisors with a fake chain; integration-test the whole chain and assert the final prompt.
+- **Security:** a regex PII mask is a helpful layer, not a guarantee – keep sensitive data out of retrieval in the first place.
 
-**Does registering both memory and retrieval automatically guarantee their intended order?** Inspect the selected API's ordering contract and verify the effective chain.
+## Interviewer follow-ups
 
-**Should an advisor read an arbitrary conversation ID from generated text?** No. Use application-authorized context.
+**How are advisors different from tools?** Advisors always run, around every call, decided by your code. Tools are functions the *model* may choose to call during a call.
 
-## 7. Closing answer
+**Can an advisor stop a call?** Yes – return a response without calling `chain.nextCall` (that's how `SafeGuardAdvisor` blocks requests).
 
-Advisors compose integration concerns, but the application still owns identity and final budgets. I verify effective ordering and request isolation, then inspect the assembled prompt and response. The selected framework version's contracts determine chain behaviour; a newer API example is not assumed compatible.
+**Where do you put the conversation ID?** In the advise context per call; the memory advisor reads it.
+
+**How do you add an advisor to just one call?** Use `.advisors(...)` on that `prompt()` instead of `defaultAdvisors`.
+
+## Wrap up
+
+Advisors wrap every `ChatClient` call in an ordered chain, so memory, retrieval, masking, logging and guardrails are written once and applied everywhere.
+
+> **📝 Key takeaways**
+> - An advisor sees the request on the way in and the response on the way out.
+> - Lower order runs earlier in, later out.
+> - Use built-ins (memory, RAG, safeguard, logger); write custom ones for cross-cutting needs.
+> - Check the final prompt and its token budget, not each advisor alone.
+
+## Going deeper (optional)
+
+The detailed version shows exactly what each advisor receives and contributes, and adds a final budget check that trims memory before retrieval when the prompt is too large.
+
+[![Understand what each advisor receives and contributes.](lessons/ai-12-flow.svg)](lessons/ai-12-flow.svg)
+
+Further reading: [Spring AI – Advisors API](https://docs.spring.io/spring-ai/reference/api/advisors.html).
+
+## Closing answer
+
+"Advisors are Spring AI's middleware around every ChatClient call. Each one receives the request, can change it, passes it down the chain, then sees the response on the way back – lower order runs earlier going in and later coming out. I use the built-ins: `MessageChatMemoryAdvisor` for history, `QuestionAnswerAdvisor` for RAG, `SafeGuardAdvisor` for blocked topics and `SimpleLoggerAdvisor` for debugging. For cross-cutting needs I write a `CallAdvisor` – and a `StreamAdvisor` for streaming – such as masking PII before memory and retrieval, and logging token usage after the call. I order them deliberately, keep business logic out of them, and check the final prompt size because memory and retrieval share one token budget."
 
 === AI 13 ===
-N|n0|User request|0|0|200|rect
-N|n1|Model proposal|250|0|200|rect
-N|n2|Tool policy|500|0|200|rect
-N|n3|Authorized order service|0|110|200|rect
-N|n4|Order database|250|110|200|rect
-N|n5|Typed tool result|500|110|200|rect
-N|n6|Final response|0|220|200|rect
-E|n0|n1|intent
-E|n1|n2|name arguments
-E|n2|n3|allowed call
-E|n3|n4|current facts
-E|n3|n5|minimal fields
-E|n5|n1|observation
-E|n1|n6|grounded explanation
+N|user|Asha's question|0|0|150|rect
+N|llm|Model|200|0|110|rect
+N|app|Spring AI tool loop|360|0|180|rect
+N|pol|Check user owns order|360|130|190|rect
+N|svc|Order service + DB|160|130|170|cylinder
+N|ans|Final answer|0|130|130|rect
+E|user|llm|question + tool list
+E|llm|app|tool call JSON
+E|app|pol|authorise
+E|pol|svc|run method
+E|svc|llm|typed result|dashed
+E|llm|ans|text
 ---
 ## Problem
 
-Explain tool (function) calling: how an LLM requests the execution of your code with structured arguments, how the application runs the tool and feeds the result back, how Spring AI exposes Java methods as tools (`@Tool`, `ToolCallback`, `ToolContext`), and how to make tool use safe in an enterprise (authorisation, validation, side effects).
+Asha asks the ShopEasy assistant: **"Where is my order 5521, and can you cancel it if it hasn't shipped?"**
+
+The model doesn't know order statuses – they're in your order database – and it can't cancel anything by itself. **Tool calling** lets the model ask your application to run a specific Java method with specific arguments, then use the result in its answer.
 
 ## Requirements
 
-- The tool-calling loop: the model returns `tool_calls`, the app executes, a tool result message goes back, the model writes the final answer.
-- Defining tools in Spring AI: `@Tool` methods, `@ToolParam` descriptions, `.tools(...)` / `defaultTools`.
-- Passing hidden context (user identity) with `ToolContext`.
-- Read vs. write tools, confirmations, idempotency, errors and timeouts.
-- Security: least privilege, never trusting model-supplied arguments blindly.
+- Explain how tool (function) calling works, step by step.
+- Describe tools well: name, description, typed parameters.
+- Implement tools with Spring AI's `@Tool` and pass them to `ChatClient`.
+- Authorise every tool call with the logged-in user, not with model-supplied text.
+- Handle errors, limits and actions that need confirmation.
 
-## 1. Selected tool and authority boundary
+## Step 1: The idea in plain words
 
-I implement a read-only order-status assistant. The model sees a schema for `lookupOrder(orderId)` and can propose it; the application checks the current principal's access before the order service reads data. Identity is application-owned and is not an argument the model can override.
+The model can't run code. But it can **reply with a request**: "please call `getOrderStatus` with `orderId = 5521`". Your app runs the method, sends back the result, and the model continues.
 
-## 2. Spring boundary and flow
+Think of the model as a smart assistant on the phone who can't touch the computer. It tells you which screen to open and what to type; you do it and read the result back.
+
+| Term | Plain meaning |
+| --- | --- |
+| **Tool** | A function your app offers the model, with a name, description and parameter schema. |
+| **Tool call** | The model's structured request to run a tool with arguments (JSON). |
+| **Tool result** | What your app returns after running it. |
+| **Tool loop** | Call model → run tools → call model again, until it gives a final answer. |
+
+> **🎯 In the interview**
+> Interviewers usually ask: how tool calling works under the hood; who executes the tool; how the model chooses a tool; how you secure tools; tool calling vs RAG.
+
+## Step 2: How a tool call works: the execution loop
+
+[![Selected design: Asha's question and the tool list go to the model, which replies with a tool call; Spring AI's tool loop checks that the user owns the order, runs the order service method and returns a typed result, and the model writes the final answer.](designs/ai-13.svg)](designs/ai-13.svg)
+
+1. Your app sends the question **plus the list of tools** (names, descriptions, JSON schemas).
+2. The model replies not with text but with a tool call: `getOrderStatus({"orderId": "5521"})`.
+3. Your app checks the call is allowed, runs the Java method, and gets `{"status": "PACKED", "shipped": false}`.
+4. Your app sends the result back to the model.
+5. The model may call another tool – `cancelOrder({"orderId": "5521"})` – or write the final answer.
+6. Final answer: *"Order 5521 is packed but not shipped yet, so I've cancelled it. You'll get a refund in 3–5 days."*
+
+![Animation: Asha asks about order 5521; the model proposes getOrderStatus; the application checks the order belongs to Asha and returns packed, not shipped; the model proposes cancelOrder; the application runs it after the policy check; the model writes the final answer.](learning-figures/ai-13-loop.gif)
+
+> **⚖️ Design choice**
+> The model **proposes**; your application **decides and executes**. Every tool call goes through the same permission checks as a button in your app would.
+
+## Step 3: In code with Spring AI
+
+**Define tools** as annotated methods:
 
 ```java
-import org.springframework.ai.tool.annotation.Tool;
-final class OrderTools {
-    private final AuthorizedOrderLookup orders;
-    OrderTools(AuthorizedOrderLookup orders) { this.orders = orders; }
-    @Tool(description="Read status of an order authorized for the current user")
-    public OrderStatus lookupOrder(String orderId) {
-        return orders.lookupForCurrentPrincipal(orderId);
+@Component
+public class OrderTools {
+    private final OrderService orders;
+
+    public OrderTools(OrderService orders) { this.orders = orders; }
+
+    @Tool(description = "Get the status of one of the current user's orders")
+    public OrderStatus getOrderStatus(
+            @ToolParam(description = "Order number, e.g. 5521") String orderId,
+            ToolContext context) {
+        String userId = (String) context.getContext().get("userId");   // from the session
+        return orders.statusFor(userId, orderId);    // throws if the order isn't the user's
     }
-}
-// Registered on the selected ChatClient request using .tools(orderTools).
-```
 
-The service validates ID format, ownership, deadline and result bounds. O123 for its owner returns current status evidence; O999 belonging to someone else returns denial without private fields. A timeout is a typed unavailable result, not permission for the model to invent delivery status. Verified identity is explicitly propagated/bound in asynchronous execution rather than assuming thread-local security survives every boundary.
-
-A refund extension would use a separate tool with current eligibility, amount/currency checks, stable refund identity and the product's approval rule. Repeated invocation returns the recorded operation; provider uncertainty is reconciled before another effect. Tool results remain untrusted external data for instruction purposes and cannot expand the caller's authority.
-
-## 3. Final design diagram
-
-[![Tool Calling / Function Calling: User request intent Model proposal; Model proposal name arguments Tool policy; Tool policy allowed call Authorized order service; Authorized order service current facts Order database; Authorized order service minimal fields Typed tool result; Typed tool result observation Model proposal; Model proposal grounded explanation Final response](designs/ai-13.svg)](designs/ai-13.svg)
-
-I start with a read-only lookup. Do not expose a general SQL executor or arbitrary HTTP client when one narrow domain operation meets the need. A tool description improves selection; it is not an authorization rule.
-
-## 4. Critical operation: worked execution
-
-![Authenticated application identity governs access to model-proposed arguments.](lessons/ai-13-flow.svg)
-
-*Authenticated application identity governs access to model-proposed arguments.*
-
-![Resource authorization runs even when arguments look syntactically valid.](lessons/ai-13-failure.svg)
-
-*Resource authorization runs even when arguments look syntactically valid.*
-
-### Define the narrow boundary
-
-```java
-import org.springframework.ai.tool.annotation.Tool;
-
-// Integration excerpt: authorizedOrders enforces identity outside model arguments.
-final class OrderTools {
-    private final AuthorizedOrderLookup authorizedOrders;
-    OrderTools(AuthorizedOrderLookup lookup) { this.authorizedOrders = lookup; }
-    @Tool(description = "Read the current user's authorized order status")
-    OrderStatus lookupOrder(String orderId) {
-        return authorizedOrders.lookupForCurrentPrincipal(orderId);
+    @Tool(description = "Cancel one of the current user's orders if it has not shipped")
+    public CancelResult cancelOrder(@ToolParam(description = "Order number") String orderId,
+                                    ToolContext context) {
+        String userId = (String) context.getContext().get("userId");
+        return orders.cancelIfNotShipped(userId, orderId);
     }
+
+    public record OrderStatus(String orderId, String status, boolean shipped) {}
+    public record CancelResult(String orderId, boolean cancelled, String reason) {}
 }
 ```
 
-The model does not get to supply `isAdmin=true` or choose another principal. In asynchronous work, propagate or explicitly bind the verified principal through an application-owned context; do not rely on a thread-local surviving arbitrary executor changes.
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Mechanism and rationale
-
-**Design question:** How can an assistant look up a live order without being allowed to act on arbitrary accounts?
-
-The model proposes a tool name and arguments. The application validates schema, derives authenticated identity, authorizes the resource and executes the tool. Tool result text returns as untrusted data for a later model step; the model never becomes the security principal.
-
-### Architecture and contracts
-
-```text
-Model proposes call -> allow-list -> parse/validate -> authorize with server identity -> operation ledger -> execute -> bounded result -> model continuation
-
-Application contracts (design outline):
-OrderLookup(orderId); ToolContext(tenant,user,requestId); ToolResult(status,data,errorCode)
-```
-
-Spring AI @Tool can expose a narrow method and .tools(instance) can register it for a request. Wrap it in application authorization and bound the result; never expose a generic SQL or shell execution tool to this assistant.
-
-### Worked reasoning and capacity example
-
-A loop with at most four model steps and two tools per step can still request eight side effects. Bound tool count, elapsed time, output bytes and spend independently, not just recursion depth.
-
-### Java and Spring AI implementation outline
+**Use them in a call:**
 
 ```java
-final class OrderTools {
-  private final AuthorizedOrders orders;
-  OrderTools(AuthorizedOrders orders) { this.orders = orders; }
-  @org.springframework.ai.tool.annotation.Tool(description="Read one authorized order status")
-  String status(String orderId) { return orders.statusForCurrentPrincipal(orderId); }
-}
-// AuthorizedOrders is an application port, not a model-provided identity.
+String answer = chatClient.prompt()
+        .user("Where is my order 5521, and cancel it if it hasn't shipped")
+        .tools(orderTools)                                   // offer these tools
+        .toolContext(Map.of("userId", currentUser.id()))     // trusted data, not shown to the model
+        .call()
+        .content();
 ```
 
-### Design decisions and alternatives
+- Spring AI builds the JSON schema from the method signature and descriptions.
+- It runs the **tool loop** for you: when the model asks for a tool, Spring AI calls the method and sends the result back.
+- `ToolContext` carries trusted values like the user ID; the model never sees or sets them.
+- Exceptions in a tool are turned into an error message for the model by default; you can customise this.
 
-I begin with read-only lookup tools. Side effects need operation IDs and a review/confirmation policy appropriate to the action. Descriptions should explain inputs and output semantics but cannot grant permissions.
+## Step 4: Common mistakes
 
-### Failure scenario and safe recovery
+| Mistake | Better |
+| --- | --- |
+| Tool takes `userId` as a parameter the model fills in | Get the user from `ToolContext` / the security context |
+| Vague descriptions ("handles orders") | Say exactly what it does, when to use it, and parameter formats |
+| One giant tool `runSql(query)` | Small, specific tools with typed parameters |
+| Dangerous actions run immediately | Ask the user to confirm refunds, payments, deletions |
+| Returning huge results | Return only the fields the model needs |
+| No limit on tool calls | Cap the number of tool calls per request |
 
-A malicious user asks for another account’s order and provides a plausible userId argument. The tool ignores model-supplied identity and checks order ownership using the authenticated context.
+> **⚠️ Common mistake**
+> Trusting arguments because they are valid JSON. `{"orderId": "7710"}` is perfectly formed – and may be Bilal's order. Authorisation happens in your service, using the authenticated user.
 
-### Security, privacy and provenance
+[![Resource authorization runs even when arguments look syntactically valid.](lessons/ai-13-failure.svg)](lessons/ai-13-failure.svg)
 
-A read-only label is descriptive metadata. Enforce read-only behavior in the implementation and database credentials.
+## Step 5: Production concerns
 
+- **Confirmation for side effects:** let the model *prepare* an action ("I can cancel order 5521 – shall I?") and execute only after the user clicks Confirm.
+- **Idempotency:** a retried model turn can call `cancelOrder` twice; make the service idempotent.
+- **Latency and cost:** each tool round trip is another model call. Two tools = three model calls.
+- **Observability:** log tool name, arguments (redacted), result status and duration for every call.
+- **Testing:** test tools as plain Java; test the conversation with a fake model that emits specific tool calls.
 
-**Verification criteria:** Task success, correct tool selection, unauthorized attempts blocked, argument validity, duplicate effects and tool latency/error classification.
+## Interviewer follow-ups
 
-### Further reading
+**Who actually executes the tool?** Your application. The model only produces a structured request.
 
-- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).
-- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).
-- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).
-- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.
+**How does the model choose a tool?** From the names, descriptions and schemas you send, plus the conversation. Good descriptions matter a lot.
 
-### Work through write tools
+**Tool calling vs RAG?** RAG adds documents before the call; tools let the model fetch live data or take actions during the call. Many assistants use both.
 
-A refund tool needs stronger handling than a status lookup: validate amount, eligibility, current state, operation identity and required user review. Persist intent and reconcile provider uncertainty. A model retry after a lost response must not create another refund.
+**What if the model calls a tool that doesn't exist or with bad arguments?** Spring AI rejects unknown tools; validate arguments in your method and return a clear error so the model can correct itself.
 
-Limit tool count, payload size and duration. Validate tool results before sending them back; external results can contain instructions and should remain data. For the pinned 1.1 API family, use its documented execution behaviour rather than copying a newer-version advisor loop without verification.
+**How do you stop tool loops?** Cap the number of iterations and the total time; return a graceful message when the cap is hit.
 
-## 6. Interviewer follow-ups
+## Wrap up
 
-**Does `@Tool` make a method safe?** No. It exposes a callable contract; domain authorization and validation remain necessary.
+The model proposes tool calls as structured JSON; your application authorises them with the real user, runs them, and returns typed results until the model can answer.
 
-**Should tools return raw database rows?** Return minimal typed data needed for the task, excluding secrets and unrelated personal fields.
+> **📝 Key takeaways**
+> - Tools = name + description + schema; the model asks, your app executes.
+> - `@Tool` methods and `.tools(...)` in Spring AI; the tool loop is automatic.
+> - Take identity from `ToolContext`, never from model arguments.
+> - Confirm side effects, make them idempotent, and cap tool calls.
 
-## 7. Closing answer
+## Going deeper (optional)
 
-Tool calling separates language intent from deterministic execution. I expose a narrow authorized order lookup, validate every proposed call and return minimal typed evidence. Write tools add explicit eligibility, operation identity and review policy; model arguments never become permission.
+The detailed version shows the application's identity governing every model-proposed argument, and how typed results keep the model from misreading tool output.
+
+[![Authenticated application identity governs access to model-proposed arguments.](lessons/ai-13-flow.svg)](lessons/ai-13-flow.svg)
+
+Further reading: [Spring AI – Tool calling](https://docs.spring.io/spring-ai/reference/api/tools.html).
+
+## Closing answer
+
+"With tool calling, I send the model the question plus a list of tools – names, descriptions and JSON schemas. Instead of text, the model can reply with a tool call such as `getOrderStatus` with order 5521; my application validates and runs it, sends the result back, and the model either calls another tool or writes the final answer. In Spring AI I annotate methods with `@Tool` and `@ToolParam`, pass them with `.tools(...)`, and Spring AI runs the loop. The model only proposes: I take the user's identity from `ToolContext`, authorise every call in the service, ask for confirmation before side effects, make actions idempotent, and cap the number of tool calls."
+
