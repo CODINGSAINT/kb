@@ -12,103 +12,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "caller",
+            "label": "Order service",
+            "x": 0,
+            "y": 0,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "svc",
             "label": "NotificationService",
-            "x": 0,
+            "x": 200,
             "y": 0,
-            "w": 200,
+            "w": 190,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "NotificationIntent",
-            "x": 250,
+            "id": "tpl",
+            "label": "Templates",
+            "x": 440,
             "y": 0,
-            "w": 200,
+            "w": 130,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "pref",
+            "label": "User preferences",
+            "x": 440,
+            "y": 130,
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "ch",
+            "label": "Channel interface",
+            "x": 200,
+            "y": 130,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "TemplateRenderer",
-            "x": 500,
-            "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n3",
-            "label": "ChannelPolicy",
+            "id": "prov",
+            "label": "Email / SMS / Push",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "DeliveryChannel",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Attempt",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Receipt",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "records"
+            "from": "caller",
+            "to": "svc",
+            "label": "event + data"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "rendered by"
+            "from": "svc",
+            "to": "tpl",
+            "label": "render"
           },
           {
-            "from": "n1",
-            "to": "n3",
-            "label": "routes through"
+            "from": "svc",
+            "to": "pref",
+            "label": "enabled channels"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "selects"
+            "from": "svc",
+            "to": "ch",
+            "label": "send with retry"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "creates"
-          },
-          {
-            "from": "n5",
-            "to": "n6",
-            "label": "records"
+            "from": "ch",
+            "to": "prov",
+            "label": "deliver"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a notification system (as an in-process library or service) that sends messages over email, SMS, push and in-app channels, respects user preferences, renders templates, retries failures and is easy to extend with new channels. It's an extensibility problem: **Strategy** per channel, **Factory** to create senders, and **Observer** to decouple producers from delivery.\n\n## Requirements\n\n**Functional**\n- `send(userId, eventType, payload)`. The system picks channels from user preferences and event priority.\n- Template per event and channel, with variables and localisation.\n- Retry with backoff. Fallback (push fails, so use SMS for critical events).\n- Rate-limit per user. Respect quiet hours. Deduplicate.\n\n**Non-functional**\n- High throughput (millions per day) and asynchronous: `send()` never blocks the caller.\n- At-least-once delivery with idempotency keys, so retries don't produce duplicate messages.\n- Adding a channel (e.g. WhatsApp) needs no change to existing senders.\n- Observable: delivery status can be tracked per message and channel.\n\n## 1. Scope and chosen solution\n\nI deliver email, SMS and push for typed business events. NotificationIntent freezes template version, recipient scope, urgency and expiry. `DeliveryChannel` is an interface implemented per provider/channel; rendering and route policy remain separate so adding a channel does not modify domain events.\n\n## 2. Dispatch and retry algorithm\n\n```text\nnotify(eventId,recipient,templateVersion,parameters) -> notificationId\ndeliver(notificationId) -> Accepted | RetryScheduled | PermanentFailure | Unknown\nAttempt: attemptId, notificationId, providerRef, outcome, nextAttemptAt\n```\n\nI deduplicate the intent, validate consent/expiry, render bounded channel content and record the attempt before the provider call. Definitive invalid addresses terminate; throttling schedules bounded backoff; timeout-after-acceptance remains uncertain and uses provider query/idempotency where available. Expired OTPs are not replayed later. At 200 SMS/minute against a 100/minute provider quota, backlog grows 100/minute, so channel admission must honor quota rather than adding unlimited threads. Receipts advance only supported states and duplicate callbacks cannot create another intent.\n\n## 3. Final design diagram\n\n[![Design Notification System: NotificationService records NotificationIntent; NotificationIntent rendered by TemplateRenderer; NotificationIntent routes through ChannelPolicy; ChannelPolicy selects DeliveryChannel; DeliveryChannel creates Attempt; Attempt records Receipt](designs/lld-13.svg)](designs/lld-13.svg)\n\nA **notification** is the intent to inform someone. A **delivery attempt** is one provider call. A **template version** determines rendered content. Provider acceptance means the provider received the message; it does not prove the recipient read it.\n\n## 4. Critical operation: worked execution\n\n![Intent is stable while attempts and provider receipts accumulate.](lessons/lld-13-flow.svg)\n\n*Intent is stable while attempts and provider receipts accumulate.*\n\n![A timeout is not proof that the message was never sent.](lessons/lld-13-failure.svg)\n\n*A timeout is not proof that the message was never sent.*\n\n### Worked calculation and implementation\n\n```java\n// Adapter contract sketch; no provider credentials in the domain object.\ninterface DeliveryChannel {\n    DeliveryReceipt send(RenderedMessage message, String attemptKey);\n}\n```\n\nKeep `EmailChannel`, `SmsChannel` and `PushChannel` responsible for their provider contracts. A policy chooses a channel; a renderer applies its length and formatting rules. An SMS long enough to become multiple billed segments needs channel-specific calculation rather than one universal “character count.”\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `NotificationService` | Facade: resolve channels, render, dispatch |\n| `NotificationChannel` (Strategy) | `EmailChannel`, `SmsChannel`, `PushChannel`, `InAppChannel`; `send(Message)` |\n| `ChannelFactory` | `get(ChannelType)` (registry map, so new channels self-register) |\n| `TemplateEngine` | `render(templateId, locale, vars)` |\n| `PreferenceService` | Per-user, per-event channel opt-ins and quiet hours |\n| `Notification` | id, user, event, channel, status (PENDING, SENT, FAILED, RETRYING) |\n| `RetryPolicy` | Exponential backoff with jitter, max attempts |\n| Filters (Chain of Responsibility) | `DedupFilter → RateLimitFilter → QuietHoursFilter` |\n\n```java\npublic interface NotificationChannel {\n    ChannelType type();\n    DeliveryResult send(RenderedMessage msg);\n}\n```\n\n### Design decisions & trade-offs\n\n**1. Open/closed via registry.** Adding WhatsApp is one class implementing `NotificationChannel`, registered with the factory. No `switch` to edit. Vendor adapters (SES vs. SendGrid) sit behind each channel as a second Strategy level.\n\n**2. Pre-send filters as a chain.** Dedup, rate limit, quiet hours and preference checks are independent rules. A chain lets you reorder them and add new ones, and each filter can short-circuit (drop or delay).\n\n**3. Async dispatch.** Producers call `send`, which enqueues work (`BlockingQueue`, or Kafka in HLD). A worker pool delivers. Producers never block on a slow SMS gateway.\n\n**4. Retries and idempotency.** Keep a notification ID through retries so vendors or your dedup can drop duplicates. Classify failures: transient (timeout, 5xx) gets retried; permanent (invalid number) fails fast.\n\n**5. Priority.** OTPs and security alerts skip quiet hours and use a separate high-priority queue, so a marketing blast can't delay them.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Creating a notification and delivering it through an unreliable provider are different responsibilities.\n\nNotificationRequest contains recipient, template version, channel preference and deduplication key. Renderer produces channel-specific payloads; ChannelAdapter calls email/SMS/push providers. DeliveryAttempt records outcome and retry schedule; PreferencePolicy decides consent and quiet hours.\n\n**Correctness rule:** A request identity maps to one logical notification. Retries may create several provider attempts but must not be misreported as several user intents. A successful enqueue is not confirmed delivery.\n\n```text\nnotification(id,request_key,recipient,template_version,status); attempt(id,notification_id,provider_ref,outcome,next_at)\n```\n\n### End-to-end execution trace\n\nAuthorize the request; validate recipient and preference; snapshot the template inputs; persist the notification and durable dispatch intent; render; send with provider idempotency when supported; classify result; retry transient failures within budget; record callbacks independently.\n\n### Concurrency and recovery walkthrough\n\nA timeout occurs after the provider accepts a message. Query using provider reference or retry with its idempotency key; when unsupported, document possible duplicate delivery. Local deduplication alone cannot undo an already sent SMS.\n\n### Policy choices and extension seams\n\nFactory selects an adapter; Strategy expresses channel fallback. Decorators can add metrics and retries only if retry policy understands idempotency. Avoid a generic retry decorator around every side effect.\n\n### Edge cases that change the design\n\nUnsubscribe takes precedence over queued marketing work under a documented cut-off policy. Missing template variables are permanent validation failures. Quiet hours depend on the recipient zone, not server local time.\n\n**Topic-specific cases:** Duplicate intent; missing variables; opt-out; retry budget; permanent provider error; out-of-order delivery callback; timezone quiet hours.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through policy choices\n\nAt 1,000 intents/minute with 20% SMS, nominal SMS traffic is 200/minute before retries. If the provider permits 100/minute, queueing will grow by 100/minute unless admission, alternate channels or the product's delay promise changes. More worker threads cannot remove the provider quota.\n\nPreserve the original event identity across retries. Distinguish permanent invalid-address failures from temporary throttling. Expire stale password-reset intents instead of sending an obsolete security code hours later. A notification system must not let an arbitrary template parameter override the recipient's authorization or consent.\n\n## 6. Interviewer follow-ups\n\n**Should email formatting live in the order aggregate?** No. The order emits a business fact; notification rendering adapts it to a channel.\n\n**Is at-least-once processing enough to prevent duplicate SMS?** No. Worker deduplication and provider idempotency capabilities are separate considerations.\n\n## 7. Closing answer\n\nI separate notification intent from channel-specific attempts and delivery evidence. Strategy chooses the channel, adapters integrate providers, and stable identities make retries inspectable. Accepted, delivered and read are separate outcomes; consent and expiry are checked before sending.\n"
+      "markdown": "## Problem\n\nDesign a notification library (or a small service) that other parts of an app call to send messages over email, SMS and push. The order service says: *\"Tell Asha that order 847 ships today\"* – and the library works out the text, the channels Asha has turned on, and delivers each one.\n\nProviders fail. Email servers time out; a user may have no phone number. The library must retry what can succeed later, give up on what can't, and never send the same notification twice because a caller retried.\n\n## Requirements\n\n- One call to notify a user through one or more channels (email, SMS, push).\n- Messages come from templates filled with data (\"Hi {name}, order {orderId} ships today!\").\n- Respect each user's channel preferences.\n- Retry temporary failures with backoff; don't retry permanent ones.\n- A repeated event (same event ID) is sent only once; adding a channel is easy.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Is this the large-scale notification system or the class design?\n\n**Interviewer:** The class design inside one service. HLD-4 covers the distributed version.\n\n**Candidate:** Which channels?\n\n**Interviewer:** Email and SMS now, push soon, maybe WhatsApp later.\n\n**Candidate:** What counts as a failure worth retrying?\n\n**Interviewer:** Timeouts and server errors. A missing phone number won't fix itself.\n\n**Candidate:** Can callers send the same event twice?\n\n**Interviewer:** Yes, if their own request is retried.\n\n**Candidate:** Do we send synchronously?\n\n**Interviewer:** Keep it synchronous for now, but design so it can move to a queue.\n\n> **🎯 In the interview**\n> Ask \"which failures are retryable?\" early. Retrying a permanent error wastes time; not retrying a timeout loses messages.\n\n| Functional | Non-functional |\n| --- | --- |\n| Templates, channels, preferences | No duplicate sends for the same event |\n| Retry with backoff | Adding a channel touches no existing code |\n| Report what happened per channel | Easy to test without real providers |\n\n## Step 2: Identify the core objects\n\n- **Template** – named text with placeholders; renders with data.\n- **User** – contact details and the channels they've enabled.\n- **Message** – one rendered text for one user on one channel.\n- **Channel** – an interface; `EmailChannel`, `SmsChannel`, `PushChannel` implement it.\n- **TemporaryFailure** – the exception type that means \"try again later\".\n- **NotificationService** – renders, checks preferences, sends with retry, de-duplicates events.\n- **Attempt** – the result per channel: SENT, FAILED or SKIPPED, with the number of tries.\n\n[![Selected design: a caller sends an event to the notification service, which renders the template, checks the user's preferences and sends one message per channel through a channel interface; temporary failures are retried with backoff and every attempt is recorded.](designs/lld-13.svg)](designs/lld-13.svg)\n\n> **⚖️ Design choice**\n> Each channel is a **Strategy** behind one `Channel` interface. The service doesn't know how SMS works; adding WhatsApp is one new class registered with the service.\n\n## Step 3: Design the classes\n\n### Template, User and Message\n\nSmall immutable records. `Template.render` fails loudly if a placeholder has no value, so nobody receives \"Hi {name}\".\n\n### Channel and TemporaryFailure\n\n`send(message)` either returns (sent), throws `TemporaryFailure` (retry), or throws anything else (permanent).\n\n### NotificationService\n\nHolds the channels by type, the templates, and the set of event IDs already handled. `notify` returns one `Attempt` per requested channel.\n\n[![Class diagram: NotificationService has Channels and Templates and returns Attempts; EmailChannel and SmsChannel implement Channel; a Message is built from a User, a ChannelType and rendered Template text.](learning-figures/lld-13-classes.svg)](learning-figures/lld-13-classes.svg)\n\n## Step 4: Write the code\n\n### Messages and templates\n\n```java\nenum ChannelType { EMAIL, SMS, PUSH }\n\nrecord Template(String name, String text) {\n    String render(Map<String, String> data) {\n        String out = text;\n        for (var e : data.entrySet()) out = out.replace(\"{\" + e.getKey() + \"}\", e.getValue());\n        if (out.contains(\"{\")) throw new IllegalArgumentException(\"Missing value in \" + name);\n        return out;\n    }\n}\n\nrecord User(String id, String email, String phone, String deviceToken,\n            Set<ChannelType> enabled) {}\n\nrecord Message(String eventId, User to, ChannelType channel, String text) {}\n```\n\n### Channels\n\n```java\n/** Thrown for failures worth retrying (timeouts, 5xx). Others are permanent. */\nclass TemporaryFailure extends RuntimeException {\n    TemporaryFailure(String why) { super(why); }\n}\n\ninterface Channel {\n    ChannelType type();\n    void send(Message m);              // throws TemporaryFailure or another exception\n}\n\nclass EmailChannel implements Channel {\n    final List<String> sent = new ArrayList<>();\n    int failNextCalls;                 // lets the demo simulate an outage\n    public ChannelType type() { return ChannelType.EMAIL; }\n    public void send(Message m) {\n        if (failNextCalls-- > 0) throw new TemporaryFailure(\"SMTP timeout\");\n        sent.add(m.to().email() + \": \" + m.text());\n    }\n}\n\nclass SmsChannel implements Channel {\n    final List<String> sent = new ArrayList<>();\n    public ChannelType type() { return ChannelType.SMS; }\n    public void send(Message m) {\n        if (m.to().phone() == null) throw new IllegalArgumentException(\"No phone number\");\n        sent.add(m.to().phone() + \": \" + m.text());\n    }\n}\n```\n\n### NotificationService\n\n```java\nenum Status { SENT, FAILED, SKIPPED }\n\nrecord Attempt(Message message, Status status, int tries, String note) {}\n\nclass NotificationService {\n    private final Map<ChannelType, Channel> channels = new EnumMap<>(ChannelType.class);\n    private final Map<String, Template> templates;\n    private final Set<String> seenEvents = new HashSet<>();   // de-duplicates retries\n    private final int maxTries;\n    final List<Long> backoffsMillis = new ArrayList<>();      // recorded, not slept\n\n    NotificationService(List<Channel> list, Map<String, Template> templates, int maxTries) {\n        list.forEach(c -> channels.put(c.type(), c));\n        this.templates = templates; this.maxTries = maxTries;\n    }\n\n    List<Attempt> notify(String eventId, User user, String template,\n                         Map<String, String> data, Set<ChannelType> wanted) {\n        String text = templates.get(template).render(data);    // fails before anything is sent\n        if (!seenEvents.add(eventId)) return List.of();          // already handled\n        List<Attempt> results = new ArrayList<>();\n        for (ChannelType type : wanted) {\n            Message m = new Message(eventId, user, type, text);\n            if (!user.enabled().contains(type)) {\n                results.add(new Attempt(m, Status.SKIPPED, 0, \"user turned it off\"));\n                continue;\n            }\n            results.add(sendWithRetry(channels.get(type), m));\n        }\n        return results;\n    }\n\n    private Attempt sendWithRetry(Channel channel, Message m) {\n        for (int attempt = 1; attempt <= maxTries; attempt++) {\n            try {\n                channel.send(m);\n                return new Attempt(m, Status.SENT, attempt, \"ok\");\n            } catch (TemporaryFailure e) {\n                backoffsMillis.add(1000L << (2 * (attempt - 1)));  // 1 s, 4 s, 16 s\n            } catch (RuntimeException e) {\n                return new Attempt(m, Status.FAILED, attempt, e.getMessage());  // permanent\n            }\n        }\n        return new Attempt(m, Status.FAILED, maxTries, \"gave up after retries\");\n    }\n}\n```\n\n### Worked example\n\n| Step | What happens | Result |\n| --- | --- | --- |\n| Order service: \"order-847-shipped\" for Asha via email, SMS, push | Template → \"Hi Asha, order 847 ships today!\" | |\n| Email: SMTP times out twice | Retry after 1 s, then 4 s | SENT on the 3rd try |\n| SMS | Asha has a phone number | SENT on the 1st try |\n| Push | Asha hasn't enabled push | SKIPPED |\n| Same event sent again | Event ID already seen | Nothing sent |\n| Bilal has SMS on but no phone number | Permanent error | FAILED after 1 try, no retries |\n| Template data missing `orderId` | Render fails before sending | Error to the caller |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Unknown template | Error before anything is sent |\n| Channel not registered | Treat as configuration error at start-up |\n| All retries fail | FAILED, \"gave up after retries\" – caller can alert |\n| User disabled every requested channel | All SKIPPED |\n\n## Step 5: The retry algorithm: retry the right failures\n\nFor each channel:\n\n1. Try to send.\n2. **Success** → record SENT with the number of tries.\n3. **TemporaryFailure** → wait longer each time (1 s, then 4 s, then 16 s) and try again, up to 3 tries.\n4. **Any other exception** → permanent: record FAILED immediately.\n5. Out of tries → FAILED, \"gave up\".\n\n![Animation: Asha's order-shipped notification goes to email and SMS; email times out, waits one second, times out again, waits four seconds and succeeds on the third try; SMS succeeds at once; push is skipped because Asha turned it off; a repeated event ID sends nothing.](learning-figures/lld-13-retry.gif)\n\n> **⚠️ Common mistake**\n> Retrying every exception. Retrying \"no phone number\" three times just delays the failure, and retrying a 400 Bad Request can't succeed. Classify failures first.\n\n> **🎯 In the interview**\n> A retry after a timeout can still create a duplicate: the provider may have sent the email before timing out. Pass a stable key (the event ID + channel) to providers that support idempotency, and accept a rare duplicate otherwise.\n\n## Step 6: Deep dives\n\n### Sending asynchronously\n\nPut each `Message` on a queue and let workers call `sendWithRetry`. The caller returns immediately; retries no longer block it. Backoff becomes \"re-queue with a delay\". (That's the HLD-4 design.)\n\n### Priorities and quiet hours\n\nAdd a `priority` to the request. OTPs bypass quiet hours and rate limits; marketing messages wait until 9 a.m.\n\n### Rate limiting per user\n\nBefore sending marketing messages, check a per-user token bucket (see the Rate Limiter lesson, LLD-14) so nobody gets 20 pushes a day.\n\n### Templates per language and channel\n\nKey templates by name + channel + language: SMS needs a 160-character version, email a subject and HTML body.\n\n## Interviewer follow-ups\n\n**Why not one big `send(type, ...)` with a switch?** Every new channel would edit that switch. With the `Channel` interface, new channels are added, not edited in (open/closed principle).\n\n**How do you test without sending real SMS?** Inject fake channels, like the demo's `EmailChannel` that fails a set number of times and records what it \"sent\".\n\n**Where do preferences come from?** A preferences store keyed by user, read for each event – checked again just before sending if delivery is delayed.\n\n**How do you keep the \"seen events\" set from growing forever?** Store event IDs with a time-to-live (for example 24 hours) in a database or Redis.\n\n## Wrap up\n\nA notification service renders templates, respects preferences, sends through pluggable channels, retries only temporary failures with backoff, and ignores repeated events.\n\n> **📝 Key takeaways**\n> - One `Channel` interface; each provider is a strategy.\n> - Fail early on template errors – before anything is sent.\n> - Retry temporary failures with exponential backoff; never retry permanent ones.\n> - De-duplicate by event ID; report a result per channel.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [NotifierDemo.java](reference-code/learning/kb/notifier/NotifierDemo.java). It replays the worked example and checks every result.\n\nThe production version keeps the notification intent stable while attempts and provider receipts accumulate, and treats a timeout as \"unknown\", not as \"not sent\".\n\n[![A timeout is not proof that the message was never sent.](lessons/lld-13-failure.svg)](lessons/lld-13-failure.svg)\n\n## Closing answer\n\n\"Callers send an event ID, a user, a template name, data and the channels they want. The NotificationService renders the template first – failing loudly on a missing value – then ignores the event if its ID was already handled. For each channel it checks the user's preferences and sends through a Channel strategy: email, SMS and push are separate classes behind one interface, so a new channel is just a new class. Channels throw a TemporaryFailure for timeouts and server errors, which we retry with exponential backoff up to three tries; other errors fail immediately. Each channel's result – sent, failed or skipped – is returned. To scale, the same send-with-retry moves behind a queue.\"\n"
     },
     {
       "category": "HLD",

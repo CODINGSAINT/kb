@@ -12,103 +12,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "cart",
             "label": "Cart",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 100,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "CartLine",
-            "x": 250,
+            "id": "eng",
+            "label": "Pricing engine",
+            "x": 160,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "PricingService",
-            "x": 500,
+            "id": "rules",
+            "label": "Ordered rules",
+            "x": 370,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Quote",
+            "id": "quote",
+            "label": "Quote (15 min)",
+            "x": 370,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "chk",
+            "label": "Checkout",
+            "x": 160,
+            "y": 130,
+            "w": 120,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "cust",
+            "label": "Customer",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "CheckoutService",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "InventoryPort",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Order",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 120,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "owns"
+            "from": "cart",
+            "to": "eng",
+            "label": "lines"
           },
           {
-            "from": "n0",
-            "to": "n2",
-            "label": "priced by"
+            "from": "eng",
+            "to": "rules",
+            "label": "apply in order"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "creates"
+            "from": "rules",
+            "to": "quote",
+            "label": "discounts"
           },
           {
-            "from": "n4",
-            "to": "n3",
-            "label": "accepts"
+            "from": "quote",
+            "to": "cust",
+            "label": "breakdown"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "reserves through"
+            "from": "cust",
+            "to": "chk",
+            "label": "confirm quote"
           },
           {
-            "from": "n4",
-            "to": "n6",
-            "label": "creates once"
+            "from": "chk",
+            "to": "eng",
+            "label": "re-price",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign the shopping cart and pricing engine of an e-commerce site: add or remove items, change quantities, apply promotions (coupons, BOGO, category discounts, cart-value thresholds) and compute the final price, then check out. The real test is a **pricing rules engine** that's extensible and gives predictable results when multiple promotions apply.\n\n## Requirements\n\n**Functional**\n- Add, update and remove items. The cart persists for logged-in users and merges with the guest cart on login.\n- Promotions: percentage or flat off on an item or category, buy X get Y, cart-level \"₹200 off above ₹1500\", coupon codes, free shipping.\n- Show a price breakdown: subtotal, each discount line, tax, shipping, total.\n- At checkout, validate stock and prices again, then create an order.\n\n**Non-functional**\n- Totals are deterministic and reproducible: money in minor units (paise), never floating point.\n- New promotion types plug in without changing the pricing engine (open/closed).\n- Correct when the same cart is edited from two devices at once.\n- Checkout re-validation is fast (well under 200 ms), as it sits on the purchase path.\n\n## 1. Scope and chosen solution\n\nI support variant quantities, coupons, price quotation and conversion to an order. `Cart` owns selection; `PricingService` calculates a bounded quote; Checkout coordinates stock and order creation. Product ID alone is insufficient when size/colour variants have distinct inventory.\n\n## 2. Checkout contract and algorithm\n\n```text\nsetQuantity(cartId,expectedVersion,variantId,quantity) -> CartVersion\nquote(cartId,cartVersion,address) -> Quote(id,total,lines,expiry)\ncheckout(checkoutId,quoteId,customer) -> ExistingOrder | NewOrder | Requote\n```\n\nAn edit validates positive bounded quantities and advances the version. Quote snapshots item, discount, shipping, currency and tax-policy inputs. Checkout locks the quote/cart boundary, rejects expired or mismatched versions, and records one accepted intent. Inventory reservation follows its authoritative conditional contract; a failed reservation resolves payment/order state explicitly. Two ₹950 shirts with 10% discount give ₹1,710; ₹50 shipping gives ₹1,760 before stated taxes. A retry returns the same order; another payload under the same checkout identity conflicts. Catalogue repricing does not silently change the accepted quote.\n\n## 3. Final design diagram\n\n[![Design Shopping Cart: Cart owns CartLine; Cart priced by PricingService; PricingService creates Quote; CheckoutService accepts Quote; CheckoutService reserves through InventoryPort; CheckoutService creates once Order](designs/lld-12.svg)](designs/lld-12.svg)\n\nA **cart line** represents a product variant and quantity. A **price quote** includes prices, discounts, tax assumptions and expiry. An **order** freezes accepted commercial facts. Inventory is a separate authority: adding something to a cart does not necessarily reserve it.\n\n## 4. Critical operation: worked execution\n\n![The customer accepts an explicit quote before order creation.](lessons/lld-12-flow.svg)\n\n*The customer accepts an explicit quote before order creation.*\n\n![An expired quote triggers a new visible offer, not a silent charge.](lessons/lld-12-failure.svg)\n\n*An expired quote triggers a new visible offer, not a silent charge.*\n\n### Worked calculation and implementation\n\nFor two ₹950 shirts, a 10% item discount gives ₹1,710. Adding ₹50 shipping gives ₹1,760 before the selected tax policy. A shipping discount and an item discount are not interchangeable if tax treatment differs. Specify discount order and rounding in the quote.\n\n```text\nCartLine(variantId, quantity)\nQuote(quoteId, cartVersion, lines, discounts, shipping, tax, total, expiresAt)\nOrder(orderId, acceptedQuoteSnapshot, checkoutId)\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Product`, `Category` | Catalogue (price comes from a `PriceService`, not cached in the cart) |\n| `Cart`, `CartItem` | productId, quantity, `addedAt` |\n| `PricingEngine` | Runs a pipeline of `PromotionRule`s and produces a `PriceBreakdown` |\n| `PromotionRule` (Strategy) | `isApplicable(ctx)`, `apply(ctx)`, `priority()`, `stackable()` |\n| `PricingContext` | Line items with running prices, applied promos, user, coupon |\n| `Coupon` | Code, validity, usage limits, eligibility (Specification pattern) |\n| `CheckoutService` | Re-price, reserve inventory, create `Order` |\n\n```java\ninterface PromotionRule {\n    int priority();                      // item-level before cart-level\n    boolean isApplicable(PricingContext ctx);\n    void apply(PricingContext ctx);      // adds DiscountLine(s) to ctx\n}\n```\n\n### Design decisions & trade-offs\n\n**1. Rules are Strategies in an ordered pipeline.** Apply item-level rules first, then category, then cart-level, then shipping. Order matters: 10% off then ₹200 off is not the same as ₹200 off then 10% off. Make the order explicit with `priority()` rather than relying on insertion order.\n\n**2. Stacking and exclusivity.** Mark rules `stackable` or put them in an exclusive group. For exclusive groups, either pick the best discount for the customer (evaluate each and keep the max) or the first by priority. State which business rule you're assuming.\n\n**3. Never trust cached prices.** The cart stores product IDs and quantities. Price is computed at view time and **recomputed at checkout**. If the price changed, show it before payment.\n\n**4. Eligibility as Specification.** `MinCartValue(1500).and(CategoryIn(\"shoes\")).and(FirstOrder())` composes conditions without one huge `if`.\n\n**5. Explainable output.** Return a `PriceBreakdown` with a line per discount. That's needed for the UI, for refunds on partial returns (allocate discounts per line), and for debugging.\n\n**6. Inventory at checkout, not at add-to-cart.** Reserving on add-to-cart lets carts hog stock. Reserve with a TTL during checkout.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** A cart is editable intent; checkout is a validated price-and-inventory commitment.\n\nCart owns CartLines keyed by product and selected options. ProductCatalogue and InventoryPort are external views. PricingEngine applies an ordered set of rules and returns a Quote with expiry. CheckoutService creates Order snapshots; CouponPolicy does not mutate inventory.\n\n**Correctness rule:** Line quantities are positive and bounded; totals use one currency; the same checkout request cannot create two orders. A stale cart price cannot establish the payable amount.\n\n```text\ncart(id,user_id,version,state); cart_line(cart_id,sku,options,quantity); quote(id,cart_version,total_minor,expires_at)\n```\n\n### End-to-end execution trace\n\nAdd or merge a line; validate option compatibility; calculate an explanatory quote; at checkout refresh price and inventory; reserve stock; obtain payment authorization; create an immutable order with line snapshots; mark the cart checked out or expose a recoverable pending state.\n\n### Concurrency and recovery walkthrough\n\nTwo browser tabs edit the same cart version, or both submit checkout. Optimistic cart versioning prevents lost updates; a durable checkout idempotency key prevents duplicate orders.\n\n### Policy choices and extension seams\n\nA pricing chain is useful when rule ordering is explicit: item promotions, order discount, tax and delivery may not commute. Keeping price as a single stored mutable cart total creates unexplained drift.\n\n### Edge cases that change the design\n\nCoupons may have per-user limits requiring atomic redemption. Product deletion leaves an unavailable line rather than silently dropping intent. Refunds use order snapshots, not current catalogue prices.\n\n**Topic-specific cases:** Concurrent tab update; empty checkout; coupon cap; price change; inventory shortage; duplicate order prevention; currency validation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through concurrent changes\n\nTwo browser tabs edit cart version 7: one changes quantity, another removes the line. Require an expected cart version or use clearly defined merge operations. A stale “set quantity to 3” must not silently resurrect an intentionally removed item.\n\nTwo checkout retries with identity X9 should return the same order. A different cart or accepted quote under the same identity is a conflict. If stock reservation later fails, record order failure and resolve payment rather than deleting history and losing the explanation.\n\nDo not use product ID alone when size/colour variants have separate stock. Bound quantity, distinct lines and coupon applications so pricing complexity cannot grow without limit.\n\n## 6. Interviewer follow-ups\n\n**Does removing a cart line cancel a submitted order?** No. They are separate lifecycles.\n\n**Where does the accepted address belong?** In the order snapshot; subsequent profile edits should not mutate it.\n\n## 7. Closing answer\n\nI treat the cart as mutable intent and the accepted quote as the commercial contract. Versioned edits prevent stale tabs from silently overwriting selections, while idempotent checkout creates one order with frozen prices and address. Adding to a cart does not claim stock.\n"
+      "markdown": "## Problem\n\nDesign the shopping cart and pricing engine of an online store. Asha adds 3 pairs of running socks (₹299 each) and trail shoes (₹3,499). There's a \"buy 2 socks, get 1 free\" deal and she has a coupon **RUN10**: 10% off orders of ₹999 or more, up to ₹200.\n\nThe cart must show her an exact price breakdown, apply deals in a predictable order, and make sure the price she pays at checkout is the price she saw.\n\n## Requirements\n\n- Add items, change quantities, remove items.\n- Apply pricing rules: item deals (buy X get Y), coupons with minimums and caps, delivery fee.\n- Show a clear breakdown: subtotal, each discount with its reason, delivery, total.\n- New promotion types can be added without rewriting the cart.\n- At checkout, charge the quoted price – or show a new quote if it changed.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Which kinds of promotions do we need?\n\n**Interviewer:** Buy-X-get-Y on items, percentage coupons with a cap, free delivery above a threshold.\n\n**Candidate:** Can promotions stack?\n\n**Interviewer:** Item deals first, then one coupon on what's left.\n\n**Candidate:** What if a price changes while the item sits in the cart?\n\n**Interviewer:** The customer must never pay more than they saw without being told.\n\n**Candidate:** How is money represented?\n\n**Interviewer:** Your choice – but no rounding surprises.\n\n**Candidate:** Do we handle tax?\n\n**Interviewer:** Assume prices include GST.\n\n> **🎯 In the interview**\n> Ask about stacking order. \"10% off, then ₹299 off\" and \"₹299 off, then 10% off\" give different totals; the order must be a deliberate rule.\n\n| Functional | Non-functional |\n| --- | --- |\n| Cart operations | Exact money (no floating point) |\n| Pricing rules and breakdown | Predictable rule order |\n| Quote and checkout | Easy to add new promotions |\n\n## Step 2: Identify the core objects\n\n- **Product** – SKU, name, price, category.\n- **Cart** – products and quantities; produces cart lines.\n- **PricingRule** – one promotion; returns a discount or nothing.\n- **Discount** – an amount and a reason shown to the customer.\n- **PricingEngine** – runs the rules in order and builds a quote.\n- **Quote** – the full breakdown plus an expiry time.\n- **Checkout** – accepts a quote only if it's still valid.\n\n[![Selected design: the cart holds products and quantities; the pricing engine runs an ordered list of pricing rules over the cart lines to produce a quote with every discount and an expiry; checkout re-prices and accepts the quote only if nothing changed.](designs/lld-12.svg)](designs/lld-12.svg)\n\n> **⚖️ Design choice**\n> Each promotion is a **Strategy** (`PricingRule`) and the engine applies a list of them in order – a simple **chain**. A new promotion type is a new class added to the list; the cart and engine don't change.\n\n## Step 3: Design the classes\n\n### Product and Cart\n\nA `Product` is an immutable record. The `Cart` maps SKUs to quantities and hands out `Line`s (product + quantity).\n\n### PricingRule and Discount\n\nThe interface has one method: given the lines and the subtotal left so far, return an optional `Discount`. `BuyTwoGetOne` and `PercentCoupon` are two implementations.\n\n### PricingEngine and Quote\n\nThe engine starts from the item subtotal, applies each rule in order, reduces the subtotal after each one, then adds delivery. The `Quote` keeps everything the customer saw and when it expires.\n\n### Checkout\n\nRe-prices the cart; if the total differs or the quote expired, it refuses with a new quote.\n\n[![Class diagram: a Cart has Lines of Products; PricingEngine holds an ordered list of PricingRules, implemented by BuyTwoGetOne and PercentCoupon, and produces a Quote with Discounts; Checkout uses the engine to confirm a quote.](learning-figures/lld-12-classes.svg)](learning-figures/lld-12-classes.svg)\n\n## Step 4: Write the code\n\n### Cart\n\n```java\nrecord Product(String sku, String name, long pricePaise, String category) {}\n\nclass Cart {\n    private final Map<String, Integer> qty = new LinkedHashMap<>();\n    private final Map<String, Product> products = new HashMap<>();\n\n    void add(Product p, int n) {\n        if (n <= 0) throw new IllegalArgumentException(\"Quantity must be positive\");\n        products.put(p.sku(), p);\n        qty.merge(p.sku(), n, Integer::sum);\n    }\n    void setQuantity(String sku, int n) {\n        if (n <= 0) { qty.remove(sku); products.remove(sku); } else qty.put(sku, n);\n    }\n    List<Line> lines() {\n        return qty.entrySet().stream()\n                .map(e -> new Line(products.get(e.getKey()), e.getValue())).toList();\n    }\n    record Line(Product product, int qty) {\n        long totalPaise() { return product.pricePaise() * qty; }\n    }\n}\n```\n\n### Pricing rules\n\n```java\nrecord Discount(String reason, long amountPaise) {}\n\n/** One pricing rule. Each looks at the cart and the subtotal left after earlier rules. */\ninterface PricingRule {\n    Optional<Discount> apply(List<Cart.Line> lines, long subtotalPaise);\n}\n\n/** Buy 2, get 1 free on one SKU: every third unit is free. */\nrecord BuyTwoGetOne(String sku) implements PricingRule {\n    public Optional<Discount> apply(List<Cart.Line> lines, long subtotal) {\n        return lines.stream().filter(l -> l.product().sku().equals(sku)).findFirst()\n                .filter(l -> l.qty() >= 3)\n                .map(l -> new Discount(\"Buy 2 get 1: \" + l.product().name(),\n                        (l.qty() / 3) * l.product().pricePaise()));\n    }\n}\n\n/** Percentage coupon with a cap, e.g. 10% off up to Rs 200 on orders from Rs 999. */\nrecord PercentCoupon(String code, int percent, long minOrderPaise, long capPaise)\n        implements PricingRule {\n    public Optional<Discount> apply(List<Cart.Line> lines, long subtotal) {\n        if (subtotal < minOrderPaise) return Optional.empty();\n        long off = Math.min(subtotal * percent / 100, capPaise);\n        return Optional.of(new Discount(\"Coupon \" + code, off));\n    }\n}\n```\n\n### PricingEngine and Quote\n\n```java\nrecord Quote(List<Cart.Line> lines, List<Discount> discounts, long subtotalPaise,\n             long deliveryPaise, long totalPaise, Instant expiresAt) {}\n\nclass PricingEngine {\n    private final List<PricingRule> rules;     // order matters: item deals, then coupons\n    private final long freeDeliveryFromPaise = 49_900, deliveryFeePaise = 4_000;\n\n    PricingEngine(List<PricingRule> rules) { this.rules = List.copyOf(rules); }\n\n    Quote quote(Cart cart, Instant now) {\n        List<Cart.Line> lines = cart.lines();\n        long subtotal = lines.stream().mapToLong(Cart.Line::totalPaise).sum();\n        List<Discount> applied = new ArrayList<>();\n        for (PricingRule rule : rules) {\n            Optional<Discount> d = rule.apply(lines, subtotal);\n            if (d.isPresent()) {\n                long off = Math.min(d.get().amountPaise(), subtotal);  // never below 0\n                applied.add(new Discount(d.get().reason(), off));\n                subtotal -= off;\n            }\n        }\n        long delivery = subtotal >= freeDeliveryFromPaise ? 0 : deliveryFeePaise;\n        return new Quote(lines, applied, subtotal, delivery, subtotal + delivery,\n                now.plusSeconds(15 * 60));\n    }\n}\n```\n\n### Checkout\n\n```java\nclass Checkout {\n    private final PricingEngine engine;\n    Checkout(PricingEngine engine) { this.engine = engine; }\n\n    /** The customer pays the quote they saw – or sees a new one if it changed. */\n    Quote confirm(Cart cart, Quote shown, Instant now) {\n        Quote fresh = engine.quote(cart, now);\n        if (now.isAfter(shown.expiresAt()) || fresh.totalPaise() != shown.totalPaise())\n            throw new QuoteChangedException(fresh);\n        return shown;\n    }\n}\n\nclass QuoteChangedException extends RuntimeException {\n    final Quote newQuote;\n    QuoteChangedException(Quote q) { super(\"Price changed: please review\"); newQuote = q; }\n}\n```\n\n### Worked example\n\nMoney is in paise (`long`): ₹299 = 29,900.\n\n| Step | Calculation | Result |\n| --- | --- | --- |\n| 3 socks | 3 × ₹299 = ₹897 | |\n| Buy 2 get 1 | 1 free × ₹299 | − ₹299 → ₹598 |\n| RUN10 | ₹598 < ₹999 minimum | not applied |\n| Delivery | ₹598 ≥ ₹499 | free → **₹598** |\n| + trail shoes ₹3,499 | ₹897 + ₹3,499 = ₹4,396 | |\n| Buy 2 get 1 | − ₹299 | ₹4,097 |\n| RUN10 | 10% of ₹4,097 = ₹409.70, capped | − ₹200 → ₹3,897 |\n| Checkout after 1 minute | same total, not expired | charged ₹3,897 |\n| Checkout after 16 minutes | quote expired | new quote shown (₹3,897) |\n| Asha drops to 1 pair of socks | deal no longer applies | new quote ₹3,598 |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Quantity 0 or negative | Remove the line / reject |\n| Discount larger than the subtotal | Capped so the total never goes below 0 |\n| Coupon minimum not met | Rule returns nothing; breakdown doesn't show it |\n| Product price changes after quoting | Checkout sees a different total and shows the new quote |\n\n## Step 5: The pricing algorithm: order and honesty\n\nTwo rules make pricing predictable:\n\n1. **Rules run in a fixed order**, and each one sees the subtotal left by the rules before it. Item deals come first; cart-level coupons apply to what remains. That's why RUN10 is calculated on ₹4,097, not ₹4,396.\n2. **The customer pays the quote they saw.** At checkout, re-price. If the total changed (a price update, a coupon expiring, a cart change) or the quote is older than 15 minutes, show the new quote instead of silently charging a different amount.\n\n![Animation: three socks get the buy-two-get-one discount, the coupon is skipped because the subtotal is below 999 rupees; adding shoes raises the subtotal so the coupon applies, capped at 200 rupees; at checkout the quote is confirmed, but after the cart changes a new quote is shown instead of a silent charge.](learning-figures/lld-12-pricing.gif)\n\n> **⚠️ Common mistake**\n> Using `double` for prices. `0.1 + 0.2` is not `0.3` in binary floating point, and a percentage discount can be off by a paisa. Use `long` paise or `BigDecimal` with explicit rounding.\n\n> **🎯 In the interview**\n> If asked about \"best discount for the customer\", say you'd try the valid combinations of stackable rules and pick the lowest total – but keep it deterministic and explainable on the receipt.\n\n## Step 6: Deep dives\n\n### A new promotion type\n\n\"₹100 off any footwear\" is a new `PricingRule` that sums footwear lines and returns a `Discount`. Add it to the engine's list in the right position.\n\n### Exclusive coupons\n\nGive rules a `group` (e.g. \"coupon\"). The engine applies at most one rule per group – the first that matches, or the one giving the biggest discount.\n\n### Inventory at checkout\n\nPricing doesn't reserve stock. Checkout also asks inventory to reserve the items (see the e-commerce lesson, HLD-12) before taking payment.\n\n### Saving the cart\n\nStore carts by user ID (logged in) or a cookie ID (guest), and merge the guest cart into the user's cart at login.\n\n## Interviewer follow-ups\n\n**Why return a Discount instead of changing prices directly?** The receipt needs every reason and amount, and rules stay independent and testable.\n\n**How do you round a percentage?** Decide once – usually round down in the customer's favour – and do it in one place (here, integer division of paise).\n\n**How long should a quote last?** Long enough to pay comfortably – 15 minutes is common – and never longer than the shortest promotion or price guarantee behind it.\n\n**How would you test the engine?** Table-driven tests: cart contents + rules → expected breakdown, exactly like the worked example.\n\n## Wrap up\n\nThe cart holds products and quantities; an ordered chain of pricing rules turns it into a quote with every discount explained; checkout charges that quote or shows a new one.\n\n> **📝 Key takeaways**\n> - Money in paise (`long`) or `BigDecimal` – never `double`.\n> - Each promotion is a `PricingRule`; the engine applies them in a fixed order.\n> - The quote is the contract: show it, then charge exactly it.\n> - Re-price at checkout; changes produce a visible new quote.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [CartPricingDemo.java](reference-code/learning/kb/cartpricing/CartPricingDemo.java). It replays the worked example and checks every result.\n\nThe production version has the customer accept an explicit quote before the order is created, and an expired quote always produces a new visible offer, never a silent charge.\n\n[![The customer accepts an explicit quote before order creation.](lessons/lld-12-flow.svg)](lessons/lld-12-flow.svg)\n\n## Closing answer\n\n\"A Cart maps products to quantities and produces lines. Each promotion is a PricingRule strategy that looks at the lines and the subtotal left so far and returns an optional Discount with a reason. The PricingEngine applies the rules in a fixed order – item deals like buy-two-get-one first, then a capped percentage coupon on what remains – then adds delivery, and returns a Quote with the full breakdown and a 15-minute expiry. All money is in paise. At checkout I re-price: if the total changed or the quote expired, the customer sees the new quote rather than being charged silently. New promotions are new rule classes added to the list.\"\n"
     },
     {
       "category": "HLD",
