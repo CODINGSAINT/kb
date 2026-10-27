@@ -104,108 +104,94 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "client",
             "label": "Sync client",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "meta",
             "label": "Metadata service",
-            "x": 250,
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Version manifests",
-            "x": 500,
+            "id": "db",
+            "label": "Versions + shares",
+            "x": 440,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
-            "label": "Chunk object store",
+            "id": "chunks",
+            "label": "Chunk store",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "y": 130,
+            "w": 140,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n4",
+            "id": "log",
             "label": "Change log",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "x": 220,
+            "y": 130,
+            "w": 140,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n5",
-            "label": "Access policy",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Garbage collector",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "id": "other",
+            "label": "Other devices",
+            "x": 440,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "conditional commit"
+            "from": "client",
+            "to": "meta",
+            "label": "missing chunks? commit"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "publishes"
+            "from": "client",
+            "to": "chunks",
+            "label": "upload new chunks"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "references chunks"
+            "from": "meta",
+            "to": "db",
+            "label": "version 7"
           },
           {
-            "from": "n1",
-            "to": "n4",
-            "label": "records changes"
+            "from": "meta",
+            "to": "log",
+            "label": "append change"
           },
           {
-            "from": "n0",
-            "to": "n4",
-            "label": "resumes cursor"
+            "from": "other",
+            "to": "log",
+            "label": "changes after cursor"
           },
           {
-            "from": "n1",
-            "to": "n5",
-            "label": "authorizes"
-          },
-          {
-            "from": "n6",
-            "to": "n3",
-            "label": "deletes unreferenced"
+            "from": "other",
+            "to": "chunks",
+            "label": "download chunks"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign Google Drive or Dropbox: users store files in the cloud, sync them across devices automatically, share with others and see version history. The key topics are **chunking and deduplication**, **metadata vs. blob separation**, **sync protocol** and **conflict resolution**.\n\n## Requirements\n\n**Functional**\n- Upload, download, delete and move files and folders. Files up to tens of GB.\n- Auto-sync changes across a user's devices within seconds. Share with permissions.\n- Version history and restore. Offline edits that sync later.\n\n**Non-functional**\n- Never lose data (11 nines durability). Efficient bandwidth: only changed parts upload.\n- Strong consistency for metadata (a folder listing must be correct after a move).\n\n**Scale:** 500M users × 15 GB average ≈ 7.5 EB logical, much less after dedup. Metadata covers billions of file rows. Sync requests: tens of thousands per second.\n\n## 1. Scope and chosen consistency\n\nI support file upload, rename, version history, offline sync and permission-controlled download. I choose immutable chunk objects plus transactional metadata/version commits. A path is not file identity, and successful object upload alone does not publish a new version.\n\n## 2. Sync protocol and model\n\n```text\nPOST /files/{id}/versions {baseVersion,chunkManifest,requestId} -> version | conflict\nPATCH /files/{id} {expectedVersion,name,parentId}\nGET /changes?cursor=... -> changes,nextCursor\nFile: id,parent,name,ACL,currentVersion,deleted\nManifest: fileId,version,chunkHashes,size; Change: seq,fileId,version,tombstone\n```\n\nClient uploads missing authorized chunks and submits a manifest against its base version. Metadata verifies chunk availability and permission, then atomically commits the version and change event. Concurrent edits from base 5 cannot silently overwrite version 6; I preserve a conflict copy or explicit merge result. A 100 MB file in 4 MB chunks needs about 25 chunks; fixed-boundary shifts can reduce deduplication. Deletion emits a tombstone retained for the offline horizon. Collection waits until no retained version or protected in-flight upload references a chunk. Hash knowledge alone never grants permission to reuse/download another tenant's data.\n\n## 3. Final design diagram\n\n[![Google Drive / Dropbox: Sync client conditional commit Metadata service; Metadata service publishes Version manifests; Version manifests references chunks Chunk object store; Metadata service records changes Change log; Sync client resumes cursor Change log; Metadata service authorizes Access policy; Garbage collector deletes unreferenced Chunk object store](designs/hld-10.svg)](designs/hld-10.svg)\n\nA **file ID** stays stable across renames. A **manifest** describes a content version's chunks. A **sync cursor** identifies metadata changes a device has seen. The blob store keeps bytes; the metadata service owns names, permissions and committed versions.\n\n## 4. Critical operation: worked execution\n\n![A new file version references verified chunks, not a half upload.](lessons/hld-10-flow.svg)\n\n*A new file version references verified chunks, not a half upload.*\n\n![Preserve both user edits rather than silently overwriting one.](lessons/hld-10-failure.svg)\n\n*Preserve both user edits rather than silently overwriting one.*\n\n### Calculate deduplication honestly\n\nA 100 MB file split into 4 MB chunks needs about 25 chunks. If one aligned chunk changes, uploading one new chunk can save bandwidth. Insertions can shift fixed boundaries and reduce reuse; content-defined chunking offers different costs. Hash equality supports deduplication, but access control must still prevent a user from claiming another tenant's bytes merely by guessing a hash.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n- **Client** watches the local file system, splits files into **chunks** (~4 MB, or content-defined chunking), hashes each one (SHA-256), and asks the server which hashes are new.\n- **Block service** uploads only missing chunks to **object storage**, keyed by hash. Identical chunks across users or versions are stored once (dedup).\n- **Metadata service** commits a new file version = an ordered list of chunk hashes, in a **transactional DB** (sharded by user or namespace): files, folders, versions, sharing ACLs and a per-namespace **journal** (change log with a monotonically increasing cursor).\n- **Notification service:** clients long-poll or keep a WebSocket. On change, they fetch journal entries after their cursor and download the needed chunks.\n\n### Key design decisions & trade-offs\n\n**1. Separate metadata and blobs.** Metadata needs transactions and fast listing. Blobs need cheap, durable bulk storage. Mixing them breaks both.\n\n**2. Chunking.** Fixed-size chunks are simple, but inserting one byte at the start shifts every chunk. **Content-defined chunking** (rolling hash, as in rsync or LBFS) keeps boundaries stable, so small edits upload one or two chunks.\n\n**3. Dedup trade-off.** Cross-user dedup saves huge storage, but it leaks information (\"does anyone have this file?\") and complicates deletion (reference counting and GC). Many systems dedup per user only.\n\n**4. Sync with a journal cursor.** Every change appends to the namespace journal. Clients store the last cursor, so sync is \"give me changes after X\". It's idempotent, resumable and works after being offline.\n\n**5. Conflicts.** Two devices edit the same file offline. The server accepts the first commit (based on version `v5`). The second commit, also based on `v5`, is a conflict, so keep both (\"file (conflicted copy).docx\"). Automatic merging is only possible for structured formats (Google Docs uses OT/CRDT for its own docs).\n\n**6. Durability.** Object storage replicated or erasure-coded across zones. Metadata DB with synchronous replicas and point-in-time backups.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A file revision references a complete immutable chunk list; concurrent edits cannot silently overwrite one another.\n\nAssume 10 million users x 20 metadata operations/day: 200 million/day, about 2,315/s. One million 100 MB uploads/day is 100 TB/day raw. Chunking permits resuming changed portions, but deduplication efficiency depends on real workloads.\n\n### API contracts and data ownership\n\n```text\nPOST /upload-sessions; PUT signed chunk; POST /files/{id}/revisions with expectedVersion; GET /changes?cursor\n```\n\n```text\nLogical records (outline, not complete DDL):\nfile(id,parent_id,name,owner,current_revision,version); revision(id,file_id,chunk_manifest); change(sequence,tenant,entity,operation)\n\nPrimary access/partitioning boundary:\ntenant_id + file_id for metadata; checksum plus storage namespace for chunk objects\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around tenant_id + file_id for metadata; checksum plus storage namespace for chunk objects. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nDetect changed chunks locally; upload missing chunks with checksums; verify ownership and object existence; atomically create a revision and advance file metadata using expected version; emit a durable change event; other devices reconcile through cursor-based delta listing.\n\n### Deep dive: the decision that changes this system\n\nContent-defined chunking resists boundary shifts better than fixed-size chunking but costs CPU and complexity. Deduplication across tenants can leak file existence and complicate encryption; prefer a defined tenant/security boundary.\n\n### Failure and race-condition walkthrough\n\nTwo devices edit offline from revision 7. The first commits revision 8; the second receives a conflict and preserves its work as a conflict copy or explicit merge. A last-writer-wins clock does not understand document intent.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nMetadata consistency matters more than immediate global propagation of every chunk. Store large bytes in object storage and small mutable indexes in a transactional store. Garbage collection needs retention and references from in-flight uploads.\n\nSync convergence time, conflict rate, missing-object references, upload resume efficiency and change-log cursor lag.\n\n**Test matrix:** Interrupted upload, corrupted chunk, offline concurrent rename/edit, moved parent folder, shared-file permission revocation and orphan-chunk cleanup.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A file revision references a complete immutable chunk list; concurrent edits cannot silently overwrite one another.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 10 million users x 20 metadata operations/day: 200 million/day, about 2,315/s. One million 100 MB uploads/day is 100 TB/day raw. Chunking permits resuming changed portions, but deduplication efficiency depends on real workloads.\n\n**Which failure would invalidate the naive design?** Two devices edit offline from revision 7. The first commits revision 8; the second receives a conflict and preserves its work as a conflict copy or explicit merge. A last-writer-wins clock does not understand document intent.\n\n**Why not introduce every distributed component immediately?** Metadata consistency matters more than immediate global propagation of every chunk. Store large bytes in object storage and small mutable indexes in a transactional store. Garbage collection needs retention and references from in-flight uploads.\n\n**How would you demonstrate the design works?** Interrupted upload, corrupted chunk, offline concurrent rename/edit, moved parent folder, shared-file permission revocation and orphan-chunk cleanup. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through deletion and recovery\n\nDeletion should create a metadata tombstone visible to offline devices; immediately forgetting the file can let an old client resurrect it as new. Retain tombstones for a documented offline/recovery horizon. Garbage collection removes chunks only when no retained authorized version references them and in-flight uploads are considered.\n\nSeparate ACL changes from cached directory listings. A revoked user might retain downloaded local bytes, but future metadata/download access must follow current permissions. Versioned manifests also make rollback a new explicit pointer update rather than destructive replacement of history.\n\n## 6. Interviewer follow-ups\n\n**Does object-store upload success make a file visible?** Not until its manifest and metadata commit.\n\n**Does rename require reuploading all bytes?** No. Stable identity and manifests separate naming from content.\n\n## 7. Closing answer\n\nStable file IDs separate naming from content, and immutable manifests separate uploaded bytes from committed versions. Conditional base-version commits preserve conflicting offline edits. Tombstones and reference-aware garbage collection make deletion and recovery explicit across disconnected devices.\n"
+      "markdown": "## Problem\n\nDesign Google Drive or Dropbox. Asha saves a 200 MB presentation on her laptop. A minute later it appears on her phone, and her colleague Bilal, who has edit access, sees the new version too.\n\nWhen Asha changes one slide, the app should not upload all 200 MB again. And if Asha and Bilal edit the same file offline, neither person's work may be silently lost.\n\n## Requirements\n\n- Upload, download and delete files and folders.\n- Sync changes automatically to all of a user's devices.\n- Share files and folders with view or edit permission.\n- Keep previous versions.\n- Upload only the changed parts of a large file; never lose an edit on conflict.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> Separate the file **bytes** from the file **metadata** (names, folders, versions). Almost every design decision follows from that split.\n\n**Candidate:** How large can files be?\n\n**Interviewer:** Up to 50 GB.\n\n**Candidate:** How many users?\n\n**Interviewer:** 500 million users, 100 million daily active.\n\n**Candidate:** Do we need real-time co-editing like Google Docs?\n\n**Interviewer:** No – whole-file sync like Dropbox.\n\n**Candidate:** What happens when two people change the same file?\n\n**Interviewer:** Don't lose either change.\n\n**Candidate:** Should it work offline?\n\n**Interviewer:** Yes. Sync when the device reconnects.\n\n**Functional requirements**\n\n1. Upload, download, delete, move files and folders.\n2. Sync across devices; share with view/edit permissions.\n3. Version history; conflict copies when edits clash.\n\n**Non-functional requirements**\n\n1. Durability: never lose a file (11 nines, like S3).\n2. Sync changes within seconds to a minute.\n3. Save bandwidth: upload only changed chunks.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Estimate storage and the number of sync notifications; both are much larger than you might expect.\n\n**Storage**\n\n```text\nUsers                  = 500 million\nAverage stored         ≈ 10 GB per user\nTotal                  = 500M × 10 GB     = 5 EB (before de-duplication)\n```\n\nWhat it means: bytes go in object storage, split into chunks, and identical chunks are stored once.\n\n**Changes**\n\n```text\nDaily active users     = 100 million\nFile changes per user  ≈ 20 per day\nChanges                = 2 billion per day ≈ 23,000 per second\n```\n\nWhat it means: the metadata database takes tens of thousands of writes a second and must be sharded, and devices must be told about changes efficiently.\n\n## Step 3: Define the API\n\n```http\nPOST /v1/files/{fileId}/versions/start   { \"chunks\": [\"sha256:ab12…\", \"sha256:9f3c…\", …] }\n→ 200 { \"missing\": [\"sha256:9f3c…\"], \"uploadUrls\": { \"sha256:9f3c…\": \"https://…\" } }\n\nPUT  {uploadUrl}                          (raw chunk bytes, straight to object storage)\n\nPOST /v1/files/{fileId}/versions/commit  { \"baseVersion\": 6, \"chunks\": [ … ] }\n→ 201 { \"version\": 7 }   |   409 { \"error\": \"CONFLICT\", \"currentVersion\": 7 }\n\nGET  /v1/changes?cursor=…                → list of changed files since cursor\nPOST /v1/files/{fileId}/share            { \"email\": \"bilal@…\", \"role\": \"EDITOR\" }\n```\n\nThe client lists the chunk hashes it has; the server says which ones it is missing. Only those are uploaded.\n\n> **🎯 In the interview**\n> `baseVersion` on commit is the key detail. It says \"I edited version 6\". If the server is already at version 7, that is a conflict, not an overwrite.\n\n## Step 4: Define the data model\n\n| Table | Key fields |\n| --- | --- |\n| `file` | fileId, ownerId, parentFolderId, name, latestVersion, deleted |\n| `file_version` | fileId, version, chunk list (ordered hashes), size, createdBy, createdAt |\n| `chunk` | hash → storage location, reference count |\n| `share` | fileId or folderId, userId, role (VIEWER / EDITOR) |\n| `change_log` | userId or namespace, sequence, fileId, change type |\n\n> **⚖️ Design choice**\n> Metadata in a sharded SQL database (by owner or namespace), because moves, renames and permissions need transactions. Chunks in object storage, addressed by their content hash.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: the sync client talks to the metadata service, which records version manifests and checks access policy; chunk bytes go to the chunk object store; every committed change is appended to a change log that other devices read; a garbage collector removes chunks no version uses.](designs/hld-10.svg)](designs/hld-10.svg)\n\n**Asha saves the presentation**\n\n1. Her sync client notices the change and splits the file into 4 MB chunks, hashing each one.\n2. It asks the metadata service which hashes are new. Only slide 12 changed, so only one chunk is missing.\n3. It uploads that one 4 MB chunk straight to object storage.\n4. It commits version 7 = the ordered list of chunk hashes, with `baseVersion 6`.\n5. The metadata service appends a change to the change log.\n\n**Her phone and Bilal see it**\n\n1. Their clients hold a long-poll (or push channel) on `/changes`.\n2. They learn \"file X is now version 7\", fetch the manifest, download only chunks they don't already have, and rebuild the file.\n\n![Animation: Asha edits slide 12; the client splits the file into chunks and only one chunk hash is new; it uploads that one chunk, commits version 7, the change log records it, and her phone downloads just the changed chunk to rebuild the file.](learning-figures/hld-10-sync.gif)\n\n## Step 6: Go deep\n\n### Chunking and de-duplication\n\nSplitting files into chunks gives three wins:\n\n- **Delta sync:** change one slide, upload one chunk – not 200 MB.\n- **Resumable transfers:** a failed upload resumes at the next chunk.\n- **De-duplication:** the same chunk (a shared PDF, a common library) is stored once, however many users have it.\n\nFixed 4 MB chunks are simple. Inserting a byte at the start shifts every boundary, though, so some systems use **content-defined chunking**, where boundaries follow the content and survive insertions.\n\n### Conflicts: two edits to the same version\n\n**Option 1: Last writer wins.**\n\n- Good: simple.\n- Problem: Asha's or Bilal's work silently disappears.\n\n**Option 2: Lock the file while someone edits.**\n\n- Good: no conflicts.\n- Problem: impossible offline, and a forgotten lock blocks everyone.\n\n**Option 3: Detect with versions; keep both.**\n\n- Good: nothing is lost; the user decides.\n- Problem: users occasionally see a \"conflicted copy\".\n\n> **⚖️ Design choice**\n> Detect with `baseVersion`. Bilal commits version 7 first. Asha's commit says \"based on 6\", so the server refuses it with 409, and her client saves her edit as `Deck (Asha's conflicted copy).pptx`. This is what Dropbox does.\n\n[![Conflict handling: Asha and Bilal both edit version 6 offline; Bilal commits first and becomes version 7; Asha's commit based on version 6 is rejected with a conflict, so her client saves her edit as a conflicted copy and both changes survive.](learning-figures/hld-10-conflict.svg)](learning-figures/hld-10-conflict.svg)\n\n> **⚠️ Common mistake**\n> Comparing modification timestamps to pick a winner. Device clocks are wrong, and \"newer\" does not mean \"contains the other person's change\".\n\n### Telling devices about changes\n\nEach user (or shared folder) has a change log with increasing sequence numbers. A device stores the last sequence it processed and asks \"what changed after 8,451?\". A long-poll or push notification wakes it when something new arrives, so it does not poll every few seconds.\n\n### Sharing and permissions\n\nPermissions are checked by the metadata service on every manifest read and every upload URL it hands out. Upload and download URLs are short-lived and signed, so a leaked link stops working quickly.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| Upload interrupted | Partial file | Chunks already uploaded are kept; the version is committed only when all exist |\n| Two offline edits | Conflict | `baseVersion` check; conflicted copy |\n| A very large shared folder | One change notifies thousands of devices | Change log per shared namespace; devices read it at their own pace |\n| Chunk no longer used | Storage leak | Reference counts plus a garbage collector that deletes after a grace period |\n| Metadata shard hot (one huge team) | Slow commits | Split by namespace; cache folder listings |\n\n## Putting it together\n\n- **Upload:** chunk and hash → upload only missing chunks → commit a version with `baseVersion`.\n- **Sync:** change log + long-poll → fetch manifest → download missing chunks.\n- **Safety:** conflicts become copies; chunks are de-duplicated and garbage-collected.\n\n## Interviewer follow-ups\n\n**Why not store the whole file in the database?** Databases are poor at huge blobs. Object storage is cheaper, more durable and serves bytes directly to clients.\n\n**How do you restore an old version?** Commit a new version whose chunk list equals the old one – no bytes move.\n\n**How do you handle deletes?** Mark the file deleted (trash) and keep its versions for 30 days; then drop references and let the garbage collector reclaim chunks.\n\n**Is de-duplication across users a privacy risk?** It can reveal that someone else has a file. Many services de-duplicate only within an account, or encrypt per user.\n\n## Wrap up\n\nWe split files into hashed chunks in object storage, kept versions and permissions in a metadata database, and synced devices through a change log with conflict detection.\n\n> **📝 Key takeaways**\n> - Bytes in object storage, metadata in a transactional database.\n> - Content-hashed chunks give delta sync, resumable uploads and de-duplication.\n> - `baseVersion` turns concurrent edits into a conflicted copy, never a silent overwrite.\n> - Devices catch up from a change-log cursor.\n\n## Going deeper (optional)\n\nThe detailed version verifies that every chunk in a manifest really exists before committing a version, so a half upload can never become the latest file.\n\n[![A new file version references verified chunks, not a half upload.](lessons/hld-10-flow.svg)](lessons/hld-10-flow.svg)\n\nFurther reading: [Dropbox – Streaming file synchronization](https://dropbox.tech/infrastructure/streaming-file-synchronization) and [Amazon S3 data durability](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html).\n\n## Closing answer\n\n\"I separate bytes from metadata. The client splits a file into 4 MB chunks and hashes each; the server says which hashes it lacks, and only those are uploaded straight to object storage with signed URLs. A version is an ordered list of chunk hashes, committed in a sharded SQL metadata service with the version it was based on. If someone else committed first, the commit is rejected and the client saves a conflicted copy, so no edit is lost. Every commit appends to a change log; other devices long-poll it, fetch the manifest and download only missing chunks. Chunks are de-duplicated and garbage-collected by reference count.\"\n"
     },
     {
       "category": "AI",
@@ -215,103 +201,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Source registry",
+            "id": "src",
+            "label": "Document sources",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "emb",
             "label": "Embedding pipeline",
-            "x": 250,
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Versioned vector index",
-            "x": 500,
+            "id": "idx",
+            "label": "Vector index (HNSW)",
+            "x": 460,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 190,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
-            "label": "Metadata filters",
-            "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
+            "id": "q",
             "label": "Query service",
-            "x": 250,
-            "y": 110,
-            "w": 200,
+            "x": 460,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n5",
-            "label": "Document revisions",
-            "x": 500,
-            "y": 110,
-            "w": 200,
+            "id": "filt",
+            "label": "Metadata filters",
+            "x": 220,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n6",
+            "id": "life",
             "label": "Lifecycle worker",
             "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "authorized sources"
+            "from": "src",
+            "to": "emb",
+            "label": "new revisions"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "upserts"
+            "from": "emb",
+            "to": "idx",
+            "label": "chunks + vectors"
           },
           {
-            "from": "n3",
-            "to": "n2",
-            "label": "restricts candidates"
+            "from": "q",
+            "to": "idx",
+            "label": "nearest k"
           },
           {
-            "from": "n4",
-            "to": "n2",
-            "label": "nearest search"
+            "from": "filt",
+            "to": "q",
+            "label": "tenant, status"
           },
           {
-            "from": "n2",
-            "to": "n5",
-            "label": "resolves evidence"
-          },
-          {
-            "from": "n6",
-            "to": "n2",
-            "label": "retires chunks"
+            "from": "life",
+            "to": "idx",
+            "label": "delete old revisions"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain vector stores: what they add beyond storing arrays of floats (ANN indexes, metadata filtering, hybrid search, CRUD and scaling), how the main options compare (PGVector, Redis, Elasticsearch/OpenSearch, dedicated databases like Pinecone, Weaviate, Qdrant, Milvus), and how Spring AI's `VectorStore` abstraction and filter expressions work.\n\n## Requirements\n\n- Core operations: add, delete and similarity search with top-k, threshold and filters.\n- Index types (HNSW, IVF) and their trade-offs.\n- Metadata filtering and why it's essential (multi-tenancy, ACLs, freshness).\n- Choosing a store for an enterprise Java stack.\n- Spring AI `VectorStore`, `SearchRequest`, the portable filter expression DSL.\n\n## 1. Selected store contract\n\nI choose a database-backed vector index for an initially moderate corpus, with typed metadata and source revisions. Document/query embeddings use one compatible model version. Search filters enforce tenant and document permissions before evidence reaches generation.\n\n## 2. Records and update transaction boundary\n\n```text\nChunk: id,documentId,revision,tenant,permissionScope,text,embeddingModel,vector\nIndexGeneration: id,model,dimension,publishedAt,state\nsearch(scope,queryVector,k,generation) -> permitted chunk IDs and scores\npublishRevision(doc,newChunks): stage -> verify -> switch -> retire old chunks\n```\n\nAn update from chunks A/B/C to A/D must retire B and C explicitly; upsert alone leaves stale evidence. New embedding models build a separate generation, evaluate recall and switch query embedding/index together. Equal vector dimensions do not prove compatible spaces. One million 1,536-dimensional float32 vectors occupy 6.144 GB raw before text, metadata, index structures and replicas.\n\nI test filter placement using a deliberately nearest forbidden vector, not random separation. Approximate indexing settings are selected by measured recall/latency and operating capacity. Source deletion tombstones immediately suppress access under current policy, with asynchronous physical cleanup verified later. Backups and re-ingestion have different recovery times, so both index/source provenance and recovery expectations are documented.\n\n## 3. Final design diagram\n\n[![Vector Stores: Source registry authorized sources Embedding pipeline; Embedding pipeline upserts Versioned vector index; Metadata filters restricts candidates Versioned vector index; Query service nearest search Versioned vector index; Versioned vector index resolves evidence Document revisions; Lifecycle worker retires chunks Versioned vector index](designs/ai-10.svg)](designs/ai-10.svg)\n\nAn **index namespace** separates logical collections, a **metadata filter** constrains candidates, and a **document revision** tells you what was embedded. **Approximate search** improves speed by potentially missing some exact nearest neighbours; measure recall rather than assuming an index configuration is universally best.\n\n## 4. Critical operation: worked execution\n\n![Text, embedding model and permissions remain traceable together.](lessons/ai-10-flow.svg)\n\n*Text, embedding model and permissions remain traceable together.*\n\n![Upsert alone does not remove chunks that disappeared from a new revision.](lessons/ai-10-failure.svg)\n\n*Upsert alone does not remove chunks that disappeared from a new revision.*\n\n### Calculate and choose\n\nOne million vectors × 1,536 dimensions × four bytes is about 6.144 GB raw values. Index graph/list structures, stored text, metadata, replicas and write headroom add to that. If your documents are small and the corpus modest, an existing database with vector support may be simpler than a new distributed dependency.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** How should embeddings be indexed, filtered, updated and migrated in a real application?\n\nA vector store combines numerical vectors, metadata and an index. Exact search establishes a correctness baseline; approximate methods such as HNSW/IVF trade search recall, memory, build time and latency. The storage engine may also support lexical indexes; vectors are not a separate mandatory database category.\n\n### Architecture and contracts\n\n```text\nDocument revision -> stable chunk IDs -> batch embedding -> versioned index upsert -> filtered search -> source lookup; tombstones and reindex govern updates\n\nApplication contracts (design outline):\nIndexVersion(embeddingModel,dimension,chunkerVersion,metric); SearchRequest(query,tenant,filter,k); DocumentRevision\n```\n\nVectorStore accepts Documents and SearchRequest-like queries in the selected release. Keep store-specific configuration outside domain code; validate metadata filter behavior with integration tests.\n\n### Worked reasoning and capacity example\n\nFive million vectors x 1,536 x 4 bytes = 30.72 GB raw floats. HNSW graph links, metadata, original text, replicas and write buffers add to that. Capacity tests must include the chosen index configuration.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord IndexVersion(String embeddingModel, int dimensions, String chunkerVersion) {}\n// Refuse reads/writes when request and index versions are incompatible.\n// Build a replacement index before changing the live query encoder.\n```\n\n### Design decisions and alternatives\n\nI start with a store that fits operating skills and consistency needs. Use stable content/revision keys for repeatable ingestion; rebuild into a new collection when model/chunker changes. Swap an index alias after validation rather than mixing incompatible vectors.\n\n### Failure scenario and safe recovery\n\nDeletion removes source text but leaves indexed chunks retrievable. Tombstone or delete every related chunk and enforce source authorization/version checks on read; track cleanup completion.\n\n### Security, privacy and provenance\n\nTwo models with equal vector dimension are not interchangeable. Distance thresholds are metric/model dependent and must be calibrated on your corpus.\n\n\n**Verification criteria:** Recall@k, filtered recall, insert/update lag, deletion propagation, memory and query p99 under concurrent ingestion. Benchmark skewed tenants, not only uniform random vectors.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through filter correctness\n\nFiltering before candidate selection and filtering a small top-k afterward can produce different recall and security properties. A post-filter cannot repair a design that exposes forbidden text to another processing step. Test tenant/resource filters with intentionally nearest forbidden vectors, not merely random fixtures.\n\nChanging embedding models requires a versioned migration. Even equal-dimensional vectors can represent different spaces. Build a new index, test retrieval, switch query embedding and index together, and keep a rollback plan. Index backup and source re-ingestion are different recovery strategies with different time/cost.\n\n## 6. Interviewer follow-ups\n\n**Is vector distance comparable across arbitrary models?** No. Use a compatible model/index and calibrated task evaluation.\n\n**Does deleting a document row guarantee vector deletion?** Only if your lifecycle explicitly performs and verifies that propagation.\n\n## 7. Closing answer\n\nI treat the vector store as a versioned retrieval index with explicit source lifecycle. Model compatibility, permission filters, stale-chunk retirement and recall measurement determine correctness; selecting a vector database alone does not solve these responsibilities.\n"
+      "markdown": "## Problem\n\nYour RAG assistant now has 5 million document chunks, each with a 1,536-number embedding. A question must find the 5 most similar chunks in under 50 ms, but only among documents the user is allowed to see, and only from the current version of each document.\n\nStoring arrays of floats is easy. Searching millions of them fast, with filters, while documents keep changing – that is what a **vector store** is for.\n\n## Requirements\n\n- Explain what a vector store adds beyond \"a table of float arrays\".\n- Explain exact vs approximate nearest-neighbour (ANN) search, and HNSW.\n- Combine vector search with metadata filters and keyword search.\n- Keep the index in step with changing documents (updates and deletes).\n- Use Spring AI's `VectorStore` with PGvector, and choose between options.\n\n## Step 1: The idea in plain words\n\nA vector store is a database that answers one question very fast: **\"which stored vectors are closest to this one?\"** – plus \"…and match these filters\".\n\n| Term | Plain meaning |\n| --- | --- |\n| **Vector / embedding** | A list of numbers that represents meaning (AI-4). |\n| **Similarity** | How close two vectors are – usually cosine similarity. |\n| **k-NN** | Find the k nearest vectors. Exact k-NN compares against every vector. |\n| **ANN** | Approximate nearest neighbours: much faster, very slightly less accurate. |\n| **HNSW** | A popular ANN index: a layered graph you walk from far to near. |\n| **Metadata filter** | Conditions like `department == 'HR'` applied with the search. |\n\n> **🎯 In the interview**\n> Interviewers usually ask: why not just a normal database; what ANN and HNSW are; how filtering works; which vector store you would pick; how you keep it up to date.\n\n## Step 2: How a vector store finds neighbours fast\n\n[![Selected design: document sources feed an embedding pipeline that writes chunks into a versioned vector index; a query service searches the index with metadata filters; a lifecycle worker removes chunks of old document revisions.](designs/ai-10.svg)](designs/ai-10.svg)\n\n### Exact search is too slow at scale\n\n```text\nChunks                     = 5,000,000\nDimensions                 = 1,536\nWork per query (exact)     = 5M × 1,536 ≈ 7.7 billion multiply-adds\nMemory for vectors         = 5M × 1,536 × 4 bytes ≈ 30 GB\n```\n\nWhat it means: comparing against every vector takes seconds per query. We need an index that looks at only a small part of the data.\n\n### HNSW in one picture\n\nHNSW builds a graph where each vector links to its near neighbours, in several layers – a few long-distance links on top, many short ones at the bottom, like motorways, main roads and lanes.\n\n1. Start at an entry point on the top layer.\n2. Jump to whichever neighbour is closer to the query; repeat until no neighbour is closer.\n3. Drop to the next layer and continue with finer links.\n4. On the bottom layer, collect the closest k.\n\nInstead of 5 million comparisons, a query makes a few thousand – and usually finds 95–99% of the true top-k.\n\n![Animation: a query enters the top layer of an HNSW graph, hops along long links toward the region of similar vectors, drops to lower layers with shorter links, and finishes on the bottom layer by collecting the five nearest chunks after checking only a small part of the graph.](learning-figures/ai-10-hnsw.gif)\n\n### Tuning knobs\n\n| Knob | Higher means |\n| --- | --- |\n| `m` (links per node) | Better recall, more memory |\n| `ef_construction` | Better graph, slower indexing |\n| `ef_search` | Better recall, slower queries |\n\n## Step 3: In code with Spring AI\n\nSpring AI hides each product behind one `VectorStore` interface. With PostgreSQL + PGvector:\n\n```properties\nspring.ai.vectorstore.pgvector.index-type=HNSW\nspring.ai.vectorstore.pgvector.distance-type=COSINE_DISTANCE\nspring.ai.vectorstore.pgvector.dimensions=1536\nspring.ai.vectorstore.pgvector.initialize-schema=true\n```\n\n**Search with a metadata filter:**\n\n```java\nList<Document> results = vectorStore.similaritySearch(\n        SearchRequest.builder()\n                .query(\"paternity leave split\")\n                .topK(5)\n                .similarityThreshold(0.6)\n                .filterExpression(\"department == 'HR' && status == 'PUBLISHED'\")\n                .build());\n```\n\n**Replace a document's chunks when it changes:**\n\n```java\npublic void reindex(String docId, List<Document> newChunks) {\n    vectorStore.delete(\"docId == '\" + docId + \"'\");   // remove every chunk of the old revision\n    vectorStore.add(newChunks);                       // embeds and stores the new ones\n}\n```\n\nThe filter strings use Spring AI's portable filter language, translated to each store's own syntax (SQL `WHERE` for PGvector, metadata filters for Pinecone, and so on). In production, build filters with `FilterExpressionBuilder` rather than concatenating strings, and take values like `docId` only from trusted code.\n\n> **⚖️ Design choice**\n> **PGvector** when you already run PostgreSQL and have up to tens of millions of vectors: one database, transactions with your metadata, familiar operations. Move to a dedicated store (Milvus, Qdrant, Weaviate, Pinecone, Elasticsearch/OpenSearch) for hundreds of millions of vectors or heavy hybrid search.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Filtering after search (\"top 5, then remove forbidden\") | Filter during search – otherwise you may get 0 allowed results |\n| Upserting new chunks without deleting old ones | Delete by `docId` (or version) first; a shorter new revision leaves stale chunks |\n| Mixing embedding models in one index | One model per index; re-embed everything when you change models |\n| Ignoring keyword search | Hybrid search: vectors for meaning + BM25 for exact terms (error codes, names) |\n| Default index settings forever | Measure recall on real queries; tune `ef_search` |\n\n> **⚠️ Common mistake**\n> Storing vectors without the chunk text and metadata. When a result is wrong you can't see why, and you can't filter or cite. Keep text, source, version and access rules with every vector.\n\n[![Upsert alone does not remove chunks that disappeared from a new revision.](lessons/ai-10-failure.svg)](lessons/ai-10-failure.svg)\n\n## Step 5: Production concerns\n\n- **Memory:** HNSW indexes live mostly in RAM. 5M × 1,536 floats ≈ 30 GB plus graph links – size machines accordingly, or use smaller dimensions or quantisation.\n- **Recall testing:** compare ANN results with exact search on a sample of queries; aim for 95%+ recall@k.\n- **Freshness:** ingest changes as events; delete by document ID; re-embed in the background when switching models, then switch indexes atomically.\n- **Multi-tenancy:** a `tenantId` filter on every query, or a separate collection per large tenant.\n- **Cost:** storage and RAM grow with vectors × dimensions; embedding calls cost per token at ingestion.\n\n## Interviewer follow-ups\n\n**Why not just use PostgreSQL arrays?** You can store them, but without an ANN index every query scans every row. PGvector adds the vector type, distance operators and HNSW/IVFFlat indexes.\n\n**HNSW or IVFFlat?** HNSW gives better recall and speed at the cost of memory and slower builds; IVFFlat clusters vectors into lists and is lighter but needs training and tuning.\n\n**Cosine, dot product or Euclidean?** Use what the embedding model was trained for – usually cosine; for normalised vectors cosine and dot product rank the same.\n\n**How do you do hybrid search?** Run keyword (BM25) and vector search, then merge results, for example with reciprocal rank fusion, and optionally rerank.\n\n## Wrap up\n\nA vector store finds the nearest embeddings fast with an ANN index such as HNSW, applies metadata filters during the search, and must be kept in step with document changes.\n\n> **📝 Key takeaways**\n> - Exact search is too slow at millions of vectors; ANN (HNSW) trades a little recall for big speed.\n> - Filter during search, not after.\n> - Delete old chunks when documents change; one embedding model per index.\n> - PGvector is a good default; dedicated stores for very large scale.\n\n## Going deeper (optional)\n\nThe detailed version keeps text, embedding model and permissions traceable together for every vector, and runs a lifecycle worker that removes superseded revisions.\n\n[![Text, embedding model and permissions remain traceable together.](lessons/ai-10-flow.svg)](lessons/ai-10-flow.svg)\n\nFurther reading: [Spring AI – Vector databases](https://docs.spring.io/spring-ai/reference/api/vectordbs.html), [pgvector](https://github.com/pgvector/pgvector) and [the HNSW paper](https://arxiv.org/abs/1603.09320).\n\n## Closing answer\n\n\"A vector store answers 'which stored embeddings are closest to this one, matching these filters' quickly. Exact search over millions of 1,536-dimension vectors is billions of operations per query, so stores use approximate indexes like HNSW – a layered neighbour graph that finds 95–99% of the true top-k by checking a small fraction. Metadata filters for tenant, permissions and status are applied during the search. In Spring AI I use the `VectorStore` interface – PGvector with an HNSW index is a good default – with `SearchRequest` for top-k, threshold and filters. When a document changes I delete its old chunks by document ID before adding new ones, keep one embedding model per index, and measure recall against exact search.\"\n"
     }
   ]
 }

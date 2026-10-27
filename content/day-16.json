@@ -90,103 +90,103 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Application agents",
+            "id": "app",
+            "label": "Apps + agents",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "gw",
             "label": "Ingest gateway",
-            "x": 250,
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Durable buffer",
-            "x": 500,
+            "id": "kafka",
+            "label": "Kafka buffer",
+            "x": 440,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
+            "id": "idx",
             "label": "Index workers",
-            "x": 0,
-            "y": 110,
-            "w": 200,
+            "x": 440,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
-            "label": "Searchable segments",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "id": "search",
+            "label": "Time-based indices",
+            "x": 220,
+            "y": 130,
+            "w": 180,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n5",
+            "id": "q",
             "label": "Query service",
-            "x": 500,
-            "y": 110,
-            "w": 200,
+            "x": 0,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n6",
-            "label": "Archive tier",
-            "x": 0,
-            "y": 220,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "id": "arch",
+            "label": "S3 archive",
+            "x": 660,
+            "y": 65,
+            "w": 130,
+            "h": 62,
+            "shape": "cylinder"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "batches"
+            "from": "app",
+            "to": "gw",
+            "label": "compressed batches"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "acknowledged events"
+            "from": "gw",
+            "to": "kafka",
+            "label": "write"
           },
           {
-            "from": "n2",
-            "to": "n3",
+            "from": "kafka",
+            "to": "idx",
             "label": "consume"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "publish"
+            "from": "idx",
+            "to": "search",
+            "label": "bulk index"
           },
           {
-            "from": "n5",
-            "to": "n4",
-            "label": "time tenant query"
+            "from": "kafka",
+            "to": "arch",
+            "label": "hourly files"
           },
           {
-            "from": "n4",
-            "to": "n6",
-            "label": "retention lifecycle"
+            "from": "q",
+            "to": "search",
+            "label": "search time range"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a centralised logging and monitoring system (like ELK, Splunk or Datadog Logs): collect logs from thousands of services and hosts, make them searchable within seconds, alert on patterns and keep them affordably for months. The challenges are **high-volume ingestion**, **buffering with Kafka**, **aggregation**, **tiered storage** and **querying**.\n\n## Requirements\n\n**Functional**\n- Ingest structured (JSON) and unstructured logs, with service, host, level and trace ID.\n- Full-text and field search over recent data, aggregations (errors per service), live tail.\n- Alert rules (\"> 100 5xx in 1 min\"). Retention per tenant (7 days hot, 1 year cold).\n\n**Non-functional**\n- Ingestion must never block or slow the apps. Tolerate bursts (incident storms).\n- Searchable within ~10 s of emission.\n\n**Scale:** 10k services emitting 5 TB/day ≈ 60 MB/s average, 5× bursts during incidents. Hot index ~35 TB for 7 days before replication.\n\n## 1. Scope and selected pipeline\n\nI collect structured service logs, search by tenant/time/trace and retain older data cheaply. I choose local bounded agents, a durable ingest buffer and immutable indexed segments. Audit events requiring stronger guarantees use a separately specified durable path.\n\n## 2. Contracts and indexing\n\n```text\nPOST /log-batches {tenant,batchId,events[]} -> accepted receipt\nGET /logs?timeRange&traceId&cursor -> authorized events,nextCursor\nEvent: eventId,tenant,service,eventTime,ingestTime,traceId,severity,fields\nSegment manifest: tenant/time partition,objectPaths,indexVersion,min/max times\n```\n\nIngest authenticates tenant, bounds decompressed bytes/fields and accepts only after its promised durability boundary. Consumers build searchable segments and publish manifests atomically. Queries prune tenant/time partitions, read indexes and merge results with stable cursors. One million 500-byte events/s is 43.2 TB/day raw; compression, index policy and retention therefore drive the architecture. If agents fill their buffers, low-priority sampling/drop counts are visible; they do not block ordinary application work forever. Search lag, dropped events, oldest buffered event and query cost reveal different health dimensions. Secrets are filtered before ordinary logging, not simply hidden in the UI.\n\n## 3. Final design diagram\n\n[![Logging / Monitoring System: Application agents batches Ingest gateway; Ingest gateway acknowledged events Durable buffer; Durable buffer consume Index workers; Index workers publish Searchable segments; Query service time tenant query Searchable segments; Searchable segments retention lifecycle Archive tier](designs/hld-16.svg)](designs/hld-16.svg)\n\nA **trace ID** connects a request's work; a **structured log field** makes attributes searchable; a **partition** distributes ingestion; a **retention tier** balances speed and cost. Metrics summarize populations, while logs preserve selected events. They complement one another.\n\n## 4. Critical operation: worked execution\n\n![Buffering and indexing add delay that must be measured.](lessons/hld-16-flow.svg)\n\n*Buffering and indexing add delay that must be measured.*\n\n![Unbounded logging can take down the application it observes.](lessons/hld-16-failure.svg)\n\n*Unbounded logging can take down the application it observes.*\n\n### Calculate storage and safety\n\nAt one million events/s and 500 bytes/event, raw input is 500 MB/s or 43.2 TB/day. Thirty days is roughly 1.3 PB before compression, indexes and replication. Retention and field-index policy matter more than choosing an arbitrary database brand.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n1. **Agents** on each host (Fluent Bit, Vector) tail files or stdout, batch, compress and ship. A local disk buffer covers network blips.\n2. **Kafka** is the ingestion buffer, partitioned by service. It absorbs bursts and decouples producers from indexers.\n3. **Stream processors** parse, enrich (Kubernetes metadata), redact PII, sample noisy debug logs, derive metrics (error counts) and evaluate alert rules on the stream.\n4. **Hot store:** Elasticsearch/OpenSearch (or a columnar store like ClickHouse or Loki-style label indexes), with time-based indexes per day for cheap deletion.\n5. **Cold store:** compressed Parquet on S3, queryable with Athena/Trino when needed.\n\n### Key design decisions & trade-offs\n\n**1. Full-text index vs. label-only index.** Elasticsearch indexes every token, so search is powerful but storage and CPU cost 1.5–3× the raw size. Loki indexes only labels and scans compressed chunks, which is much cheaper but slower for needle-in-haystack searches. Pick per use case or tier.\n\n**2. Backpressure and loss policy.** When the pipeline is behind, Kafka retention buys hours. Agents drop DEBUG before ERROR. Never block the application thread on logging (async appenders with bounded buffers).\n\n**3. Time-partitioned indexes.** Daily indexes make retention a cheap \"drop index\". Rollover by size handles hot days. Queries hit only the relevant time ranges.\n\n**4. Metrics derived from logs.** Counting errors by scanning logs at query time is expensive. Derive metrics in the stream and send them to a time-series DB (next topic). Use logs for detail.\n\n**5. Multi-tenancy.** Quotas per tenant on ingest rate and storage, so one noisy service can't evict others' data or starve indexing.\n\n**6. Correlation.** Inject trace IDs everywhere, so logs, metrics and traces link up during an incident.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** Accepted telemetry has a declared durability and loss policy; ingestion acknowledgement does not imply it is searchable yet.\n\nAssume 100,000 services x 10 log events/s x 500 bytes = 500 MB/s, about 43.2 TB/day raw. Compression and sampling change storage substantially and must be measured, not assumed to be free.\n\n### API contracts and data ownership\n\n```text\nBatch ingest with bounded payload and tenant credentials; query by time/service/correlation ID; tail stream\n```\n\n```text\nLogical records (outline, not complete DDL):\nlog(event_id,tenant,service,observed_at,ingested_at,severity,trace_id,body); segment(time_range,index_ref,object_ref)\n\nPrimary access/partitioning boundary:\ntenant + service + time bucket for storage; event_id or source sequence for deduplication when required\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around tenant + service + time bucket for storage; event_id or source sequence for deduplication when required. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nAgents batch and buffer within disk limits; collector authenticates and applies quotas; durable log absorbs bursts; processors redact/parse and index; hot storage serves recent search; immutable compressed objects retain colder data under policy.\n\n### Deep dive: the decision that changes this system\n\nEvent time and ingestion time differ when clients disconnect or clocks skew. A query must expose its time semantics. Index only selected fields; indexing arbitrary JSON creates a mapping explosion. Traces and logs share correlation IDs but have different retention and query patterns.\n\n### Failure and race-condition walkthrough\n\nAn outage generates more logs precisely when storage is strained. Backpressure, severity-aware shedding and bounded buffers prevent telemetry from taking down the application. State whether a dropped record was never accepted or lost after acknowledgement.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nFull-text indexes offer flexible search at high cost; structured indexes plus object storage reduce cost but slow broad investigations. Sampling helps volume but must not quietly remove all rare errors.\n\nIngest acceptance, acknowledged loss, oldest unindexed event, searchable lag, dropped events by priority and cost per retained TB.\n\n**Test matrix:** Collector outage, local disk full, schema explosion, redaction failure, oversized batches, clock skew and query during index lag.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: Accepted telemetry has a declared durability and loss policy; ingestion acknowledgement does not imply it is searchable yet.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 100,000 services x 10 log events/s x 500 bytes = 500 MB/s, about 43.2 TB/day raw. Compression and sampling change storage substantially and must be measured, not assumed to be free.\n\n**Which failure would invalidate the naive design?** An outage generates more logs precisely when storage is strained. Backpressure, severity-aware shedding and bounded buffers prevent telemetry from taking down the application. State whether a dropped record was never accepted or lost after acknowledgement.\n\n**Why not introduce every distributed component immediately?** Full-text indexes offer flexible search at high cost; structured indexes plus object storage reduce cost but slow broad investigations. Sampling helps volume but must not quietly remove all rare errors.\n\n**How would you demonstrate the design works?** Collector outage, local disk full, schema explosion, redaction failure, oversized batches, clock skew and query during index lag. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through queries and privacy\n\nPartitioning by time limits range scans, but tenant isolation and skew also affect placement. Indexing every high-cardinality field increases costs. Keep searchable trace IDs while controlling arbitrary labels and unbounded payloads. Authentication headers, secrets and personal documents should not appear in ordinary application logs.\n\nMeasure ingest acknowledgement separately from search visibility: an accepted event can still wait in a buffer. Replay must preserve event identity where deduplication matters. A logging outage should not block normal work indefinitely unless the specific audit requirement deliberately requires it.\n\n## 6. Interviewer follow-ups\n\n**Can the platform promise no loss with bounded buffers and unlimited outages?** No. State the operating envelope and overflow policy.\n\n**Does deleting an index remove archived raw records?** Not automatically; enforce retention across tiers.\n\n## 7. Closing answer\n\nI decouple ingestion durability from search visibility and put bounds on every buffer. Tenant/time partitioning and selective indexing control cost. Retention spans hot and archived data, and a logging outage follows an explicit loss/backpressure policy instead of silently exhausting the observed application.\n"
+      "markdown": "## Problem\n\nDesign a centralised logging system like ELK, Splunk or Datadog Logs. An order service on 2,000 servers writes lines such as `ERROR payment timeout orderId=5521`. At 2 a.m. an on-call engineer searches \"payment timeout in the last 15 minutes\" and finds the matching lines from every server in a few seconds.\n\nLogs arrive in huge volumes, mostly never read. The system must swallow bursts without slowing the applications, make recent logs searchable quickly, and keep old logs cheaply.\n\n## Requirements\n\n- Collect logs from thousands of servers and containers.\n- Search recent logs by text, service, level and time within seconds of them being written.\n- Keep 7–15 days searchable, and older logs in cheap storage for a year.\n- Never slow down or crash the application because logging is busy.\n- Handle traffic bursts (an incident makes services log 10× more).\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> Logging is a pipeline: collect → buffer → index → query → archive. Name the stages early.\n\n**Candidate:** How much log data?\n\n**Interviewer:** About 2 million lines a second, 500 bytes each.\n\n**Candidate:** How quickly must a line be searchable?\n\n**Interviewer:** Within about 30 seconds.\n\n**Candidate:** How long do we keep logs?\n\n**Interviewer:** Searchable for 15 days, archived for a year.\n\n**Candidate:** Is it acceptable to drop logs under extreme load?\n\n**Interviewer:** Debug logs, yes. Errors and audit logs, no.\n\n**Candidate:** Do we need alerts on log patterns?\n\n**Interviewer:** Nice to have.\n\n**Functional requirements**\n\n1. Collect structured and plain-text logs.\n2. Search by text, fields and time range; live tail.\n3. Retention tiers: hot search, cold archive.\n\n**Non-functional requirements**\n\n1. Searchable within ~30 seconds.\n2. Never block or crash the application.\n3. Survive 10× bursts; cost-efficient storage.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Log volume makes storage cost the main design driver.\n\n```text\nIngest            = 2M lines/s × 500 bytes = 1 GB/s ≈ 86 TB/day raw\nCompressed (~10×) ≈ 8.6 TB/day\nHot, 15 days      ≈ 130 TB (×2 replicas = 260 TB) + index overhead\nArchive, 1 year   ≈ 3 PB raw → ~300 TB compressed in object storage\n```\n\nWhat it means: hot search storage is expensive, so keep it short and move everything else to object storage.\n\n## Step 3: Define the API\n\n```http\nPOST /v1/logs/bulk   (from agents, compressed batches)\n[ { \"ts\": \"2026-10-27T02:03:11.402Z\", \"service\": \"orders\", \"host\": \"ord-117\",\n    \"level\": \"ERROR\", \"msg\": \"payment timeout\", \"orderId\": \"5521\", \"traceId\": \"a91f…\" } ]\n\nGET /v1/search?q=level:ERROR AND msg:\"payment timeout\"&from=now-15m&service=orders\nGET /v1/tail?service=orders&level=ERROR     (streaming)\n```\n\n> **🎯 In the interview**\n> Push for **structured logs** (JSON with fields such as service, level, traceId). Fields make filters fast and let you jump from a log line to its trace.\n\n## Step 4: Define the data model\n\n| Store | Contents | Technology |\n| --- | --- | --- |\n| Buffer | raw batches, partitioned by service | Kafka, a few days' retention |\n| Hot index | time-based indices (one per day per service group), inverted index on text and fields | Elasticsearch / OpenSearch, or a column store like ClickHouse |\n| Archive | compressed files per hour per service | Object storage (S3), queried rarely |\n\n> **⚖️ Design choice**\n> **Time-based indices.** One index per day makes deleting old data trivial (drop the whole index) and lets queries skip days outside their time range.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: agents on application hosts ship logs to an ingest gateway, which writes them to a durable buffer; index workers read the buffer and build searchable time-based segments; the query service searches those segments; old data moves to an archive tier.](designs/hld-16.svg)](designs/hld-16.svg)\n\n**Write path**\n\n1. The app writes to stdout or a local file – fast, never waiting on the network.\n2. An **agent** on each host (Fluent Bit, Vector, Filebeat) tails the file, batches lines, compresses them and sends them on.\n3. The **ingest gateway** checks the API key and quotas, then writes batches to **Kafka**.\n4. **Index workers** read from Kafka, parse fields, and bulk-write to the search cluster.\n5. Every hour, a job also writes compressed files to object storage for the archive.\n\n**Read path**\n\n1. The engineer's query hits the query service, which picks the indices for the time range.\n2. The search cluster scans only those indices and returns the newest matches first.\n\n![Animation: an incident makes the order service log ten times more; agents keep batching to the ingest gateway, Kafka absorbs the burst, index workers fall behind for a few minutes and then catch up, while the application itself is never slowed.](learning-figures/hld-16-burst.gif)\n\n## Step 6: Go deep\n\n### Absorbing bursts: the ingest algorithm\n\n**Option 1: The app sends logs straight to the search cluster.**\n\n- Good: fewest moving parts.\n- Problem: when the cluster is slow, the app's logging calls block – the incident gets worse.\n\n**Option 2: Agent + durable buffer (Kafka) in the middle.**\n\n- Good: the app writes locally; Kafka soaks up bursts; indexers catch up at their own pace.\n- Problem: one more system to run.\n\n> **⚖️ Design choice**\n> Agent + Kafka. Each layer has a bounded buffer. If everything downstream is jammed, the agent drops DEBUG lines first and keeps ERROR and audit lines – it never blocks the application.\n\n[![Back-pressure ladder: the application writes locally without waiting; the agent batches and, if its buffer fills, drops debug lines first; Kafka holds days of data during a burst; index workers catch up; errors and audit logs are never dropped.](learning-figures/hld-16-backpressure.svg)](learning-figures/hld-16-backpressure.svg)\n\n> **⚠️ Common mistake**\n> Using synchronous network logging inside request threads. A logging outage then becomes an application outage. Logging must be fire-and-forget from the app's point of view.\n\n### Making search fast and affordable\n\n- Index only useful fields; store the message text with a full-text index but skip indexing huge payloads.\n- Partition by time and service so a 15-minute query touches a tiny slice.\n- Keep 2 replicas for hot data; none needed in the archive (object storage is already durable).\n- Sample very noisy debug logs (keep 1 in 100) instead of storing them all.\n\n### Retention tiers\n\n| Tier | Age | Where | Query speed |\n| --- | --- | --- | --- |\n| Hot | 0–2 days | SSD search nodes | seconds |\n| Warm | 2–15 days | cheaper disks, fewer replicas | seconds to tens of seconds |\n| Archive | 15 days – 1 year | compressed files in S3 | minutes (rehydrate or scan) |\n\n### Connecting logs to traces\n\nPut the `traceId` from OpenTelemetry in every log line. From one error you can find every log line for the same request across ten services.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| Incident burst (10× logs) | Indexers fall behind | Kafka buffers; scale indexers; search lags a few minutes |\n| Search cluster down | No search | Kafka keeps data; indexers replay when it returns |\n| One service logs in a loop | Floods everyone | Per-service quotas at the gateway; drop or sample over quota |\n| Secrets in log lines | Leaked passwords | Redact at the agent with patterns; restrict access by service |\n| Disk full on a host | App could crash | Agent rotates files with size limits |\n\n## Putting it together\n\n- **Collect:** app writes locally → agent batches and compresses → gateway → Kafka.\n- **Index:** workers bulk-load time-based indices; hot, warm and archive tiers.\n- **Protect:** bounded buffers, quotas, drop debug first, never block the app.\n\n## Interviewer follow-ups\n\n**Elasticsearch or ClickHouse?** Elasticsearch excels at free-text search; ClickHouse-style column stores are cheaper for structured fields and aggregations. Many teams use structured logs in a column store.\n\n**How do you alert on logs?** A stream processor counts matching lines per minute (for example ERROR in orders) and fires when a threshold is crossed.\n\n**How do you search the archive?** Rehydrate the needed hours into a temporary index, or query the files directly with a tool like Athena.\n\n**Why not keep everything hot for a year?** Roughly 20× the cost for data almost nobody reads.\n\n## Wrap up\n\nWe collected logs with local agents, buffered them in Kafka, indexed them into time-based indices, and moved old data to cheap storage.\n\n> **📝 Key takeaways**\n> - The application writes locally and never waits for logging.\n> - Kafka absorbs bursts; indexers catch up.\n> - Time-based indices make queries and deletion cheap.\n> - Hot / warm / archive tiers control cost; drop debug before errors.\n\n## Going deeper (optional)\n\nThe detailed version measures the delay each stage adds (agent, Kafka, indexing) so \"searchable within 30 seconds\" can be monitored, not just hoped for.\n\n[![Buffering and indexing add delay that must be measured.](lessons/hld-16-flow.svg)](lessons/hld-16-flow.svg)\n\nFurther reading: [OpenTelemetry logs](https://opentelemetry.io/docs/concepts/signals/logs/) and [Elasticsearch data streams](https://www.elastic.co/guide/en/elasticsearch/reference/current/data-streams.html).\n\n## Closing answer\n\n\"Applications write structured logs locally and never wait on the network. An agent on each host batches, compresses and redacts them, sending them through an ingest gateway with per-service quotas into Kafka, which absorbs bursts. Index workers bulk-load the logs into time-based indices in Elasticsearch or a column store, making them searchable in about 30 seconds; queries touch only the indices in their time range. Hot data stays on fast nodes for a couple of days, warm data up to 15 days, and hourly compressed files go to object storage for a year. Under pressure the agent drops debug logs first, never errors, and never blocks the application.\"\n"
     },
     {
       "category": "AI",
@@ -196,108 +196,94 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Coordinator",
+            "id": "coord",
+            "label": "Coordinator (Java)",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Evidence researcher",
-            "x": 250,
+            "id": "res",
+            "label": "Researchers x4",
+            "x": 240,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
+            "id": "ev",
             "label": "Evidence bundle",
-            "x": 500,
+            "x": 450,
             "y": 0,
-            "w": 200,
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "wr",
+            "label": "Writer",
+            "x": 450,
+            "y": 130,
+            "w": 110,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Answer writer",
+            "id": "rev",
+            "label": "Reviewer",
+            "x": 240,
+            "y": 130,
+            "w": 120,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "out",
+            "label": "Final brief",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "Claim reviewer",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Shared budget",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Final decision",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 130,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "scoped task"
+            "from": "coord",
+            "to": "res",
+            "label": "in parallel"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "source spans"
+            "from": "res",
+            "to": "ev",
+            "label": "facts + sources"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "grounded input"
+            "from": "ev",
+            "to": "wr",
+            "label": "draft from evidence"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "draft claims"
+            "from": "wr",
+            "to": "rev",
+            "label": "draft"
           },
           {
-            "from": "n2",
-            "to": "n4",
-            "label": "independent evidence"
+            "from": "rev",
+            "to": "coord",
+            "label": "unsupported claims"
           },
           {
-            "from": "n0",
-            "to": "n5",
-            "label": "enforces"
-          },
-          {
-            "from": "n4",
-            "to": "n6",
-            "label": "supported claims"
+            "from": "coord",
+            "to": "out",
+            "label": "accept (1 revision max)"
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain multi-agent architectures: splitting a complex task across several specialised LLM agents coordinated by a supervisor or by peer-to-peer handoffs. Cover the patterns (supervisor-worker, hierarchical, handoff/swarm, debate), communication and shared state, and the honest trade-offs: when multiple agents help, and when they just multiply cost and failure modes.\n\n## Requirements\n\n- Why split: specialisation, smaller focused contexts, parallelism, separation of permissions.\n- Patterns: supervisor/orchestrator-workers, hierarchical teams, sequential handoffs, debate or critique.\n- Communication: message passing, shared blackboard state, agent-to-agent protocols.\n- Failure modes: error compounding, loops, inconsistent shared state, cost explosion.\n- Implementation in Java/Spring: each agent as its own `ChatClient` with its own prompt and tools.\n\n## 1. Selected multi-agent design\n\nI choose a fixed researcher→writer→reviewer workflow for complex evidence-backed reports, with parallel research only for independent subquestions. The coordinator owns task acceptance and total budget; workers cannot grant one another new user authority or publish autonomously.\n\n## 2. Handoff contracts and acceptance\n\n```text\nEvidenceBundle: sourceId,revision,spans,accessScope\nDraft: claimId,text,evidenceReferences\nReview: supportedClaims,unsupportedClaims,corrections,unresolvedQuestions\nFinal: accepted claims plus explicit unresolved limitations\n```\n\nThe researcher reads only approved sources. The writer receives the evidence bundle; the reviewer receives both draft and original evidence, preventing draft-only agreement from laundering an invented claim. The coordinator rejects unsupported claims and completes only against task criteria. Each artifact has one writer/version; concurrent workers do not overwrite a shared document.\n\nFour calls averaging 2,000 input and 500 output tokens consume at least 8,000 input and 2,000 output tokens before coordination/history. Parallelism can reduce elapsed independent work but not token cost, and a dependent review waits for a draft. I compare against a single-worker baseline on support, latency, spend and critical failures. Roles get least-privilege tools, so a research worker cannot inherit a publisher's write capability merely through a handoff.\n\n## 3. Final design diagram\n\n[![Multi-Agent Architecture: Coordinator scoped task Evidence researcher; Evidence researcher source spans Evidence bundle; Evidence bundle grounded input Answer writer; Answer writer draft claims Claim reviewer; Evidence bundle independent evidence Claim reviewer; Coordinator enforces Shared budget; Claim reviewer supported claims Final decision](designs/ai-16.svg)](designs/ai-16.svg)\n\nA **coordinator** owns the task and budget. A **worker** performs a bounded role. An **artifact contract** describes what passes between roles: sources, draft claims, critiques or decisions. I start with a deterministic workflow and add model-driven coordination only when its flexibility is justified.\n\n## 4. Critical operation: worked execution\n\n![Each role has a bounded input, output and stopping condition.](lessons/ai-16-flow.svg)\n\n*Each role has a bounded input, output and stopping condition.*\n\n![Agreement is weak evidence when both roles use the same missing sources.](lessons/ai-16-failure.svg)\n\n*Agreement is weak evidence when both roles use the same missing sources.*\n\n### Calculate coordination cost\n\nIf four workers each consume 2,000 input and 500 output tokens, that is 8,000 input plus 2,000 output before coordinator calls and repeated handoffs. Parallel workers may reduce elapsed time but do not remove token cost. A ten-second independent lookup can parallelize; a review dependent on a draft cannot start meaningfully before that draft exists.\n\n```text\nEvidenceBundle(sourceId, revision, spans)\nDraft(claimsWithEvidence)\nReview(supportedClaims, unsupportedClaims, proposedCorrections)\nFinalDecision(acceptedClaims, unresolvedQuestions)\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** Does splitting a task across several agents improve results enough to justify coordination overhead?\n\nA multi-agent system is a workflow with several model-driven roles and explicit handoffs. Roles alone do not create independent evidence or authority. A supervisor may assign narrow tasks while a reducer merges structured results; every worker needs a bounded context, budget and capability set.\n\n### Architecture and contracts\n\n```text\nAuthenticated task -> planner/workflow -> bounded parallel workers -> typed evidence/results -> conflict resolution -> validated synthesis -> final response\n\nApplication contracts (design outline):\nTask(id,objective,evidenceScope,budget); WorkerResult(findings,sourceIds,uncertainties); Handoff(allowedTools,deadline)\n```\n\nExecutorService/CompletableFuture can orchestrate independent tasks, but use bounded executors and cancellation. Persist task IDs and typed results rather than passing unlimited chat transcripts among workers.\n\n### Worked reasoning and capacity example\n\nThree workers each making four model calls plus two synthesis calls produce fourteen calls. Parallelism can reduce wall-clock time but typically increases total tokens and quota pressure. Cap per-worker and total run spend.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord WorkerTask(String id, String objective, int maxCalls) {}\nrecord WorkerResult(String taskId, java.util.List<String> evidenceIds, String uncertainty) {}\n// Submit only independent tasks to a bounded executor; cancel siblings on deadline.\n```\n\n### Design decisions and alternatives\n\nUse multiple agents for separable subtasks with independently checkable outputs. Prefer one workflow when the task is mostly sequential or all workers repeat the same retrieval.\n\n### Failure scenario and safe recovery\n\nTwo agents disagree using the same stale document. Voting does not make the majority correct. Compare source revisions and assumptions, escalate unresolved contradictions, and keep uncertain statements visible in the final result.\n\n### Security, privacy and provenance\n\nAn instruction received from another agent is task data; it does not grant a worker permissions beyond the host’s established user authorization.\n\n\n**Verification criteria:** Quality relative to single-agent baseline, duplicated calls, handoff errors, evidence coverage, latency and total cost. Track whether a worker exceeded its assigned scope.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through authority and shared state\n\nWorkers should not all write the same mutable document without coordination. Assign artifact ownership, version inputs and merge deliberately. Give a research worker read-only tools instead of the writer's publishing capability. An instruction in another agent's output is not fresh user authorization.\n\nUse a held-out evaluation set to compare one-agent and multi-agent versions. Measure source support, task completion, total spend, latency and unresolved disagreement. A reviewer that sees no original evidence may add persuasive wording while reducing reliability.\n\n## 6. Interviewer follow-ups\n\n**Does more agents imply more intelligence?** No. It can multiply context loss, correlated errors and coordination cost.\n\n**Should workers share every secret and conversation?** Only the minimum authorized context needed for their role.\n\n## 7. Closing answer\n\nI coordinate explicit artifacts rather than unrestricted agent conversations. Research, writing and review have narrow roles, source-level verification and one shared budget. Independent evidence checks—not agreement or agent count—justify accepting the final answer.\n"
+      "markdown": "## Problem\n\nA product manager asks your assistant: **\"Write a one-page brief comparing our refund policy with three competitors', with sources.\"** One prompt doing everything – searching, reading, comparing, writing, checking – tends to produce a long, shallow answer that mixes facts up.\n\nA **multi-agent** design splits the job between specialised roles: a researcher that gathers evidence, a writer that drafts, a reviewer that checks claims, and a coordinator that runs them. It can be better – or just more expensive. This lesson is about knowing which.\n\n## Requirements\n\n- Explain what a multi-agent system is and when it beats a single agent.\n- Describe common structures: orchestrator-workers, sequential hand-offs, evaluator loops.\n- Give each role a narrow job, its own tools and a clear output.\n- Share a budget and stopping rules across all agents.\n- Build a simple orchestrator with Spring AI.\n\n## Step 1: The idea in plain words\n\nThink of a small newsroom. The editor (coordinator) assigns work; a researcher collects facts with sources; a writer turns them into a story; a fact-checker challenges every claim. Each person is focused, and the editor decides when the story is done.\n\n| Term | Plain meaning |\n| --- | --- |\n| **Agent** | An LLM with a role, instructions and tools, possibly looping (AI-14). |\n| **Coordinator / orchestrator** | Splits the task, calls other agents, combines results. |\n| **Worker** | An agent with one narrow job (research, write, review). |\n| **Hand-off** | Passing a structured result from one agent to the next. |\n| **Shared budget** | One limit on steps, tokens and time for the whole run. |\n\n> **Rule of thumb:** start with one agent. Split only when one prompt is clearly overloaded, or parts can run in parallel.\n\n> **🎯 In the interview**\n> Interviewers usually ask: why use multiple agents; how agents communicate; how you prevent endless back-and-forth; how cost grows; when a single agent is better.\n\n## Step 2: How the agents work together: the execution flow\n\n[![Selected design: a Java coordinator runs four researchers in parallel, whose facts and sources form an evidence bundle; a writer drafts from the bundle; a reviewer lists unsupported claims; the coordinator allows at most one revision before accepting the final brief.](designs/ai-16.svg)](designs/ai-16.svg)\n\n1. **Coordinator** splits the brief: \"research us + 3 competitors\", then \"write\", then \"review\".\n2. **Researchers** (four, in parallel) each return an evidence list: claim + source URL + quote.\n3. **Writer** drafts the one-page brief **only** from the evidence bundle.\n4. **Reviewer** checks each sentence against the bundle and flags unsupported claims.\n5. If the reviewer flags problems, the writer revises **once**. Then the coordinator accepts or returns \"needs human review\".\n\n![Animation: the coordinator splits the task; four researchers gather evidence in parallel into one bundle; the writer drafts from it; the reviewer flags one claim without a source; the writer fixes it in one revision; the coordinator accepts the brief within the shared budget.](learning-figures/ai-16-team.gif)\n\n### Common structures\n\n**Option 1: Orchestrator-workers.** A coordinator assigns subtasks dynamically.\n\n- Good: flexible; workers can run in parallel.\n- Problem: the coordinator is a single, expensive brain that can over-delegate.\n\n**Option 2: Sequential pipeline (hand-offs).** Research → write → review, fixed order.\n\n- Good: predictable, easy to test – really a workflow.\n- Problem: can't adapt when a step needs more work.\n\n**Option 3: Evaluator loop.** A writer and a reviewer iterate until the review passes.\n\n- Good: quality improves on each round.\n- Problem: can loop forever or \"agree\" on wrong facts.\n\n> **⚖️ Design choice**\n> A **fixed pipeline with parallel research and one review round** for this brief. It gets most of the benefit with predictable cost; the coordinator is plain Java, not another LLM.\n\n## Step 3: In code with Spring AI\n\nEach role is a `ChatClient` with its own system prompt and tools; the coordinator is ordinary Java:\n\n```java\n@Service\npublic class BriefTeam {\n    private final ChatClient researcher, writer, reviewer;\n\n    public BriefTeam(ChatClient.Builder b, WebSearchTools search) {\n        researcher = b.clone().defaultSystem(\"Find facts with source URLs and short quotes.\")\n                .defaultTools(search).build();\n        writer   = b.clone().defaultSystem(\"Write a one-page brief using ONLY the evidence given.\").build();\n        reviewer = b.clone().defaultSystem(\"List every sentence not supported by the evidence.\").build();\n    }\n\n    public String brief(List<String> companies) {\n        List<Evidence> bundle = companies.parallelStream()                 // research in parallel\n                .map(c -> researcher.prompt().user(\"Refund policy of \" + c)\n                        .call().entity(Evidence.class))\n                .toList();\n\n        String draft = writer.prompt().user(\"Evidence: \" + bundle).call().content();\n        Review review = reviewer.prompt()\n                .user(\"Evidence: \" + bundle + \"\\nDraft: \" + draft).call().entity(Review.class);\n\n        if (!review.unsupported().isEmpty()) {                             // one revision only\n            draft = writer.prompt().user(\"Fix these: \" + review.unsupported()\n                    + \"\\nEvidence: \" + bundle + \"\\nDraft: \" + draft).call().content();\n        }\n        return draft;\n    }\n\n    record Evidence(String company, List<Fact> facts) {}\n    record Fact(String claim, String url, String quote) {}\n    record Review(List<String> unsupported) {}\n}\n```\n\n- Each agent has a narrow prompt and only the tools it needs (only the researcher can search).\n- Hand-offs are **typed records**, not free text – easier to validate and log.\n- The coordinator enforces the \"one revision\" rule in code.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Multi-agent for a simple task | One agent or a workflow first |\n| Agents chatting freely with each other | Structured hand-offs with a fixed schema |\n| No overall budget | One shared limit on steps, tokens and time |\n| Reviewer uses the same missing sources as the writer | Review against the evidence bundle and source links, not the writer's memory |\n| Every role gets every tool | Least privilege per role |\n| No trace of who said what | Log each agent's input, output and cost |\n\n> **⚠️ Common mistake**\n> Treating agreement between agents as proof. If the writer and reviewer both rely on the same wrong assumption, they will happily agree. Check claims against sources, not against each other.\n\n[![Agreement is weak evidence when both roles use the same missing sources.](lessons/ai-16-failure.svg)](lessons/ai-16-failure.svg)\n\n## Step 5: Production concerns\n\n- **Cost:** 4 researchers + writer + reviewer + revision ≈ 7+ model calls, often with long contexts – 5–15× a single call. Measure whether quality improves enough.\n- **Latency:** run independent agents in parallel; keep the critical path short.\n- **Evaluation:** compare single-agent vs multi-agent on the same task set (accuracy, citations, cost, time).\n- **Failure isolation:** if one researcher fails, continue with partial evidence and say so.\n- **Model choice:** cheaper models for narrow roles (extraction, review checklists), stronger ones for planning and writing.\n\n## Interviewer follow-ups\n\n**When does multi-agent clearly help?** Parallel, independent subtasks (research many sources), or when separate roles need different tools, permissions or models.\n\n**How do agents communicate?** Through the coordinator, with structured messages. Shared scratchpads are possible but harder to control.\n\n**How do you stop infinite loops between writer and reviewer?** A fixed number of rounds, a shared budget, and a \"needs human review\" exit.\n\n**Multi-agent vs one agent with many tools?** One agent is simpler and often enough. Split when the prompt gets too long, roles conflict, or you need parallelism.\n\n## Wrap up\n\nA multi-agent system splits a task among narrow roles with structured hand-offs, a shared budget and a coordinator that decides when the work is done – used only when it beats a single agent.\n\n> **📝 Key takeaways**\n> - Start with one agent; split for parallelism or genuinely different roles.\n> - Narrow prompts, least-privilege tools, typed hand-offs.\n> - One shared budget and a fixed number of rounds.\n> - Check claims against evidence, not against other agents.\n\n## Going deeper (optional)\n\nThe detailed version gives every role a bounded input, output and stopping condition, and records the evidence bundle so the final brief can be audited.\n\n[![Each role has a bounded input, output and stopping condition.](lessons/ai-16-flow.svg)](lessons/ai-16-flow.svg)\n\nFurther reading: [Anthropic – How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) and [Spring AI – Agentic patterns](https://spring.io/blog/2025/01/21/spring-ai-agentic-patterns).\n\n## Closing answer\n\n\"A multi-agent system splits a task between specialised LLM roles – for example parallel researchers, a writer and a reviewer – coordinated by an orchestrator. I use it only when a single agent is overloaded or when subtasks can run in parallel, because cost grows with every agent. Each role has a narrow prompt, only the tools it needs, and returns a typed result; hand-offs go through the coordinator, which in my design is plain Java enforcing a shared budget and a fixed number of review rounds. The reviewer checks claims against the evidence bundle, not against the writer. In Spring AI each role is its own ChatClient, and I compare quality, cost and latency against a single-agent baseline.\"\n"
     }
   ]
 }

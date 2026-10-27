@@ -12,103 +12,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
+            "id": "cart",
             "label": "Cart",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 100,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "CartLine",
-            "x": 250,
+            "id": "eng",
+            "label": "Pricing engine",
+            "x": 160,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "PricingService",
-            "x": 500,
+            "id": "rules",
+            "label": "Ordered rules",
+            "x": 370,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Quote",
+            "id": "quote",
+            "label": "Quote (15 min)",
+            "x": 370,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "chk",
+            "label": "Checkout",
+            "x": 160,
+            "y": 130,
+            "w": 120,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "cust",
+            "label": "Customer",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "CheckoutService",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "InventoryPort",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Order",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 120,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "owns"
+            "from": "cart",
+            "to": "eng",
+            "label": "lines"
           },
           {
-            "from": "n0",
-            "to": "n2",
-            "label": "priced by"
+            "from": "eng",
+            "to": "rules",
+            "label": "apply in order"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "creates"
+            "from": "rules",
+            "to": "quote",
+            "label": "discounts"
           },
           {
-            "from": "n4",
-            "to": "n3",
-            "label": "accepts"
+            "from": "quote",
+            "to": "cust",
+            "label": "breakdown"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "reserves through"
+            "from": "cust",
+            "to": "chk",
+            "label": "confirm quote"
           },
           {
-            "from": "n4",
-            "to": "n6",
-            "label": "creates once"
+            "from": "chk",
+            "to": "eng",
+            "label": "re-price",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign the shopping cart and pricing engine of an e-commerce site: add or remove items, change quantities, apply promotions (coupons, BOGO, category discounts, cart-value thresholds) and compute the final price, then check out. The real test is a **pricing rules engine** that's extensible and gives predictable results when multiple promotions apply.\n\n## Requirements\n\n**Functional**\n- Add, update and remove items. The cart persists for logged-in users and merges with the guest cart on login.\n- Promotions: percentage or flat off on an item or category, buy X get Y, cart-level \"₹200 off above ₹1500\", coupon codes, free shipping.\n- Show a price breakdown: subtotal, each discount line, tax, shipping, total.\n- At checkout, validate stock and prices again, then create an order.\n\n**Non-functional**\n- Totals are deterministic and reproducible: money in minor units (paise), never floating point.\n- New promotion types plug in without changing the pricing engine (open/closed).\n- Correct when the same cart is edited from two devices at once.\n- Checkout re-validation is fast (well under 200 ms), as it sits on the purchase path.\n\n## 1. Scope and chosen solution\n\nI support variant quantities, coupons, price quotation and conversion to an order. `Cart` owns selection; `PricingService` calculates a bounded quote; Checkout coordinates stock and order creation. Product ID alone is insufficient when size/colour variants have distinct inventory.\n\n## 2. Checkout contract and algorithm\n\n```text\nsetQuantity(cartId,expectedVersion,variantId,quantity) -> CartVersion\nquote(cartId,cartVersion,address) -> Quote(id,total,lines,expiry)\ncheckout(checkoutId,quoteId,customer) -> ExistingOrder | NewOrder | Requote\n```\n\nAn edit validates positive bounded quantities and advances the version. Quote snapshots item, discount, shipping, currency and tax-policy inputs. Checkout locks the quote/cart boundary, rejects expired or mismatched versions, and records one accepted intent. Inventory reservation follows its authoritative conditional contract; a failed reservation resolves payment/order state explicitly. Two ₹950 shirts with 10% discount give ₹1,710; ₹50 shipping gives ₹1,760 before stated taxes. A retry returns the same order; another payload under the same checkout identity conflicts. Catalogue repricing does not silently change the accepted quote.\n\n## 3. Final design diagram\n\n[![Design Shopping Cart: Cart owns CartLine; Cart priced by PricingService; PricingService creates Quote; CheckoutService accepts Quote; CheckoutService reserves through InventoryPort; CheckoutService creates once Order](designs/lld-12.svg)](designs/lld-12.svg)\n\nA **cart line** represents a product variant and quantity. A **price quote** includes prices, discounts, tax assumptions and expiry. An **order** freezes accepted commercial facts. Inventory is a separate authority: adding something to a cart does not necessarily reserve it.\n\n## 4. Critical operation: worked execution\n\n![The customer accepts an explicit quote before order creation.](lessons/lld-12-flow.svg)\n\n*The customer accepts an explicit quote before order creation.*\n\n![An expired quote triggers a new visible offer, not a silent charge.](lessons/lld-12-failure.svg)\n\n*An expired quote triggers a new visible offer, not a silent charge.*\n\n### Worked calculation and implementation\n\nFor two ₹950 shirts, a 10% item discount gives ₹1,710. Adding ₹50 shipping gives ₹1,760 before the selected tax policy. A shipping discount and an item discount are not interchangeable if tax treatment differs. Specify discount order and rounding in the quote.\n\n```text\nCartLine(variantId, quantity)\nQuote(quoteId, cartVersion, lines, discounts, shipping, tax, total, expiresAt)\nOrder(orderId, acceptedQuoteSnapshot, checkoutId)\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `Product`, `Category` | Catalogue (price comes from a `PriceService`, not cached in the cart) |\n| `Cart`, `CartItem` | productId, quantity, `addedAt` |\n| `PricingEngine` | Runs a pipeline of `PromotionRule`s and produces a `PriceBreakdown` |\n| `PromotionRule` (Strategy) | `isApplicable(ctx)`, `apply(ctx)`, `priority()`, `stackable()` |\n| `PricingContext` | Line items with running prices, applied promos, user, coupon |\n| `Coupon` | Code, validity, usage limits, eligibility (Specification pattern) |\n| `CheckoutService` | Re-price, reserve inventory, create `Order` |\n\n```java\ninterface PromotionRule {\n    int priority();                      // item-level before cart-level\n    boolean isApplicable(PricingContext ctx);\n    void apply(PricingContext ctx);      // adds DiscountLine(s) to ctx\n}\n```\n\n### Design decisions & trade-offs\n\n**1. Rules are Strategies in an ordered pipeline.** Apply item-level rules first, then category, then cart-level, then shipping. Order matters: 10% off then ₹200 off is not the same as ₹200 off then 10% off. Make the order explicit with `priority()` rather than relying on insertion order.\n\n**2. Stacking and exclusivity.** Mark rules `stackable` or put them in an exclusive group. For exclusive groups, either pick the best discount for the customer (evaluate each and keep the max) or the first by priority. State which business rule you're assuming.\n\n**3. Never trust cached prices.** The cart stores product IDs and quantities. Price is computed at view time and **recomputed at checkout**. If the price changed, show it before payment.\n\n**4. Eligibility as Specification.** `MinCartValue(1500).and(CategoryIn(\"shoes\")).and(FirstOrder())` composes conditions without one huge `if`.\n\n**5. Explainable output.** Return a `PriceBreakdown` with a line per discount. That's needed for the UI, for refunds on partial returns (allocate discounts per line), and for debugging.\n\n**6. Inventory at checkout, not at add-to-cart.** Reserving on add-to-cart lets carts hog stock. Reserve with a TTL during checkout.\n\n### Ownership, boundaries and invariants\n\n**Central design question:** A cart is editable intent; checkout is a validated price-and-inventory commitment.\n\nCart owns CartLines keyed by product and selected options. ProductCatalogue and InventoryPort are external views. PricingEngine applies an ordered set of rules and returns a Quote with expiry. CheckoutService creates Order snapshots; CouponPolicy does not mutate inventory.\n\n**Correctness rule:** Line quantities are positive and bounded; totals use one currency; the same checkout request cannot create two orders. A stale cart price cannot establish the payable amount.\n\n```text\ncart(id,user_id,version,state); cart_line(cart_id,sku,options,quantity); quote(id,cart_version,total_minor,expires_at)\n```\n\n### End-to-end execution trace\n\nAdd or merge a line; validate option compatibility; calculate an explanatory quote; at checkout refresh price and inventory; reserve stock; obtain payment authorization; create an immutable order with line snapshots; mark the cart checked out or expose a recoverable pending state.\n\n### Concurrency and recovery walkthrough\n\nTwo browser tabs edit the same cart version, or both submit checkout. Optimistic cart versioning prevents lost updates; a durable checkout idempotency key prevents duplicate orders.\n\n### Policy choices and extension seams\n\nA pricing chain is useful when rule ordering is explicit: item promotions, order discount, tax and delivery may not commute. Keeping price as a single stored mutable cart total creates unexplained drift.\n\n### Edge cases that change the design\n\nCoupons may have per-user limits requiring atomic redemption. Product deletion leaves an unavailable line rather than silently dropping intent. Refunds use order snapshots, not current catalogue prices.\n\n**Topic-specific cases:** Concurrent tab update; empty checkout; coupon cap; price change; inventory shortage; duplicate order prevention; currency validation.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through concurrent changes\n\nTwo browser tabs edit cart version 7: one changes quantity, another removes the line. Require an expected cart version or use clearly defined merge operations. A stale “set quantity to 3” must not silently resurrect an intentionally removed item.\n\nTwo checkout retries with identity X9 should return the same order. A different cart or accepted quote under the same identity is a conflict. If stock reservation later fails, record order failure and resolve payment rather than deleting history and losing the explanation.\n\nDo not use product ID alone when size/colour variants have separate stock. Bound quantity, distinct lines and coupon applications so pricing complexity cannot grow without limit.\n\n## 6. Interviewer follow-ups\n\n**Does removing a cart line cancel a submitted order?** No. They are separate lifecycles.\n\n**Where does the accepted address belong?** In the order snapshot; subsequent profile edits should not mutate it.\n\n## 7. Closing answer\n\nI treat the cart as mutable intent and the accepted quote as the commercial contract. Versioned edits prevent stale tabs from silently overwriting selections, while idempotent checkout creates one order with frozen prices and address. Adding to a cart does not claim stock.\n"
+      "markdown": "## Problem\n\nDesign the shopping cart and pricing engine of an online store. Asha adds 3 pairs of running socks (₹299 each) and trail shoes (₹3,499). There's a \"buy 2 socks, get 1 free\" deal and she has a coupon **RUN10**: 10% off orders of ₹999 or more, up to ₹200.\n\nThe cart must show her an exact price breakdown, apply deals in a predictable order, and make sure the price she pays at checkout is the price she saw.\n\n## Requirements\n\n- Add items, change quantities, remove items.\n- Apply pricing rules: item deals (buy X get Y), coupons with minimums and caps, delivery fee.\n- Show a clear breakdown: subtotal, each discount with its reason, delivery, total.\n- New promotion types can be added without rewriting the cart.\n- At checkout, charge the quoted price – or show a new quote if it changed.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Which kinds of promotions do we need?\n\n**Interviewer:** Buy-X-get-Y on items, percentage coupons with a cap, free delivery above a threshold.\n\n**Candidate:** Can promotions stack?\n\n**Interviewer:** Item deals first, then one coupon on what's left.\n\n**Candidate:** What if a price changes while the item sits in the cart?\n\n**Interviewer:** The customer must never pay more than they saw without being told.\n\n**Candidate:** How is money represented?\n\n**Interviewer:** Your choice – but no rounding surprises.\n\n**Candidate:** Do we handle tax?\n\n**Interviewer:** Assume prices include GST.\n\n> **🎯 In the interview**\n> Ask about stacking order. \"10% off, then ₹299 off\" and \"₹299 off, then 10% off\" give different totals; the order must be a deliberate rule.\n\n| Functional | Non-functional |\n| --- | --- |\n| Cart operations | Exact money (no floating point) |\n| Pricing rules and breakdown | Predictable rule order |\n| Quote and checkout | Easy to add new promotions |\n\n## Step 2: Identify the core objects\n\n- **Product** – SKU, name, price, category.\n- **Cart** – products and quantities; produces cart lines.\n- **PricingRule** – one promotion; returns a discount or nothing.\n- **Discount** – an amount and a reason shown to the customer.\n- **PricingEngine** – runs the rules in order and builds a quote.\n- **Quote** – the full breakdown plus an expiry time.\n- **Checkout** – accepts a quote only if it's still valid.\n\n[![Selected design: the cart holds products and quantities; the pricing engine runs an ordered list of pricing rules over the cart lines to produce a quote with every discount and an expiry; checkout re-prices and accepts the quote only if nothing changed.](designs/lld-12.svg)](designs/lld-12.svg)\n\n> **⚖️ Design choice**\n> Each promotion is a **Strategy** (`PricingRule`) and the engine applies a list of them in order – a simple **chain**. A new promotion type is a new class added to the list; the cart and engine don't change.\n\n## Step 3: Design the classes\n\n### Product and Cart\n\nA `Product` is an immutable record. The `Cart` maps SKUs to quantities and hands out `Line`s (product + quantity).\n\n### PricingRule and Discount\n\nThe interface has one method: given the lines and the subtotal left so far, return an optional `Discount`. `BuyTwoGetOne` and `PercentCoupon` are two implementations.\n\n### PricingEngine and Quote\n\nThe engine starts from the item subtotal, applies each rule in order, reduces the subtotal after each one, then adds delivery. The `Quote` keeps everything the customer saw and when it expires.\n\n### Checkout\n\nRe-prices the cart; if the total differs or the quote expired, it refuses with a new quote.\n\n[![Class diagram: a Cart has Lines of Products; PricingEngine holds an ordered list of PricingRules, implemented by BuyTwoGetOne and PercentCoupon, and produces a Quote with Discounts; Checkout uses the engine to confirm a quote.](learning-figures/lld-12-classes.svg)](learning-figures/lld-12-classes.svg)\n\n## Step 4: Write the code\n\n### Cart\n\n```java\nrecord Product(String sku, String name, long pricePaise, String category) {}\n\nclass Cart {\n    private final Map<String, Integer> qty = new LinkedHashMap<>();\n    private final Map<String, Product> products = new HashMap<>();\n\n    void add(Product p, int n) {\n        if (n <= 0) throw new IllegalArgumentException(\"Quantity must be positive\");\n        products.put(p.sku(), p);\n        qty.merge(p.sku(), n, Integer::sum);\n    }\n    void setQuantity(String sku, int n) {\n        if (n <= 0) { qty.remove(sku); products.remove(sku); } else qty.put(sku, n);\n    }\n    List<Line> lines() {\n        return qty.entrySet().stream()\n                .map(e -> new Line(products.get(e.getKey()), e.getValue())).toList();\n    }\n    record Line(Product product, int qty) {\n        long totalPaise() { return product.pricePaise() * qty; }\n    }\n}\n```\n\n### Pricing rules\n\n```java\nrecord Discount(String reason, long amountPaise) {}\n\n/** One pricing rule. Each looks at the cart and the subtotal left after earlier rules. */\ninterface PricingRule {\n    Optional<Discount> apply(List<Cart.Line> lines, long subtotalPaise);\n}\n\n/** Buy 2, get 1 free on one SKU: every third unit is free. */\nrecord BuyTwoGetOne(String sku) implements PricingRule {\n    public Optional<Discount> apply(List<Cart.Line> lines, long subtotal) {\n        return lines.stream().filter(l -> l.product().sku().equals(sku)).findFirst()\n                .filter(l -> l.qty() >= 3)\n                .map(l -> new Discount(\"Buy 2 get 1: \" + l.product().name(),\n                        (l.qty() / 3) * l.product().pricePaise()));\n    }\n}\n\n/** Percentage coupon with a cap, e.g. 10% off up to Rs 200 on orders from Rs 999. */\nrecord PercentCoupon(String code, int percent, long minOrderPaise, long capPaise)\n        implements PricingRule {\n    public Optional<Discount> apply(List<Cart.Line> lines, long subtotal) {\n        if (subtotal < minOrderPaise) return Optional.empty();\n        long off = Math.min(subtotal * percent / 100, capPaise);\n        return Optional.of(new Discount(\"Coupon \" + code, off));\n    }\n}\n```\n\n### PricingEngine and Quote\n\n```java\nrecord Quote(List<Cart.Line> lines, List<Discount> discounts, long subtotalPaise,\n             long deliveryPaise, long totalPaise, Instant expiresAt) {}\n\nclass PricingEngine {\n    private final List<PricingRule> rules;     // order matters: item deals, then coupons\n    private final long freeDeliveryFromPaise = 49_900, deliveryFeePaise = 4_000;\n\n    PricingEngine(List<PricingRule> rules) { this.rules = List.copyOf(rules); }\n\n    Quote quote(Cart cart, Instant now) {\n        List<Cart.Line> lines = cart.lines();\n        long subtotal = lines.stream().mapToLong(Cart.Line::totalPaise).sum();\n        List<Discount> applied = new ArrayList<>();\n        for (PricingRule rule : rules) {\n            Optional<Discount> d = rule.apply(lines, subtotal);\n            if (d.isPresent()) {\n                long off = Math.min(d.get().amountPaise(), subtotal);  // never below 0\n                applied.add(new Discount(d.get().reason(), off));\n                subtotal -= off;\n            }\n        }\n        long delivery = subtotal >= freeDeliveryFromPaise ? 0 : deliveryFeePaise;\n        return new Quote(lines, applied, subtotal, delivery, subtotal + delivery,\n                now.plusSeconds(15 * 60));\n    }\n}\n```\n\n### Checkout\n\n```java\nclass Checkout {\n    private final PricingEngine engine;\n    Checkout(PricingEngine engine) { this.engine = engine; }\n\n    /** The customer pays the quote they saw – or sees a new one if it changed. */\n    Quote confirm(Cart cart, Quote shown, Instant now) {\n        Quote fresh = engine.quote(cart, now);\n        if (now.isAfter(shown.expiresAt()) || fresh.totalPaise() != shown.totalPaise())\n            throw new QuoteChangedException(fresh);\n        return shown;\n    }\n}\n\nclass QuoteChangedException extends RuntimeException {\n    final Quote newQuote;\n    QuoteChangedException(Quote q) { super(\"Price changed: please review\"); newQuote = q; }\n}\n```\n\n### Worked example\n\nMoney is in paise (`long`): ₹299 = 29,900.\n\n| Step | Calculation | Result |\n| --- | --- | --- |\n| 3 socks | 3 × ₹299 = ₹897 | |\n| Buy 2 get 1 | 1 free × ₹299 | − ₹299 → ₹598 |\n| RUN10 | ₹598 < ₹999 minimum | not applied |\n| Delivery | ₹598 ≥ ₹499 | free → **₹598** |\n| + trail shoes ₹3,499 | ₹897 + ₹3,499 = ₹4,396 | |\n| Buy 2 get 1 | − ₹299 | ₹4,097 |\n| RUN10 | 10% of ₹4,097 = ₹409.70, capped | − ₹200 → ₹3,897 |\n| Checkout after 1 minute | same total, not expired | charged ₹3,897 |\n| Checkout after 16 minutes | quote expired | new quote shown (₹3,897) |\n| Asha drops to 1 pair of socks | deal no longer applies | new quote ₹3,598 |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Quantity 0 or negative | Remove the line / reject |\n| Discount larger than the subtotal | Capped so the total never goes below 0 |\n| Coupon minimum not met | Rule returns nothing; breakdown doesn't show it |\n| Product price changes after quoting | Checkout sees a different total and shows the new quote |\n\n## Step 5: The pricing algorithm: order and honesty\n\nTwo rules make pricing predictable:\n\n1. **Rules run in a fixed order**, and each one sees the subtotal left by the rules before it. Item deals come first; cart-level coupons apply to what remains. That's why RUN10 is calculated on ₹4,097, not ₹4,396.\n2. **The customer pays the quote they saw.** At checkout, re-price. If the total changed (a price update, a coupon expiring, a cart change) or the quote is older than 15 minutes, show the new quote instead of silently charging a different amount.\n\n![Animation: three socks get the buy-two-get-one discount, the coupon is skipped because the subtotal is below 999 rupees; adding shoes raises the subtotal so the coupon applies, capped at 200 rupees; at checkout the quote is confirmed, but after the cart changes a new quote is shown instead of a silent charge.](learning-figures/lld-12-pricing.gif)\n\n> **⚠️ Common mistake**\n> Using `double` for prices. `0.1 + 0.2` is not `0.3` in binary floating point, and a percentage discount can be off by a paisa. Use `long` paise or `BigDecimal` with explicit rounding.\n\n> **🎯 In the interview**\n> If asked about \"best discount for the customer\", say you'd try the valid combinations of stackable rules and pick the lowest total – but keep it deterministic and explainable on the receipt.\n\n## Step 6: Deep dives\n\n### A new promotion type\n\n\"₹100 off any footwear\" is a new `PricingRule` that sums footwear lines and returns a `Discount`. Add it to the engine's list in the right position.\n\n### Exclusive coupons\n\nGive rules a `group` (e.g. \"coupon\"). The engine applies at most one rule per group – the first that matches, or the one giving the biggest discount.\n\n### Inventory at checkout\n\nPricing doesn't reserve stock. Checkout also asks inventory to reserve the items (see the e-commerce lesson, HLD-12) before taking payment.\n\n### Saving the cart\n\nStore carts by user ID (logged in) or a cookie ID (guest), and merge the guest cart into the user's cart at login.\n\n## Interviewer follow-ups\n\n**Why return a Discount instead of changing prices directly?** The receipt needs every reason and amount, and rules stay independent and testable.\n\n**How do you round a percentage?** Decide once – usually round down in the customer's favour – and do it in one place (here, integer division of paise).\n\n**How long should a quote last?** Long enough to pay comfortably – 15 minutes is common – and never longer than the shortest promotion or price guarantee behind it.\n\n**How would you test the engine?** Table-driven tests: cart contents + rules → expected breakdown, exactly like the worked example.\n\n## Wrap up\n\nThe cart holds products and quantities; an ordered chain of pricing rules turns it into a quote with every discount explained; checkout charges that quote or shows a new one.\n\n> **📝 Key takeaways**\n> - Money in paise (`long`) or `BigDecimal` – never `double`.\n> - Each promotion is a `PricingRule`; the engine applies them in a fixed order.\n> - The quote is the contract: show it, then charge exactly it.\n> - Re-price at checkout; changes produce a visible new quote.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [CartPricingDemo.java](reference-code/learning/kb/cartpricing/CartPricingDemo.java). It replays the worked example and checks every result.\n\nThe production version has the customer accept an explicit quote before the order is created, and an expired quote always produces a new visible offer, never a silent charge.\n\n[![The customer accepts an explicit quote before order creation.](lessons/lld-12-flow.svg)](lessons/lld-12-flow.svg)\n\n## Closing answer\n\n\"A Cart maps products to quantities and produces lines. Each promotion is a PricingRule strategy that looks at the lines and the subtotal left so far and returns an optional Discount with a reason. The PricingEngine applies the rules in a fixed order – item deals like buy-two-get-one first, then a capped percentage coupon on what remains – then adds delivery, and returns a Quote with the full breakdown and a 15-minute expiry. All money is in paise. At checkout I re-price: if the total changed or the quote expired, the customer sees the new quote rather than being charged silently. New promotions are new rule classes added to the list.\"\n"
     },
     {
       "category": "HLD",
@@ -118,103 +110,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Storefront and search",
+            "id": "store",
+            "label": "Storefront + search",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 180,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
+            "id": "cat",
+            "label": "Catalogue + index",
+            "x": 0,
+            "y": 130,
+            "w": 170,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "order",
             "label": "Order service",
-            "x": 250,
+            "x": 240,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Inventory authority",
-            "x": 500,
+            "id": "inv",
+            "label": "Inventory service",
+            "x": 470,
             "y": 0,
-            "w": 200,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
+            "id": "pay",
             "label": "Payment service",
-            "x": 0,
-            "y": 110,
-            "w": 200,
+            "x": 470,
+            "y": 130,
+            "w": 170,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
-            "label": "Workflow outbox",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
+            "id": "ful",
             "label": "Fulfilment",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Catalogue store",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "x": 240,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "accepted checkout"
+            "from": "store",
+            "to": "cat",
+            "label": "read products"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "reserves units"
+            "from": "store",
+            "to": "order",
+            "label": "checkout"
           },
           {
-            "from": "n1",
-            "to": "n3",
-            "label": "authorizes"
+            "from": "order",
+            "to": "inv",
+            "label": "reserve stock"
           },
           {
-            "from": "n1",
-            "to": "n4",
-            "label": "commits progress"
+            "from": "order",
+            "to": "pay",
+            "label": "take payment"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "dispatches"
-          },
-          {
-            "from": "n0",
-            "to": "n6",
-            "label": "browses"
+            "from": "order",
+            "to": "ful",
+            "label": "order confirmed event"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign an Amazon-scale e-commerce platform: product catalogue and search, cart, checkout, order processing, inventory, payments and fulfilment, all built as cooperating services with traffic spikes like Prime Day. The interview focus is **service decomposition**, **data ownership**, **event-driven workflows (sagas)** and **inventory correctness**.\n\n## Requirements\n\n**Functional**\n- Browse and search products, product pages with price and availability, reviews.\n- Cart, checkout, payment, order tracking, cancellations, returns.\n- Sellers manage listings and stock.\n\n**Non-functional**\n- Browse is read-heavy with very low latency (cache and CDN friendly). Checkout must be correct (no overselling, no double charging).\n- Survive 10× flash spikes. High availability for browse even if ordering degrades.\n\n**Scale:** 300M products, 100M DAU, ~100k browse req/s, ~5k orders/s at peak.\n\n## 1. Scope and selected consistency\n\nI design catalogue browsing, cart checkout, stock reservation, payment and fulfilment. I choose authoritative inventory conditional updates and a persisted order workflow. Search is a projection; it cannot decide whether the last unit may be sold.\n\n## 2. Checkout contract and stock claim\n\n```text\nPOST /orders {checkoutId,quoteId,items,address} -> orderId,state\nStock PK(sku,warehouse): onHand,reserved,version\nReservation UNIQUE(orderId,lineId): quantity,expiry,state\nOrder: acceptedQuoteSnapshot,state,workflowVersion\nUPDATE stock SET reserved=reserved+:n\n WHERE sku=:sku AND warehouse=:w AND onHand-reserved>=:n;\n```\n\nThe inventory transaction combines that conditional change with one reservation record. If no row changes, allocation fails. Multi-line claims use one transaction where colocated, otherwise recorded partial progress and compensation. After successful reservations, payment authorization/capture follows policy; fulfilment begins only from the required states. Definitive payment rejection releases those reservations. An unknown capture is reconciled before assuming no money moved. With 100 units, 70 sold and 20 held, only ten remain; simultaneous requests cannot enlarge physical stock. Outbox events advance downstream work once effectively, while consumers still deduplicate repeated deliveries.\n\n## 3. Final design diagram\n\n[![Amazon E-Commerce: Storefront and search accepted checkout Order service; Order service reserves units Inventory authority; Order service authorizes Payment service; Order service commits progress Workflow outbox; Workflow outbox dispatches Fulfilment; Storefront and search browses Catalogue store](designs/hld-12.svg)](designs/hld-12.svg)\n\n**Available stock** is stock not already committed or held under the chosen policy. A **reservation** temporarily claims units. An **order** freezes accepted terms. A **saga** coordinates a multi-step workflow using recorded progress and explicit compensations when one database transaction cannot cover every service.\n\n## 4. Critical operation: worked execution\n\n![The order records progress while inventory and payment keep their own evidence.](lessons/hld-12-flow.svg)\n\n*The order records progress while inventory and payment keep their own evidence.*\n\n![Compensation releases the original reservation rather than inventing a new checkout.](lessons/hld-12-failure.svg)\n\n*Compensation releases the original reservation rather than inventing a new checkout.*\n\n### Calculate and protect stock\n\nIf 100 units exist, 70 are sold and 20 are validly held, availability is 10. A cached “100 in stock” badge may attract clicks but cannot authorize purchase. An authoritative conditional reservation must enforce the remaining quantity under contention.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\nServices own their data:\n- **Catalog** (document store) plus **Search** (Elasticsearch, fed by change events). Product pages are mostly served from cache and CDN.\n- **Pricing** and **Inventory** (strongly consistent per SKU per warehouse) are fetched separately, because they change often.\n- **Cart** in a KV store (DynamoDB or Redis), keyed by user, highly available.\n- **Order service** orchestrates checkout as a **saga**: create order (PENDING), reserve inventory, authorise payment, confirm, then emit `OrderPlaced` to Kafka.\n- **Fulfilment, notifications, analytics, recommendations** consume events asynchronously.\n\n### Key design decisions & trade-offs\n\n**1. Saga instead of a distributed transaction.** Each step has a compensation: payment fails, so release inventory; inventory fails, so cancel the order. Orchestration (a central order service) is easier to reason about; choreography (pure events) is more decoupled but harder to trace. Persist saga state so it survives crashes.\n\n**2. Inventory: no overselling.** A conditional decrement, `UPDATE stock SET qty = qty - :n WHERE sku=:s AND qty >= :n`, or a reservation table with TTL. For flash sales, **pre-allocate stock into tokens** in Redis (atomic `DECR`) and queue buyers, so the DB never sees the stampede.\n\n**3. Availability vs. consistency per domain.** The cart favours availability (Dynamo's original use case: always writable, merge on conflict). Payment and inventory favour consistency. Catalogue reads can be eventually consistent.\n\n**4. Idempotency everywhere.** Checkout carries an idempotency key. Retried \"place order\" calls return the same order. Payment calls use the order ID as the key.\n\n**5. Cache layers.** CDN for static and media, edge-cached product HTML fragments, Redis for hot product data. Price and stock are fetched live or with very short TTLs.\n\n**6. Spike readiness.** Autoscaling, load shedding, queue-based checkout (waiting room) for flash sales, and graceful degradation (hide recommendations before failing checkout).\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A confirmed order owns a price snapshot and a durable inventory/payment outcome, not a mutable cart total.\n\nAssume 1 million orders/day: 11.6/s average; a 100x sale peak is 1,157/s. Catalogue reads at 100:1 give about 116,000/s at that peak. One hot SKU may exhaust a single stock authority before overall capacity is reached.\n\n### API contracts and data ownership\n\n```text\nGET /products; POST /checkout with quoteId and request key; GET /orders/{id}; signed payment callback\n```\n\n```text\nLogical records (outline, not complete DDL):\norder(id,user,quote_version,status,total_minor); reservation(order_id,sku,warehouse,qty,expires_at); payment_attempt(id,provider_ref,status)\n\nPrimary access/partitioning boundary:\norder_id for orchestration; sku + warehouse for inventory; user + request_key for checkout\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around order_id for orchestration; sku + warehouse for inventory; user + request_key for checkout. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nValidate quote and address; reserve stock atomically; create pending order plus outbox; authorize payment; confirm or compensate reservation; orchestrate fulfillment; capture according to policy; publish status events with stable identities.\n\n### Deep dive: the decision that changes this system\n\nA checkout saga coordinates local transactions; it cannot atomically commit a remote card network call with inventory. An outbox closes the database-write/event-publish gap. Each compensating action is itself idempotent and may require retry/review.\n\n### Failure and race-condition walkthrough\n\nPayment succeeds but the client times out while inventory reservation expires. Reconcile by payment operation identity and apply the documented late-success policy; never charge again simply because the HTTP response was lost.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nCatalogue, recommendations and carts tolerate some stale views; final stock and payment ownership require stronger boundaries. Queueing flash-sale admissions protects inventory rather than scaling every component indiscriminately.\n\nCheckout completion, oversell count, unknown payment age, reservation leak count, reconciliation backlog and per-step saga latency.\n\n**Test matrix:** Hot SKU race, callback duplication, abandoned checkout, price update, warehouse partial failure, inventory release after payment rejection and partial shipment refund.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A confirmed order owns a price snapshot and a durable inventory/payment outcome, not a mutable cart total.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 1 million orders/day: 11.6/s average; a 100x sale peak is 1,157/s. Catalogue reads at 100:1 give about 116,000/s at that peak. One hot SKU may exhaust a single stock authority before overall capacity is reached.\n\n**Which failure would invalidate the naive design?** Payment succeeds but the client times out while inventory reservation expires. Reconcile by payment operation identity and apply the documented late-success policy; never charge again simply because the HTTP response was lost.\n\n**Why not introduce every distributed component immediately?** Catalogue, recommendations and carts tolerate some stale views; final stock and payment ownership require stronger boundaries. Queueing flash-sale admissions protects inventory rather than scaling every component indiscriminately.\n\n**How would you demonstrate the design works?** Hot SKU race, callback duplication, abandoned checkout, price update, warehouse partial failure, inventory release after payment rejection and partial shipment refund. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through delayed outcomes\n\nA payment timeout is different from a decline. Releasing stock immediately after an unknown capture may produce a paid but unfulfillable order. Keep the unresolved state, query the original payment reference and apply a documented expiry/refund policy.\n\nThe outbox connects committed order facts to downstream messages. Consumers still deduplicate by event identity. Search indexes and product recommendations can lag, while checkout rechecks authoritative price/availability. Splitting every noun into a service increases coordination costs; a modular transactional starting point can be easier to reason about.\n\n## 6. Interviewer follow-ups\n\n**Can payment and inventory always roll back together?** No. External payment is not part of the local database transaction.\n\n**Does queueing purchases prevent overselling?** Only if the consumer's ownership decision enforces stock correctly; a queue by itself is not a stock constraint.\n\n## 7. Closing answer\n\nBrowsing can lag, but checkout revalidates accepted price and claims stock authoritatively. I record order workflow progress and use stable payment/reservation identities to recover partial completion. This preserves the distinction between availability hints, accepted obligations and settled money.\n"
+      "markdown": "## Problem\n\nDesign an e-commerce platform like Amazon or Flipkart. Asha searches for \"running shoes\", adds a pair to her cart, pays ₹3,499 with UPI, and gets an order confirmation. Behind that one click, inventory, payment and shipping all have to agree.\n\nBrowsing is huge and read-heavy. Checkout is smaller but must be correct: no selling the last pair twice, no charging without an order.\n\n## Requirements\n\n- Browse and search a product catalogue.\n- Add to cart; the cart survives across devices.\n- Checkout: reserve stock, take payment, create the order.\n- Track the order through packing, shipping and delivery.\n- Survive sale-day spikes (10× normal traffic).\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> E-commerce is many systems. Agree early on which ones you will cover in depth – usually catalogue/search and checkout.\n\n**Candidate:** What should I focus on?\n\n**Interviewer:** The read path for browsing and the checkout flow.\n\n**Candidate:** What scale?\n\n**Interviewer:** 300 million users, 10 million orders a day, 100× more product views than orders.\n\n**Candidate:** Can we oversell?\n\n**Interviewer:** No. If the last pair sells, the next buyer must be told before paying.\n\n**Candidate:** Which payment methods?\n\n**Interviewer:** Cards and UPI through a payment gateway.\n\n**Candidate:** Is there a big sale event?\n\n**Interviewer:** Yes – on Big Billion Days traffic is 10× normal.\n\n**Functional requirements**\n\n1. Search and view products.\n2. Cart, checkout, payment.\n3. Order tracking.\n\n**Non-functional requirements**\n\n1. Product pages fast (under 200 ms) and always available.\n2. Checkout correct: no overselling, no paid order without stock.\n3. Handle 10× spikes.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Show that reads and checkouts differ by two orders of magnitude; they get different designs.\n\n```text\nOrders per day          = 10 million     → ~115/s average, ~1,500/s on sale peaks\nProduct page views      = 1 billion/day  → ~11,600/s average, ~120,000/s on sale peaks\nCatalogue               = 100 million products × 5 KB ≈ 500 GB\n```\n\nWhat it means: product pages must come from caches and a CDN; checkout is modest in volume but needs transactions.\n\n## Step 3: Define the API\n\n```http\nGET  /v1/search?q=running+shoes&page=1\nGET  /v1/products/{productId}\nPUT  /v1/cart/items/{productId}           { \"qty\": 1 }\nPOST /v1/checkout                         { \"cartId\": \"...\", \"addressId\": \"...\", \"paymentMethod\": \"UPI\" }\n     Idempotency-Key: 6c1e…\n→ 201 { \"orderId\": \"...\", \"status\": \"PENDING_PAYMENT\", \"payUrl\": \"...\" }\n→ 409 { \"error\": \"OUT_OF_STOCK\", \"items\": [\"...\"] }\nGET  /v1/orders/{orderId}\n```\n\n> **🎯 In the interview**\n> Mention the `Idempotency-Key` on checkout. If Asha's network drops after she taps Pay and the app retries, she must not get two orders.\n\n## Step 4: Define the data model\n\n| Service | Data | Technology |\n| --- | --- | --- |\n| Catalogue | productId, title, attributes, images, seller | Document store + search index (Elasticsearch) |\n| Price | productId, sellerId, price | Key-value, cached |\n| Cart | userId → items | Key-value (DynamoDB / Redis + persistence) |\n| Inventory | (productId, warehouse) → available, reserved | SQL, row per SKU per warehouse |\n| Orders | orderId, userId, lines, status, total | SQL, sharded by userId |\n| Payments | paymentId, orderId, amount, status | SQL |\n\n> **⚖️ Design choice**\n> Each service owns its own database. Catalogue data is denormalised for fast reads; inventory and orders live in SQL because they need transactions.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: the storefront and search read from the catalogue store; checkout goes to the order service, which reserves stock with the inventory service and takes payment through the payment service; a workflow outbox drives fulfilment once the order is paid.](designs/hld-12.svg)](designs/hld-12.svg)\n\n**Browsing (read path)**\n\n1. Product pages are served from CDN-cached HTML/JSON and a cache in front of the catalogue.\n2. Search queries go to Elasticsearch, which holds a denormalised copy of products, updated from catalogue change events.\n3. Price and \"in stock\" badges come from their own fast caches.\n\n**Checkout (write path)**\n\n1. The order service creates an order in `PENDING`.\n2. It asks inventory to **reserve** each item for 10 minutes.\n3. It sends Asha to pay ₹3,499 through the payment gateway.\n4. On payment success, the reservation becomes a sale and the order becomes `CONFIRMED`.\n5. Fulfilment picks it up: pack, ship, deliver.\n\n![Animation: Asha checks out; the order service creates a pending order and reserves the shoes for ten minutes; payment succeeds, so the reservation is confirmed and the order becomes confirmed; in a second run, payment fails, so the reservation is released and the order is cancelled.](learning-figures/hld-12-checkout.gif)\n\n## Step 6: Go deep\n\n### Checkout across services: the saga\n\nOrder, inventory and payment are separate services with separate databases, so one database transaction cannot cover them.\n\n**Option 1: A distributed transaction (two-phase commit).**\n\n- Good: all-or-nothing.\n- Problem: slow, fragile, and payment gateways do not take part in your 2PC.\n\n**Option 2: A saga – a sequence of local steps, each with an undo.**\n\n- Good: each step is a simple local transaction; failures run compensations.\n- Problem: there are visible in-between states (`PENDING_PAYMENT`) to handle.\n\n> **⚖️ Design choice**\n> An **orchestrated saga** run by the order service: reserve stock → take payment → confirm. If payment fails or times out, compensate by releasing the reservation and cancelling the order.\n\n[![Checkout saga: create a pending order, reserve inventory, take payment; on success confirm the reservation and the order; on payment failure release the reservation and cancel; on timeout check the payment status before deciding.](learning-figures/hld-12-saga.svg)](learning-figures/hld-12-saga.svg)\n\n### Not overselling\n\nReserving is one atomic, conditional update:\n\n```sql\nUPDATE inventory\n   SET available = available - 1, reserved = reserved + 1\n WHERE product_id = :shoe AND warehouse = 'BLR-1' AND available >= 1;\n-- 1 row → reserved; 0 rows → out of stock, tell Asha before she pays\n```\n\nReservations expire after 10 minutes, so an abandoned checkout returns the stock.\n\n> **⚠️ Common mistake**\n> Checking stock in the product page cache and treating it as truth. The badge can be seconds old. Only the inventory service's conditional update decides.\n\n### Sale-day spikes\n\n- Serve product pages almost entirely from CDN and caches.\n- Put a **waiting room** (queue) in front of checkout for the hottest deals, letting in a steady flow.\n- Split a hot item's stock into several inventory rows (\"buckets\") so many reservations don't fight over one row.\n\n### Reliable events between services\n\nWhen the order becomes `CONFIRMED`, fulfilment and email must hear about it exactly when it commits. Write the status change and an \"order confirmed\" event in the same transaction (an **outbox** table); a relay publishes the event to Kafka.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| Payment times out | We don't know if Asha paid | Keep the reservation, ask the gateway for status, decide then |\n| Asha retries checkout | Two orders | Idempotency key returns the first order |\n| Search index lags | New price shows late | Product page reads price from the price service; search is a hint |\n| Last item, many buyers | Contention on one row | Conditional update; bucketed stock; waiting room |\n| Fulfilment service down | Confirmed orders wait | Events stay in Kafka until it recovers |\n\n## Putting it together\n\n- **Browse:** CDN + caches + a denormalised search index.\n- **Checkout:** saga – reserve with a conditional update, pay, confirm; compensate on failure.\n- **Scale:** separate services and databases; outbox events; waiting room on sale days.\n\n## Interviewer follow-ups\n\n**Why reserve before payment instead of after?** So Asha is never charged for shoes that sold out. A reservation with a timeout holds stock briefly without blocking it forever.\n\n**How does search stay in sync with the catalogue?** Catalogue changes publish events; an indexer updates Elasticsearch within seconds.\n\n**How do you handle multiple sellers in one order?** Split the order into one shipment per seller or warehouse; each has its own fulfilment status.\n\n**What if payment succeeds after the reservation expired?** The confirm step finds the reservation gone; try to reserve again, and if stock is gone, refund automatically.\n\n## Wrap up\n\nWe served browsing from caches and a search index, and ran checkout as a saga with an atomic stock reservation, payment and compensation.\n\n> **📝 Key takeaways**\n> - Reads (browse) and writes (checkout) get different designs.\n> - Each service owns its data; a saga with compensations replaces a distributed transaction.\n> - A conditional update reserves stock; reservations expire.\n> - Idempotency keys and an outbox make retries and events safe.\n\n## Going deeper (optional)\n\nThe detailed version keeps each service's own evidence (reservation, payment attempt) so compensation releases exactly the original reservation.\n\n[![The order records progress while inventory and payment keep their own evidence.](lessons/hld-12-flow.svg)](lessons/hld-12-flow.svg)\n\nFurther reading: [Microservices.io – Saga pattern](https://microservices.io/patterns/data/saga.html) and [Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html).\n\n## Closing answer\n\n\"I split browsing from checkout. Product pages and search are served from a CDN, caches and an Elasticsearch index fed by catalogue events. Checkout is an orchestrated saga run by the order service: create a pending order with an idempotency key, reserve each item with a conditional update that fails if stock is gone, take payment through the gateway, then confirm. If payment fails, compensate by releasing the reservation and cancelling; if it times out, check the gateway before deciding. Reservations expire so abandoned carts return stock. Status changes publish events through an outbox to fulfilment. On sale days, a waiting room and bucketed stock protect the hot items.\"\n"
     },
     {
       "category": "AI",
@@ -224,103 +202,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Application policy",
+            "id": "req",
+            "label": "Request",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 110,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Request context",
-            "x": 250,
+            "id": "pii",
+            "label": "PII mask (0)",
+            "x": 160,
             "y": 0,
-            "w": 200,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Memory advisor",
-            "x": 500,
+            "id": "mem",
+            "label": "Memory (100)",
+            "x": 340,
             "y": 0,
-            "w": 200,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Retrieval advisor",
-            "x": 0,
-            "y": 110,
-            "w": 200,
+            "id": "rag",
+            "label": "RAG (200)",
+            "x": 520,
+            "y": 0,
+            "w": 120,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
-            "label": "Final budget check",
-            "x": 250,
-            "y": 110,
-            "w": 200,
+            "id": "log",
+            "label": "Logger (1000)",
+            "x": 520,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n5",
-            "label": "ChatClient model call",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Response observation",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "id": "llm",
+            "label": "Model call",
+            "x": 340,
+            "y": 130,
+            "w": 130,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "verified identity"
+            "from": "req",
+            "to": "pii",
+            "label": "in"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "owned conversation"
+            "from": "pii",
+            "to": "mem",
+            "label": "in"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "augmented request"
+            "from": "mem",
+            "to": "rag",
+            "label": "in"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "authorized evidence"
+            "from": "rag",
+            "to": "log",
+            "label": "in"
           },
           {
-            "from": "n4",
-            "to": "n5",
-            "label": "bounded prompt"
+            "from": "log",
+            "to": "llm",
+            "label": "final prompt"
           },
           {
-            "from": "n5",
-            "to": "n6",
-            "label": "result and metadata"
+            "from": "llm",
+            "to": "req",
+            "label": "response back in reverse",
+            "dashed": true
           }
         ]
       },
-      "markdown": "## Problem\n\nExplain Spring AI advisors, the interceptor or middleware chain around every `ChatClient` call: how they modify requests and responses, how ordering works, the built-in advisors (memory, RAG, logging, safeguards), and how to write custom advisors for concerns like PII redaction, auditing, caching and guardrails.\n\n## Requirements\n\n- The advisor concept (Chain of Responsibility / around-advice) and the request → model → response flow.\n- Built-ins: `MessageChatMemoryAdvisor`, `PromptChatMemoryAdvisor`, `QuestionAnswerAdvisor`, `RetrievalAugmentationAdvisor`, `SimpleLoggerAdvisor`, `SafeGuardAdvisor`.\n- Ordering via `getOrder()`, and sharing data between advisors via the advisor context.\n- Writing custom `CallAdvisor` / `StreamAdvisor` implementations.\n\n## 1. Selected advisor composition\n\nI use the pinned Spring AI 1.1 family to compose memory, authorized retrieval and observation around one ChatClient boundary. Application code resolves principal/conversation before advisor execution. Each component receives immutable request-scoped policy; singleton advisors do not hold mutable per-user state.\n\n## 2. Ordering and request contract\n\n```text\nApplicationContext: principal,ownedConversation,evidenceScope,remainingBudget\nEffective order: memory selection -> scoped retrieval -> final context check\n                -> model -> output validation/telemetry\nMemory output: bounded messages; retrieval output: source IDs/revisions/spans\n```\n\nI configure and verify ordering using the selected API's ordering contract rather than assuming registration order is always execution order. The final budget check matters because a prior 4,000-token check becomes obsolete if memory adds 3,000 and retrieval adds 8,000 later. Token contributions are attributed to their components.\n\nThe same advisor chain is tested with two concurrent users and distinguishable history/evidence. Any cross-request state fails isolation. Retry re-entry cannot duplicate memory writes or business effects; completed-turn persistence stays in the application workflow. Observation records versions, latency and usage with redaction, not unrestricted prompt bodies. This composition reduces duplicated endpoint integration while keeping ownership and failure transitions visible.\n\n## 3. Final design diagram\n\n[![Spring AI Advisors: Application policy verified identity Request context; Request context owned conversation Memory advisor; Memory advisor augmented request Retrieval advisor; Retrieval advisor authorized evidence Final budget check; Final budget check bounded prompt ChatClient model call; ChatClient model call result and metadata Response observation](designs/ai-12.svg)](designs/ai-12.svg)\n\nAdvisors are integration middleware, not permission to hide business decisions in invisible interceptors. Their order, state scope and error behaviour need to be visible in the application's design. This chapter uses the pinned Spring AI 1.1 family; later versions may change chain/tool integration.\n\n## 4. Critical operation: worked execution\n\n![Understand what each advisor receives and contributes.](lessons/ai-12-flow.svg)\n\n*Understand what each advisor receives and contributes.*\n\n![Inspect the final prompt context and filter boundaries, not just individual components.](lessons/ai-12-failure.svg)\n\n*Inspect the final prompt context and filter boundaries, not just individual components.*\n\n### Build a chain you can explain\n\nWrite an input/output table before adding advisors: memory receives an owned conversation identity and returns selected messages; retrieval receives an authorized query and returns versioned passages; telemetry records metadata with redacted content. Avoid keeping request-specific mutable data on a singleton advisor instance.\n\n```text\nRequest context:\n  principal: application-owned, never model-generated\n  conversation: resolved and authorized before memory lookup\n  evidence: source IDs and current access scope\n  budget: remaining tokens and deadline after all augmentation\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** Where should cross-cutting prompt transformations live without making their order invisible?\n\nAdvisors wrap the model interaction and can transform requests and responses. Their order determines whether logging sees raw or redacted text, whether memory precedes retrieval and which errors are visible. A call path and a streaming path may have different contracts.\n\n### Architecture and contracts\n\n```text\nAuthorization before client -> redaction/budget policy -> memory/context enrichment -> model/tool execution -> output validation -> redacted observations\n\nApplication contracts (design outline):\nAdvisorPolicy(order,requestTransform,responseTransform); RequestContext(tenant,traceId,budget); ValidatedResponse\n```\n\nUse the CallAdvisor/StreamAdvisor interfaces for the selected release and call the next chain exactly as its contract requires. Interface signatures are version-sensitive; the manuscript distinguishes conceptual sequence from compilable example code.\n\n### Worked reasoning and capacity example\n\nThree sequential enrichment calls at 100 ms each add at least 300 ms before the model begins. Parallelize only truly independent authorized work; do not hide this latency behind an innocuous advisor name.\n\n### Java and Spring AI implementation outline\n\n```java\n// Conceptual chain; adapt actual interfaces to the pinned Spring AI release.\n// authorize -> bound/redact -> retrieve/memory -> model -> validate -> observe\n// Tests must verify both request and response order, including exceptions.\n```\n\n### Design decisions and alternatives\n\nUse advisors for reusable integration concerns, not as a substitute for domain-service authorization. Document chain order and state ownership. Keep request context immutable or narrowly scoped so concurrent calls cannot contaminate each other.\n\n### Failure scenario and safe recovery\n\nA debug logger is ordered before redaction and captures private evidence. Tests should assert log fields and chain ordering, not merely that the model returns a string.\n\n### Security, privacy and provenance\n\nRetries wrapped around the entire advisor chain may repeat retrieval, memory writes or tool effects. Assign retry ownership deliberately.\n\n\n**Verification criteria:** Order correctness, exception propagation, stream cancellation, context isolation and redaction coverage. Record advisor latency in traces without raw sensitive content.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through hidden costs\n\nIf memory adds 3,000 tokens and retrieval adds 8,000 after an earlier 4,000-token budget check, that check no longer protects a 12,000-token limit with output reserve. Validate the assembled prompt near the final model boundary. Record which component contributed tokens so tuning is explainable.\n\nRetries can re-enter parts of a chain depending on the API. Memory writes or external side effects should not repeat blindly. Test ordering with spies/stubs and a known request, then inspect the actual assembled evidence and final result. The repository's general API compile check does not establish every advisor configuration's runtime behaviour.\n\n## 6. Interviewer follow-ups\n\n**Does registering both memory and retrieval automatically guarantee their intended order?** Inspect the selected API's ordering contract and verify the effective chain.\n\n**Should an advisor read an arbitrary conversation ID from generated text?** No. Use application-authorized context.\n\n## 7. Closing answer\n\nAdvisors compose integration concerns, but the application still owns identity and final budgets. I verify effective ordering and request isolation, then inspect the assembled prompt and response. The selected framework version's contracts determine chain behaviour; a newer API example is not assumed compatible.\n"
+      "markdown": "## Problem\n\nYour Spring AI support assistant now needs, on **every** call: chat memory, RAG retrieval, masking of phone numbers before text leaves the company, logging of token usage, and a check that blocks banned topics.\n\nYou could paste that code around each `chatClient.prompt()` call – and forget it somewhere. Spring AI **advisors** let you write each concern once and plug it into every call, like servlet filters or Spring interceptors.\n\n## Requirements\n\n- Explain what an advisor is and where it sits in a `ChatClient` call.\n- Explain advisor order: who runs first on the way in and on the way out.\n- Use built-in advisors: memory, RAG, logging, safeguard.\n- Write a custom advisor (PII masking and token logging).\n- Avoid common mistakes with ordering and budgets.\n\n## Step 1: The idea in plain words\n\nAn advisor is **middleware around the model call**. Each advisor gets the request, can change it, passes it on, then gets the response and can change or record it.\n\n| Term | Plain meaning |\n| --- | --- |\n| **Advisor** | A component that wraps every `ChatClient` call. |\n| **Chain** | The ordered list of advisors; the last link calls the model. |\n| **Order** | A number; lower runs earlier on the way in and later on the way out. |\n| **Advise context** | A map shared by advisors during one call (e.g. conversation ID). |\n| **CallAdvisor / StreamAdvisor** | The interfaces for normal and streaming calls. |\n\nAn everyday picture: airport security. Your bag passes several checkpoints in a fixed order on the way in; on the way back, the same checkpoints are passed in reverse.\n\n> **🎯 In the interview**\n> Interviewers usually ask: what advisors are for; how ordering works; which built-in advisors exist; how you would write one for logging, PII masking or guardrails.\n\n## Step 2: How a call flows through advisors: the execution order\n\n[![Selected design: a request passes through the PII mask, memory, RAG and logger advisors in order of their numbers before the model call; the response travels back through the same advisors in reverse order.](designs/ai-12.svg)](designs/ai-12.svg)\n\nWith advisors ordered **PII mask (order 0) → memory (100) → RAG (200) → logger (1000)**, one call goes like this:\n\n**Way in (lowest order first)**\n\n1. **PII mask** replaces `98450 12345` with `[PHONE]` in the user message.\n2. **Memory** adds the last 20 messages of this conversation.\n3. **RAG** retrieves policy chunks and appends them to the user message.\n4. **Logger** logs the final prompt; the chain calls the model.\n\n**Way out (reverse order)**\n\n1. **Logger** records the response and token usage.\n2. **RAG** attaches the retrieved documents to the response metadata.\n3. **Memory** saves the user message and the reply.\n4. **PII mask** could restore or check the output.\n\n![Animation: a request passes through the PII mask, memory, retrieval and logging advisors in order, reaches the model, and the response travels back through the same advisors in reverse order, with memory saving the turn on the way out.](learning-figures/ai-12-chain.gif)\n\n> **⚖️ Design choice**\n> Mask PII **before** memory and RAG, so masked text is what gets stored and searched. Put logging **last** on the way in, so it logs the final prompt that is actually sent.\n\n## Step 3: In code with Spring AI\n\n**Built-in advisors on a client:**\n\n```java\nChatClient chatClient = builder\n        .defaultSystem(\"You are ShopEasy's support assistant.\")\n        .defaultAdvisors(\n                new PiiMaskingAdvisor(0),\n                MessageChatMemoryAdvisor.builder(chatMemory).order(100).build(),\n                QuestionAnswerAdvisor.builder(vectorStore).order(200).build(),\n                new SafeGuardAdvisor(List.of(\"salary of\", \"home address of\")),\n                new SimpleLoggerAdvisor())\n        .build();\n```\n\n- `MessageChatMemoryAdvisor` – adds and saves conversation history (AI-9).\n- `QuestionAnswerAdvisor` – retrieves chunks from a vector store (AI-5).\n- `SafeGuardAdvisor` – blocks requests containing listed sensitive words.\n- `SimpleLoggerAdvisor` – logs requests and responses at DEBUG.\n\n**A custom advisor** that masks phone numbers and logs token usage:\n\n```java\npublic class PiiMaskingAdvisor implements CallAdvisor {\n    private static final Pattern PHONE = Pattern.compile(\"\\\\b\\\\d{5}\\\\s?\\\\d{5}\\\\b\");\n    private static final Logger log = LoggerFactory.getLogger(PiiMaskingAdvisor.class);\n    private final int order;\n\n    public PiiMaskingAdvisor(int order) { this.order = order; }\n\n    @Override\n    public ChatClientResponse adviseCall(ChatClientRequest request, CallAdvisorChain chain) {\n        Prompt masked = request.prompt().augmentUserMessage(u ->\n                u.mutate().text(PHONE.matcher(u.getText()).replaceAll(\"[PHONE]\")).build());\n        ChatClientResponse response = chain.nextCall(request.mutate().prompt(masked).build());\n\n        var usage = response.chatResponse().getMetadata().getUsage();\n        log.info(\"tokens in={} out={}\", usage.getPromptTokens(), usage.getCompletionTokens());\n        return response;\n    }\n\n    @Override public String getName() { return \"pii-masking\"; }\n    @Override public int getOrder() { return order; }\n}\n```\n\n- `chain.nextCall(...)` passes the (changed) request to the next advisor; without it, the model is never called.\n- For streaming calls, implement `StreamAdvisor` as well.\n- Per-call values go through the advise context: `.advisors(a -> a.param(ChatMemory.CONVERSATION_ID, id))`.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Forgetting `getOrder()` meaning | Lower = earlier on the way in, later on the way out; write the intended order down |\n| Logging before masking | Mask first, then memory/RAG, log last |\n| Doing slow I/O in many advisors | Each advisor adds latency; measure the chain |\n| Memory + RAG with no budget | Both add tokens; check the final prompt size before the model call |\n| Business logic in advisors | Advisors are for cross-cutting concerns; keep domain rules in services |\n| Implementing only `CallAdvisor` | Streaming calls skip it; implement `StreamAdvisor` too if you stream |\n\n> **⚠️ Common mistake**\n> Assuming each advisor is safe on its own. Memory adds 1,600 tokens, RAG adds 3,000, and together they overflow the budget. Inspect the **final** prompt, not just each component.\n\n[![Inspect the final prompt context and filter boundaries, not just individual components.](lessons/ai-12-failure.svg)](lessons/ai-12-failure.svg)\n\n## Step 5: Production concerns\n\n- **Observability:** Spring AI emits Micrometer observations for ChatClient and advisor calls; you can see time spent per advisor in traces.\n- **Budget check:** a final advisor just before the model can count tokens and trim memory or RAG content if the prompt is too large.\n- **Testing:** unit-test custom advisors with a fake chain; integration-test the whole chain and assert the final prompt.\n- **Security:** a regex PII mask is a helpful layer, not a guarantee – keep sensitive data out of retrieval in the first place.\n\n## Interviewer follow-ups\n\n**How are advisors different from tools?** Advisors always run, around every call, decided by your code. Tools are functions the *model* may choose to call during a call.\n\n**Can an advisor stop a call?** Yes – return a response without calling `chain.nextCall` (that's how `SafeGuardAdvisor` blocks requests).\n\n**Where do you put the conversation ID?** In the advise context per call; the memory advisor reads it.\n\n**How do you add an advisor to just one call?** Use `.advisors(...)` on that `prompt()` instead of `defaultAdvisors`.\n\n## Wrap up\n\nAdvisors wrap every `ChatClient` call in an ordered chain, so memory, retrieval, masking, logging and guardrails are written once and applied everywhere.\n\n> **📝 Key takeaways**\n> - An advisor sees the request on the way in and the response on the way out.\n> - Lower order runs earlier in, later out.\n> - Use built-ins (memory, RAG, safeguard, logger); write custom ones for cross-cutting needs.\n> - Check the final prompt and its token budget, not each advisor alone.\n\n## Going deeper (optional)\n\nThe detailed version shows exactly what each advisor receives and contributes, and adds a final budget check that trims memory before retrieval when the prompt is too large.\n\n[![Understand what each advisor receives and contributes.](lessons/ai-12-flow.svg)](lessons/ai-12-flow.svg)\n\nFurther reading: [Spring AI – Advisors API](https://docs.spring.io/spring-ai/reference/api/advisors.html).\n\n## Closing answer\n\n\"Advisors are Spring AI's middleware around every ChatClient call. Each one receives the request, can change it, passes it down the chain, then sees the response on the way back – lower order runs earlier going in and later coming out. I use the built-ins: `MessageChatMemoryAdvisor` for history, `QuestionAnswerAdvisor` for RAG, `SafeGuardAdvisor` for blocked topics and `SimpleLoggerAdvisor` for debugging. For cross-cutting needs I write a `CallAdvisor` – and a `StreamAdvisor` for streaming – such as masking PII before memory and retrieval, and logging token usage after the call. I order them deliberately, keep business logic out of them, and check the final prompt size because memory and retrieval share one token budget.\"\n"
     }
   ]
 }

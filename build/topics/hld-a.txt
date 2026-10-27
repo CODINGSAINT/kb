@@ -669,7 +669,7 @@ POST /v1/notifications
 }
 
 202 Accepted
-{ "notificationId": "N501" }
+{ "notificationId": "ntf_8f3k2q" }
 ```
 
 `202 Accepted` means "we have it and will deliver it", not "delivered". `eventId` lets us ignore the same event if a caller sends it twice.
@@ -1045,497 +1045,690 @@ E|n0|n6|heartbeats
 ---
 ## Problem
 
-Design a chat system like WhatsApp: 1:1 and group messaging, real-time delivery, delivery and read receipts (✓✓), online presence, offline delivery, and history on multiple devices. The core topics are **persistent connections (WebSockets)**, **message ordering**, **delivery guarantees** and **presence**.
+Design a chat app like WhatsApp. Asha sends "Running 10 minutes late" to Bilal. Bilal's phone shows it within a second, and Asha sees one tick (sent), then two ticks (delivered), then blue ticks (read).
+
+If Bilal's phone is off, he gets the message when it comes back online. Groups work the same way, and every chat keeps its messages in order.
 
 ## Requirements
 
-**Functional**
-- 1:1 and group chat (≤ 1024 members). Text plus media (via object storage).
-- Sent ✓, delivered ✓✓ and read receipts. Last seen and online status.
-- Offline users receive messages on reconnect, plus a push notification.
+- 1:1 and group chats (up to 1,024 members), text plus photos and videos.
+- Real-time delivery when both users are online; offline users get messages on reconnect.
+- Sent, delivered and read receipts; online / last-seen status.
+- Messages in a chat appear in the same order for everyone, and no message is lost.
+- 500 million daily users.
 
-**Non-functional**
-- Delivery latency < 200 ms when both users are online. No message loss. Per-chat ordering.
+## Step 1: Clarify the requirements
 
-**Scale:** 500M DAU and 50B messages/day ≈ 600k msgs/s average, more at peak. Around 100M concurrent connections; at ~100k per gateway box, that's ~1,000+ gateway servers.
+> **💡 Tip**
+> Chat interviews are about three things: keeping connections open, never losing a message, and keeping order. Steer the questions toward them.
 
-## 1. Scope and selected guarantees
+**Candidate:** One-to-one only, or groups too?
 
-I support direct/group chat, offline replay, device delivery and read receipts. I choose one logical conversation owner for sequence allocation; independent conversations scale across partitions. Payload media lives in object storage. End-to-end encryption is a separate key-management requirement and is not implied by TLS.
+**Interviewer:** Both. Groups have at most 1,024 members.
 
-## 2. Message protocol and persistence
+**Candidate:** Can one user be logged in on several devices?
 
-```text
-SEND(conversationId,clientMessageId,body) -> ACCEPTED(serverSeq,messageId)
-RESUME(conversationId,afterSeq,deviceId) -> ordered messages
-ACK_DELIVERED(deviceId,conversationId,seq); ACK_READ(userId,conversationId,seq)
-Message PK(conversationId,seq), UNIQUE(senderId,clientMessageId)
-DeviceCursor PK(deviceId,conversationId): deliveredSeq
-```
+**Interviewer:** Yes – a phone and a laptop, each must get every message.
 
-The owner validates membership, returns a matching prior send on retry, allocates sequence and commits before ACCEPTED. Outbox/delivery fan-out pushes to live connections; reconnect fetches durable gaps. Concurrent senders receive one committed order independent of device clocks. At 100,000 envelopes/s and 500 bytes, raw history grows 4.32 TB/day before indexes/replication. Cursor updates are monotonic and scoped to device; a laptop cannot inherit proof of delivery from a phone. Presence expiry changes routing efficiency, not durability. Membership changes are checked before replay to avoid exposing removed-group history beyond the chosen policy.
+**Candidate:** Do we keep chat history on the server?
 
-## 3. Final design diagram
+**Interviewer:** Yes, so a new device can load it.
 
-[![Chat / WhatsApp: Client connections send and resume Conversation service; Conversation service ordered commit Message store; Conversation service fanout Delivery queue; Delivery queue online push Client connections; Client connections acknowledges Device cursors; Conversation service media references Media object store; Client connections heartbeats Presence cache](designs/hld-6.svg)](designs/hld-6.svg)
+**Candidate:** Do we need end-to-end encryption?
 
-A **conversation sequence** orders messages within one conversation. A **client message ID** deduplicates retries from the sender. A **delivery cursor** records what a particular device has received; multiple devices can have different cursors.
+**Interviewer:** Mention it, but focus on delivery.
 
-## 4. Critical operation: worked execution
+**Candidate:** How fast should delivery be?
 
-![Persist before acknowledging acceptance to the sender.](lessons/hld-6-flow.svg)
+**Interviewer:** Under 200 ms when both users are online.
 
-*Persist before acknowledging acceptance to the sender.*
+**Functional requirements**
 
-![Client identity connects a retry to the original committed result.](lessons/hld-6-failure.svg)
+1. Send text and media in 1:1 and group chats.
+2. Deliver in real time to online devices; store for offline devices.
+3. Sent, delivered and read receipts; online status.
 
-*Client identity connects a retry to the original committed result.*
+**Non-functional requirements**
 
-### Calculate and partition
+1. Low latency: under 200 ms when both are online.
+2. No message loss; order is preserved within each chat.
+3. 500 million daily users; about 100 million connected at once.
 
-At 100,000 messages/s and 500 bytes per stored envelope, raw message data grows about 50 MB/s or 4.32 TB/day before media, indexes and replicas. Store media objects separately and send authorized references. Partition message ownership by conversation to make ordering local rather than inventing one global sequence for every user.
+## Step 2: Estimate the scale
 
-## 5. Detailed decisions, algorithms and failure behaviour
+> **💡 Tip**
+> For chat, size the open connections as well as the messages. Connections are what make this design unusual.
 
-### Architecture
-
-- **Connection gateways** hold WebSocket (or MQTT) connections. A **session registry** (Redis: `userId → gatewayId`) tracks where each user is connected.
-- **Chat service** receives a message, assigns a per-conversation **sequence number**, persists it, then routes it to the recipient's gateway (looked up in the registry) via an internal pub/sub or RPC.
-- **Message store:** Cassandra/HBase partitioned by `conversationId`, clustered by `seq`. Efficient "messages after seq X" queries.
-- **Offline path:** if the recipient isn't connected, the message waits in the store or an inbox, plus a push notification. On reconnect, the client syncs from its last acked seq.
-- **Media:** upload to object storage via a pre-signed URL. The message carries the URL (and an encryption key in E2E designs).
-
-### Key design decisions & trade-offs
-
-**1. WebSocket vs. long-polling.** WebSockets give bidirectional, low-overhead messaging, which suits chat. Long-polling is a fallback. Gateways are stateful, so you need draining on deploy and reconnect with resume.
-
-**2. Ordering.** Global ordering is unnecessary and expensive. Order **per conversation** with a server-assigned monotonic seq (a counter per conversation, or a Snowflake ID plus tiebreak). Clients sort by seq, not by device clock.
-
-**3. Delivery guarantees.** Client sends with a `clientMsgId` (for dedup on retry). Server persists, then acks "sent ✓". The recipient's device acks, giving "delivered ✓✓". Read acks travel the same way. That's at-least-once plus idempotent IDs, which gives effectively-once.
-
-**4. Groups.** Fan-out on write to each member's gateway or inbox for small groups. For large groups, write once to the group log and have members pull by seq.
-
-**5. Presence.** Heartbeats every ~30 s update `lastSeen` in Redis with a TTL. Fan presence changes out only to contacts who are currently viewing that chat, to avoid presence storms.
-
-**6. Multi-device.** Each device keeps its own cursor (last seq) and syncs independently.
-
-### Scope, guarantees and sizing assumptions
-
-**Correctness requirement:** Messages have stable IDs and a defined per-conversation order; delivery and read receipts mean different things.
-
-Assume 1 million concurrently connected clients and 50,000 messages/s. At 1 KB/message, ingress is 50 MB/s before replication and group fanout. A 1,000-member group can amplify one message into 1,000 delivery attempts.
-
-### API contracts and data ownership
+**Messages**
 
 ```text
-POST /conversations/{id}/messages with clientMessageId; GET /messages?after=sequence; authenticated WebSocket events and receipt acknowledgements
+Messages per day    = 500M users × 40 messages   = 20 billion
+Average             = 20B / 86,400 s             ≈ 230,000 per second
+Peak (×3)                                        ≈ 700,000 per second
 ```
+
+What it means: one database cannot take this. Messages must be split (sharded) across many machines.
+
+**Connections**
 
 ```text
-Logical records (outline, not complete DDL):
-message(conversation_id,sequence,message_id,sender_id,ciphertext_or_body_ref); device_cursor(user,device,conversation,last_delivered,last_read)
-
-Primary access/partitioning boundary:
-conversation_id for ordering; user_id/device_id for connection routing and inbox cursors
+Connected at once        ≈ 100 million
+Connections per server   ≈ 100,000 (WebSockets are mostly idle)
+Connection servers       = 100M / 100,000         ≈ 1,000
 ```
 
-### Build the architecture in stages
+What it means: we need a large fleet of connection servers and a way to know which server each user is connected to.
 
-**Stage 3 — Partition and isolate.** Partition around conversation_id for ordering; user_id/device_id for connection routing and inbox cursors. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+**Storage**
 
-### Trace the critical request
+```text
+Average message     ≈ 200 bytes (text; media is stored separately)
+Per day             = 20B × 200 bytes             ≈ 4 TB
+Per year                                          ≈ 1.5 PB
+```
 
-Authenticate session and membership; deduplicate client message ID; persist with conversation sequence; acknowledge durable acceptance; publish delivery events; gateways send to online devices; offline devices catch up using sequence cursors. Read receipts update only after an explicit user/device read signal.
+What it means: message storage must be cheap and grow sideways – a wide-column store such as Cassandra fits.
 
-### Deep dive: the decision that changes this system
+## Step 3: Define the API
 
-WebSockets provide a transport, not durable delivery. Reconnect can replay messages and receipts; clients deduplicate by message ID and request gaps. Per-conversation sequencing avoids an unnecessary global order. End-to-end encryption changes searchable metadata, key management and multi-device history design.
+Chat uses a **WebSocket**: one connection that stays open so the server can push messages to the phone at any time. Messages on it are small JSON frames.
 
-### Failure and race-condition walkthrough
+```http
+SEND     { "chatId": "c-981", "clientMsgId": "7f3a…", "text": "Running 10 minutes late" }
+→ ACK    { "clientMsgId": "7f3a…", "seq": 1042 }            (sent ✓)
 
-A gateway dies after persistence but before client acknowledgement. Retrying the same client message ID returns the original message. A presence cache can be wrong without losing the durable inbox.
+← MESSAGE{ "chatId": "c-981", "seq": 1042, "from": "asha", "text": "…" }
+DELIVERED{ "chatId": "c-981", "seq": 1042 }                 (delivered ✓✓)
+READ     { "chatId": "c-981", "seq": 1042 }                 (read, blue ✓✓)
 
-### Security, tenancy and lifecycle
+SYNC     { "chatId": "c-981", "afterSeq": 1030 }            (catch up after reconnect)
+```
 
-### Trade-offs and a starting recommendation
+Photos and videos are uploaded over normal HTTP to object storage first; the chat message carries only the link.
 
-Small groups can fanout on write; very large channels favor shared logs and read cursors. Ordering across two independent conversations is usually unnecessary. Push notification delivery is not a read receipt.
+> **🎯 In the interview**
+> Explain why HTTP polling is wasteful here: the phone would ask "anything new?" every few seconds, mostly to hear "no". A WebSocket lets the server push the moment a message arrives.
 
-Track durable-ack latency, end-to-end delivery latency, reconnect success, missing-message repair, fanout lag and receipt consistency.
+## Step 4: Define the data model
 
-**Test matrix:** Reconnect after a lost acknowledgement, duplicate send, device clock skew, group membership change during delivery, gaps in sequence and offline device catch-up.
+| Table | Key | Fields |
+| --- | --- | --- |
+| `messages` | partition: chatId, sort: seq | messageId, senderId, clientMsgId, text or mediaUrl, sentAt |
+| `chat_members` | chatId | userId, role, joinedAt |
+| `device_cursor` | (userId, deviceId, chatId) | lastDeliveredSeq, lastReadSeq |
+| `sessions` (Redis) | userId | list of (deviceId, connection server) |
+| `presence` (Redis, with TTL) | userId | online, lastSeen |
 
-### Follow-up questions with answers
+> **⚖️ Design choice**
+> Store messages in Cassandra, partitioned by `chatId` and sorted by `seq`. "Give me chat c-981 after message 1030" is then a single, fast read from one partition.
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: Messages have stable IDs and a defined per-conversation order; delivery and read receipts mean different things.
+## Step 5: Draw the high-level design
 
-**What is the first scaling pressure to test?** Use the actual workload: Assume 1 million concurrently connected clients and 50,000 messages/s. At 1 KB/message, ingress is 50 MB/s before replication and group fanout. A 1,000-member group can amplify one message into 1,000 delivery attempts.
+[![High-level design: client connections send messages to the conversation service, which commits them in order to the message store and fans them out through a delivery queue back to online connections; devices record what they received in device cursors, media goes to an object store and heartbeats update a presence cache.](designs/hld-6.svg)](designs/hld-6.svg)
 
-**Which failure would invalidate the naive design?** A gateway dies after persistence but before client acknowledgement. Retrying the same client message ID returns the original message. A presence cache can be wrong without losing the durable inbox.
+**Sending a message**
 
-**Why not introduce every distributed component immediately?** Small groups can fanout on write; very large channels favor shared logs and read cursors. Ordering across two independent conversations is usually unnecessary. Push notification delivery is not a read receipt.
+1. Asha's phone sends `SEND` over its WebSocket to connection server 12.
+2. The chat service checks Asha is a member, gives the message the next sequence number for this chat (1042), and saves it.
+3. Only after saving does it reply `ACK` – Asha sees one tick.
+4. It looks up Bilal's devices in the session store and pushes the message to their connection servers.
 
-**How would you demonstrate the design works?** Reconnect after a lost acknowledgement, duplicate send, device clock skew, group membership change during delivery, gaps in sequence and offline device catch-up. Keep the expected invariant and recovery outcome visible in the results.
+**Receiving it**
 
-### Further reading
+1. Bilal's phone gets `MESSAGE`, shows it and replies `DELIVERED`. Asha sees two ticks.
+2. When Bilal opens the chat, his phone sends `READ`. Asha sees blue ticks.
+3. If Bilal is offline, the message waits in the store. He gets a push notification, and on reconnect his phone sends `SYNC afterSeq=1041`.
 
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+![Animation: Asha's phone sends a message; the chat service saves it with sequence 1042 and acknowledges one tick; it pushes the message to Bilal's online phone, which reports delivered for two ticks; Bilal's laptop is offline, so it later reconnects and syncs everything after its last sequence.](learning-figures/hld-6-delivery.gif)
 
-### Work through ordering and presence
+## Step 6: Go deep
 
-Two concurrent senders can each show optimistic local messages, but the server must choose the conversation's committed order. Device clocks are not a reliable total-order authority. Gaps in a receiver's sequence should trigger replay rather than an assumption that missing messages were deleted.
+### Which server is Bilal connected to?
 
-Presence is soft state with expiry: a disconnected mobile app can appear online briefly. Do not make durable delivery depend on a perfectly accurate online flag. End-to-end encryption changes what servers can inspect and index; explain its key/device model separately from transport TLS.
+Each connection server registers its users in Redis: `bilal → [(phone, server 7), (laptop, server 31)]`. The chat service looks this up and forwards the message to servers 7 and 31, which write it down the open sockets.
 
-## 6. Interviewer follow-ups
+When a phone disconnects, the entry is removed (or expires with a short TTL), so we never push to a dead connection.
 
-**Does a WebSocket write prove delivery?** No. It may only enqueue bytes locally; require protocol-level evidence for stronger claims.
+### Keeping messages in order
 
-**Can Bob's laptop reuse his phone's cursor?** Not blindly. Device delivery state differs even if read state is shared by policy.
+**Option 1: Order by the sender's clock.**
 
-## 7. Closing answer
+- Good: no coordination.
+- Problem: phone clocks are wrong all the time; two people would see different orders.
 
-I acknowledge a message after durable conversation-ordered storage, deduplicate by sender message identity and replay from per-device cursors. Persistent messages survive offline recipients; presence is only a soft hint. Accepted, delivered and read acknowledgements remain separate.
+**Option 2: One global sequence for all chats.**
+
+- Good: total order.
+- Problem: a single counter for 700,000 messages a second is a bottleneck, and nobody needs order *between* different chats.
+
+**Option 3: A sequence number per chat, assigned by the server.**
+
+- Good: everyone sees the same order in a chat; different chats scale independently.
+- Problem: one chat's messages must go through one owner at a time (fine – one chat is small).
+
+> **⚖️ Design choice**
+> Per-chat sequence numbers assigned by the server. Each chat is owned by one chat-service instance at a time (route by `hash(chatId)`), which hands out 1041, 1042, 1043….
+
+### Never losing a message
+
+The rule: **save first, acknowledge second**. Asha's phone keeps the message as "sending" until it gets `ACK`. If the network drops, the phone sends it again with the same `clientMsgId`.
+
+The server keeps a unique key on `(senderId, clientMsgId)`. A retry finds the saved message and returns the same `seq` instead of storing a duplicate.
+
+[![Sending safely: the phone sends with a client message ID; the server checks for a duplicate, assigns the next chat sequence, saves the message and only then acknowledges; a retry with the same ID returns the original sequence instead of creating a second message.](learning-figures/hld-6-send.svg)](learning-figures/hld-6-send.svg)
+
+> **⚠️ Common mistake**
+> Treating "written to the WebSocket" as "delivered". The bytes can sit in a buffer while the phone goes into a tunnel. Only the phone's `DELIVERED` reply proves delivery.
+
+### Multiple devices
+
+Each device keeps its own cursor – the last `seq` it received for each chat. Bilal's laptop, offline all day, syncs with `afterSeq` from its own cursor; it does not trust the phone's progress.
+
+Read status is per user: when Bilal reads on his phone, both devices clear the unread badge.
+
+### Groups
+
+For a group of 200, the chat service saves the message once and pushes it to the 200 members' devices (fanout on write). For very large groups or channels, members instead pull from the group's message list using their cursor, so one message does not cause 100,000 pushes at once.
+
+### Online status
+
+Each phone sends a heartbeat every 30 seconds, which sets `presence:bilal = online` with a 60-second TTL. If heartbeats stop, the key expires and Bilal shows "last seen 9:42".
+
+Presence is only sent to people who currently have Bilal's chat open – otherwise one user coming online would notify hundreds of contacts.
+
+## Step 7: Find bottlenecks and failure points
+
+| What fails | What happens | How we handle it |
+| --- | --- | --- |
+| A connection server dies | 100,000 phones lose their socket | Phones reconnect to another server and `SYNC` from their cursors – nothing is lost because messages were saved first |
+| ACK lost on the way back | Asha's phone retries | Same `clientMsgId` returns the original `seq`; no duplicate |
+| Bilal is offline for a week | Messages pile up | They stay in the store; push notification; `SYNC` on reconnect, paged |
+| A huge group message | Thousands of pushes at once | Members pull by cursor instead of fanout |
+| Deploying connection servers | Every socket would drop at once | Drain servers gradually; clients reconnect with jitter |
+
+## Putting it together
+
+- **Send:** WebSocket → chat service → per-chat `seq` → save → ACK → push to recipients' servers.
+- **Receive:** push to online devices; offline devices `SYNC` from their own cursor.
+- **Scale:** ~1,000 connection servers, Redis for sessions and presence, Cassandra partitioned by chat.
+
+## Interviewer follow-ups
+
+**Why not HTTP long polling?** It works as a fallback, but each poll is a new request with headers and a held thread. WebSockets keep one cheap open connection that both sides can use.
+
+**How does end-to-end encryption change the design?** The server stores and forwards encrypted bytes it cannot read. Each device has its own keys, so a message is encrypted once per recipient device. Server-side search becomes impossible.
+
+**How do you send photos?** The phone uploads the photo to object storage using a short-lived upload link, then sends a chat message containing the link and a thumbnail.
+
+**How do you show "typing…"?** A short-lived event pushed only to the open chat; it is never stored.
+
+**What if two people send at the same moment?** Both go to the same chat owner, which gives them consecutive numbers. Both phones then show the server's order.
+
+## Wrap up
+
+We kept a WebSocket open per device, saved each message with a per-chat sequence number before acknowledging it, and let every device catch up from its own cursor.
+
+> **📝 Key takeaways**
+> - WebSockets let the server push; a session store says which server holds each device.
+> - Save first, then acknowledge; `clientMsgId` turns retries into no-ops.
+> - Order per chat with server-assigned sequence numbers, not device clocks.
+> - Sent, delivered and read are three different facts, each confirmed by a reply.
+
+## Going deeper (optional)
+
+The detailed version covers what to do when a user is removed from a group while messages are in flight, how to repair gaps in a device's sequence, and why presence must never decide whether a message is stored.
+
+[![Persist before acknowledging acceptance to the sender.](lessons/hld-6-flow.svg)](lessons/hld-6-flow.svg)
+
+Further reading: [RFC 6455 – The WebSocket Protocol](https://datatracker.ietf.org/doc/html/rfc6455) and the [Signal protocol overview](https://signal.org/docs/) for end-to-end encryption.
+
+## Closing answer
+
+"Each device keeps a WebSocket open to a connection server, and a Redis session store records which server holds which device. When Asha sends a message, the chat service that owns the chat gives it the next per-chat sequence number, saves it in Cassandra partitioned by chat, and only then acknowledges – one tick. It pushes the message to Bilal's online devices; their delivered and read replies give two ticks and blue ticks. Offline devices sync from their own cursor on reconnect. Retries carry a client message ID, so they never create duplicates. Presence is soft state with heartbeats and a TTL."
 
 === HLD 7 ===
-N|n0|Upload service|0|0|200|rect
-N|n1|Original object store|250|0|200|rect
-N|n2|Processing queue|500|0|200|rect
-N|n3|Transcode workers|0|110|200|rect
-N|n4|Asset metadata|250|110|200|rect
-N|n5|CDN|500|110|200|rect
-N|n6|Player|0|220|200|rect
-E|n0|n1|resumable chunks
-E|n0|n2|verified finalize
-E|n2|n3|profile tasks
-E|n3|n4|validated renditions
-E|n4|n5|published manifest
-E|n5|n6|segments
+N|up|Creator app|0|0|150|rect
+N|obj|Object storage|220|0|170|cylinder
+N|proc|Transcoding pipeline|440|0|190|rect
+N|meta|Video metadata|440|130|170|cylinder
+N|cdn|CDN edges|220|130|150|rect
+N|view|Viewer player|0|130|150|rect
+E|up|obj|resumable upload
+E|obj|proc|upload done event
+E|proc|obj|segments + manifest
+E|proc|meta|mark READY
+E|view|meta|get video
+E|view|cdn|stream segments
+E|cdn|obj|cache miss|dashed
 ---
 ## Problem
 
-Design YouTube: creators upload videos, which get transcoded into multiple resolutions and formats, and viewers worldwide stream them smoothly with adaptive bitrate. The discussion centres on the **upload and transcoding pipeline**, **object storage**, **CDN delivery** and the **metadata/view-count** systems.
+Design YouTube. Asha uploads a 10-minute cooking video from her phone. A few minutes later, viewers can watch it in 240p on a slow train or in 1080p on a laptop, and the quality changes smoothly as their network changes.
+
+The two hard parts are processing every upload into many formats, and serving billions of views without melting our servers.
 
 ## Requirements
 
-**Functional**
-- Upload large videos (GBs) reliably, including resuming after a network drop.
-- Transcode to 144p–4K in several codecs. Generate thumbnails.
-- Stream with adaptive bitrate. Search, view counts, likes, comments.
+- Creators upload videos (up to a few GB).
+- Videos are processed into several resolutions and become watchable within minutes.
+- Viewers stream with quality that adapts to their bandwidth.
+- Show title, views and a thumbnail; search and recommendations are out of scope.
+- Very read-heavy: far more watching than uploading.
 
-**Non-functional**
-- Playback starts in < 2 s, with minimal rebuffering, at global scale.
-- Uploads must never be lost. Processing can take minutes.
+## Step 1: Clarify the requirements
 
-**Scale:** 500 hours uploaded per minute ≈ 30k hours/hour. At ~1 GB per hour of raw video × ~3 for renditions, that's **≈ 2–3 PB of new storage per day**. Views of billions per day are served mostly by the CDN.
+> **💡 Tip**
+> Split the system into an upload path and a watch path early. They have completely different scale and design.
 
-## 1. Scope and chosen pipeline
+**Candidate:** What is the scale?
 
-I support creator upload, asynchronous multi-bitrate preparation, public/private publication and adaptive playback. I choose direct resumable object uploads, a durable processing queue and independently retryable transcode tasks keyed by asset version/profile. Search/recommendation are downstream consumers, not prerequisites for serving a known video.
+**Interviewer:** 1 billion daily viewers, 500 hours of video uploaded every minute.
 
-## 2. API and asset model
+**Candidate:** Which devices and network speeds?
 
-```text
-POST /uploads -> uploadId, authorized chunk destinations
-POST /uploads/{id}/finalize {size,checksum} -> assetId,PROCESSING
-GET /videos/{id}/playback -> authorized manifest and status
-Asset: id,owner,sourceVersion,state; Rendition UNIQUE(asset,version,profile)
-```
+**Interviewer:** Everything from cheap phones on 3G to smart TVs.
 
-Finalize verifies chunks/checksum and records processing intent once. Workers write temporary outputs, validate segments, then mark their rendition complete. Manifest publication is an atomic metadata/version switch referencing completed outputs. I may publish 720p while 1080p retries if the readiness policy allows it. A million viewers at 3 Mb/s imply 3 Tb/s, so media bypasses application servers via CDN. Failed uploads expire; deletion revokes metadata access and schedules source/rendition/cache lifecycle cleanup. Upload throughput, processing age, playback startup and rebuffer rate cover different failure stages.
+**Candidate:** How quickly must an upload be watchable?
 
-## 3. Final design diagram
+**Interviewer:** Within a few minutes is fine.
 
-[![YouTube: Upload service resumable chunks Original object store; Upload service verified finalize Processing queue; Processing queue profile tasks Transcode workers; Transcode workers validated renditions Asset metadata; Asset metadata published manifest CDN; CDN segments Player](designs/hld-7.svg)](designs/hld-7.svg)
+**Candidate:** Do we need comments, likes, search?
 
-An **original asset** is the uploaded source. A **rendition** is an encoded version. A **manifest** lists segments and available variants. A **CDN** keeps content near viewers. I begin with one durable original and an asynchronous preparation pipeline.
+**Interviewer:** No. Upload, process and watch.
 
-## 4. Critical operation: worked execution
+**Candidate:** Can uploads resume after a network drop?
 
-![Publication follows verified processing rather than mere upload completion.](lessons/hld-7-flow.svg)
+**Interviewer:** Yes – people upload from phones.
 
-*Publication follows verified processing rather than mere upload completion.*
+**Functional requirements**
 
-![Track each processing task and publish only valid outputs.](lessons/hld-7-failure.svg)
+1. Upload a video, resumable.
+2. Process it into multiple resolutions and a thumbnail.
+3. Stream it with adaptive quality.
 
-*Track each processing task and publish only valid outputs.*
+**Non-functional requirements**
 
-### Calculate the bottleneck
+1. Smooth playback worldwide: start in about 2 seconds, rarely buffer.
+2. Highly available watch path; uploads may take minutes to process.
+3. Storage and bandwidth cost matter more than anything else.
 
-One million concurrent viewers averaging 3 Mb/s require 3 Tb/s of delivery bandwidth before overhead. That belongs on object/CDN delivery infrastructure rather than application servers proxying every segment. Ten minutes at 3 Mb/s is approximately 225 MB decimal, illustrating why watch time dominates storage/control-plane API payloads.
+## Step 2: Estimate the scale
 
-## 5. Detailed decisions, algorithms and failure behaviour
+> **💡 Tip**
+> For video, bandwidth is the number that decides the architecture.
 
-### Architecture
-
-**Upload path:**
-1. The client gets a **pre-signed, resumable upload URL** and uploads chunks directly to object storage (S3/GCS), bypassing app servers.
-2. Upload complete triggers an event, which enqueues a **transcode job** (DAG: split, then encode per resolution/codec in parallel, then package as HLS/DASH segments, plus thumbnails, content-ID scan).
-3. Workers write the segments to object storage, update the **metadata DB** (`video → status, renditions, manifest URL`), and the video becomes public.
-
-**Playback path:** the client fetches the manifest from the API, then the segments from the **CDN**. The player switches bitrate per segment based on measured bandwidth (ABR).
-
-### Key design decisions & trade-offs
-
-**1. Direct-to-storage uploads.** App servers never proxy video bytes. Resumable chunked upload (tus or S3 multipart) survives flaky mobile networks.
-
-**2. Parallel transcoding.** Split the video into GOP-aligned chunks and encode them in parallel across workers, then stitch. A 1-hour video finishes in minutes instead of hours. The queue plus idempotent jobs (keyed by `videoId + rendition`) allows safe retries.
-
-**3. Adaptive bitrate.** HLS/DASH segments (2–6 s) per rendition plus a manifest. Shorter segments adapt faster but mean more requests and less efficient caching.
-
-**4. CDN strategy.** Popular videos are cached at edge PoPs worldwide. The long tail is served from regional origin caches (most videos are rarely watched). Pre-warm the CDN for big launches.
-
-**5. Storage tiers.** Hot renditions on standard storage. Old, rarely watched videos move to cheaper tiers, and some renditions (4K of an unwatched video) can be dropped and regenerated on demand.
-
-**6. View counts.** Don't update a DB row per view. Stream view events to Kafka, aggregate (with dedup and fraud filtering) and flush periodically. Counts are eventually consistent.
-
-### Scope, guarantees and sizing assumptions
-
-**Correctness requirement:** A video becomes playable only when a committed manifest references verified output objects.
-
-Assume 100,000 uploads/day x 500 MB: 50 TB/day original ingress. A 10-minute title with six bitrates averaging a combined 12 Mb/s creates roughly 900 MB of encoded media. At 1 million viewers x 3 Mb/s, edge delivery is 3 Tb/s.
-
-### API contracts and data ownership
+**Uploads and storage**
 
 ```text
-POST /uploads -> signed multipart destination; POST /uploads/{id}/complete; GET /videos/{id}/playback; GET /search
+Uploaded             = 500 hours / minute = 720,000 hours / day
+Stored per hour      ≈ 1 GB original + ~2 GB for all resolutions = 3 GB
+Per day              = 720,000 × 3 GB     ≈ 2 PB
 ```
+
+What it means: storage grows by petabytes a day – only object storage (like S3 or GCS) works.
+
+**Watching**
 
 ```text
-Logical records (outline, not complete DDL):
-video(id,owner,status,source_object,manifest_version); encode_job(video_id,profile,state); segment(checksum,object_key)
-
-Primary access/partitioning boundary:
-video_id for metadata and workflow; content-addressed object keys for media segments
+Views per day        = 1B users × 5 videos     = 5 billion
+Average bitrate      ≈ 3 Mbps; average watch ≈ 5 minutes
+Bandwidth            ≈ 5B × 5 min × 60 s × 3 Mb / 86,400 s ≈ 260 Tbps
 ```
 
-### Build the architecture in stages
+What it means: no data centre can send this. Videos must be served from a **CDN** – servers close to viewers, inside ISPs.
 
-**Stage 3 — Partition and isolate.** Partition around video_id for metadata and workflow; content-addressed object keys for media segments. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+## Step 3: Define the API
 
-### Trace the critical request
+```http
+POST /v1/uploads                       { "title": "Masala dosa at home", "size": 812000000 }
+→ 201 { "videoId": "v-8Kq2", "uploadUrl": "https://upload.example.com/v-8Kq2?sig=..." }
 
-Authorize upload quota; allocate multipart upload; verify completion/checksum; enqueue metadata-driven transcode jobs; scan and generate renditions/thumbnails; validate outputs; atomically publish a manifest version; deliver segments through CDN signed URLs.
+PUT  {uploadUrl}  (chunks, with Content-Range – resumable)
 
-### Deep dive: the decision that changes this system
+GET  /v1/videos/v-8Kq2      → 200 { "title": "...", "status": "READY", "manifestUrl": "https://cdn.example.com/v-8Kq2/master.m3u8" }
+```
 
-Adaptive bitrate playback requests small segments based on bandwidth and buffer state. Metadata is a control plane; bulk bytes should not proxy through API servers. Idempotent rendition jobs write to versioned temporary prefixes and publish only after validation.
+The client uploads bytes straight to object storage with a short-lived signed URL, so our API servers never carry video bytes.
 
-### Failure and race-condition walkthrough
+> **🎯 In the interview**
+> Say clearly: API servers handle metadata only. Video bytes go phone → object storage on upload, and CDN → viewer on playback.
 
-An encoder crashes after writing half a rendition. Its lease can expire and another worker retry, but incomplete prefixes are never made playable. Old CDN manifests need a controlled retirement window.
+## Step 4: Define the data model
 
-### Security, tenancy and lifecycle
+| Store | Contents | Technology |
+| --- | --- | --- |
+| Video metadata | videoId, owner, title, status (UPLOADING / PROCESSING / READY / FAILED), duration | SQL, sharded by videoId, plus a cache |
+| Original uploads | the raw file | Object storage |
+| Processed video | small segments per resolution + manifest files | Object storage, served through a CDN |
+| Processing jobs | videoId, task, status, attempts | A queue plus a job table |
+| View counts | videoId → count | Counters aggregated in batches |
 
-### Trade-offs and a starting recommendation
+> **⚖️ Design choice**
+> Keep metadata in a database and bytes in object storage. Metadata is small and queried often; bytes are huge and only streamed.
 
-Precompute popular bitrates for predictable playback; just-in-time encoding saves unused storage but risks startup stalls. Content moderation and copyright handling are separate workflows with appeal/audit boundaries.
+## Step 5: Draw the high-level design
 
-Upload completion rate, time-to-playable, playback start time, rebuffer ratio, CDN hit ratio, encoding backlog and cost per viewing minute.
+[![High-level design: the creator uploads the original to object storage; a processing pipeline transcodes it into segments and manifests; the video becomes published in metadata; viewers fetch metadata from the API and stream segments from the CDN.](designs/hld-7.svg)](designs/hld-7.svg)
 
-**Test matrix:** Resume interrupted multipart upload, retry an encoder job, corrupt a segment checksum, simulate CDN miss storms, remove a video while manifests are cached.
+**Upload path**
 
-### Follow-up questions with answers
+1. Asha's app calls `POST /uploads` and gets a signed upload URL.
+2. The app uploads the file in chunks straight to object storage; a dropped connection resumes from the last chunk.
+3. Upload complete → an event goes on a queue; status becomes PROCESSING.
+4. Workers transcode the video into 240p, 480p, 720p and 1080p, cut it into 4-second segments, and create a thumbnail.
+5. When every required output is checked, status becomes READY.
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: A video becomes playable only when a committed manifest references verified output objects.
+**Watch path**
 
-**What is the first scaling pressure to test?** Use the actual workload: Assume 100,000 uploads/day x 500 MB: 50 TB/day original ingress. A 10-minute title with six bitrates averaging a combined 12 Mb/s creates roughly 900 MB of encoded media. At 1 million viewers x 3 Mb/s, edge delivery is 3 Tb/s.
+1. Bilal opens the video. The API returns metadata and the manifest URL.
+2. His player downloads the manifest from the CDN, then segments, choosing quality as it goes.
+3. The CDN serves popular segments from its cache; on a miss it fetches from object storage once.
 
-**Which failure would invalidate the naive design?** An encoder crashes after writing half a rendition. Its lease can expire and another worker retry, but incomplete prefixes are never made playable. Old CDN manifests need a controlled retirement window.
+[![Processing pipeline: the uploaded original is split into chunks, each chunk is transcoded into several resolutions in parallel, the results are packaged into segments with a manifest, outputs are verified, and only then the video is marked ready.](learning-figures/hld-7-pipeline.svg)](learning-figures/hld-7-pipeline.svg)
 
-**Why not introduce every distributed component immediately?** Precompute popular bitrates for predictable playback; just-in-time encoding saves unused storage but risks startup stalls. Content moderation and copyright handling are separate workflows with appeal/audit boundaries.
+## Step 6: Go deep
 
-**How would you demonstrate the design works?** Resume interrupted multipart upload, retry an encoder job, corrupt a segment checksum, simulate CDN miss storms, remove a video while manifests are cached. Keep the expected invariant and recovery outcome visible in the results.
+### Processing at scale: the transcoding algorithm
 
-### Further reading
+Transcoding a 10-minute video to four resolutions on one machine can take longer than the video itself.
 
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+**Option 1: One worker transcodes the whole file.**
 
-### Work through retries and access
+- Good: simple.
+- Problem: slow for long videos, and a crash at 95% means starting over.
 
-Transcode job identity should include original asset version and encoding profile. Retrying a task may rewrite deterministic output paths or produce a new version, but must not publish partial files as completed segments. Upload finalization is idempotent and verifies all chunks; abandoned sessions need lifecycle cleanup.
+**Option 2: Split into chunks and transcode in parallel.**
 
-Private video access requires checking entitlements when issuing short-lived playback access, not merely hiding the video in search. CDN caching keys and signed URLs must preserve the chosen authorization boundary. Deletion requires original, renditions, manifests and CDN policy to be considered together.
+- Good: 60 chunks on 60 workers finish in about the time of one chunk; a failed chunk is retried alone.
+- Problem: needs a coordinator that tracks every chunk and joins the results.
 
-## 6. Interviewer follow-ups
+> **⚖️ Design choice**
+> Split the video into chunks at keyframes (about 10 seconds each), queue one task per chunk per resolution, and have a coordinator mark the video READY only when every task has succeeded. This is a small DAG of tasks: split → transcode (parallel) → package → thumbnail → publish.
 
-**Does adaptive bitrate mean changing the original video?** No. The player selects among prepared variants as conditions change.
+### Adaptive streaming
 
-**Can a task acknowledgement prove playable output?** Only after validating its expected artifacts.
+Each resolution is cut into short segments, and a **manifest** lists them (HLS `.m3u8` or DASH `.mpd`). The player measures its download speed: on a fast network it fetches 1080p segments; when the train enters a tunnel it switches to 240p for the next segment. No server work is needed – it is all in the player.
 
-## 7. Closing answer
+![Animation: a player fetches the manifest, starts with 480p segments, network speed rises so it switches to 1080p, then the train enters a tunnel and it drops to 240p for the next segment without stopping playback.](learning-figures/hld-7-abr.gif)
 
-I separate resumable ingestion, idempotent media preparation and CDN playback. Publication references only verified versioned artifacts; incomplete transcodes never become playable output. Application APIs handle metadata and permissions while object/CDN infrastructure carries the video bandwidth.
+### Serving through a CDN
+
+Popular videos are cached at the CDN edges. For the long tail of rarely watched videos, the edge fetches from object storage on demand. A new viral video gets pre-warmed into edges in the regions where it is trending.
+
+> **⚠️ Common mistake**
+> Streaming from your own application servers. At hundreds of terabits per second, only a CDN – ideally with servers inside ISPs, as YouTube and Netflix do – can carry the load.
+
+### Counting views
+
+Writing to a database row on every view would create a hot row for viral videos. Instead, count in memory or in a stream and add the totals every few seconds. The displayed count may lag slightly – that is fine.
+
+## Step 7: Find bottlenecks and failure points
+
+| What fails | What happens | How we handle it |
+| --- | --- | --- |
+| Upload drops at 70% | Asha would start again | Resumable chunked upload continues from the last chunk |
+| A transcode worker crashes | One chunk missing | The task returns to the queue and is retried; the video stays PROCESSING |
+| A corrupt or unsupported file | Processing can never succeed | After a few attempts mark FAILED and tell the creator |
+| A video goes viral | Origin gets hammered | CDN caches it; edges fetch each segment once |
+| A CDN region has problems | Buffering for viewers there | DNS / multi-CDN steers viewers to a healthy provider |
+
+## Putting it together
+
+- **Upload:** signed URL → object storage, resumable → queue → parallel chunk transcoding → verify → READY.
+- **Watch:** metadata from the API → manifest and segments from the CDN → the player adapts quality.
+- **Scale:** bytes never touch API servers; the CDN carries the bandwidth.
+
+## Interviewer follow-ups
+
+**How do you avoid duplicate uploads?** Hash the file (or its first chunks) and reuse existing processed outputs when the same content is uploaded again – a policy decision for copyright too.
+
+**How do you reduce storage cost?** Rarely watched videos keep fewer resolutions or move to colder storage; popular ones get more efficient codecs such as AV1, which cost more CPU once but save bandwidth on every view.
+
+**Live streaming?** Same segments-and-manifest idea, but segments are produced in real time and the manifest keeps growing; latency is a few seconds.
+
+**How do you show a thumbnail before processing ends?** Generate the thumbnail as an early, separate task so the video page is ready while higher resolutions are still processing.
+
+## Wrap up
+
+We uploaded straight to object storage, transcoded chunks in parallel into segmented resolutions, and served them through a CDN with adaptive streaming.
+
+> **📝 Key takeaways**
+> - Upload and watch are two separate paths; API servers never carry video bytes.
+> - Chunked, parallel transcoding makes processing fast and retryable.
+> - Segments + a manifest let the player switch quality on the fly.
+> - The CDN is the design: bandwidth, not compute, is the bottleneck.
+
+## Going deeper (optional)
+
+The detailed version tracks each processing task separately so a retried task cannot publish a half-written output, and adds content-moderation and copyright checks before publication.
+
+[![Publication follows verified processing rather than mere upload completion.](lessons/hld-7-flow.svg)](lessons/hld-7-flow.svg)
+
+Further reading: [Apple HTTP Live Streaming (HLS)](https://developer.apple.com/streaming/) and the [Netflix Open Connect overview](https://openconnect.netflix.com/en/).
+
+## Closing answer
+
+"I separate upload from watching. The app gets a signed URL and uploads the video in resumable chunks straight to object storage. An event starts a pipeline: the video is split at keyframes, each chunk is transcoded into several resolutions in parallel, packaged into short segments with an HLS or DASH manifest, verified, and only then marked ready. Metadata lives in a sharded database with a cache. Viewers get metadata from our API but stream segments from a CDN, and the player switches resolution segment by segment as bandwidth changes. Bandwidth, not compute, is the main cost, so the CDN is central."
 
 === HLD 8 ===
-N|n0|Playback API|0|0|200|rect
-N|n1|Entitlement service|250|0|200|rect
-N|n2|Session leases|500|0|200|rect
-N|n3|Manifest service|0|110|200|rect
-N|n4|License boundary|250|110|200|rect
-N|n5|CDN and origins|500|110|200|rect
-N|n6|Player|0|220|200|rect
-E|n0|n1|authorizes
-E|n0|n2|claims stream
-E|n0|n3|resolves variant
-E|n0|n4|grants scoped access
-E|n3|n5|media paths
-E|n5|n6|segments
+N|tv|Netflix app|0|0|150|rect
+N|api|Playback API|220|0|160|rect
+N|ent|Subscription check|440|0|190|rect
+N|steer|CDN steering|220|130|160|rect
+N|oca|Open Connect boxes|440|130|190|cylinder
+N|lic|DRM licence|0|130|150|rect
+E|tv|api|play title
+E|api|ent|active plan?
+E|api|steer|pick nearest box
+E|tv|oca|stream segments
+E|tv|lic|decrypt key
 ---
 ## Problem
 
-Design Netflix: a subscription streaming service with a fixed, curated catalogue (unlike YouTube's user uploads), delivering high-quality video to ~250M members on every device, with personalised recommendations and extreme availability. The focus is **CDN design**, **adaptive streaming**, **recommendation** and **resilience**.
+Design Netflix. Bilal opens the app on his TV on a Saturday night, browses rows of shows, presses Play on a movie, and it starts in two seconds in 4K – along with millions of other people doing the same thing at the same time.
+
+Unlike YouTube, the catalogue is fixed and curated: Netflix knows in advance exactly which files it will serve. That changes the design.
 
 ## Requirements
 
-**Functional**
-- Browse a personalised home page, search, play with resume across devices, profiles, downloads.
-- Multiple audio and subtitle tracks, adaptive quality up to 4K HDR.
+- Browse a personalised home page and title details.
+- Play a title with adaptive quality, resume where you stopped.
+- Only paying subscribers can play; enforce the plan's screen limit (for example 2 screens).
+- Content is protected with DRM.
+- Huge evening peaks across 190 countries.
 
-**Non-functional**
-- Very high availability for playback start. Smooth streaming with minimal rebuffering.
-- Netflix is a big share of peak internet traffic, so delivery cost and ISP-friendliness matter.
+## Step 1: Clarify the requirements
 
-**Scale:** 250M members and ~100M concurrent streams at peak. At ~5 Mbps average that's on the order of **hundreds of Tbps** at the edge. It can't be served from a few datacentres.
+> **💡 Tip**
+> Ask what makes this different from YouTube. The answer – a fixed catalogue and paid access – drives the design.
 
-## 1. Scope and chosen architecture
+**Candidate:** Who adds content?
 
-I design subscription playback, regional title rights, stream limits and adaptive streaming. Catalogue, recommendation and progress tracking can be eventually consistent; starting/renewing playback requires current entitlement under a documented grant lifetime. DRM license delivery, when required, is separate from subscription authorization.
+**Interviewer:** Only Netflix's studio team, a few thousand titles a month.
 
-## 2. Playback contract
+**Candidate:** What scale?
 
-```text
-POST /playback-sessions {titleId,deviceId} -> sessionId,manifest,accessExpiry
-POST /playback-sessions/{id}/heartbeat -> renewed | revoked
-DELETE /playback-sessions/{id} -> ended
-Session: accountId,deviceId,titleId,leaseExpiry,rightsVersion,state
-```
+**Interviewer:** 250 million subscribers; at peak evening hours, tens of millions stream at once.
 
-The service authenticates, checks subscription/region, atomically claims a session lease within account limits and issues short-lived scoped access. Player fetches segments from CDN, selects bitrate and reports quality/progress asynchronously. A crashed device retains its slot only until lease expiry; renewal rechecks policy. Two million 5 Mb/s streams require about 10 Tb/s delivery, so origin shielding/pre-positioning matter independently of API scaling. Rights revocation cannot retract already downloaded bytes; the grant/license lifetime bounds future access. I track startup delay, rebuffering, playback errors, origin saturation and lease leakage by region/device.
+**Candidate:** Do we enforce simultaneous-screen limits?
 
-## 3. Final design diagram
+**Interviewer:** Yes – a Standard plan allows two screens.
 
-[![Netflix: Playback API authorizes Entitlement service; Playback API claims stream Session leases; Playback API resolves variant Manifest service; Playback API grants scoped access License boundary; Manifest service media paths CDN and origins; CDN and origins segments Player](designs/hld-8.svg)](designs/hld-8.svg)
+**Candidate:** Should playback resume on another device?
 
-A **playback session** is an authorized attempt to watch a title. A **manifest** describes playable variants. **DRM** adds a license/key-delivery boundary; it does not replace subscription authorization. Start by tracing play authorization and segment delivery separately.
+**Interviewer:** Yes, from the last position.
 
-## 4. Critical operation: worked execution
+**Candidate:** Are recommendations in scope?
 
-![Control APIs grant bounded playback access; CDN serves the bytes.](lessons/hld-8-flow.svg)
+**Interviewer:** Mention them; focus on playback.
 
-*Control APIs grant bounded playback access; CDN serves the bytes.*
+**Functional requirements**
 
-![Fresh authorization protects playback even when browsing data is stale.](lessons/hld-8-failure.svg)
+1. Browse the home page and title pages.
+2. Play with adaptive quality and DRM; resume position across devices.
+3. Check subscription and screen limits before playing.
 
-*Fresh authorization protects playback even when browsing data is stale.*
+**Non-functional requirements**
 
-### Calculate the delivery path
+1. Playback starts in about 2 seconds and rarely buffers.
+2. Very high availability at evening peaks.
+3. Keep bandwidth cost low – it is the largest cost.
 
-With two million simultaneous streams at 5 Mb/s, media delivery is about 10 Tb/s. Even a modest cache miss percentage can generate enormous origin egress. Popularity-aware pre-positioning and origin shielding are capacity choices; the account API does not need to carry the media bytes.
+## Step 2: Estimate the scale
 
-## 5. Detailed decisions, algorithms and failure behaviour
+> **💡 Tip**
+> As with YouTube, bandwidth decides the architecture. Compute is small in comparison.
 
-### Architecture
-
-- **Control plane (cloud):** API gateway, auth, catalogue and metadata, the playback service (licence/DRM, manifest, choosing the CDN node), recommendations, billing. Microservices with bulkheads.
-- **Data plane (Open Connect CDN):** Netflix's own cache appliances placed **inside ISPs** and at IXPs. Content is **pre-positioned overnight** based on predicted popularity, so peak traffic stays inside the ISP network.
-- **Encoding:** per-title and per-shot encoding ladders (the bitrate/resolution set chosen per content complexity), many codecs (H.264, HEVC, AV1), packaged for DASH/HLS.
-- **Client:** ABR algorithm with a buffer, picking the bitrate per segment, and a **steering** service that returns a ranked list of nearby healthy caches.
-
-### Key design decisions & trade-offs
-
-**1. Own CDN vs. a commercial CDN.** At this volume, owning the edge (free appliances for ISPs) cuts cost and improves quality. YouTube-like long-tail catalogues benefit less from pre-positioning, while Netflix's catalogue is fixed and predictable.
-
-**2. Pre-positioning vs. pull-through caching.** Netflix knows what will be popular tomorrow, so it fills caches off-peak and avoids cache misses during peak.
-
-**3. Per-title encoding.** An animated show looks great at a low bitrate; an action film needs more. Tailored ladders save bandwidth for the same perceived quality.
-
-**4. Recommendations.** Viewing events go through Kafka into a data lake, then offline model training (collaborative filtering plus deep models). Results are precomputed per profile and cached, with real-time context re-ranking. Even artwork is personalised.
-
-**5. Resilience.** Multi-region active-active. Circuit breakers, timeouts, fallbacks (if recommendations are down, show popular titles). **Chaos engineering** proves it. Playback must keep working even when the home page degrades.
-
-**6. Resume across devices.** Heartbeat events write the playback position to a fast KV store keyed by profile and title.
-
-### Scope, guarantees and sizing assumptions
-
-**Correctness requirement:** Playback authorization is checked in the control plane; protected media access expires according to entitlement policy.
-
-Assume 5 million concurrent streams at 5 Mb/s: 25 Tb/s delivery. A 2-hour title encoded at an aggregate 20 Mb/s consumes about 18 GB before additional audio/subtitle tracks. These planning numbers exclude CDN redundancy.
-
-### API contracts and data ownership
+**Peak bandwidth**
 
 ```text
-POST /playback-sessions; GET /manifest/{session}; license request; heartbeat/checkpoint endpoint
+Concurrent streams at peak   ≈ 30 million
+Average bitrate              ≈ 5 Mbps (HD, some 4K at 15 Mbps)
+Peak bandwidth               = 30M × 5 Mbps ≈ 150 Tbps
 ```
+
+What it means: this must be served from inside ISPs, close to viewers. Netflix runs its own CDN, **Open Connect**, with cache servers placed inside ISP networks.
+
+**Catalogue storage**
 
 ```text
-Logical records (outline, not complete DDL):
-catalogue(title_id,manifest_version,regions); entitlement(account,plan,valid_until); playback_session(id,device,lease_expiry); watch_progress
-
-Primary access/partitioning boundary:
-title_id + rendition_version for objects; account_id/session_id for entitlement and concurrency
+Titles                ≈ 20,000 (films and episodes ≈ 200,000 video files)
+Encodes per video     ≈ 100+ (resolutions × codecs × audio and subtitle tracks)
+Total                 ≈ a few PB
 ```
 
-### Build the architecture in stages
+What it means: the whole catalogue is small enough that popular titles can be copied to every edge server in advance.
 
-**Stage 3 — Partition and isolate.** Partition around title_id + rendition_version for objects; account_id/session_id for entitlement and concurrency. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.
+## Step 3: Define the API
 
-### Trace the critical request
+```http
+GET  /v1/home                         → rows of titles for this profile
+GET  /v1/titles/{titleId}             → details, episodes
 
-Authenticate account/device; check geographic rights and plan; enforce concurrency lease; return short-lived manifest/license references; client selects adaptive segments from CDN; report bounded playback telemetry; persist watch position asynchronously.
+POST /v1/playback/{titleId}/start     { "deviceId": "tv-livingroom" }
+→ 200 { "sessionId": "...", "manifestUrl": "https://oca-17.isp.example/...", "licenseUrl": "...", "resumeAt": 1834 }
+→ 403 { "error": "SCREEN_LIMIT" }
 
-### Deep dive: the decision that changes this system
+POST /v1/playback/{sessionId}/heartbeat  { "position": 1900 }
+POST /v1/playback/{sessionId}/stop
+```
 
-A CDN caches immutable segments at enormous scale; tokenized manifests and DRM/license services control access. DRM is not just encrypting a URL. The playback dependency chain must avoid synchronous calls to recommendations, analytics and billing for every segment.
+`start` is the important call: it checks the subscription and screen limit, and returns which edge server to stream from.
 
-### Failure and race-condition walkthrough
+> **🎯 In the interview**
+> Separate the **control plane** (browse, start, licences – in the cloud, e.g. AWS) from the **data plane** (video bytes – from Open Connect boxes in ISPs). Netflix describes exactly this split.
 
-A control-plane region fails while streams are already playing. Existing signed media access can continue until expiry; new session creation fails over according to replicated entitlement freshness. Very short token TTLs improve revocation but increase control-plane dependence.
+## Step 4: Define the data model
 
-### Security, tenancy and lifecycle
+| Store | Contents | Technology |
+| --- | --- | --- |
+| Catalogue | titles, episodes, artwork, available encodes per region | Cassandra / key-value, heavily cached |
+| Subscriptions | accountId, plan, maxScreens, status | SQL |
+| Active streams | accountId → sessions with last heartbeat | Redis, with TTL |
+| Viewing history | profileId, titleId, position, updatedAt | Cassandra |
+| Video files | encoded segments per title | Object storage (origin) + Open Connect caches |
 
-### Trade-offs and a starting recommendation
+> **⚖️ Design choice**
+> Store resume positions in Cassandra keyed by profile. It is write-heavy (a heartbeat every few seconds per viewer) and losing the last few seconds is harmless.
 
-Pre-position popular titles near demand; origin fetch reduces storage but increases first-view latency and egress. Availability and consistency goals differ between catalogue browsing, licence grants and progress updates.
+## Step 5: Draw the high-level design
 
-Start-up latency, rebuffering, error-free playback, licence p99, origin egress and entitlement decision errors.
+[![High-level design: the Netflix app asks the playback API to play a title; the API checks the subscription and screen limit and asks CDN steering for the nearest healthy Open Connect box; the app streams segments from that box and fetches a DRM licence to decrypt them.](designs/hld-8.svg)](designs/hld-8.svg)
 
-**Test matrix:** Playback under bandwidth changes, CDN origin loss, expired entitlement, concurrent device limit, regional rights change and licence-service degradation.
+**Browsing**
 
-### Follow-up questions with answers
+1. The app calls `/home`. Rows of titles come from precomputed recommendations plus the cached catalogue.
+2. Artwork images come from the CDN.
 
-**What cannot be eventually consistent here?** The operation establishing this guarantee: Playback authorization is checked in the control plane; protected media access expires according to entitlement policy.
+**Pressing Play**
 
-**What is the first scaling pressure to test?** Use the actual workload: Assume 5 million concurrent streams at 5 Mb/s: 25 Tb/s delivery. A 2-hour title encoded at an aggregate 20 Mb/s consumes about 18 GB before additional audio/subtitle tracks. These planning numbers exclude CDN redundancy.
+1. The app calls `playback/start`. The service checks Bilal's plan is active and that fewer than 2 streams are running.
+2. Steering picks the best Open Connect box for Bilal's ISP and location that holds this title.
+3. The response has the manifest URL, the licence URL and the resume position.
+4. The player fetches a DRM licence (the decryption key), then streams segments from the box, switching quality as bandwidth changes.
+5. Every few seconds it sends a heartbeat with the position.
 
-**Which failure would invalidate the naive design?** A control-plane region fails while streams are already playing. Existing signed media access can continue until expiry; new session creation fails over according to replicated entitlement freshness. Very short token TTLs improve revocation but increase control-plane dependence.
+[![Playback start: the app asks to play, the subscription and screen limit are checked, steering picks an Open Connect box inside the viewer's ISP that holds the title, the player gets a licence and streams segments, and heartbeats save the position.](learning-figures/hld-8-play.svg)](learning-figures/hld-8-play.svg)
 
-**Why not introduce every distributed component immediately?** Pre-position popular titles near demand; origin fetch reduces storage but increases first-view latency and egress. Availability and consistency goals differ between catalogue browsing, licence grants and progress updates.
+## Step 6: Go deep
 
-**How would you demonstrate the design works?** Playback under bandwidth changes, CDN origin loss, expired entitlement, concurrent device limit, regional rights change and licence-service degradation. Keep the expected invariant and recovery outcome visible in the results.
+### Getting video close to viewers
 
-### Further reading
+**Option 1: A commercial CDN that caches on demand.**
 
-- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).
-- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).
-- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.
+- Good: no hardware to run.
+- Problem: at 150 Tbps the cost is enormous, and cache misses at peak hurt start time.
 
-### Work through resilience
+**Option 2: Own boxes inside ISPs, filled in advance (Open Connect).**
 
-Playback-session heartbeats approximate active viewing. A crashed TV may leave a lease until expiry, so stream-limit enforcement needs a documented grace/lease policy. Revoking a subscription cannot instantly retract segments already downloaded; define what must be checked at session renewal or license expiry.
+- Good: the catalogue is known, so popular titles are copied overnight during quiet hours; the ISP saves transit cost too.
+- Problem: you build and operate hardware worldwide.
 
-Keep continue-watching progress separate from billing and entitlement. A delayed progress update can be accepted eventually, whereas granting a restricted title needs a stronger decision. Track startup delay, rebuffer ratio and playback failure by device/region; a fast catalogue API can coexist with terrible viewing quality.
+> **⚖️ Design choice**
+> Pre-position content. Each night, predict tomorrow's popular titles per region and copy them to the boxes. At peak, almost every byte comes from a box inside Bilal's ISP.
 
-## 6. Interviewer follow-ups
+![Animation: overnight, popular titles are copied from the origin to Open Connect boxes inside ISPs; in the evening, Bilal presses play and steering sends him to the box in his own ISP; that box goes down, so the player switches to another nearby box and keeps playing.](learning-figures/hld-8-fill.gif)
 
-**Must every segment call the account database?** Usually no. Short-lived scoped playback access amortizes authorization while bounding its staleness.
+### Encoding once, very well
 
-**Is CDN hit ratio alone enough?** No. Playback startup, rebuffering and origin overload reveal different problems.
+Because each title is watched millions of times, Netflix spends a lot of compute on encoding. It picks bitrates per title (and per scene): a cartoon needs far fewer bits than an action film for the same quality. This saves bandwidth on every view.
 
-## 7. Closing answer
+### Screen limits
 
-I keep entitlement and concurrent-session decisions in the playback control path and distribute media through CDN/origin infrastructure. Bounded playback grants, lease expiry and explicit regional rights preserve access policy without a billing-database lookup for every segment. User experience is measured at the player.
+Each `start` adds a session to `active_streams:account` in Redis with a TTL of about a minute; heartbeats refresh it, `stop` removes it. If 2 sessions are already live, return `SCREEN_LIMIT`. A crashed TV simply stops heartbeating and its session expires.
+
+> **⚠️ Common mistake**
+> Counting screens with a permanent database row per stream. When a TV loses power it never calls stop, and the user is locked out. Use leases that expire.
+
+### Resilience
+
+Netflix famously tests failure on purpose (Chaos Monkey). If recommendations are down, show a generic popular row; if a box fails, the player switches to another box from its list. Playback must survive almost anything.
+
+## Step 7: Find bottlenecks and failure points
+
+| What fails | What happens | How we handle it |
+| --- | --- | --- |
+| An Open Connect box fails | Streams from it stop | The manifest lists several boxes; the player switches |
+| A new hit series launches | Huge first-night demand | Pre-fill boxes before release; spread episodes' start times naturally |
+| Recommendation service down | Home page incomplete | Fall back to cached or generic rows |
+| A TV crashes mid-stream | Its screen stays "in use" | Session lease expires without heartbeats |
+| A whole cloud region fails | Control plane down there | Run active-active in several regions and shift traffic |
+
+## Putting it together
+
+- **Browse:** precomputed rows + cached catalogue in the cloud.
+- **Play:** check plan and screens → steer to a box in the viewer's ISP → licence → stream with adaptive quality.
+- **Scale:** pre-position the known catalogue in ISP boxes overnight.
+
+## Interviewer follow-ups
+
+**How is this different from YouTube?** A small, known catalogue, encoded expensively once and pre-pushed to edges; paid access with DRM and screen limits. YouTube has a huge, unpredictable long tail and pulls into caches on demand.
+
+**How does DRM work?** Segments are encrypted. The player asks a licence server for the key, which checks the subscription and returns a key the device's secure hardware can use but not export.
+
+**How do you resume on another device?** Read the latest position for the profile from viewing history at `start`.
+
+**How do you handle a regional catalogue?** Store licensing rules per title and country; the catalogue and `start` filter by the viewer's region.
+
+## Wrap up
+
+We split a cloud control plane (browse, start, licences) from a data plane of ISP-hosted boxes, pre-filled overnight with the titles people will watch.
+
+> **📝 Key takeaways**
+> - Control plane in the cloud; video bytes from boxes inside ISPs.
+> - A known catalogue can be pre-positioned, unlike user uploads.
+> - Screen limits use expiring sessions refreshed by heartbeats.
+> - Design every dependency to fail without stopping playback.
+
+## Going deeper (optional)
+
+The detailed version checks the subscription freshly at licence time even if browsing data is stale, so a cancelled account cannot keep streaming.
+
+[![Control APIs grant bounded playback access; CDN serves the bytes.](lessons/hld-8-flow.svg)](lessons/hld-8-flow.svg)
+
+Further reading: [Netflix Open Connect](https://openconnect.netflix.com/en/) and the [Netflix Technology Blog](https://netflixtechblog.com/).
+
+## Closing answer
+
+"Netflix splits a cloud control plane from a data plane. The control plane serves the home page from precomputed recommendations and a cached catalogue, and handles play: it checks the plan, enforces the screen limit with expiring sessions refreshed by heartbeats, returns the resume position, and steers the player to the best Open Connect box. Those boxes sit inside ISPs and are filled overnight with titles predicted to be popular, because the catalogue is known in advance. The player fetches a DRM licence and streams segments, adapting quality; if a box fails it switches to another. Bandwidth is the main cost, so encoding is done carefully per title."
+

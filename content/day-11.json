@@ -12,103 +12,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "VendingMachine",
+            "id": "user",
+            "label": "User",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 100,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "VendSession",
-            "x": 250,
+            "id": "machine",
+            "label": "CoffeeMachine",
+            "x": 160,
             "y": 0,
-            "w": 200,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Recipe",
-            "x": 500,
-            "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n3",
+            "id": "inv",
             "label": "Inventory",
+            "x": 380,
+            "y": 0,
+            "w": 130,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "coins",
+            "label": "CoinBox",
+            "x": 380,
+            "y": 130,
+            "w": 130,
+            "h": 62,
+            "shape": "cylinder"
+          },
+          {
+            "id": "brew",
+            "label": "Brew + change",
+            "x": 160,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "refund",
+            "label": "Refund coins",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "ChangePlanner",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "DispenserPort",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "PaymentPort",
-            "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 140,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "owns"
+            "from": "user",
+            "to": "machine",
+            "label": "select, insert"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "selects"
+            "from": "machine",
+            "to": "inv",
+            "label": "enough milk?"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "reserves from"
+            "from": "machine",
+            "to": "coins",
+            "label": "plan change"
           },
           {
-            "from": "n1",
-            "to": "n4",
-            "label": "reserves change"
+            "from": "machine",
+            "to": "brew",
+            "label": "both OK"
           },
           {
-            "from": "n1",
-            "to": "n5",
-            "label": "dispenses through"
-          },
-          {
-            "from": "n1",
-            "to": "n6",
-            "label": "collects through"
+            "from": "machine",
+            "to": "refund",
+            "label": "either fails"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign a coffee vending machine that serves espresso, cappuccino, latte and so on. Each drink consumes ingredients (water, milk, beans, sugar). The machine takes payment, checks inventory, brews, returns change and reports low stock. It tests **State** (machine modes), **Factory** (beverages from recipes) and inventory consistency.\n\n## Requirements\n\n**Functional**\n- Show the menu with prices. Only drinks with enough ingredients are selectable.\n- Accept coins, notes or card. Return change or refund on cancel or failure.\n- Deduct ingredients and dispense. A technician can refill and go into maintenance mode.\n- Alert when an ingredient drops below a threshold.\n\n**Non-functional**\n- One transaction at a time; button presses while dispensing are rejected cleanly.\n- Never keep money without dispensing: every failure path ends in a dispense or a refund.\n- New drinks, recipes and payment methods plug in without touching the core flow.\n- Recovers to a safe state after a power cut mid-transaction.\n\n## 1. Scope and chosen solution\n\nI implement one machine with a menu, ingredient stock, coins, cancellation and maintenance. `VendingMachine` serializes sessions; `Recipe` is immutable quantities; `Inventory` reserves resources; a `ChangePlanner` solves bounded coin selection. I keep device and payment results outside domain assumptions.\n\n## 2. Vend algorithm and transitions\n\n```text\nselect(productId) -> price and recipe\nfund(sessionId,coin/payment) -> accepted credit\nvend(sessionId) -> COMPLETE | FAILED | DELIVERY_UNCERTAIN\nIDLE -> SELECTED -> FUNDED -> DISPENSING -> COMPLETE\n```\n\nBefore DISPENSING I atomically reserve ingredients, a cup and change, then persist the vend identity. A ₹30 drink funded by ₹50 reserves ₹20 change before brewing. Known pre-brew failure refunds/releases untouched resources; after partial brewing I record consumed stock and waste, not a fictitious rollback. Device uncertainty blocks automatic repeat dispensing until reconciled. With 95 g beans, 1,000 ml water and 20 cups, a 10 g/150 ml recipe permits six servings. Maintenance rejects new sessions and records operator stock/cash adjustments without overwriting history.\n\n## 3. Final design diagram\n\n[![Design Coffee Vending Machine: VendingMachine owns VendSession; VendSession selects Recipe; Recipe reserves from Inventory; VendSession reserves change ChangePlanner; VendSession dispenses through DispenserPort; VendSession collects through PaymentPort](designs/lld-11.svg)](designs/lld-11.svg)\n\nThe **recipe** describes ingredient quantities, **inventory** records available ingredients, and a **vend session** owns one customer's interaction. A state machine answers which actions are allowed at each stage: inserting money during maintenance must not accidentally start brewing.\n\n## 4. Critical operation: worked execution\n\n![Reserve ingredients and change before committing the physical action.](lessons/lld-11-flow.svg)\n\n*Reserve ingredients and change before committing the physical action.*\n\n![Physical evidence determines whether retry or refund is appropriate.](lessons/lld-11-failure.svg)\n\n*Physical evidence determines whether retry or refund is appropriate.*\n\n### Worked calculation and implementation\n\nA recipe requiring 10 g beans and 150 ml water allows `min(beans/10, water/150, cups)` servings. With 95 g beans, 1,000 ml water and 20 cups, water limits capacity to six drinks. Inventory checks must reserve the whole recipe together; separately decrementing beans and then discovering no cup leaves inconsistent stock.\n\n```text\nVendSession: IDLE -> SELECTED -> FUNDED -> DISPENSING -> COMPLETE\nFailures: SELECTED/FUNDED -> CANCELLED\n          DISPENSING -> DELIVERY_UNCERTAIN -> RECONCILIATION\n```\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Key abstractions\n\n| Type | Responsibility |\n|---|---|\n| `VendingMachine` | Context and facade; holds the current `MachineState` |\n| `MachineState` | `Idle`, `Selecting`, `PaymentPending`, `Dispensing`, `Maintenance` |\n| `Beverage` / `Recipe` | name, price, `Map<Ingredient, Integer>` quantities |\n| `BeverageFactory` | `create(type)` builds a beverage from the recipe registry |\n| `Inventory` | `hasEnough(recipe)`, `deduct(recipe)` (atomic), `refill` |\n| `PaymentHandler` | Strategy: `CoinPayment`, `CardPayment`; change calculation |\n| `InventoryObserver` | Low-stock alert |\n\n```java\nclass Inventory {\n    private final Map<Ingredient, Integer> stock = new EnumMap<>(Ingredient.class);\n    synchronized boolean tryDeduct(Recipe r) {\n        if (!r.needs().entrySet().stream().allMatch(e -> stock.get(e.getKey()) >= e.getValue())) return false;\n        r.needs().forEach((ing, q) -> stock.merge(ing, -q, Integer::sum));\n        return true;\n    }\n}\n```\n\n### Design decisions & trade-offs\n\n**1. Recipes as data.** Don't make `Cappuccino extends Coffee` with hard-coded quantities. A recipe registry (loaded from config) plus a Factory means a new drink is a config entry. Use a Decorator only for user add-ons (extra shot, extra sugar).\n\n**2. Check and deduct atomically.** \"Check, then deduct\" as two calls races if two dispense paths exist. A single `tryDeduct` under a lock is all-or-nothing.\n\n**3. When to deduct versus when to charge.** Order: confirm availability, collect payment, reserve and deduct ingredients, dispense. If dispensing fails, refund and restore ingredients. Never take money for a drink you can't make.\n\n**4. State pattern.** In `Maintenance`, selections are rejected. In `Dispensing`, cancel is rejected. Each state handles only its legal events.\n\n**5. Menu availability is derived.** Recompute which drinks are selectable from inventory after every deduct or refill, and push that to the display (Observer).\n\n### Ownership, boundaries and invariants\n\n**Central design question:** Inventory reservation, money acceptance and physical dispensing are separate observable steps.\n\nMachine owns SlotInventory and a VendSession. Product describes a SKU; Recipe or Selection maps it to ingredients when appropriate. PaymentAcceptor tracks tender; ChangePolicy selects available denominations; DispenserPort reports success or jam. RefundJournal records incomplete recovery.\n\n**Correctness rule:** Never decrement sellable stock twice for one vend request. Do not claim successful delivery before the hardware confirms it. Accepted money must end in purchase, change, refund or an explicit recoverable balance.\n\n```text\nslot(id,sku,available,reserved); vend(id,sku,price_minor,tender_minor,state); cash(denomination,count)\n```\n\n### End-to-end execution trace\n\nSelect a product; validate stock and price; reserve stock; accept sufficient tender; verify change availability; journal the vend; dispense; on confirmation consume stock and return change; on jam reverse the reservation and initiate refund.\n\n### Concurrency and recovery walkthrough\n\nTwo sessions select the last unit while an operator restocks. One inventory owner serializes reserve/commit/release; restocking must not overwrite reserved counts. Network payment callbacks use the vend operation ID.\n\n### Policy choices and extension seams\n\nState is helpful for selection/payment/dispense transitions. Different products can use Strategy for preparation. Do not let product factories control cash or mutate global inventory.\n\n### Edge cases that change the design\n\nEnough total money does not imply the machine can make change. Power loss after dispensing needs journal reconciliation. A refund actuator can fail too, so expose an operator-review state instead of looping forever.\n\n**Topic-specific cases:** Last-item race; exact change; impossible change; jam; duplicate confirmation; refund failure; restart during dispense.\n\n### Further reading\n\n- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.\n- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.\n\n### Work through the important decisions\n\nCoin selection is a bounded change problem: available denominations and counts matter. A ₹20 difference does not prove a ₹20 coin is present. Reserve a feasible change plan before consuming money, or show an exact-change policy before purchase.\n\nOnce hot water has entered a cup, cancelling cannot restore the original ingredients. Record consumed quantities and waste; do not “roll back” physical brewing by incrementing every ingredient counter. Maintenance mode should block new sessions and reconcile cash/stock under an operator identity.\n\n## 6. Interviewer follow-ups\n\n**Does a new drink require another machine state?** Usually no. A new recipe changes data; new physical behaviour may need a new dispenser strategy.\n\n**Can a failed sensor mean zero delivery?** Not necessarily. Distinguish known none from unknown.\n\n## 7. Closing answer\n\nI reserve a complete recipe and feasible change plan before vending. Session state distinguishes financial acceptance from physical delivery, and unknown dispense outcomes require evidence rather than an automatic second drink. Recipes are data; hardware and payment are explicit adapters.\n"
+      "markdown": "## Problem\n\nDesign the software for a coffee vending machine in an office. It serves Espresso (₹30), Cappuccino (₹60) and Latte (₹70). Each drink uses coffee, water and sometimes milk. People pay with coins and get change back.\n\nAsha picks a Cappuccino and inserts ₹70. The machine must make sure it has the milk **and** the ₹10 change *before* it keeps her money and brews – a half-served customer is the bug everyone remembers.\n\n## Requirements\n\n- Show drinks with prices; a drink is unavailable if any ingredient is short.\n- Accept coins (₹1, 2, 5, 10, 20); return change.\n- Brew only if both the ingredients and the change are available; otherwise refund.\n- Let the user cancel and get their coins back.\n- Staff can refill ingredients and coins; adding a new drink should be easy.\n\n## Step 1: Clarify the requirements\n\n**Candidate:** Which drinks, and what do they need?\n\n**Interviewer:** Espresso, Cappuccino and Latte. Each has a recipe of coffee, water and milk.\n\n**Candidate:** How do people pay?\n\n**Interviewer:** Coins only for now.\n\n**Candidate:** What if the machine can't give change?\n\n**Interviewer:** Don't serve, and give the coins back.\n\n**Candidate:** Can one machine serve two people at once?\n\n**Interviewer:** No, one user at a time.\n\n**Candidate:** Will new drinks be added later?\n\n**Interviewer:** Yes – a Mocha next month.\n\n> **🎯 In the interview**\n> The key question is \"what if we can't give change?\". It shows you're thinking about the order of operations, not just the classes.\n\n| Functional | Non-functional |\n| --- | --- |\n| Select, insert coins, brew, cancel | Never keep money without serving |\n| Change and refunds | New drinks without code changes |\n| Refill ingredients and coins | Clear, testable states |\n\n## Step 2: Identify the core objects\n\n- **Drink** – a name, a price and a recipe (ingredient → amount).\n- **Ingredient** – coffee, milk, water, sugar.\n- **Inventory** – how much of each ingredient is left.\n- **CoinBox** – how many coins of each value the machine holds; plans change.\n- **CoffeeMachine** – the state (idle or drink selected), the coins inserted, and the brew flow.\n- **Result** – what happened: served or not, coins returned, a message.\n\n[![Selected design: the user selects a drink and inserts coins; the machine checks the inventory for ingredients and the coin box for change; only if both are possible does it brew and return change, otherwise it refunds the inserted coins.](designs/lld-11.svg)](designs/lld-11.svg)\n\n> **⚖️ Design choice**\n> A drink is **data** (a recipe), not a subclass. A Mocha is a new `Drink` value with chocolate in its recipe – no new class, no new `if`.\n\n## Step 3: Design the classes\n\n### Drink and Ingredient\n\nA `Drink` record holds its price and recipe. Prices are whole rupees here because only coins are used; with digital payments, use paise.\n\n### Inventory\n\nKnows ingredient levels, answers `canMake(drink)` and `consume(drink)`.\n\n### CoinBox\n\nHolds coins by value. `planChange(amount)` works out which coins to give **without changing anything**; `pay(plan)` then removes them. Planning first is what lets us refuse safely.\n\n### CoffeeMachine\n\nTwo states – `IDLE` and `DRINK_SELECTED` – and three actions: `select`, `insert`, `brew` (plus `cancel`).\n\n[![Class diagram: CoffeeMachine uses an Inventory and a CoinBox and has a State; a Drink has a recipe of Ingredients; brew returns a Result with the drink, the coins given back and a message.](learning-figures/lld-11-classes.svg)](learning-figures/lld-11-classes.svg)\n\n## Step 4: Write the code\n\n### Drink and Ingredient\n\n```java\nenum Ingredient { COFFEE_G, MILK_ML, WATER_ML, SUGAR_G }\n\nrecord Drink(String name, int priceRupees, Map<Ingredient, Integer> recipe) {\n    static final Drink ESPRESSO = new Drink(\"Espresso\", 30,\n            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30));\n    static final Drink CAPPUCCINO = new Drink(\"Cappuccino\", 60,\n            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30, Ingredient.MILK_ML, 120));\n    static final Drink LATTE = new Drink(\"Latte\", 70,\n            Map.of(Ingredient.COFFEE_G, 8, Ingredient.WATER_ML, 30, Ingredient.MILK_ML, 200));\n}\n```\n\n### Inventory\n\n```java\nclass Inventory {\n    private final Map<Ingredient, Integer> stock = new EnumMap<>(Ingredient.class);\n\n    void refill(Ingredient i, int amount) { stock.merge(i, amount, Integer::sum); }\n    int level(Ingredient i)               { return stock.getOrDefault(i, 0); }\n\n    boolean canMake(Drink d) {\n        return d.recipe().entrySet().stream().allMatch(e -> level(e.getKey()) >= e.getValue());\n    }\n    void consume(Drink d) {\n        if (!canMake(d)) throw new IllegalStateException(\"Not enough for \" + d.name());\n        d.recipe().forEach((i, amt) -> stock.merge(i, -amt, Integer::sum));\n    }\n}\n```\n\n### CoinBox\n\n```java\n/** Coins the machine holds, largest first. */\nclass CoinBox {\n    private final TreeMap<Integer, Integer> coins = new TreeMap<>(Comparator.reverseOrder());\n\n    void add(int coin, int count) { coins.merge(coin, count, Integer::sum); }\n    int count(int coin)           { return coins.getOrDefault(coin, 0); }\n\n    /** Plan change without touching the box; empty if exact change is impossible. */\n    Optional<Map<Integer, Integer>> planChange(int amount) {\n        Map<Integer, Integer> plan = new LinkedHashMap<>();\n        for (var e : coins.entrySet()) {\n            int use = Math.min(amount / e.getKey(), e.getValue());\n            if (use > 0) { plan.put(e.getKey(), use); amount -= use * e.getKey(); }\n        }\n        return amount == 0 ? Optional.of(plan) : Optional.empty();\n    }\n    void pay(Map<Integer, Integer> plan) {\n        plan.forEach((c, n) -> coins.merge(c, -n, Integer::sum));\n    }\n}\n```\n\n### CoffeeMachine\n\n```java\nenum State { IDLE, DRINK_SELECTED }\n\nrecord Result(boolean served, String drink, Map<Integer, Integer> coinsBack, String msg) {}\n\nclass CoffeeMachine {\n    private final Inventory inventory;\n    private final CoinBox coinBox;\n    private State state = State.IDLE;\n    private Drink selected;\n    private final Map<Integer, Integer> inserted = new LinkedHashMap<>();\n\n    CoffeeMachine(Inventory inventory, CoinBox coinBox) {\n        this.inventory = inventory; this.coinBox = coinBox;\n    }\n\n    void select(Drink d) {\n        if (state != State.IDLE) throw new IllegalStateException(\"Finish or cancel first\");\n        if (!inventory.canMake(d)) throw new IllegalStateException(d.name() + \" unavailable\");\n        selected = d; state = State.DRINK_SELECTED;\n    }\n\n    void insert(int coin) {\n        requireSelected();\n        if (!Set.of(1, 2, 5, 10, 20).contains(coin)) throw new IllegalArgumentException(\n                \"Unknown coin: \" + coin);\n        inserted.merge(coin, 1, Integer::sum);\n    }\n\n    int paid() {\n        return inserted.entrySet().stream().mapToInt(e -> e.getKey() * e.getValue()).sum();\n    }\n\n    /** Check everything first; only then take the money and brew. */\n    Result brew() {\n        requireSelected();\n        int changeDue = paid() - selected.priceRupees();\n        if (changeDue < 0) return new Result(false, null, Map.of(), \"Insert ₹\" + -changeDue);\n\n        inserted.forEach(coinBox::add);              // their coins can be used for change\n        Optional<Map<Integer, Integer>> change = coinBox.planChange(changeDue);\n        if (change.isEmpty() || !inventory.canMake(selected)) {\n            coinBox.pay(inserted);                   // give back exactly what they put in\n            return reset(new Result(false, null, Map.copyOf(inserted), \"Refunded\"));\n        }\n        coinBox.pay(change.get());\n        inventory.consume(selected);\n        return reset(new Result(true, selected.name(), change.get(), \"Enjoy!\"));\n    }\n\n    Result cancel() {\n        requireSelected();\n        return reset(new Result(false, null, Map.copyOf(inserted), \"Cancelled\"));\n    }\n\n    private void requireSelected() {\n        if (state != State.DRINK_SELECTED) throw new IllegalStateException(\"Select a drink\");\n    }\n\n    private Result reset(Result r) {\n        inserted.clear(); selected = null; state = State.IDLE;\n        return r;\n    }\n    State getState() { return state; }\n}\n```\n\n### Worked example\n\nThe machine starts with 100 g coffee, 500 ml water, 300 ml milk and **no coins**.\n\n| Step | Check | Result |\n| --- | --- | --- |\n| Asha: Cappuccino (₹60), inserts 20 + 20 + 20 + 10 | Change ₹10: her own ₹10 coin can be used | Served, ₹10 back, milk 300 → 180 ml |\n| Someone selects Latte (200 ml milk) | Only 180 ml left | \"Latte unavailable\" |\n| Bilal: Espresso (₹30), inserts 20 + 20 | Change ₹10: no ₹10 coin in the box | Not served, both ₹20 coins back, no coffee used |\n| Bilal again: inserts 20 + 10 | Exact money | Served |\n| Chetan selects Espresso, inserts ₹10, cancels | – | ₹10 back, machine idle |\n\n### Edge cases\n\n| Case | Behaviour |\n| --- | --- |\n| Not enough money | \"Insert ₹X more\"; coins stay in until cancel |\n| Unknown coin | Rejected |\n| Brew before selecting | Refused by the state check |\n| Ingredient runs out between select and brew | Checked again in `brew`; refund |\n\n## Step 5: The brew algorithm: check everything, then commit\n\nThe order of operations is the whole design:\n\n1. Is enough money inserted? If not, ask for more.\n2. Add the inserted coins to the box (they can be used for change).\n3. **Plan** the change without touching the box.\n4. Check the ingredients **again**.\n5. If either check fails: give back exactly the coins inserted. Nothing else has changed.\n6. Only now: pay out the change, consume the ingredients, brew.\n\n![Animation: Bilal selects an Espresso for 30 rupees and inserts two 20-rupee coins; the machine plans ten rupees of change, finds no ten-rupee coin, and returns both coins without using any coffee; he inserts 20 plus 10, which needs no change, and the espresso is served.](learning-figures/lld-11-brew.gif)\n\n> **⚠️ Common mistake**\n> Brewing first and calculating change afterwards. If change turns out to be impossible, the coffee is already in the cup and the money is already in the box – there is no clean way back.\n\n> **🎯 In the interview**\n> Real machines add one more step: the brewer can fail mid-way (a jam). Record \"money taken, brewing\" before starting, and on failure refund – physical evidence decides whether to retry or refund.\n\n## Step 6: Deep dives\n\n### Better change-making\n\nGreedy (largest coin first) works for Indian coin values when every coin is in stock. With limited coins it can fail even when change is possible – for example ₹6 from {5, 2, 2, 2}: greedy takes 5 and is stuck, but 2 + 2 + 2 works. A small dynamic-programming search over coin counts fixes this (see the ATM lesson, LLD-6).\n\n### More payment methods\n\nIntroduce a `PaymentMethod` interface (coins, UPI, card). The machine asks it to `authorise(amount)` and later `capture` or `release` – the same check-then-commit idea.\n\n### The State pattern\n\nWith only two states, an enum and a few checks is clearest. If you add states like `MAINTENANCE` or `OUT_OF_ORDER` with different behaviour for every action, move to the State pattern (as in the ATM lesson).\n\n### Low-stock alerts\n\nAfter each brew, if an ingredient drops below a threshold, notify staff (Observer). The machine can also hide drinks that can't be made.\n\n## Interviewer follow-ups\n\n**Why is Drink a record and not an abstract class with subclasses?** Drinks differ only in data – price and recipe. Subclasses would add classes without adding behaviour.\n\n**How would you add sugar levels?** A `Customisation` (sugar: 0–3 spoons) that adjusts the recipe for this order before the inventory check.\n\n**What if the power fails mid-brew?** Keep a small persistent log of the current transaction; on restart, refund if brewing didn't complete.\n\n**How do you test it?** Like the demo: set inventory and coins, run a sequence of actions and assert the results, the coins returned and the remaining stock.\n\n## Wrap up\n\nWe modelled drinks as recipes, kept ingredients and coins in their own classes, and made brewing a check-everything-then-commit operation so nobody pays without being served.\n\n> **📝 Key takeaways**\n> - Drinks are data: price + recipe; new drinks need no new classes.\n> - Plan change without changing the coin box; refuse safely if impossible.\n> - Check ingredients and change before taking money or brewing.\n> - A simple enum state is enough until states gain different behaviour.\n\n## Going deeper (optional)\n\nThe complete, runnable code is [CoffeeMachineDemo.java](reference-code/learning/kb/coffeemachine/CoffeeMachineDemo.java). It replays the worked example and checks every result.\n\nThe production version reserves ingredients and change before committing the physical action, and uses evidence from the brewer to decide between retry and refund.\n\n[![Reserve ingredients and change before committing the physical action.](lessons/lld-11-flow.svg)](lessons/lld-11-flow.svg)\n\n## Closing answer\n\n\"I model a Drink as a record with a price and a recipe of ingredients, so new drinks are just data. An Inventory tracks ingredient levels and a CoinBox tracks coins and plans change without changing anything. The CoffeeMachine has two states – idle and drink selected – and the brew operation checks everything before committing: enough money, a change plan that works with the coins available including the user's own, and enough ingredients. If any check fails, it returns exactly the coins inserted; only after all checks pass does it pay out change, consume ingredients and brew. Cancel refunds at any time before brewing. Greedy change can fail with limited coins, so a production machine would use a small search.\"\n"
     },
     {
       "category": "HLD",
@@ -118,103 +104,95 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Crawler frontier",
+            "id": "front",
+            "label": "URL frontier",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Fetch and parse",
-            "x": 250,
+            "id": "fetch",
+            "label": "Fetch + parse",
+            "x": 220,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
+            "id": "docs",
             "label": "Document store",
-            "x": 500,
+            "x": 440,
             "y": 0,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n3",
+            "id": "idx",
             "label": "Index builders",
-            "x": 0,
-            "y": 110,
-            "w": 200,
+            "x": 440,
+            "y": 130,
+            "w": 160,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n4",
-            "label": "Index generations",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "id": "shards",
+            "label": "Index shards",
+            "x": 220,
+            "y": 130,
+            "w": 150,
+            "h": 62,
+            "shape": "cylinder"
           },
           {
-            "id": "n5",
+            "id": "broker",
             "label": "Query broker",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Rank and snippets",
             "x": 0,
-            "y": 220,
-            "w": 200,
+            "y": 130,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "polite scheduling"
+            "from": "front",
+            "to": "fetch",
+            "label": "next URLs"
           },
           {
-            "from": "n1",
-            "to": "n2",
-            "label": "canonical pages"
+            "from": "fetch",
+            "to": "front",
+            "label": "new links",
+            "dashed": true
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "build postings"
+            "from": "fetch",
+            "to": "docs",
+            "label": "pages"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "validated publish"
+            "from": "docs",
+            "to": "idx",
+            "label": "documents"
           },
           {
-            "from": "n5",
-            "to": "n4",
-            "label": "scatter query"
+            "from": "idx",
+            "to": "shards",
+            "label": "new generation"
           },
           {
-            "from": "n5",
-            "to": "n6",
-            "label": "merge results"
+            "from": "broker",
+            "to": "shards",
+            "label": "query all shards"
           }
         ]
       },
-      "markdown": "## Problem\n\nDesign web search like Google at a high level: crawl billions of pages, build an index, and answer keyword queries in ~100–200 ms with relevant ranked results. The building blocks are **crawling**, **inverted indexes**, **distributed search (scatter-gather)** and **ranking**.\n\n## Requirements\n\n**Functional**\n- Crawl the web politely, re-crawling pages according to how often they change.\n- Index text, titles, links. Answer free-text queries with ranked results and snippets.\n- Spelling correction and autocomplete (bonus).\n\n**Non-functional**\n- Query latency p99 ~200 ms. Huge read QPS (~100k/s). Freshness from minutes (news) to weeks.\n\n**Scale:** 50B pages × ~100 KB ≈ 5 PB raw. A compressed index is still hundreds of TB, so it must be **sharded** across thousands of machines.\n\n## 1. Scope and chosen architecture\n\nI support keyword web search with snippets and updates/deletions. I choose document-sharded inverted indexes and an offline crawl/index pipeline. Serving uses the last fully published generation while another builds. I exclude crawling private networks and do not fetch arbitrary pages synchronously for each search.\n\n## 2. Query and index contracts\n\n```text\nGET /search?q=...&cursor=... -> ranked document IDs, URLs, snippets, generation\nDocument: docId,canonicalUrl,contentHash,fetchedAt,deleted\nPosting: term -> sorted(docId,termFrequency,positions)\nGeneration: id,shardManifests,termStatistics,readyState\n```\n\nThe crawler canonicalizes URLs, obeys site/politeness policy and stores changed content. Builders tokenize, produce compressed postings and compatible statistics, validate each shard and publish one generation manifest. Query broker normalizes the query, scatters to serving shards, retrieves sufficiently many candidates, merges comparable scores and builds snippets from the corresponding source version. One billion documents with 500 distinct indexed terms create about 500 billion associations before compression. A failed shard build cannot replace part of a healthy generation. Recrawl cadence follows measured change; deletion tombstones reach serving generations and retained snippets under the lifecycle policy.\n\n## 3. Final design diagram\n\n[![Google Search: Crawler frontier polite scheduling Fetch and parse; Fetch and parse canonical pages Document store; Document store build postings Index builders; Index builders validated publish Index generations; Query broker scatter query Index generations; Query broker merge results Rank and snippets](designs/hld-11.svg)](designs/hld-11.svg)\n\nI begin with a thousand local documents and a deterministic tokenizer. Make search return document IDs and matched evidence before introducing web-scale crawling or machine-learned ranking.\n\n## 4. Critical operation: worked execution\n\n![Query serving reads a published index generation rather than crawling on demand.](lessons/hld-11-flow.svg)\n\n*Query serving reads a published index generation rather than crawling on demand.*\n\n![Versioned publication avoids exposing half-built posting lists.](lessons/hld-11-failure.svg)\n\n*Versioned publication avoids exposing half-built posting lists.*\n\n### Calculate and trace\n\nFor one billion documents with an assumed 500 distinct indexed terms each, there are roughly 500 billion term-document associations before compression. This is not the same as raw page bytes. Posting-list compression, document IDs and sharding determine actual index size.\n\nFor query `java lock`, retrieve each term's postings and intersect or combine them under the query policy. Rank candidates using signals such as term relevance and document quality. A snippet should come from the matching document version, not an unrelated cached revision.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Architecture\n\n**Crawl:** a **URL frontier** (prioritised queues per host, for politeness and priority) feeds distributed **crawler** workers. They fetch (respecting robots.txt), deduplicate content (simhash), extract links back into the frontier, and store pages in a doc store.\n\n**Index:** batch plus incremental pipelines tokenise and normalise text and build an **inverted index**: `term → posting list [(docId, positions, tf)]`, sorted by docId and compressed (delta plus varint). Also compute static signals: PageRank, spam score, freshness.\n\n**Serve:** the index is **document-partitioned** into shards, each replicated. A query goes to a root aggregator, which scatters to every shard. Each shard returns its local top-k by a cheap score. The aggregator merges, then a re-ranker (ML) refines the top few hundred, and snippets come from a doc server.\n\n### Key design decisions & trade-offs\n\n**1. Document vs. term partitioning.** *Document-partitioned:* every shard holds the full index for a subset of docs, so a query hits all shards (fan-out). It's simple, load-balanced and tolerant: a missing shard just means slightly fewer results. *Term-partitioned:* a query only touches the shards for its terms, but multi-term intersections cross the network and hot terms create hotspots. Real engines use document partitioning.\n\n**2. Tail latency with fan-out.** With 1,000 shards, a p99 query sees the p99.9 of shards. Mitigations: replicas plus **hedged requests**, early termination (tiered indexes with the best docs first), and partial results under a deadline.\n\n**3. Ranking layers.** Lexical relevance (BM25), query-independent quality (PageRank), freshness, and learned ranking on the candidate set. Cheap-to-expensive cascades keep latency bounded.\n\n**4. Freshness.** A small, fast **real-time index** for recent and news pages, merged with the large batch index at query time.\n\n**5. Caching.** Query result caches catch the head (a large share of traffic is repeated queries). Posting-list caches handle hot terms.\n\n### Scope, guarantees and sizing assumptions\n\n**Correctness requirement:** A searchable document revision is associated with an index generation and canonical source identity.\n\nAssume 1 billion documents x 20 KB extracted text: 20 TB text before postings and replicas. At 10 million queries/day: about 116/s average, with explicit peak/skew headroom. Inverted-index size depends on term distribution, positions and compression.\n\n### API contracts and data ownership\n\n```text\nGET /search?q=...&cursor=...; crawler enqueue URL; document indexing update with revision\n```\n\n```text\nLogical records (outline, not complete DDL):\ndocument(id,url,canonical_url,revision,language); posting(term,doc_id,frequency,positions); crawl(url,next_fetch,etag)\n\nPrimary access/partitioning boundary:\nterm partitions or document shards for index; URL/document_id for crawl frontier and canonicalization\n```\n\n### Build the architecture in stages\n\n**Stage 3 — Partition and isolate.** Partition around term partitions or document shards for index; URL/document_id for crawl frontier and canonicalization. Track ownership with a routing epoch or a database-native partition mechanism. Move virtual buckets or copy/backfill data with a verified cutover, rather than changing a modulo divisor and assuming records move themselves. Isolate bulk/background workloads from the latency-sensitive path and test the busiest tenant independently.\n\n### Trace the critical request\n\nMaintain a polite deduplicated frontier; fetch allowed pages; canonicalize and extract text; tokenize/normalize; build posting segments; merge and publish a consistent index generation; query fans out to index shards, merges top candidates and returns snippets.\n\n### Deep dive: the decision that changes this system\n\nAn inverted index maps terms to documents; positional postings support phrase queries. BM25-like lexical ranking provides a strong baseline before semantic reranking. Search is not a full table scan with wildcard LIKE. Freshness updates and deletions must reach all relevant replicas.\n\n### Failure and race-condition walkthrough\n\nA shard is slow or missing. Return clearly degraded results under a deadline rather than waiting forever, and record coverage so ranking evaluation can distinguish partial results. Index-generation mismatch can produce duplicates or stale snippets.\n\n### Security, tenancy and lifecycle\n\n### Trade-offs and a starting recommendation\n\nDocument sharding scatters queries but localizes document updates; term sharding complicates multi-term joins. Web-scale crawling needs robots policy, rate limits and fetch isolation because URLs are untrusted network destinations.\n\nQuery p99, result relevance on labelled queries, index freshness, crawl error rate, shard coverage and indexing backlog.\n\n**Test matrix:** Phrase query, typo/empty query, crawler redirect loop, duplicate canonical URLs, deleted pages, shard deadline and index generation rollover.\n\n### Follow-up questions with answers\n\n**What cannot be eventually consistent here?** The operation establishing this guarantee: A searchable document revision is associated with an index generation and canonical source identity.\n\n**What is the first scaling pressure to test?** Use the actual workload: Assume 1 billion documents x 20 KB extracted text: 20 TB text before postings and replicas. At 10 million queries/day: about 116/s average, with explicit peak/skew headroom. Inverted-index size depends on term distribution, positions and compression.\n\n**Which failure would invalidate the naive design?** A shard is slow or missing. Return clearly degraded results under a deadline rather than waiting forever, and record coverage so ranking evaluation can distinguish partial results. Index-generation mismatch can produce duplicates or stale snippets.\n\n**Why not introduce every distributed component immediately?** Document sharding scatters queries but localizes document updates; term sharding complicates multi-term joins. Web-scale crawling needs robots policy, rate limits and fetch isolation because URLs are untrusted network destinations.\n\n**How would you demonstrate the design works?** Phrase query, typo/empty query, crawler redirect loop, duplicate canonical URLs, deleted pages, shard deadline and index generation rollover. Keep the expected invariant and recovery outcome visible in the results.\n\n### Further reading\n\n- [PostgreSQL isolation and anomalies](https://www.postgresql.org/docs/current/transaction-iso.html).\n- [Apache Kafka delivery and transaction design](https://kafka.apache.org/41/design/design/).\n- [Redis rate-limiter design](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) for atomic shared-state examples.\n\n### Work through freshness and abuse\n\nDifferent pages change at different rates. Recrawl scheduling allocates budget using observed changes, importance and site limits. Canonicalization avoids indexing trivial URL variants repeatedly, but aggressive rules can merge genuinely different pages. Crawler network access must resist private-address fetching and resource exhaustion.\n\nPartitioning by document keeps complete document metadata local but queries fan out. Partitioning by term changes query and update costs. Explain the selected access pattern before choosing a partition key. Spam, duplicate pages and deleted content need index-lifecycle handling, not only a ranking adjustment.\n\n## 6. Interviewer follow-ups\n\n**Does a crawler make search fast?** No. The prepared index does; crawling supplies input.\n\n**Is top-10 from each shard automatically global top-10?** Only under compatible scoring and sufficient local candidates; distributed ranking needs an explicit merge contract.\n\n## 7. Closing answer\n\nI separate crawl freshness, index construction and low-latency query serving. Versioned immutable index generations make publication recoverable; a document-sharded inverted index gives each shard comparable local candidates for broker merging. Ranking quality and source freshness are measured independently.\n"
+      "markdown": "## Problem\n\nDesign web search like Google, at a high level. Asha types **\"spring boot rate limiter\"** and, in about 200 ms, gets ten relevant pages with titles and short snippets – chosen from billions of pages on the web.\n\nSearch has two halves: an offline half that crawls the web and builds an index, and an online half that answers queries from that index very fast.\n\n## Requirements\n\n- Crawl billions of web pages and keep them reasonably fresh.\n- Build an index that maps words to the pages containing them.\n- Answer keyword queries with the top 10 results, titles and snippets, in about 200 ms.\n- Rank results by relevance and page quality.\n- Handle about 100,000 queries per second.\n\n## Step 1: Clarify the requirements\n\n> **💡 Tip**\n> Say up front that you will split the design into crawl → index → serve. Interviewers want to see that separation.\n\n**Candidate:** How many pages should we index?\n\n**Interviewer:** About 10 billion.\n\n**Candidate:** How fresh must results be?\n\n**Interviewer:** News within minutes would be nice; most pages within days or weeks is fine.\n\n**Candidate:** Query volume?\n\n**Interviewer:** About 100,000 queries a second at peak.\n\n**Candidate:** Do we need images, maps, ads, spelling correction?\n\n**Interviewer:** No. Plain web results.\n\n**Candidate:** How sophisticated should ranking be?\n\n**Interviewer:** Explain the main signals; no machine-learning deep dive.\n\n**Functional requirements**\n\n1. Crawl pages politely and repeatedly.\n2. Build an inverted index.\n3. Serve ranked top-10 results with snippets.\n\n**Non-functional requirements**\n\n1. Query latency about 200 ms.\n2. Always available; a slightly stale index is acceptable.\n3. Index billions of pages across thousands of machines.\n\n## Step 2: Estimate the scale\n\n> **💡 Tip**\n> Size the crawl and the index separately. They are different problems.\n\n**Crawling**\n\n```text\nPages                 = 10 billion\nRefresh every ~10 days → 1 billion pages per day ≈ 11,600 pages per second\nAverage page          ≈ 100 KB HTML → about 1.2 GB/s of downloads\n```\n\nWhat it means: crawling is a large distributed job with thousands of fetchers.\n\n**Index**\n\n```text\nText per page after cleaning   ≈ 10 KB\nRaw text                       = 10B × 10 KB  = 100 TB\nInverted index (compressed)    ≈ 30–50% of text ≈ 30–50 TB\n```\n\nWhat it means: the index does not fit on one machine; it must be split into shards, and each shard copied for query throughput.\n\n## Step 3: Define the API\n\n```http\nGET /v1/search?q=spring+boot+rate+limiter&page=1\n→ 200 {\n  \"results\": [\n    { \"url\": \"https://…\", \"title\": \"Rate limiting in Spring Boot…\", \"snippet\": \"…use a token bucket…\" }\n  ],\n  \"estimatedTotal\": 1840000\n}\n```\n\n> **🎯 In the interview**\n> The public API is tiny. The interesting design is behind it: how the index is built and how one query fans out to many machines.\n\n## Step 4: Define the data model\n\n| Store | Contents |\n| --- | --- |\n| URL frontier | URLs to fetch, priority, next fetch time, per-host queues |\n| Document store | url, fetched HTML/text, fetch time, content hash |\n| Inverted index (per shard) | term → posting list of (docId, positions, term frequency) |\n| Document metadata | docId → url, title, PageRank score, language |\n| Index generations | which index version each shard is currently serving |\n\n> **⚖️ Design choice**\n> Split the index **by document** (each shard holds all terms for a subset of pages). A query goes to every shard, each returns its own top results, and a broker merges them. This keeps shards independent and balanced.\n\n## Step 5: Draw the high-level design\n\n[![High-level design: the crawler frontier feeds fetch-and-parse workers that store documents; index builders turn documents into index generations; the query broker sends each query to all index shards and the rank-and-snippets stage returns the top results.](designs/hld-11.svg)](designs/hld-11.svg)\n\n**Offline: crawl and index**\n\n1. The **frontier** holds URLs to fetch, ordered by priority and grouped by host.\n2. **Fetchers** download pages, respecting `robots.txt` and a polite rate per site.\n3. **Parsers** extract text, title and links; new links go back into the frontier.\n4. **Index builders** turn documents into posting lists and publish a new **index generation** to the shards.\n\n**Online: answer a query**\n\n1. Asha's query reaches a **broker**, which normalises it to terms: `spring`, `boot`, `rate`, `limiter`.\n2. The broker sends the query to every index shard (one replica of each).\n3. Each shard intersects the posting lists, scores matches and returns its top 10.\n4. The broker merges the shards' lists, picks the overall top 10, and fetches snippets.\n\n![Animation: a query is split into four terms; the broker fans it out to every index shard; each shard intersects posting lists and returns its own top ten; the broker merges them into one global top ten and adds snippets.](learning-figures/hld-11-query.gif)\n\n## Step 6: Go deep\n\n### The inverted index\n\nA book's index maps a word to page numbers. A search index does the same: each term points to a sorted list of the documents that contain it.\n\n```text\nspring   → [3, 17, 42, 108, 977, …]\nboot     → [17, 42, 300, 977, …]\nlimiter  → [42, 977, 5120, …]\n```\n\nFor \"spring boot limiter\", walk the sorted lists together and keep documents present in all of them: 42 and 977. Because the lists are sorted, this intersection is fast and needs no random access.\n\n[![Inverted index: documents are split into terms; each term maps to a sorted posting list of document IDs; a query intersects the posting lists of its terms and only the shared documents are scored.](learning-figures/hld-11-index.svg)](learning-figures/hld-11-index.svg)\n\n### Ranking: the scoring algorithm\n\nEach candidate document gets a score from several signals:\n\n- **Text relevance (BM25):** the query words appear often in this page and are rare across the web; title matches count more.\n- **Link authority (PageRank):** many good pages link to it.\n- **Freshness, language, location** and – at Google's scale – machine-learned models over hundreds of signals.\n\n### Crawling politely and efficiently\n\n**Option 1: A single global queue of URLs.**\n\n- Good: simple.\n- Problem: fetchers hammer one popular site, and important pages wait behind junk.\n\n**Option 2: A frontier with per-host queues and priorities.**\n\n- Good: one connection per host at a polite rate; important or fast-changing pages are fetched more often.\n- Problem: more bookkeeping.\n\n> **⚖️ Design choice**\n> Per-host queues with priorities. News front pages are revisited every few minutes; a rarely changing page every few weeks. Content hashes detect duplicate pages so they are indexed once.\n\n> **⚠️ Common mistake**\n> Updating the live index in place while queries read it. A query could see half of a shard's new data. Build a new index generation, then switch shards to it atomically.\n\n### Serving fast\n\nEvery shard has several replicas, so 100,000 queries a second are spread across copies. Popular queries (\"weather\", \"cricket score\") are cached at the broker. If one shard is slow, the broker can return results from the others rather than wait – slightly less complete, but on time.\n\n## Step 7: Find bottlenecks and failure points\n\n| What fails | What happens | How we handle it |\n| --- | --- | --- |\n| A site blocks or slows our crawler | Fetches fail | Respect robots.txt and back off per host |\n| Crawler traps (infinite calendars) | Endless URLs | Limit depth and URLs per host; detect patterns |\n| One index shard is slow | Every query waits for it | Replicas, hedged requests, and a time budget per shard |\n| Index build has a bug | Bad results everywhere | Validate a generation before switching; keep the previous one to roll back |\n| Popular query spike | Hot load | Result cache at the broker |\n\n## Putting it together\n\n- **Crawl:** prioritised, polite frontier → fetch → parse → new links.\n- **Index:** documents → posting lists → a new generation, switched atomically.\n- **Serve:** broker fans out to all shards → each scores its top 10 → merge → snippets.\n\n## Interviewer follow-ups\n\n**Why shard by document rather than by term?** With term sharding, a popular term's shard becomes a hotspot and multi-word queries must gather huge lists across machines. Document sharding keeps every shard's work similar.\n\n**How do you get news into results within minutes?** A small, frequently rebuilt \"fresh\" index alongside the big one; the broker queries both.\n\n**How do you handle typos?** A spelling-correction step before search, using query logs and edit distance.\n\n**How do you make the result page fast?** Cache popular queries, pre-compute snippets where possible, and stop waiting for slow shards after the time budget.\n\n## Wrap up\n\nWe crawled politely into a document store, built an inverted index in versioned generations, and answered queries by fanning out to all shards and merging their top results.\n\n> **📝 Key takeaways**\n> - Offline crawl and index; online serve. Keep them separate.\n> - An inverted index maps each term to a sorted list of documents.\n> - Shard by document; the broker merges each shard's top results.\n> - Rank with text relevance plus link authority and other signals.\n\n## Going deeper (optional)\n\nThe detailed version shows how index generations are published so no query ever sees a half-built posting list.\n\n[![Query serving reads a published index generation rather than crawling on demand.](lessons/hld-11-flow.svg)](lessons/hld-11-flow.svg)\n\nFurther reading: [Brin and Page – The Anatomy of a Large-Scale Hypertextual Web Search Engine](http://infolab.stanford.edu/~backrub/google.html) and [Google – How Search works](https://www.google.com/search/howsearchworks/).\n\n## Closing answer\n\n\"I split search into crawl, index and serve. A frontier with per-host queues and priorities feeds polite fetchers that respect robots.txt; parsers extract text and links, and new links go back into the frontier. Index builders turn documents into an inverted index – each term maps to a sorted posting list – sharded by document and published as versioned generations. At query time a broker sends the terms to every shard; each intersects posting lists, scores candidates with BM25, PageRank and other signals, and returns its top ten. The broker merges them, adds snippets and caches popular queries. Replicas and time budgets keep latency near 200 ms.\"\n"
     },
     {
       "category": "AI",
@@ -224,108 +202,89 @@
       "diagram": {
         "nodes": [
           {
-            "id": "n0",
-            "label": "Source lifecycle",
+            "id": "q",
+            "label": "Question",
             "x": 0,
             "y": 0,
-            "w": 200,
+            "w": 120,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n1",
-            "label": "Hybrid retriever",
-            "x": 250,
+            "id": "rw",
+            "label": "Rewrite query",
+            "x": 170,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n2",
-            "label": "Reranker",
-            "x": 500,
+            "id": "hyb",
+            "label": "Hybrid search",
+            "x": 370,
             "y": 0,
-            "w": 200,
+            "w": 150,
             "h": 50,
             "shape": "rect"
           },
           {
-            "id": "n3",
-            "label": "Evidence packer",
+            "id": "rr",
+            "label": "Rerank top 30",
+            "x": 370,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "gen",
+            "label": "Answer + cite",
+            "x": 170,
+            "y": 130,
+            "w": 150,
+            "h": 50,
+            "shape": "rect"
+          },
+          {
+            "id": "ev",
+            "label": "Traces + eval set",
             "x": 0,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n4",
-            "label": "Generation",
-            "x": 250,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n5",
-            "label": "Claim validator",
-            "x": 500,
-            "y": 110,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
-          },
-          {
-            "id": "n6",
-            "label": "Evaluation and traces",
-            "x": 0,
-            "y": 220,
-            "w": 200,
-            "h": 50,
-            "shape": "rect"
+            "y": 130,
+            "w": 160,
+            "h": 62,
+            "shape": "cylinder"
           }
         ],
         "edges": [
           {
-            "from": "n0",
-            "to": "n1",
-            "label": "published scope"
+            "from": "q",
+            "to": "rw",
+            "label": "user words"
           },
           {
-            "from": "n1",
-            "to": "n2",
+            "from": "rw",
+            "to": "hyb",
+            "label": "search query"
+          },
+          {
+            "from": "hyb",
+            "to": "rr",
             "label": "candidates"
           },
           {
-            "from": "n2",
-            "to": "n3",
-            "label": "ranked passages"
+            "from": "rr",
+            "to": "gen",
+            "label": "best 5"
           },
           {
-            "from": "n3",
-            "to": "n4",
-            "label": "bounded evidence"
-          },
-          {
-            "from": "n4",
-            "to": "n5",
-            "label": "claims citations"
-          },
-          {
-            "from": "n6",
-            "to": "n1",
-            "label": "measures recall"
-          },
-          {
-            "from": "n6",
-            "to": "n5",
-            "label": "measures support"
+            "from": "gen",
+            "to": "ev",
+            "label": "trace every stage"
           }
         ]
       },
-      "markdown": "## Problem\n\nTake RAG from demo to production: the techniques that move answer quality from \"sometimes right\" to dependable. That means smarter chunking with metadata, hybrid search, re-ranking, query rewriting and expansion, context compression, freshness and access control, and evaluation-driven tuning, plus how Spring AI's modular RAG components map onto them.\n\n## Requirements\n\n- Advanced chunking (structure-aware, parent-child, contextual headers).\n- Hybrid lexical + semantic retrieval and rank fusion.\n- Re-ranking with cross-encoders or LLM rankers.\n- Query transformation: rewriting, multi-query, HyDE, conversational compression.\n- Operational concerns: incremental ingestion, dedup, ACLs, evals and monitoring.\n\n## 1. Selected production pipeline\n\nI choose hybrid retrieval, optional reranking, bounded evidence packing and a typed cited-answer validator. Every answer records source revisions, prompt/model/index versions and a request trace. Current authorization applies before exposure, while index cleanup can remain asynchronous within the lifecycle contract.\n\n## 2. Execution and measurable acceptance\n\n```text\nQuestion -> authorize -> lexical/vector retrieval -> fuse/rerank\n         -> pack source spans -> generate -> validate citations/support\nResult: SUPPORTED | INSUFFICIENT_EVIDENCE | CONFLICTING_EVIDENCE | FAILURE\nCache scope: tenant + permission/freshness + corpus/prompt/model versions\n```\n\nFor 100 answerable cases, retrieving relevant evidence for 85 gives recall 85%; 75 supported final answers give end-to-end success 75%, and conditional generation success 75/85≈88.2%. I also evaluate unanswerable questions; otherwise a system that fabricates every missing answer can look strong. Revoked/deleted sources and conflicting revisions form independent critical slices.\n\nI change chunking, embedding model, fusion, reranking or prompting one at a time against that corpus. Increasing k can add contradictions and token cost, so it is accepted only if measured support improves. Failed queries retain inspectable candidate/selected source IDs without dumping confidential text into general logs. A cached answer is reused only when permission and evidence freshness still match; semantic question similarity does not establish that equivalence.\n\n## 3. Final design diagram\n\n[![Production RAG: Source lifecycle published scope Hybrid retriever; Hybrid retriever candidates Reranker; Reranker ranked passages Evidence packer; Evidence packer bounded evidence Generation; Generation claims citations Claim validator; Evaluation and traces measures recall Hybrid retriever; Evaluation and traces measures support Claim validator](designs/ai-11.svg)](designs/ai-11.svg)\n\n**Recall@k** measures whether relevant evidence appears among retrieved candidates. A **reranker** reorders candidates with a more expensive relevance judgement. **Groundedness** evaluates whether the answer is supported by selected evidence. Improve the failing stage instead of blindly increasing every limit.\n\n## 4. Critical operation: worked execution\n\n![Each stage leaves evidence for diagnosis and versioned evaluation.](lessons/ai-11-flow.svg)\n\n*Each stage leaves evidence for diagnosis and versioned evaluation.*\n\n![Evidence lifecycle extends beyond the primary document store.](lessons/ai-11-failure.svg)\n\n*Evidence lifecycle extends beyond the primary document store.*\n\n### Trace and calculate quality\n\nOn 100 answerable questions, relevant evidence may appear for 85. If 75 of those produce supported answers, retrieval recall is 85% while supported end-to-end success is 75% on that set. The conditional generation success is 75/85, about 88.2%. These diagnose different problems; one “accuracy” number hides them.\n\nReserve a separate unanswerable set. A system that confidently answers every question can score well on answer-present cases while failing dangerously when evidence is missing. Evaluate abstention precision/recall and critical security failures separately.\n\n## 5. Detailed decisions, algorithms and failure behaviour\n\n### Mechanism and rationale\n\n**Design question:** What turns a successful RAG demo into a dependable multi-tenant documentation product?\n\nProduction RAG is a lifecycle of ingestion, revisioning, retrieval, authorization, evaluation and operations. Hybrid search retrieves lexical and semantic candidates; reranking orders a small candidate set; context assembly removes duplicates and respects token budget.\n\n### Architecture and contracts\n\n```text\nSource connector -> revision/ACL capture -> parse/chunk/embed -> staged index -> retrieval -> authorization -> rerank -> citation generation -> support verification\n\nApplication contracts (design outline):\nIngestRun(sourceRevision,chunkerVersion,indexVersion,status); AnswerTrace(queryId,evidenceIds,promptVersion,modelVersion)\n```\n\nUse a simple QuestionAnswerAdvisor path as a baseline, then application-owned retrieval/reranking when policy requires it. Do not copy unversioned advisor constructors into a pinned build.\n\n### Worked reasoning and capacity example\n\nAssume 100 queries/s x 8 retrieved chunks x 600 tokens = 480,000 evidence tokens/s before history and output. Reranking all corpus chunks is impossible; first-stage retrieval must bound the candidate pool.\n\n### Java and Spring AI implementation outline\n\n```java\nrecord RetrievalTrace(String queryId, String indexVersion,\n    java.util.List<String> evidenceIds, String promptVersion) {}\n// Log identities and counts, not raw private passages by default.\n```\n\n### Design decisions and alternatives\n\nEvaluate retrieval failures before adding a larger model. Track data freshness and ACL updates as first-class work. Cache keys include tenant, permitted corpus version, prompt/model version and query normalization.\n\n### Failure scenario and safe recovery\n\nA shared semantic answer cache serves a correct answer to a user lacking access to the supporting documents. Partition caches by authorization domain and verify access on hits; similarity alone is not a safe cache key.\n\n### Security, privacy and provenance\n\nA more complex pipeline can be harder to debug and less reliable. Keep a measurable baseline and change one retrieval/generation component at a time.\n\n\n**Verification criteria:** Supported-answer rate, retrieval recall, citation correctness, abstention, p99 latency, indexing freshness and unauthorized evidence exposure. Slice metrics by tenant, language and document type.\n\n### Further reading\n\n- [Spring AI 1.1 ChatClient and request APIs](https://docs.spring.io/spring-ai/reference/1.1/api/chatclient.html).\n- [Spring AI tool-execution boundary](https://docs.spring.io/spring-ai/reference/1.1/api/tools.html).\n- [MCP specification, versioned protocol concepts](https://modelcontextprotocol.io/specification/2025-06-18).\n- [Original RAG research](https://arxiv.org/abs/2005.11401) and [Transformer research](https://arxiv.org/abs/1706.03762) for background rather than framework instructions.\n\n### Work through release changes\n\nChange one variable at a time: chunking, embedding model, hybrid weights, reranker or prompt. Version the corpus and expected evidence, then compare by topic, document age, language and answerability. A larger k increases latency/context and may add contradictory evidence; it is not an automatic quality improvement.\n\nCache keys need tenant, permission/freshness scope and relevant corpus/prompt/model versions. Similar questions are not sufficient grounds for sharing answers across users. Preserve source spans in traces so support review can inspect a claim without rerunning today's changed index.\n\n## 6. Interviewer follow-ups\n\n**Should generation be blamed when the source was never retrieved?** First diagnose retrieval; the generator cannot reliably cite missing evidence.\n\n**Is a retrieval score a confidence score for the final answer?** No.\n\n## 7. Closing answer\n\nProduction RAG is a lifecycle and quality pipeline, not one vector lookup. I version sources and components, measure evidence recall separately from answer support, and enforce current permissions even when indexes or caches lag. Release decisions use critical-case gates and inspected regressions.\n"
+      "markdown": "## Problem\n\nYour HR RAG assistant (AI-5) works in the demo. In the pilot, people complain: \"What's the WFH policy?\" returns nothing because the documents say \"remote work\"; a question about error code `PAY-4012` finds unrelated pages; and some answers mix the 2024 and 2026 versions of a policy.\n\nProduction RAG is the set of techniques that move a RAG system from \"sometimes right\" to dependable – and the measurements that prove it.\n\n## Requirements\n\n- Improve retrieval: query rewriting, hybrid search, reranking, better chunking and metadata.\n- Improve generation: good context packing, citations, and abstaining when evidence is missing.\n- Keep sources fresh and versioned.\n- Evaluate retrieval and answers with a test set; trace every request.\n- Implement with Spring AI's modular RAG components.\n\n## Step 1: The idea in plain words\n\nA RAG answer can go wrong at three stages. Fix the stage that is failing – don't just swap the model.\n\n| Stage | Typical failure | Fix |\n| --- | --- | --- |\n| **Find** | The right chunk isn't retrieved | Query rewriting, hybrid search, better chunking |\n| **Choose** | It's retrieved but ranked 9th, behind noise | Reranking, metadata filters |\n| **Answer** | The model ignores, mixes or invents | Tight prompt, citations, abstain, validation |\n\n| Term | Plain meaning |\n| --- | --- |\n| **Query rewriting** | Turn the user's question into a better search query (\"WFH\" → \"work from home remote work policy\"). |\n| **Hybrid search** | Combine vector search (meaning) with keyword search (exact words). |\n| **Reranker** | A second model that scores each (question, chunk) pair more precisely. |\n| **Recall@k** | How often the right chunk is in the top k results. |\n| **Faithfulness** | Whether every claim in the answer is supported by the retrieved text. |\n\n> **🎯 In the interview**\n> Interviewers usually ask: how to improve a RAG system that gives poor answers; what hybrid search and reranking are; how to evaluate RAG; how to handle document updates.\n\n## Step 2: The production RAG pipeline: execution step by step\n\n[![Selected design: the question is rewritten for search; hybrid search combines keyword and vector results; a reranker keeps the best five of thirty candidates; the model answers with citations; every stage is traced and checked against an evaluation set.](designs/ai-11.svg)](designs/ai-11.svg)\n\nFollow \"What's the WFH policy for new joiners?\":\n\n1. **Rewrite:** \"work from home remote work policy new employees probation\".\n2. **Retrieve wide:** vector search top 20 + keyword (BM25) search top 20, filtered to `status = PUBLISHED` and the user's region.\n3. **Merge:** reciprocal rank fusion – chunks ranked high in either list rise.\n4. **Rerank:** a cross-encoder scores the 30 unique candidates against the question; keep the best 5.\n5. **Pack:** order them, add titles and versions, stay within ~3,000 tokens.\n6. **Generate:** answer only from the sources, cite each claim, say \"not found\" if needed.\n7. **Validate and trace:** check the citations exist; log every stage for evaluation.\n\n![Animation: the question about WFH finds nothing with plain vector search; query rewriting adds remote-work terms; hybrid search returns candidates from both keyword and vector search; the reranker moves the remote-work policy section to the top; the answer cites the 2026 policy only.](learning-figures/ai-11-pipeline.gif)\n\n### Worked numbers: does reranking help?\n\nOn a test set of 100 HR questions with known correct sections:\n\n```text\n                         recall@5   answer correct\nVector only               0.71         0.66\n+ hybrid (BM25 + vector)  0.84         0.76\n+ reranker (top 30 → 5)   0.91         0.84\n```\n\nWhat it means: most of the gain came from finding the right chunk, not from changing the model. (Illustrative numbers – measure on your own data.)\n\n## Step 3: In code with Spring AI\n\nSpring AI's `RetrievalAugmentationAdvisor` lets you plug in each stage:\n\n```java\nAdvisor rag = RetrievalAugmentationAdvisor.builder()\n        .queryTransformers(RewriteQueryTransformer.builder()\n                .chatClientBuilder(chatClientBuilder)   // a small, cheap model is fine\n                .build())\n        .documentRetriever(VectorStoreDocumentRetriever.builder()\n                .vectorStore(vectorStore)\n                .topK(20)\n                .similarityThreshold(0.5)\n                .filterExpression(new FilterExpressionBuilder()\n                        .eq(\"status\", \"PUBLISHED\").build())\n                .build())\n        .queryAugmenter(ContextualQueryAugmenter.builder()\n                .allowEmptyContext(false)        // no documents → a polite \"I don't know\"\n                .build())\n        .build();\n\nString answer = chatClient.prompt()\n        .advisors(rag)\n        .user(\"What's the WFH policy for new joiners?\")\n        .call()\n        .content();\n```\n\n- `RewriteQueryTransformer` – rewrites the question for search.\n- `VectorStoreDocumentRetriever` – retrieves wide (20) with filters.\n- `ContextualQueryAugmenter` with `allowEmptyContext(false)` – if nothing is found, the model is told to say it doesn't know instead of guessing.\n- Hybrid search and reranking can be added as a custom `DocumentRetriever` (merging keyword and vector results) and a `DocumentPostProcessor` (calling a reranker), or by using a store with built-in hybrid search.\n\n> **⚖️ Design choice**\n> Add one technique at a time and keep it only if the evaluation set improves. Hybrid search is usually the biggest single win for enterprise documents full of codes and product names.\n\n## Step 4: Common mistakes\n\n| Mistake | Better |\n| --- | --- |\n| Changing chunking, prompt and model together | One change at a time against a fixed test set |\n| Only judging final answers | Measure retrieval recall too – it tells you which stage failed |\n| Retrieving the top 3 directly | Retrieve wide (20–50), rerank to 3–5 |\n| Old and new policy versions both indexed | Index only the published version, or filter by version |\n| No traces | Log query, rewritten query, candidates, reranked list, prompt size and answer |\n\n> **⚠️ Common mistake**\n> Increasing `topK` to 20 and sending all 20 chunks to the model. More context often makes answers worse – the right chunk gets lost among near-misses. Rerank and send fewer.\n\n[![Evidence lifecycle extends beyond the primary document store.](lessons/ai-11-failure.svg)](lessons/ai-11-failure.svg)\n\n## Step 5: Production concerns\n\n- **Evaluation set:** 100–300 real questions with expected sources and good answers, including \"not in the documents\" questions. Run it on every change.\n- **Metrics:** recall@k (retrieval), faithfulness and answer correctness (generation, scored by humans or an LLM judge calibrated against humans), abstain rate.\n- **Latency budget:** rewrite ~300 ms + search ~50 ms + rerank ~150 ms + generation ~1–2 s. Skip rewriting for short, clear queries.\n- **Freshness:** re-ingest on document change events; delete superseded versions; record which version each answer cited.\n- **Feedback:** thumbs up/down and \"wrong source\" buttons feed new test cases.\n\n## Interviewer follow-ups\n\n**Your RAG gives bad answers. What do you do first?** Look at traces: was the right chunk retrieved? If not, fix retrieval (chunking, hybrid, rewriting). If yes but the answer is wrong, fix the prompt or context packing.\n\n**What is a reranker and why not use it for everything?** A cross-encoder reads the question and chunk together – more accurate but too slow for millions of chunks. Use cheap retrieval for candidates, then rerank a few dozen.\n\n**How do you handle multi-part questions?** Split them into sub-queries (query decomposition), retrieve for each, and combine the evidence.\n\n**How do you evaluate without humans labelling everything?** Start with a small human-labelled set, then use an LLM judge for faithfulness and relevancy, checking the judge against human labels.\n\n## Wrap up\n\nProduction RAG fixes each stage separately – rewrite and hybrid search to find, rerank to choose, a tight grounded prompt to answer – and proves each change with an evaluation set and traces.\n\n> **📝 Key takeaways**\n> - Diagnose by stage: find, choose, answer.\n> - Hybrid search + reranking usually beat a bigger model.\n> - Abstain when evidence is missing.\n> - Evaluate retrieval and generation separately; trace every request.\n\n## Going deeper (optional)\n\nThe detailed version stores evidence for every stage so each failure can be diagnosed, and versions the evaluation set so comparisons stay fair.\n\n[![Each stage leaves evidence for diagnosis and versioned evaluation.](lessons/ai-11-flow.svg)](lessons/ai-11-flow.svg)\n\nFurther reading: [Spring AI – Retrieval Augmented Generation (modular RAG)](https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html) and [Reciprocal Rank Fusion (Cormack et al.)](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf).\n\n## Closing answer\n\n\"I treat RAG as a pipeline and fix the stage that fails. To find the right text I rewrite the query, run hybrid search – BM25 for exact terms like error codes plus vector search for meaning – with filters for published versions and permissions, and merge with reciprocal rank fusion. To choose, I retrieve wide and rerank with a cross-encoder down to about five chunks. To answer, I pack those chunks with titles and versions, require citations and let the model abstain when evidence is missing. In Spring AI that's `RetrievalAugmentationAdvisor` with a query transformer, a document retriever and a contextual augmenter. Every change is measured on a fixed evaluation set – recall@k and faithfulness – with traces for every stage.\"\n"
     }
   ]
 }

@@ -1,617 +1,1118 @@
 === LLD 17 ===
-N|n0|Game|0|0|200|rect
-N|n1|Board|250|0|200|rect
-N|n2|Player|500|0|200|rect
-N|n3|Dice|0|110|200|rect
-N|n4|TurnPolicy|250|110|200|rect
-N|n5|JumpResolver|500|110|200|rect
-N|n6|MoveHistory|0|220|200|rect
-E|n0|n1|uses
-E|n0|n2|rotates
-E|n0|n3|rolls through
-E|n0|n4|advances with
-E|n1|n5|resolves jumps
-E|n0|n6|records
+N|game|Game|0|0|110|rect
+N|dice|Dice|170|0|100|rect
+N|board|Board + jumps|330|0|150|cylinder
+N|turns|Turn queue|330|130|130|rect
+N|move|Move record|170|130|130|rect
+N|win|Winner on cell 100|0|130|170|rect
+E|game|dice|roll
+E|game|board|afterJump(cell)
+E|game|turns|next player
+E|game|move|record turn
+E|game|win|exact landing
 ---
 ## Problem
 
-Design Snake & Ladder: N players take turns rolling dice and move along a board of 100 cells; snakes send you down, ladders send you up, and the first to reach 100 wins. Interviewers use it to test a **game-engine abstraction**: clean entities, configurable rules and **Strategy** for dice and rule variations.
+Design the game Snake & Ladder. Two or more players take turns rolling a die and moving along a board of 100 cells. Landing at the foot of a ladder takes you up; landing on a snake's head takes you down. The first player to land exactly on 100 wins.
+
+It's a favourite interview warm-up because it is small enough to finish – and it still tests clean classes, a testable random element, and rules such as "what if a ladder ends on a snake?".
 
 ## Requirements
 
-**Functional**
-- Configurable board size, snakes and ladders (validated: no cycles, nothing starting at the end cell).
-- 2+ players in a turn queue. One or more dice.
-- Rule variants: exact roll needed to finish, extra turn on a 6, three 6s forfeits the turn.
-- Report each move and the winner. Optionally continue to rank all players.
+- A board of N cells (usually 100) with snakes and ladders.
+- 2 or more players take turns in order; everyone starts off the board (cell 0).
+- Roll a die, move, follow at most one snake or ladder, then pass the turn.
+- You must land exactly on the last cell to win; overshooting means you stay put.
+- The game can be replayed and tested with fixed dice rolls.
 
-**Non-functional**
-- Deterministic and testable: dice and randomness are injectable (seeded).
-- Rule variants are configurable without changing the game loop.
-- The board is validated once at setup, not during play.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** How many players and dice?
 
-I choose a 100-square board, six-sided dice, exact landing to win, one jump per landing and first winner ends the game. No bonus turn for six in this ruleset. The board validates jump endpoints and direction; snakes descend and ladders ascend.
+**Interviewer:** Two to four players, one six-sided die.
 
-## 2. Turn execution
+**Candidate:** Do you need an exact roll to finish?
 
-```text
-playTurn(playerId):
-  verify active game and expected player
-  roll injected dice, require 1..6
-  candidate = position + roll
-  if candidate > 100: final = old position
-  else: final = jumpMap.getOrDefault(candidate,candidate)
-  commit roll, old/final position and winner or next player
-```
+**Interviewer:** Yes. If you'd go past 100, you don't move.
 
-At 14 with roll 3 and ladder 17→38, final position is 38. At 97 with roll 5, it stays 97. One-jump resolution cannot loop even if arbitrary map data contains a cycle; I still reject invalid self-jumps and endpoints at construction. A chained-jump extension uses a visited set and rejects cycles. Concurrent turn calls serialize at Game, preventing two dice rolls for the same accepted turn/version. Expected dice value 3.5 does not equal net progress because jumps and overshoots alter movement.
+**Candidate:** Can a ladder end on a snake's head?
 
-## 3. Final design diagram
+**Interviewer:** Your call – explain it.
 
-[![Design Snake & Ladder: Game uses Board; Game rotates Player; Game rolls through Dice; Game advances with TurnPolicy; Board resolves jumps JumpResolver; Game records MoveHistory](designs/lld-17.svg)](designs/lld-17.svg)
+**Candidate:** Does rolling a 6 give an extra turn?
 
-The **board** stores snakes and ladders, the **dice source** produces a roll, and the **game** owns turn order and player positions. Randomness is an input boundary, so tests should supply predetermined rolls rather than hope the right number appears.
+**Interviewer:** Not in the basic version. Mention how you'd add it.
 
-## 4. Critical operation: worked execution
+**Candidate:** Is it played by people or simulated?
 
-![The game applies movement policy before resolving a jump.](lessons/lld-17-flow.svg)
+**Interviewer:** Both – we also run simulations to test board designs.
 
-*The game applies movement policy before resolving a jump.*
+> **🎯 In the interview**
+> Ask about exact-finish and chained jumps. They are the two rules people forget, and they shape the `Board` validation and the turn logic.
 
-![Validate jump chains or restrict the board to one jump per landing.](lessons/lld-17-failure.svg)
+| Functional | Non-functional |
+| --- | --- |
+| Board with snakes and ladders | Rules easy to change (extra turn on 6) |
+| Turns, moves, winner | Deterministic tests: dice can be fixed |
+| Exact finish | Invalid boards rejected at creation |
 
-*Validate jump chains or restrict the board to one jump per landing.*
+## Step 2: Identify the core objects
 
-### Selected algorithm
+- **Board** – size and a map from start cell to end cell (snakes and ladders).
+- **Jump** – one snake or ladder: start and end.
+- **Dice** – an interface; `RandomDice` for real games, `FixedDice` for tests and replays.
+- **Player** – a name.
+- **Game** – positions, the turn order, the winner, and `playTurn()`.
+- **Move** – what happened in one turn: roll, from, to, and a note ("ladder", "snake", "needs exact roll").
+
+[![Selected design: the game asks the dice for a roll, moves the current player, asks the board whether the target cell starts a snake or ladder, records the move and passes the turn, or declares the winner on the last cell.](designs/lld-17.svg)](designs/lld-17.svg)
+
+> **⚖️ Design choice**
+> Snakes and ladders are the **same thing**: a jump from one cell to another. One `Jump` record and one map replace two class hierarchies – a snake simply has `end < start`.
+
+## Step 3: Design the classes
+
+### Board and Jump
+
+The board validates jumps when it's created: on the board, not from the last cell, one jump per start cell, and no jump ending where another starts.
+
+### Dice
+
+An interface with `roll()`. Injecting it is what makes the game testable.
+
+### Game, Player and Move
+
+`Game` keeps a queue of players for turn order and a map of positions. `playTurn` returns a `Move`, so the UI or a log can show exactly what happened.
+
+[![Class diagram: Game has a Board, a Dice and a queue of Players with positions, and returns a Move per turn; Board has Jumps; RandomDice and FixedDice implement Dice.](learning-figures/lld-17-classes.svg)](learning-figures/lld-17-classes.svg)
+
+## Step 4: Write the code
+
+### Board and Jump
 
 ```java
-// Rule sketch: exact landing; an overshoot leaves the position unchanged.
-int advance(int current, int roll, int lastSquare) {
-    if (roll < 1 || roll > 6) throw new IllegalArgumentException();
-    int target = current + roll;
-    return target > lastSquare ? current : target;
+/** A snake (end below start) or a ladder (end above start). */
+record Jump(int start, int end) {
+    boolean isSnake() { return end < start; }
+}
+
+class Board {
+    private final int size;
+    private final Map<Integer, Integer> jumps = new HashMap<>();
+
+    Board(int size, List<Jump> list) {
+        this.size = size;
+        for (Jump j : list) {
+            if (j.start() <= 1 || j.start() >= size || j.end() < 1 || j.end() > size)
+                throw new IllegalArgumentException("Jump off the board: " + j);
+            if (jumps.putIfAbsent(j.start(), j.end()) != null)
+                throw new IllegalArgumentException("Two jumps start at " + j.start());
+        }
+        for (Jump j : list)                                 // one jump per landing, no chains
+            if (jumps.containsKey(j.end()))
+                throw new IllegalArgumentException("Jump ends on another jump: " + j);
+    }
+    int size()                   { return size; }
+    int afterJump(int cell)      { return jumps.getOrDefault(cell, cell); }
 }
 ```
 
-For a board with six-sided dice, the expected single roll is `(1+2+3+4+5+6)/6 = 3.5`. That is not the expected net movement once snakes, ladders and overshoot rules apply. Avoid replacing the actual board process with this average when explaining game duration.
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Key abstractions
-
-| Type | Responsibility |
-|---|---|
-| `Game` | Turn loop, winner detection |
-| `Board` | size, `Map<Integer, Integer> jumps` (start → end) |
-| `Jump` (or `Snake`/`Ladder` subtypes) | start, end; a snake has end < start |
-| `Player` | name, position |
-| `Dice` (Strategy) | `StandardDice(count)`, `CrookedDice` (only even numbers), `FixedDice` for tests |
-| `RuleSet` | `ExactFinishRule`, `ExtraTurnOnSix`, `ThreeSixesForfeit` |
-| `BoardFactory` | Builds a board from config and validates it |
+### Dice
 
 ```java
-int move(Player p, int roll) {
-    int target = p.position() + roll;
-    if (target > board.size()) return p.position();     // exact-finish rule
-    return board.jumps().getOrDefault(target, target);   // O(1) snake/ladder
+interface Dice { int roll(); }
+
+class RandomDice implements Dice {
+    private final Random random = new Random();
+    public int roll() { return random.nextInt(6) + 1; }
+}
+
+/** For tests and replays: returns a fixed sequence of rolls. */
+class FixedDice implements Dice {
+    private final Iterator<Integer> rolls;
+    FixedDice(Integer... rolls) { this.rolls = List.of(rolls).iterator(); }
+    public int roll() { return rolls.next(); }
 }
 ```
 
-### Design decisions & trade-offs
+### Game
 
-**1. Snakes and ladders are the same thing.** Both are a jump from `start` to `end`. One `Map<Integer, Integer>` handles both in O(1). Separate classes add nothing except display labels. This is a nice "avoid needless inheritance" point.
+```java
+record Player(String name) {}
 
-**2. Dice as a Strategy.** It makes the game testable: inject `FixedDice(4, 2, 6)` to script a game. Variants (two dice, crooked dice) don't touch `Game`.
+record Move(Player player, int roll, int from, int to, String note) {}
 
-**3. Rules as composable objects.** Rule toggles change between house variants. A list of `Rule` objects consulted in order (`afterRoll`, `canFinish`, `grantsExtraTurn`) keeps the turn loop stable.
+class Game {
+    private final Board board;
+    private final Dice dice;
+    private final Deque<Player> turns;
+    private final Map<Player, Integer> position = new HashMap<>();
+    private Player winner;
 
-**4. Turn order.** Use a `Deque<Player>`: poll, play, offer back (unless they finished or forfeit). With an extra-turn rule, re-offer to the front.
+    Game(Board board, Dice dice, List<Player> players) {
+        if (players.size() < 2) throw new IllegalArgumentException("Need at least 2 players");
+        this.board = board; this.dice = dice; this.turns = new ArrayDeque<>(players);
+        players.forEach(p -> position.put(p, 0));           // everyone starts off the board
+    }
 
-**5. Board validation.** Reject jumps that start at 1 or 100, jumps that land on another jump's start (chains), and two jumps from the same cell. Fail at construction, not mid-game.
+    Move playTurn() {
+        if (winner != null) throw new IllegalStateException(winner.name() + " already won");
+        Player p = turns.pollFirst();
+        int roll = dice.roll(), from = position.get(p), target = from + roll;
+        String note;
+        int to;
+        if (target > board.size()) { to = from; note = "needs exact roll"; }
+        else {
+            to = board.afterJump(target);
+            note = to > target ? "ladder" : to < target ? "snake" : "";
+        }
+        position.put(p, to);
+        if (to == board.size()) winner = p; else turns.addLast(p);
+        return new Move(p, roll, from, to, note);
+    }
 
-### Ownership, boundaries and invariants
-
-**Central design question:** Make game rules explicit, especially overshoot and whether special squares chain.
-
-Board maps starting squares to Jump targets; Game owns Players and current turn. Dice is an injected source of bounded values. MovePolicy handles exact-finish rules; TurnPolicy handles extra turns. Randomness is a dependency so tests can be deterministic.
-
-**Correctness rule:** Player positions stay within board bounds, every jump target is valid, and terminal games stop accepting moves. A malformed jump cycle cannot cause an infinite turn.
-
-```text
-game(id,board_size,current_player,version); player(id,position); jump(from_square,to_square); turn(id,roll,result)
+    Optional<Player> winner() { return Optional.ofNullable(winner); }
+    int positionOf(Player p)  { return position.get(p); }
+}
 ```
 
-### End-to-end execution trace
+### Worked example
 
-Verify current player; obtain a dice value from the configured dice; compute tentative square; apply overshoot policy; resolve the allowed snake/ladder behavior with a visited set if chaining is supported; commit the final position; declare victory or advance turn.
+Board of 100 with ladders 4→25 and 40→89, snakes 27→5 and 99→41. Rolls: 4, 6, 2, 1.
 
-### Concurrency and recovery walkthrough
+| Turn | Player | Roll | Move | Note |
+| --- | --- | --- | --- | --- |
+| 1 | Asha | 4 | 0 → 4 → **25** | ladder |
+| 2 | Bilal | 6 | 0 → 6 | |
+| 3 | Asha | 2 | 25 → 27 → **5** | snake |
+| 4 | Bilal | 1 | 6 → 7 | |
 
-Two roll commands for the same turn use different random values. A turn request ID and aggregate version prevent both from advancing the game; persist the chosen roll before returning success.
+A quick game on a 10-cell board (ladder 3→8, snake 9→2), rolls 3, 2, 4, 1, 2:
 
-### Policy choices and extension seams
+| Turn | Player | Roll | Move | Note |
+| --- | --- | --- | --- | --- |
+| 1 | Asha | 3 | 0 → 3 → 8 | ladder |
+| 2 | Bilal | 2 | 0 → 2 | |
+| 3 | Asha | 4 | 8 → 12? stays 8 | needs exact roll |
+| 4 | Bilal | 1 | 2 → 3 → 8 | ladder |
+| 5 | Asha | 2 | 8 → **10** | **Asha wins** |
 
-A map from square to destination is sufficient for snakes and ladders. Subclasses for every snake add little value. Strategy becomes useful for house rules, number of dice or finish behavior.
+### Edge cases
 
-### Edge cases that change the design
+| Case | Behaviour |
+| --- | --- |
+| Fewer than 2 players | Rejected |
+| Two players on the same cell | Allowed – no capturing |
+| Turn after the game ended | `IllegalStateException` |
+| Board with a jump from the last cell, or a chain | Rejected when the board is built |
 
-Reject jumps from or to invalid squares, duplicate jump origins and forbidden start/end cells. Decide whether landing on a ladder leads to another jump. Do not quietly hard-code a popular house rule as the only valid ruleset.
+## Step 5: The tricky part: a jump that lands on a jump
 
-**Topic-specific cases:** Deterministic dice; overshoot; exact finish; cycle detection; extra-turn rule; duplicate roll command; board configuration validation.
+What if the ladder 3→8 ends on a snake's head at 8 (8→2)? Two possible rules:
 
-### Further reading
+- **Follow the chain:** 3 → 8 → 2 → maybe another jump… With a careless board, 8→2 and 2→8 loop forever.
+- **One jump per landing:** only the first jump applies.
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+Our `Board` avoids the question by **rejecting** a board where a jump ends on another jump's start. Rules about the board are checked once, when it's built, not on every turn.
 
-### Work through extension seams
+![Animation: a board is built with a ladder from 3 to 8 and a snake from 8 to 2; validation notices the ladder ends on the snake's head and rejects the board; a valid board is built instead and Asha's roll of 3 climbs the ladder to 8 and stops there.](learning-figures/lld-17-validate.gif)
 
-Represent jumps as data `start -> end`; validate endpoints inside the board and forbid a zero-length jump. If the chosen rules allow at most one jump per turn, document that instead of accidentally chaining jumps because the implementation uses recursion.
+> **⚠️ Common mistake**
+> Using `new Random()` directly inside `Game`. You can't test "Asha lands on the snake" without controlling the die. Inject a `Dice` and use `FixedDice` in tests.
 
-Rules such as “roll six again” and “three sixes lose the turn” belong in a turn policy with an explicit roll history. They do not belong in the physical dice implementation. A replay log should store actual rolls and committed moves so results remain reproducible even if a random generator changes.
+> **🎯 In the interview**
+> If asked to support chains anyway, follow jumps with a limit (say 10) and validate at build time that following never revisits a cell – a small cycle check.
 
-## 6. Interviewer follow-ups
+## Step 6: Deep dives
 
-**How do you test a ladder landing?** Inject a roll that reaches its starting square and assert the final destination.
+### Extra turn on a 6
 
-**Should a winner keep receiving turns?** No. Define whether the game ends at first victory or ranks all players, then enforce that terminal policy.
+In `playTurn`, if `roll == 6` and the player hasn't won, put them back at the **front** of the queue instead of the back. Limit it to three sixes in a row if you like.
 
-## 7. Closing answer
+### Two dice, different dice
 
-I make board jumps data and inject dice results, while Game owns deterministic turn transitions. Exact-landing and one-jump-per-landing are explicit policies. A move log records actual rolls, so tests and replay do not depend on randomness.
+`Dice` is an interface: `TwoDice` returns the sum of two rolls; a "crooked" dice for a test of probability is one more class.
+
+### More players and a UI
+
+`Move` records make it easy to animate each turn or print a log. Players can be humans or bots without changing `Game`.
+
+### Simulating board designs
+
+Run 100,000 games with `RandomDice` and record the number of turns per game – a quick way to check a board isn't too long or too short.
+
+## Interviewer follow-ups
+
+**Why one `Jump` instead of `Snake` and `Ladder` classes?** They have the same data and the same behaviour – move from one cell to another. Separate classes add code, not meaning.
+
+**Why a queue for turns?** Taking the first player and adding them to the back is exactly "round robin", and removing the winner is easy.
+
+**Where would you put the "exact finish" rule if it became optional?** In a small `FinishRule` strategy (exact, bounce back, or allow overshoot) that `Game` calls.
+
+**How do you make the game replayable?** Store the seed or the sequence of rolls; replaying with `FixedDice` gives the same game.
+
+## Wrap up
+
+A Board of validated jumps, an injected Dice, and a Game that moves players in a round-robin queue and records each Move – small, testable and easy to extend.
+
+> **📝 Key takeaways**
+> - Snakes and ladders are one concept: a jump.
+> - Validate the board once when it's built.
+> - Inject the dice so games can be tested and replayed.
+> - Turns are a queue; each turn returns a Move record.
+
+## Going deeper (optional)
+
+The complete, runnable code is [SnakeLadderDemo.java](reference-code/learning/kb/snakeladder/SnakeLadderDemo.java). It replays both worked examples and the board validations.
+
+[![The game applies movement policy before resolving a jump.](lessons/lld-17-flow.svg)](lessons/lld-17-flow.svg)
+
+## Closing answer
+
+"I model a Board with a size and a map of jumps – snakes and ladders are the same Jump record, a snake just goes down. The board is validated when it's built: jumps must be on the board, not start on the last cell, have unique starts, and never end where another starts, so there are no chains or loops. Dice is an interface, with RandomDice for play and FixedDice for tests and replays. Game keeps a queue of players and their positions; each turn rolls, moves, stays put if the roll would overshoot the last cell, applies at most one jump, and either declares the winner or puts the player at the back of the queue. Each turn returns a Move record for the UI and logs."
 
 === LLD 18 ===
-N|n0|ReservationService|0|0|200|rect
-N|n1|TrainRun|250|0|200|rect
-N|n2|SeatAllocation|500|0|200|rect
-N|n3|JourneyInterval|0|110|200|rect
-N|n4|Booking|250|110|200|rect
-N|n5|Waitlist|500|110|200|rect
-N|n6|FarePolicy|0|220|200|rect
-E|n0|n1|selects
-E|n1|n2|owns
-E|n2|n3|claims segments
-E|n0|n4|creates
-E|n0|n5|promotes
-E|n4|n6|freezes price
+N|req|Book A → B|0|0|130|rect
+N|run|TrainRun|180|0|130|rect
+N|seg|Seats × segments|360|0|170|cylinder
+N|ok|Confirm whole group|360|130|180|rect
+N|wl|Waitlist queue|180|130|140|rect
+N|cancel|Cancel|0|130|110|rect
+E|req|run|passengers + journey
+E|run|seg|free on every segment?
+E|seg|ok|enough seats
+E|run|wl|not enough
+E|cancel|seg|release segments
+E|cancel|wl|promote in order|dashed
 ---
 ## Problem
 
-Design a train reservation system like IRCTC: search trains between stations on a date, check availability per class, book seats for several passengers, handle waitlists and RAC, and cancel. The distinctive challenge is **segment-based seat allocation**: one seat can be sold Delhi→Agra and again Agra→Bhopal on the same journey. It all has to be correct under heavy **concurrency** (Tatkal rush).
+Design the booking core of a train reservation system like IRCTC. The Bengaluru–Chennai Shatabdi stops at Jolarpettai and Katpadi. Asha books seat S1 from Bengaluru to Jolarpettai. Bilal then books from Jolarpettai to Chennai – and can get **the same seat S1**, because Asha leaves before he boards.
+
+That's what makes trains different from movies or flights: a seat is sold **per stretch of the route**, not once for the whole trip. And a family of four must get seats together for the whole journey, or go on the waitlist.
 
 ## Requirements
 
-**Functional**
-- Search trains by source, destination and date. Show classes, fare and availability.
-- Book up to 6 passengers on one PNR, with berth preferences.
-- Allocate a confirmed seat, else RAC, else a waitlist position. Cancellations promote waitlisted passengers.
-- Cancellation and refund rules depend on time to departure.
+- A train run (train + date) has a route of stops and a set of seats.
+- Book one or more passengers from station A to station B.
+- A seat is available if it is free on **every segment** between A and B.
+- All passengers in a booking are confirmed together, or the booking is waitlisted.
+- Cancelling frees the seat's segments and promotes waitlisted bookings in order.
 
-**Non-functional**
-- No overlapping allocation of a seat on any segment. Fair under huge spikes.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Can a seat be sold to different people on different parts of the route?
 
-I support one dated train run, reserved seats, cancellations and a FIFO eligible waitlist. A route version supplies ordered stop indices. Booking holds the accepted fare and journey; SeatAllocation owns occupied segments for each run-seat pair.
+**Interviewer:** Yes – that's how real trains get full use of seats.
 
-## 2. Allocation algorithm
+**Candidate:** Do all passengers on one booking need confirmed seats together?
 
-```text
-book(id,runId,fromStop,toStop,passengers):
-  translate stops to validated interval [fromIndex,toIndex)
-  lock candidate run-seat rows in stable seat order
-  choose seats whose occupied bits do not intersect the interval mask
-  require enough seats; atomically OR masks and create one booking
-cancel(bookingId): remove only that booking's segments; reevaluate waitlist
+**Interviewer:** Yes. Confirm all or none.
+
+**Candidate:** What happens when no seat is free?
+
+**Interviewer:** Waitlist, in order. Cancellations promote them.
+
+**Candidate:** Coach classes, quotas, berth preferences?
+
+**Interviewer:** Mention them; one class of seats is enough for the design.
+
+**Candidate:** How busy does it get?
+
+**Interviewer:** Tatkal opens at 10 a.m.; thousands book the same train in the first minute.
+
+> **🎯 In the interview**
+> Ask whether seats can be reused along the route. The answer changes the core data structure from "a seat is booked" to "a seat is booked for these segments".
+
+| Functional | Non-functional |
+| --- | --- |
+| Book A → B for 1–6 passengers | Never two people on one seat-segment |
+| Waitlist and promotion | All-or-nothing per booking |
+| Cancel | Fair, first-come waitlist |
+
+## Step 2: Identify the core objects
+
+- **Route** – the ordered stops; segment *i* runs from stop *i* to stop *i+1*.
+- **Journey** – a booking's range of segments, `[from, to)`.
+- **Seat** – a number and, for each segment, which booking holds it.
+- **Booking** – PNR, passengers, journey, seats and status.
+- **BookingStatus** – CONFIRMED, WAITLISTED, CANCELLED.
+- **TrainRun** – one train on one date: seats, waitlist, `book` and `cancel`.
+
+[![Selected design: a booking request for a journey from one station to another goes to the train run, which checks each seat's segments for the whole journey, holds enough seats for every passenger together or puts the booking on the waitlist, and promotes the waitlist when a cancellation frees segments.](designs/lld-18.svg)](designs/lld-18.svg)
+
+> **⚖️ Design choice**
+> Store availability **per seat, per segment**. A journey is a range of segment numbers, so "is S1 free from Jolarpettai to Chennai?" means "are segments 1 and 2 of S1 empty?".
+
+## Step 3: Design the classes
+
+### Route and Journey
+
+The route turns station names into indexes. Bengaluru → Chennai with four stops is segments 0, 1 and 2.
+
+### Seat
+
+An array with one slot per segment, holding the booking ID or `null`. `isFree(journey)` checks the slots in the range; `hold` and `release` fill or clear them.
+
+### Booking
+
+Passengers, journey, the seats assigned and the status.
+
+### TrainRun
+
+`book` tries to confirm; if that fails it adds the booking to the waitlist queue. `cancel` frees the booking's segments and walks the waitlist in order, confirming anyone who now fits.
+
+[![Class diagram: TrainRun has a Route, Seats and a waitlist of Bookings; a Booking has passengers, a Journey, seats and a BookingStatus; each Seat records which booking holds each segment.](learning-figures/lld-18-classes.svg)](learning-figures/lld-18-classes.svg)
+
+## Step 4: Write the code
+
+### Route and Journey
+
+```java
+/** A train's stops in order. Segment i is the stretch from stop i to stop i+1. */
+record Route(List<String> stops) {
+    int index(String station) {
+        int i = stops.indexOf(station);
+        if (i < 0) throw new IllegalArgumentException("Train doesn't stop at " + station);
+        return i;
+    }
+}
+
+/** The journey Asha asked for, as a range of segments [from, to). */
+record Journey(int from, int to) {
+    Journey {
+        if (from >= to) throw new IllegalArgumentException("Destination is before source");
+    }
+}
 ```
 
-A→C occupies `[0,2)` and C→D `[2,3)`, so the same seat serves both. B→D `[1,3)` conflicts with the first booking. With S stops, each seat needs S−1 segment bits in this fixed-route model. Passenger groups are all-or-nothing under the chosen contract. Two allocation workers cannot independently read and rewrite the same free mask: the locked/versioned update is decisive. Cancellation cannot clear another passenger's later segment, and timetable changes do not reinterpret tickets issued against an earlier route version.
+### Seat
 
-## 3. Final design diagram
+```java
+class Seat {
+    private final String number;
+    private final String[] heldBy;                  // one slot per segment; null = free
 
-[![Design Train Reservation System: ReservationService selects TrainRun; TrainRun owns SeatAllocation; SeatAllocation claims segments JourneyInterval; ReservationService creates Booking; ReservationService promotes Waitlist; Booking freezes price FarePolicy](designs/lld-18.svg)](designs/lld-18.svg)
+    Seat(String number, int segments) {
+        this.number = number;
+        this.heldBy = new String[segments];
+    }
+    String number() { return number; }
 
-A **route** defines ordered stops, a **run** is a train on a date, and a **reservation** owns seat capacity between two stop indices. For run R, A–C occupies `[0,2)` and C–D occupies `[2,3)`, which do not overlap.
-
-## 4. Critical operation: worked execution
-
-![A seat must be free for every occupied segment in the requested interval.](lessons/lld-18-flow.svg)
-
-*A seat must be free for every occupied segment in the requested interval.*
-
-![Reserve the full requested journey or nothing.](lessons/lld-18-failure.svg)
-
-*Reserve the full requested journey or nothing.*
-
-### Worked calculation and implementation
-
-For a route with S stops, each seat has S−1 travel segments. A bitset can represent segment occupancy for a fixed run; interval records can be clearer when route lengths vary. Both require an atomic check-and-reserve operation.
-
-```text
-Existing seat 12: A-C = [0,2)
-New request C-D = [2,3): allowed
-New request B-D = [1,3): overlaps, reject for this seat
+    boolean isFree(Journey j) {
+        for (int s = j.from(); s < j.to(); s++) if (heldBy[s] != null) return false;
+        return true;
+    }
+    void hold(Journey j, String bookingId) {
+        for (int s = j.from(); s < j.to(); s++) heldBy[s] = bookingId;
+    }
+    void release(String bookingId) {
+        for (int s = 0; s < heldBy.length; s++) {
+            if (bookingId.equals(heldBy[s])) heldBy[s] = null;
+        }
+    }
+}
 ```
 
-## 5. Detailed decisions, algorithms and failure behaviour
+### Booking
 
-### Key abstractions
+```java
+enum BookingStatus { CONFIRMED, WAITLISTED, CANCELLED }
 
-| Type | Responsibility |
-|---|---|
-| `Station`, `Train`, `Route` (ordered stops) | Static data |
-| `TrainRun` | Train + date: the bookable instance |
-| `Coach`, `Seat` | Layout, class and berth type |
-| `SeatInventory` | Per seat, a bitset of occupied segments (stop i → i+1) |
-| `Booking` / `PNR` | passengers, status per passenger: `CNF`, `RAC`, `WL` |
-| `WaitlistQueue` | Per run and class, FIFO; promotion on cancellation |
-| `AllocationStrategy` | Berth preference, keep a group together, minimise fragmentation |
+class Booking {
+    final String id;
+    final List<String> passengers;
+    final Journey journey;
+    final List<Seat> seats = new ArrayList<>();
+    BookingStatus status;
 
-### Design decisions & trade-offs
-
-**1. Segments, not seats.** Number the stops 0..k. A journey from stop `a` to `b` occupies segments `[a, b)`. Each seat keeps a `BitSet` (or `long` bitmask when k ≤ 64). It's available iff `(mask & journeyMask) == 0`, and booking does `mask |= journeyMask`. That's O(1) per seat check.
-
-**2. Allocation strategy.** Prefer seats whose occupied segments are adjacent to the journey (best fit), so long journeys aren't blocked by scattered short bookings. This is the interval-scheduling or fragmentation trade-off, and it's worth mentioning.
-
-**3. Concurrency.** Lock per `(TrainRun, Class)` partition, not globally. Within the lock: find seats, set the masks, write the booking. At scale: a sharded inventory service per train run with a single writer per partition (an actor or queue model), which gives fairness and no lock storms during Tatkal.
-
-**4. Waitlist and RAC.** When there are no confirmed seats, use RAC (a shared side-lower berth, two passengers), then WL. On cancellation: free the segment bits, then promote RAC → CNF and WL → RAC in FIFO order, inside the same partition lock.
-
-**5. PNR status per passenger.** One PNR can be partly confirmed. Model status on each passenger, not on the booking.
-
-### Ownership, boundaries and invariants
-
-**Central design question:** A train seat is occupied over station segments, so availability cannot be one boolean for the entire journey.
-
-TrainRun identifies a dated journey; Route has ordered Stations. Coach and Seat describe physical inventory. Reservation contains origin and destination indexes, passenger and status. SegmentInventory tracks occupied legs; AllocationPolicy handles class and adjacency preferences.
-
-**Correctness rule:** A seat can be sold to two passengers only when their half-open segment intervals do not overlap. A reservation from station i to j occupies legs i through j-1.
-
-```text
-run(id,service_date,route_version); seat(run_id,seat_id,occupied_mask,version); reservation(id,from_index,to_index,hold_id,status)
+    Booking(String id, List<String> passengers, Journey journey) {
+        this.id = id; this.passengers = List.copyOf(passengers); this.journey = journey;
+    }
+}
 ```
 
-### End-to-end execution trace
+### TrainRun
 
-Validate station order and dated run; find seats with every requested segment free; atomically claim the segment set; create an expiring hold; confirm after payment; release only those segments on cancellation and promote waitlisted passengers according to policy.
+```java
+class TrainRun {                                    // one train on one date
+    private final Route route;
+    private final List<Seat> seats = new ArrayList<>();
+    private final Deque<Booking> waitlist = new ArrayDeque<>();
+    private int nextId = 1;
 
-### Concurrency and recovery walkthrough
+    TrainRun(Route route, int seatCount) {
+        this.route = route;
+        int segments = route.stops().size() - 1;
+        for (int i = 1; i <= seatCount; i++) seats.add(new Seat("S" + i, segments));
+    }
 
-Requests A-to-C and B-to-D both see the same seat. Their bit masks overlap on B-to-C; atomic mask update or locked segment rows permits one. A-to-B and B-to-C can safely share the seat.
+    /** All passengers get seats for the whole journey, or the booking is waitlisted. */
+    synchronized Booking book(List<String> passengers, String from, String to) {
+        Journey j = new Journey(route.index(from), route.index(to));
+        Booking b = new Booking("PNR" + (1000 + nextId++), passengers, j);
+        if (!tryConfirm(b)) { b.status = BookingStatus.WAITLISTED; waitlist.addLast(b); }
+        return b;
+    }
 
-### Policy choices and extension seams
+    synchronized void cancel(Booking b) {
+        if (b.status == BookingStatus.CANCELLED) return;
+        if (b.status == BookingStatus.WAITLISTED) waitlist.remove(b);
+        b.seats.forEach(s -> s.release(b.id));
+        b.seats.clear();
+        b.status = BookingStatus.CANCELLED;
+        waitlist.removeIf(this::tryConfirm);        // promote anyone who now fits, in order
+    }
 
-A bitset is compact for a short fixed route; relational segment rows make constraints and reporting clearer. Waiting lists require fairness and partial allocation rules; a universal seat-level free flag cannot model them.
+    private boolean tryConfirm(Booking b) {
+        List<Seat> free = seats.stream().filter(s -> s.isFree(b.journey))
+                .limit(b.passengers.size()).toList();
+        if (free.size() < b.passengers.size()) return false;
+        free.forEach(s -> s.hold(b.journey, b.id));
+        b.seats.addAll(free);
+        b.status = BookingStatus.CONFIRMED;
+        return true;
+    }
+}
+```
 
-### Edge cases that change the design
+### Worked example
 
-Route changes and coach substitutions need migration policies for existing reservations. Store service date and station zones explicitly. Cancellation after partial journey must not resell already traversed segments as future inventory.
+Stops: Bengaluru (0) → Jolarpettai (1) → Katpadi (2) → Chennai (3). Two seats, S1 and S2.
 
-**Topic-specific cases:** Overlapping and adjacent segments; multi-seat atomicity; waitlist order; partial cancellation; late payment; route-version mismatch.
+| Step | Request | Segments | Result |
+| --- | --- | --- | --- |
+| 1 | Asha: Bengaluru → Jolarpettai | 0 | S1 confirmed |
+| 2 | Bilal: Jolarpettai → Chennai | 1, 2 | **S1** confirmed (free after Asha leaves) |
+| 3 | Chetan + Ravi: Bengaluru → Chennai | 0, 1, 2 | Only S2 is free throughout → **waitlisted** |
+| 4 | Ravi alone: Katpadi → Chennai | 2 | S2 confirmed |
+| 5 | Ravi cancels | – | Family still needs S1 from Bengaluru → waitlisted |
+| 6 | Bilal cancels | – | Asha still holds S1 segment 0 → waitlisted |
+| 7 | Asha cancels | – | S1 and S2 free end to end → **family confirmed together** |
 
-### Further reading
+### Edge cases
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+| Case | Behaviour |
+| --- | --- |
+| Station not on the route | Rejected |
+| Destination before source | Rejected |
+| Cancel twice | No effect |
+| Waitlisted booking cancelled | Removed from the queue |
 
-### Work through waitlists and cancellation
+## Step 5: The booking algorithm: whole journey, whole group
 
-Waitlist priority must be defined for the whole requested interval. Freeing A–B does not satisfy a passenger waiting for A–D. A cancellation releases only the original booking's segments, then reevaluates eligible waiting requests under the fairness policy.
+The rule has two parts:
 
-Two allocation workers must not both observe a free bitset and write independent updates. Lock the run-seat allocation or perform a versioned conditional update. Multi-passenger adjacent-seat requests need all-or-nothing allocation if the product promises seating together.
+1. **Whole journey:** a seat counts only if *every* segment of the journey is free on it.
+2. **Whole group:** find enough such seats for every passenger; if there aren't enough, take none.
 
-Keep route indices with a route version; changing a timetable's stop order must not reinterpret issued tickets. Price and cancellation fee snapshots preserve the contract even when tariffs later change.
+Only after both checks pass are the segments held. Because `book` and `cancel` are `synchronized` on the train run, two Tatkal bookings can't both take the last seat.
 
-## 6. Interviewer follow-ups
+![Animation: Asha holds seat S1 for segment 0 and Bilal holds S1 for segments 1 and 2; the family's request for segments 0 to 2 finds only S2 free throughout and is waitlisted; as Ravi, Bilal and Asha cancel, the waitlist is re-checked each time, and only when both seats are free for the whole route is the family confirmed together.](learning-figures/lld-18-segments.gif)
 
-**Can the same seat have two tickets on a run?** Yes, for non-overlapping intervals.
+> **⚠️ Common mistake**
+> Confirming passengers one at a time. The first two of a family of four get seats, the last two don't, and the family is split across "confirmed" and "waitlisted". Check the whole group first, then hold.
 
-**Does cancelling A–C also free C–D?** No. That may belong to another passenger.
+> **🎯 In the interview**
+> In a database, a seat-segment is a row (or a bit in a bitmap). Holding a journey is one transaction that updates all the needed rows only if they're all free; across many train runs, partition by train and date.
 
-## 7. Closing answer
+## Step 6: Deep dives
 
-I allocate dated-run seat segments, not globally booked seats. Half-open intervals permit back-to-back journeys, and one atomic allocation covers the entire requested route. Cancellation releases only the original owned segments and promotes only waitlist requests whose full journey can now fit.
+### Coaches, classes and berth preferences
+
+Group seats into coaches with a class (SL, 3A, 2A). `tryConfirm` filters by class first, then prefers lower berths or seats together, as a pluggable `SeatSelectionStrategy`.
+
+### RAC (shared berths)
+
+IRCTC's RAC lets two passengers share one side-lower berth. Model it as a seat with capacity 2 for RAC bookings – between confirmed and waitlisted.
+
+### Quotas
+
+Tatkal, ladies and senior-citizen quotas reserve some seats for some requests: tag seats with a quota and filter by the request's eligibility.
+
+### Fast availability search
+
+Searching thousands of trains can't scan every seat. Keep a per-train, per-segment count of free seats, updated on booking and cancellation, and use it for the search page; the exact seat check happens only when booking.
+
+## Interviewer follow-ups
+
+**Why segments instead of "booked from A to B" ranges on each seat?** Segments make overlap checks trivial (any slot in the range taken?) and work the same for every journey length.
+
+**How is the waitlist fair?** It's a queue; after each cancellation we try bookings in order. A large group may wait while a smaller later booking fits – you can choose strict order instead if fairness requires it.
+
+**What about two Tatkal bookings at the same moment?** One lock per train run here; in a database, a conditional update on the seat-segment rows so only one transaction wins.
+
+**How do you show availability on the search page?** From the per-segment free counts – approximate, but fast; the booking step is exact.
+
+## Wrap up
+
+Seats are sold per segment, a booking needs every segment of its journey for every passenger, and cancellations free segments and promote the waitlist in order.
+
+> **📝 Key takeaways**
+> - A route is a list of stops; a journey is a range of segments.
+> - A seat is free for a journey only if every segment in it is free.
+> - Confirm the whole group or none; otherwise waitlist.
+> - Cancelling frees segments and re-checks the waitlist in order.
+
+## Going deeper (optional)
+
+The complete, runnable code is [TrainBookingDemo.java](reference-code/learning/kb/trainbooking/TrainBookingDemo.java). It replays the worked example and checks every result.
+
+[![A seat must be free for every occupied segment in the requested interval.](lessons/lld-18-flow.svg)](lessons/lld-18-flow.svg)
+
+## Closing answer
+
+"A TrainRun is one train on one date with a route of stops; segment i runs from stop i to stop i+1, so a journey is a range of segments. Each Seat records which booking holds each segment, so the same seat can be sold Bengaluru–Jolarpettai to Asha and Jolarpettai–Chennai to Bilal. Booking finds seats free on every segment of the journey for every passenger; if there aren't enough, nothing is held and the booking joins a first-come waitlist. Cancelling releases that booking's segments and re-checks the waitlist in order. Booking and cancelling are atomic per train run – in a database, one conditional transaction on the seat-segment rows."
 
 === LLD 19 ===
-N|n0|Order|0|0|200|rect
-N|n1|OrderLine|250|0|200|rect
-N|n2|InventoryReservation|500|0|200|rect
-N|n3|Shipment|0|110|200|rect
-N|n4|PaymentIntent|250|110|200|rect
-N|n5|Return|500|110|200|rect
-N|n6|Outbox|0|220|200|rect
-E|n0|n1|owns
-E|n1|n2|reserves
-E|n1|n3|fulfilled by
-E|n0|n4|collects through
-E|n3|n5|can produce
-E|n0|n6|publishes events
+N|order|Order|0|0|110|rect
+N|lines|Order lines (units)|170|0|180|rect
+N|ship|Shipment per seller|400|0|180|rect
+N|cancel|Cancel pending units|170|130|190|rect
+N|refund|Refunds|400|130|120|cylinder
+N|status|Derived status|0|130|150|rect
+E|order|lines|has
+E|lines|ship|pack pending units
+E|cancel|lines|only pending
+E|cancel|refund|units × price
+E|lines|status|count units
+E|ship|status|delivered?|dashed
 ---
 ## Problem
 
-Design Amazon's order management: from a cart, create an order that may hold items from several sellers and warehouses; reserve inventory, take payment, split into shipments, track each shipment, and support cancellation and returns. It brings together a **State machine**, **Observer** and **Strategy** (fulfilment and payment), plus consistency across inventory and payment.
+Design order management for a marketplace like Amazon. Asha orders headphones and 3 USB-C cables from the seller SoundHub, and 4 notebooks from PaperCo, in one checkout. Before anything ships she cancels one cable. SoundHub and PaperCo then send separate parcels, and later she returns one notebook.
+
+One "order" is really several things moving at different speeds. The design must track every unit – ordered, cancelled, shipped, returned – and show an order status that is always consistent with them.
 
 ## Requirements
 
-**Functional**
-- Place an order: validate the cart, reserve inventory, charge, confirm.
-- Split into shipments by warehouse and seller, each with its own lifecycle.
-- Cancel (fully or one item) before shipping. Return and refund after delivery.
-- Notify the customer on every change.
+- An order has lines (product, seller, quantity, price) from one or more sellers.
+- Each seller ships its own parcel (shipment); an order can be partly shipped.
+- Customers can cancel units that haven't shipped, and return units that have.
+- Refunds match exactly the units cancelled or returned.
+- The order's status is always consistent with its lines and shipments.
 
-**Non-functional**
-- No overselling and no double charging: inventory reservation and payment stay consistent, and order placement is idempotent.
-- State changes follow the order lifecycle only, with a full audit history.
-- Handles sale-day peaks: high write throughput, with notifications sent asynchronously.
-- New payment methods and fulfilment types plug in without rewriting order flow.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Can one order contain items from several sellers?
 
-I support multi-line orders with split shipments, cancellation before dispatch and returns after delivery. An Order owns accepted terms; each line tracks quantities; warehouse and payment integrations have stable operation references. I choose quantity accounting rather than a single SHIPPED flag.
+**Interviewer:** Yes. Each seller ships separately.
 
-## 2. Commands and conservation
+**Candidate:** Can a customer cancel part of a line – one of three cables?
 
-```text
-submit(checkoutId,acceptedQuote) -> Order
-reserve(lineId,reservationId,quantity)
-ship(eventId,lineId,shipmentId,quantity)
-cancel(commandId,lineId,quantity)
-returnItem(returnId,lineId,quantity,evidence)
-Invariant: cancelled + shipped <= ordered; returned <= shipped
+**Interviewer:** Yes, as long as those units haven't shipped.
+
+**Candidate:** After shipping?
+
+**Interviewer:** Then it's a return, not a cancellation.
+
+**Candidate:** What statuses does the customer see?
+
+**Interviewer:** Placed, partly shipped, shipped, delivered, cancelled.
+
+**Candidate:** Do we design payment and warehouses too?
+
+**Interviewer:** No – assume payment is done; focus on lines, shipments and statuses.
+
+> **🎯 In the interview**
+> Ask about partial cancellation early. It tells you that status belongs to **units**, not just to the whole order.
+
+| Functional | Non-functional |
+| --- | --- |
+| Lines from many sellers | Units never double-counted (cancelled *and* shipped) |
+| Shipments per seller | Refund = exactly the units cancelled or returned |
+| Cancel, return, track | Status never contradicts the details |
+
+## Step 2: Identify the core objects
+
+- **Order** – a customer, its lines, its shipments and refunds.
+- **OrderLine** – a product from one seller: ordered quantity, unit price, and how many units are shipped, cancelled and returned.
+- **Shipment** – one seller's parcel: which lines and how many units, plus its status.
+- **ShipmentStatus** – created, dispatched, delivered.
+- **OrderStatus** – placed, partly shipped, shipped, delivered, cancelled – **calculated**, not stored.
+
+[![Selected design: an order holds lines from several sellers; each line splits its units into pending, shipped and cancelled; pending units are packed into one shipment per seller; cancellations and returns produce refunds per unit; the order status is calculated from the lines and shipments.](designs/lld-19.svg)](designs/lld-19.svg)
+
+> **⚖️ Design choice**
+> **Derive the order status** from lines and shipments instead of storing it. A stored status can drift ("SHIPPED" while a cable is still pending); a calculated one can't.
+
+## Step 3: Design the classes
+
+### OrderLine
+
+Keeps the invariant: `ordered = pending + shipped + cancelled`. You can cancel only pending units and return only shipped (not yet returned) units.
+
+### Shipment
+
+One per seller per dispatch. It records how many units of each line it carries and its delivery status.
+
+### Order
+
+`planShipments` groups pending units by seller into new shipments. `cancel(sku, qty)` cancels units and adds to the refund. `status()` computes the customer-facing status.
+
+[![Class diagram: an Order has OrderLines and Shipments; each Shipment carries units of OrderLines and has a ShipmentStatus; the Order calculates an OrderStatus; each OrderLine tracks ordered, shipped, cancelled and returned units.](learning-figures/lld-19-classes.svg)](learning-figures/lld-19-classes.svg)
+
+## Step 4: Write the code
+
+### OrderLine
+
+```java
+/** One product in an order. Its units are split across pending, shipped and cancelled. */
+class OrderLine {
+    final String sku, seller;
+    final int ordered;
+    final long unitPricePaise;
+    private int shipped, cancelled, returned;
+
+    OrderLine(String sku, String seller, int qty, long unitPricePaise) {
+        this.sku = sku; this.seller = seller; this.ordered = qty;
+        this.unitPricePaise = unitPricePaise;
+    }
+    int pending()   { return ordered - shipped - cancelled; }   // always >= 0
+    int shipped()   { return shipped; }
+    int cancelled() { return cancelled; }
+
+    void ship(int n) {
+        if (n > pending()) throw new IllegalStateException("Only " + pending() + " to ship");
+        shipped += n;
+    }
+    long cancel(int n) {
+        if (n > pending()) throw new IllegalStateException("Only " + pending() + " left");
+        cancelled += n;
+        return n * unitPricePaise;                                // refund
+    }
+    long returnUnits(int n) {
+        if (n > shipped - returned) throw new IllegalStateException("Nothing to return");
+        returned += n;
+        return n * unitPricePaise;
+    }
+}
 ```
 
-Every line transition locks its current version, checks remaining eligible quantity, deduplicates the operation/event and commits quantity plus outbox fact. For ordered 3, cancelled 1 and shipped 2, remaining-to-fulfil is zero. A repeated shipment event cannot increment shipped again. Cancellation racing dispatch competes for the same remaining units; the loser becomes a rejection or a return workflow. Capture-per-shipment and refunds reference actual captured amounts; a never-captured authorization is released instead of refunded. Returns append evidence without deleting original shipment history.
+### Shipment
 
-## 3. Final design diagram
+```java
+enum ShipmentStatus { CREATED, DISPATCHED, DELIVERED }
 
-[![Design Amazon Order Management: Order owns OrderLine; OrderLine reserves InventoryReservation; OrderLine fulfilled by Shipment; Order collects through PaymentIntent; Shipment can produce Return; Order publishes events Outbox](designs/lld-19.svg)](designs/lld-19.svg)
+/** What one seller sends in one parcel. */
+class Shipment {
+    final String id, seller;
+    final Map<OrderLine, Integer> units = new LinkedHashMap<>();
+    ShipmentStatus status = ShipmentStatus.CREATED;
 
-Separate the **order** from its **lines**, **inventory reservations**, **shipments** and **payment operations**. An order summarizes the commercial agreement; fulfilment facts belong at the line/quantity level. I start with one transactional order store and explicit integrations.
-
-## 4. Critical operation: worked execution
-
-![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)
-
-*Ordered quantities are partitioned across fulfilment outcomes.*
-
-![A line cannot be both newly cancelled and dispatched for the same units.](lessons/lld-19-failure.svg)
-
-*A line cannot be both newly cancelled and dispatched for the same units.*
-
-### Worked calculation and implementation
-
-For an order line with quantity 3, track ordered, cancelled, shipped and returned quantities explicitly. If one unit is cancelled and two ship, fulfilment is complete even though shipped quantity is less than the original three. Returns refer to shipped units and do not rewrite the original order quantity.
-
-```text
-OrderLine: ordered=3, cancelled=1, shipped=2, returned=0
-Constraints: cancelled + shipped <= ordered
-             returned <= shipped
-Remaining to fulfil = ordered - cancelled - shipped = 0
+    Shipment(String id, String seller) { this.id = id; this.seller = seller; }
+}
 ```
 
-## 5. Detailed decisions, algorithms and failure behaviour
+### Order
 
-### Key abstractions
+```java
+enum OrderStatus { PLACED, PARTLY_SHIPPED, SHIPPED, DELIVERED, CANCELLED }
 
-| Type | Responsibility |
-|---|---|
-| `Order` | id, customer, `List<OrderLine>`, payment, status, address snapshot |
-| `OrderLine` | product, seller, qty, price snapshot, line status |
-| `OrderState` | `CREATED → PAYMENT_PENDING → CONFIRMED → PARTIALLY_SHIPPED → SHIPPED → DELIVERED`; `CANCELLED`, `RETURN_REQUESTED → RETURNED` |
-| `Shipment` | lines, warehouse, carrier, tracking; `PACKED → SHIPPED → OUT_FOR_DELIVERY → DELIVERED` |
-| `FulfilmentStrategy` | Nearest warehouse, fewest shipments, cheapest |
-| `InventoryService` | `reserve(lines, ttl)`, `commit`, `release` |
-| `OrderEventPublisher` | Observer hub: `OrderConfirmed`, `ShipmentDelivered`, … |
+class Order {
+    final String id, customer;
+    final List<OrderLine> lines;
+    final List<Shipment> shipments = new ArrayList<>();
+    private long refundedPaise;
 
-### Design decisions & trade-offs
+    Order(String id, String customer, List<OrderLine> lines) {
+        this.id = id; this.customer = customer; this.lines = List.copyOf(lines);
+    }
 
-**1. Order status is derived from shipments and lines.** With partial shipping, an order is "shipped" only when all shipments are. Derive aggregate status from children rather than setting it independently. That prevents contradictions like "order DELIVERED, shipment still in transit".
+    /** One shipment per seller for everything not yet shipped or cancelled. */
+    List<Shipment> planShipments() {
+        Map<String, List<OrderLine>> bySeller = lines.stream().filter(l -> l.pending() > 0)
+                .collect(Collectors.groupingBy(l -> l.seller, LinkedHashMap::new,
+                        Collectors.toList()));
+        List<Shipment> created = new ArrayList<>();
+        bySeller.forEach((seller, ls) -> {
+            Shipment s = new Shipment(id + "-S" + (shipments.size() + 1), seller);
+            ls.forEach(l -> { s.units.put(l, l.pending()); l.ship(l.pending()); });
+            shipments.add(s);
+            created.add(s);
+        });
+        return created;
+    }
 
-**2. Transactional flow as a saga.** Reserve inventory (with a TTL), then charge payment, then commit inventory and confirm. On payment failure, release the inventory. Each step has a compensating action, so you can explain it without a distributed transaction.
+    long cancel(String sku, int qty) {
+        long refund = line(sku).cancel(qty);
+        refundedPaise += refund;
+        return refund;
+    }
 
-**3. Observer for side effects.** The state machine publishes events. Email, SMS, loyalty points and analytics subscribe. Adding "notify the seller" doesn't touch `Order`.
+    /** The status is derived from the lines and shipments, never set by hand. */
+    OrderStatus status() {
+        int pending = lines.stream().mapToInt(OrderLine::pending).sum();
+        int shipped = lines.stream().mapToInt(OrderLine::shipped).sum();
+        if (shipped == 0) return pending == 0 ? OrderStatus.CANCELLED : OrderStatus.PLACED;
+        if (pending > 0) return OrderStatus.PARTLY_SHIPPED;
+        boolean allDelivered = shipments.stream()
+                .allMatch(s -> s.status == ShipmentStatus.DELIVERED);
+        return allDelivered ? OrderStatus.DELIVERED : OrderStatus.SHIPPED;
+    }
 
-**4. Snapshots.** Copy price, title and address into the order. Later catalogue or address edits must not rewrite history.
-
-**5. Guarded transitions.** `cancel()` is legal only before `SHIPPED` (per line). A transition table plus `canTransition(from, to)` stops illegal moves, and an optimistic version field handles concurrent updates such as a warehouse "packed" racing a customer "cancel".
-
-### Ownership, boundaries and invariants
-
-**Central design question:** An order is a durable commercial record whose fulfillment and payment can progress independently.
-
-Order snapshots buyer, lines, address, currency and totals. OrderLine references a purchased SKU snapshot. InventoryReservation, PaymentAttempt and Shipment carry separate lifecycle state. OrderCoordinator applies business policy; TaxPolicy and ShippingPolicy return deterministic quotes.
-
-**Correctness rule:** The total equals the sum of immutable line amounts, tax, discounts and delivery under a defined rounding policy. A shipment cannot exceed purchased quantities, and retries cannot create a second paid order.
-
-```text
-orders(id,request_key,total_minor,status,version); line(id,qty,shipped_qty,cancelled_qty); shipment; payment_attempt; refund
+    OrderLine line(String sku) {
+        return lines.stream().filter(l -> l.sku.equals(sku)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("No line " + sku));
+    }
+    long refunded() { return refundedPaise; }
+}
 ```
 
-### End-to-end execution trace
+### Worked example
 
-Validate quote; reserve inventory; create a pending order; authorize payment; confirm or compensate stock; capture according to fulfillment policy; split into shipments; record delivery; process partial refunds as separate auditable records.
+Prices in paise: headphones ₹2,499, cable ₹399, notebook ₹120.
 
-### Concurrency and recovery walkthrough
+| Step | Action | Effect | Order status |
+| --- | --- | --- | --- |
+| 1 | Asha places the order | 1 headphones + 3 cables (SoundHub), 4 notebooks (PaperCo) | PLACED |
+| 2 | Cancel 1 cable | Refund ₹399; 2 cables pending | PLACED |
+| 3 | Plan shipments | SoundHub parcel: headphones + 2 cables; PaperCo parcel: 4 notebooks | SHIPPED |
+| 4 | Cancel 1 notebook | Refused – it's in a parcel | SHIPPED |
+| 5 | Return 1 notebook | Refund ₹120 | SHIPPED |
+| 6 | SoundHub parcel delivered | PaperCo still on the way | SHIPPED |
+| 7 | PaperCo parcel delivered | All parcels delivered | DELIVERED |
+| – | Bilal cancels both notebooks of his order | Refund ₹240, nothing to ship | CANCELLED |
 
-Cancellation crosses shipment handoff. Compare order-line fulfillment quantities and cancel only unshipped units; compensation may become return/refund after the boundary. Late payment callbacks are deduplicated and reconciled.
+### Edge cases
 
-### Policy choices and extension seams
+| Case | Behaviour |
+| --- | --- |
+| Cancel more units than are pending | Refused |
+| Return more than shipped | Refused |
+| Unknown SKU | Refused |
+| Everything cancelled | Status CANCELLED, full refund |
 
-One giant enum for every shipment/payment combination becomes unmaintainable. Separate state axes plus invariants give clearer composition. Saga coordination belongs in application logic, not in every OrderLine getter.
+## Step 5: The status algorithm: count units, then decide
 
-### Edge cases that change the design
+`status()` follows a small decision list:
 
-Two warehouses can partially fulfill one order. Refund arithmetic must account for prorated discounts and taxes. A retry with a reused idempotency key and changed cart payload is a conflict.
+1. Nothing shipped and nothing pending → **CANCELLED**.
+2. Nothing shipped, something pending → **PLACED**.
+3. Something shipped, something still pending → **PARTLY_SHIPPED**.
+4. All non-cancelled units shipped: all parcels delivered → **DELIVERED**, otherwise **SHIPPED**.
 
-**Topic-specific cases:** Duplicate checkout; inventory compensation; partial shipment; cancellation boundary; duplicate webhook; partial refund conservation; immutable price snapshots.
+Because each unit is in exactly one bucket (pending, shipped or cancelled), the status can't contradict the lines.
 
-### Further reading
+![Animation: Asha's order starts with headphones, three cables and four notebooks; one cable is cancelled and refunded; the remaining units are packed into a SoundHub parcel and a PaperCo parcel; a notebook cancellation is refused because it is already in a parcel and becomes a return; when both parcels are delivered the order status becomes delivered.](learning-figures/lld-19-units.gif)
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+> **⚠️ Common mistake**
+> One status field on the order, updated by whoever touched it last. A seller dispatch and a customer cancellation arriving together can leave the order saying "CANCELLED" while a parcel is on its way. Track units per line and derive the status.
 
-### Work through integration failures
+> **🎯 In the interview**
+> With many services, the cancel and the warehouse pick can race. Make "cancel pending units" a conditional update (`pending >= qty`) on the line, the same row the warehouse updates when it packs units – only one can take the last unit.
 
-A duplicate warehouse event must not increment `shipped` twice. Use event identity and the line's legal remaining quantity. A reservation timeout that later succeeds needs reconciliation by reservation reference, especially if another warehouse was already asked to fulfil the same item.
+## Step 6: Deep dives
 
-Payments follow capture policy: authorize at order placement, perhaps capture per shipment. Refunds must reference captured amounts; a cancelled, never-captured line may need authorization release rather than a refund. Store the financial evidence instead of inferring it from shipping status.
+### Several warehouses per seller
 
-## 6. Interviewer follow-ups
+Group pending units by **(seller, warehouse)** instead of seller. One seller can then send two parcels from Bengaluru and Delhi.
 
-**Can an order be completed with a cancelled line?** Yes, if every unit has a final documented fulfilment disposition.
+### Payments and refunds
 
-**Should a return delete a shipment?** No. The shipment happened; the return is a later event.
+Store each refund as its own record (order, line, units, amount, reason). Refunds are always calculated from units × unit price, so partial refunds are exact.
 
-## 7. Closing answer
+### Return pickup and inspection
 
-I make fulfilment quantitative at order-line level and derive the order summary. Immutable commercial snapshots, versioned quantity transitions and idempotent warehouse events preserve partial shipments, cancellations and returns. Financial capture/refund follows actual recorded fulfilment policy rather than one overloaded status.
+A return has its own small state machine: requested → picked up → inspected → refunded (or rejected). Refund only after inspection if the policy says so.
+
+### Notifications and tracking
+
+Each shipment status change publishes an event; the customer sees per-parcel tracking, while the order status summarises them.
+
+## Interviewer follow-ups
+
+**Why not split the order into one order per seller at checkout?** The customer thinks of one order and one payment. Keep one order; split into shipments underneath.
+
+**Why derive status instead of storing it?** It can't get out of sync. If reading it is expensive, store a cached copy updated in the same transaction as the lines.
+
+**How do you handle a seller who can't fulfil?** Cancel those units on the seller's side – same `cancel` on pending units, with reason "seller unavailable" and an automatic refund.
+
+**How would you scale it?** Orders partitioned by customer; shipments also indexed by seller for seller dashboards; events to analytics and notifications.
+
+## Wrap up
+
+An order is lines of units from many sellers; units are pending, shipped or cancelled; pending units become per-seller shipments; refunds follow units; and the order status is calculated from all of that.
+
+> **📝 Key takeaways**
+> - Track units per line: ordered = pending + shipped + cancelled.
+> - Cancel only pending units; after shipping it's a return.
+> - One shipment per seller (or warehouse).
+> - Derive the order status so it can't contradict the details.
+
+## Going deeper (optional)
+
+The complete, runnable code is [OrderManagementDemo.java](reference-code/learning/kb/ordermgmt/OrderManagementDemo.java). It replays the worked example and checks every result.
+
+[![Ordered quantities are partitioned across fulfilment outcomes.](lessons/lld-19-flow.svg)](lessons/lld-19-flow.svg)
+
+## Closing answer
+
+"An Order holds OrderLines – product, seller, quantity and unit price – and each line splits its units into pending, shipped and cancelled, with returns tracked against shipped units, so a unit is never counted twice. Customers can cancel only pending units, and the refund is units times price. Pending units are grouped by seller into Shipments, each with its own delivery status. The order's status – placed, partly shipped, shipped, delivered or cancelled – is calculated from the lines and shipments rather than stored, so it can't contradict them. Across services, cancelling and packing use a conditional update on the line so only one can take the last unit."
 
 === LLD 20 ===
-N|n0|CalendarService|0|0|200|rect
-N|n1|Event|250|0|200|rect
-N|n2|Occurrence|500|0|200|rect
-N|n3|RoomReservation|0|110|200|rect
-N|n4|RecurrenceRule|250|110|200|rect
-N|n5|Invitation|500|110|200|rect
-N|n6|ConflictPolicy|0|220|200|rect
-E|n0|n1|owns edits
-E|n1|n2|expands into
-E|n2|n3|claims
-E|n1|n4|defined by
-E|n1|n5|versions
-E|n3|n6|checks intervals
+N|req|Schedule request|0|0|160|rect
+N|svc|CalendarService|210|0|160|rect
+N|room|Room bookings|420|0|150|cylinder
+N|people|Events by person|420|130|160|cylinder
+N|free|Free-slot sweep|210|130|150|rect
+N|rule|Weekly rule + zone|0|130|170|rect
+E|req|svc|attendees, slot, room
+E|svc|room|no overlap?
+E|svc|people|add to calendars
+E|free|people|busy slots
+E|rule|svc|expand to instants
 ---
 ## Problem
 
-Design a calendar and meeting scheduler like Google Calendar: create events, invite attendees, detect conflicts, find free slots common to all attendees, book rooms, and handle recurring meetings and RSVPs. The core is **interval algorithms** (overlap detection and free-slot search) plus **concurrency** when two people book the same room.
+Design a calendar and meeting scheduler like Google Calendar. Asha wants a 45-minute meeting with Bilal and Chetan tomorrow in the Kaveri room. The system should show conflicts, never double-book the room, and suggest the first time all three are free.
+
+Bilal's weekly standup is "every Monday 9:00 New York time" – which is 18:30 in Bengaluru one week and 19:30 the next, when US clocks change. Time zones are where calendar designs usually break.
 
 ## Requirements
 
-**Functional**
-- Create, update and cancel meetings with attendees, a time range, a room and an optional recurrence.
-- Detect conflicts for attendees and rooms. Suggest the earliest common free slot of length D.
-- RSVP (accept, decline, tentative). Notifications and reminders.
+- Create events with an organiser, attendees, a time slot and optionally a room.
+- A room can never be booked for two overlapping events.
+- Show a person's conflicts for a proposed time.
+- Find the earliest slot of a given length when all attendees are free.
+- Support weekly recurring events in the organiser's time zone.
 
-**Non-functional**
-- A room can never be double-booked. Searching across many attendees must be fast.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Can people be double-booked?
 
-I schedule meetings with rooms, attendees and recurring local-time rules. Concrete occurrences store instants; recurring definitions store local time, ZoneId and an explicit gap/overlap policy. I materialize a bounded future horizon and extend it, avoiding an impossible infinite expansion.
+**Interviewer:** Yes – show a warning, but let them decide. Rooms can't be.
 
-## 2. Reservation and edit transaction
+**Candidate:** Do we need free-slot suggestions?
 
-```text
-create(eventId,organizer,start,end,room,attendees) -> EventVersion
-reschedule(eventId,expectedVersion,newInterval,newRoom) -> Version | Conflict
-respond(invitationId,eventVersion,attendee,answer) -> AttendanceState
-conflict(a,b) = a.start < b.end && b.start < a.end
+**Interviewer:** Yes: "first 45 minutes when everyone's free between 9:30 and 18:00".
+
+**Candidate:** Recurring events?
+
+**Interviewer:** Weekly is enough for now.
+
+**Candidate:** Attendees in different time zones?
+
+**Interviewer:** Yes – the team is in Bengaluru and New York.
+
+**Candidate:** Is a meeting ending at 11:00 a conflict with one starting at 11:00?
+
+**Interviewer:** No, back-to-back is fine.
+
+> **🎯 In the interview**
+> Settle three rules early: are slots half-open (end exclusive), can people be double-booked, and in which time zone does a recurring event repeat.
+
+| Functional | Non-functional |
+| --- | --- |
+| Create events, rooms, attendees | Rooms never double-booked |
+| Conflicts and free-slot search | Correct across time zones and DST |
+| Weekly recurrence | Fast enough for a day's view |
+
+## Step 2: Identify the core objects
+
+- **Slot** – a time range `[start, end)` stored as `Instant`s.
+- **Event** – title, organiser, attendees, slot, optional room.
+- **WeeklyRule** – day of week, local start time, length and **time zone**; expands into slots.
+- **CalendarService** – schedules events, checks room clashes, finds conflicts and free slots.
+
+[![Selected design: a scheduling request goes to the calendar service, which checks the room's events for overlaps, stores the event on every attendee's calendar, reports personal conflicts, searches merged busy times for the first common free slot, and expands weekly rules using a time zone.](designs/lld-20.svg)](designs/lld-20.svg)
+
+> **⚖️ Design choice**
+> Store every slot as an **`Instant`** (a point on the global timeline) and keep the **time zone with the rule**, not with the stored times. Comparisons are then always correct; local times appear only when displaying or expanding a rule.
+
+## Step 3: Design the classes
+
+### Slot
+
+Two instants with `overlaps(other)`: `start < other.end && other.start < end`. Because the end is exclusive, 10:00–11:00 and 11:00–11:30 don't overlap.
+
+### Event
+
+An immutable record with the attendees and the optional room.
+
+### WeeklyRule
+
+Turns "every Monday 09:00 in America/New_York" into real instants week by week, letting Java's time zone rules handle daylight saving.
+
+### CalendarService
+
+Keeps events by person and by room. `schedule` refuses room overlaps; `conflictsFor` lists a person's overlapping events; `firstCommonFree` finds the earliest gap.
+
+[![Class diagram: CalendarService keeps Events by person and by room; each Event has a Slot of two Instants, an organiser, attendees and an optional room; WeeklyRule has a day, a local start time, a length and a ZoneId and produces Slots.](learning-figures/lld-20-classes.svg)](learning-figures/lld-20-classes.svg)
+
+## Step 4: Write the code
+
+### Slot and Event
+
+```java
+/** A time range [start, end). Stored as Instants so time zones can't confuse comparisons. */
+record Slot(Instant start, Instant end) {
+    Slot {
+        if (!start.isBefore(end)) throw new IllegalArgumentException("End before start");
+    }
+    boolean overlaps(Slot o) { return start.isBefore(o.end) && o.start.isBefore(end); }
+}
+
+record Event(String id, String title, String organizer, Set<String> attendees,
+             Slot slot, String room) {}
 ```
 
-The room transaction serializes interval allocation and the event version change. A failed reschedule keeps the original reservation intact. 10:00–11:00 and 11:00–12:00 coexist; 10:30–11:30 conflicts. Editing one recurrence creates an exception; “this and future” splits the series under explicit identity/version rules. Responses to an old invitation version do not overwrite the new version's attendance. A 09:00 Europe/London weekly rule is re-expanded using timezone rules, not by adding a fixed UTC offset forever. Late notifications refer to event versions and cannot resurrect cancelled occurrences.
+### Weekly recurrence
 
-## 3. Final design diagram
-
-[![Design Calendar / Meeting Scheduler: CalendarService owns edits Event; Event expands into Occurrence; Occurrence claims RoomReservation; Event defined by RecurrenceRule; Event versions Invitation; RoomReservation checks intervals ConflictPolicy](designs/lld-20.svg)](designs/lld-20.svg)
-
-An **event** is a user's scheduling intent; an **occurrence** is one dated instance of a recurring event; a **resource reservation** claims a room over an interval. Separate personal invitations from the room's exclusive allocation.
-
-## 4. Critical operation: worked execution
-
-![Room ownership is decided independently of email invitations.](lessons/lld-20-flow.svg)
-
-*Room ownership is decided independently of email invitations.*
-
-![Expand recurring occurrences using a timezone identifier and policy.](lessons/lld-20-failure.svg)
-
-*Expand recurring occurrences using a timezone identifier and policy.*
-
-### Selected algorithm
-
-```text
-Overlap(a,b) = a.start < b.end AND b.start < a.end
-10:00-11:00 vs 11:00-12:00: no overlap
-10:00-11:00 vs 10:30-11:30: overlap
+```java
+/** "Every Monday 10:00–10:30 in Asia/Kolkata", expanded into concrete slots. */
+record WeeklyRule(DayOfWeek day, LocalTime start, Duration length, ZoneId zone) {
+    List<Slot> occurrences(LocalDate from, int count) {
+        List<Slot> out = new ArrayList<>();
+        LocalDate d = from;
+        while (d.getDayOfWeek() != day) d = d.plusDays(1);
+        for (int i = 0; i < count; i++, d = d.plusWeeks(1)) {
+            Instant s = ZonedDateTime.of(d, start, zone).toInstant();  // local → instant
+            out.add(new Slot(s, s.plus(length)));
+        }
+        return out;
+    }
+}
 ```
 
-Store instants for concrete occurrences and a `ZoneId` plus local rule for recurrence. Some local times are missing or duplicated during clock changes; choose a policy and show it to the organizer rather than silently shifting an important meeting.
+### CalendarService
 
-## 5. Detailed decisions, algorithms and failure behaviour
+```java
+class CalendarService {
+    private final Map<String, List<Event>> byPerson = new HashMap<>();
+    private final Map<String, List<Event>> byRoom = new HashMap<>();
+    private int nextId = 1;
 
-### Key abstractions
+    /** Rooms can't be double-booked; people get a warning-free invite (they decide). */
+    synchronized Event schedule(String title, String organizer, Set<String> attendees,
+                                Slot slot, String room) {
+        if (room != null && byRoom.getOrDefault(room, List.of()).stream()
+                .anyMatch(e -> e.slot().overlaps(slot)))
+            throw new IllegalStateException(room + " is already booked then");
+        Event e = new Event("EV-" + nextId++, title, organizer, Set.copyOf(attendees),
+                slot, room);
+        Set<String> everyone = new HashSet<>(attendees);
+        everyone.add(organizer);
+        everyone.forEach(p -> byPerson.computeIfAbsent(p, k -> new ArrayList<>()).add(e));
+        if (room != null) byRoom.computeIfAbsent(room, k -> new ArrayList<>()).add(e);
+        return e;
+    }
 
-| Type | Responsibility |
-|---|---|
-| `Interval` (record) | start, end (half-open `[s, e)`), `overlaps(other)` |
-| `Meeting` | id, organiser, attendees, interval, room, recurrence rule |
-| `Calendar` | Per user: `TreeMap<Instant, Meeting>` keyed by start |
-| `Room` + `RoomCalendar` | Same structure, plus capacity and features |
-| `ConflictChecker` | `hasConflict(calendar, interval)` in O(log n) |
-| `SlotFinder` | Merge busy intervals across attendees, scan the gaps |
-| `RecurrenceRule` | RRULE-like; expands occurrences lazily within a window |
-| `Invitation` | attendee, RSVP status |
+    List<Event> conflictsFor(String person, Slot slot) {
+        return byPerson.getOrDefault(person, List.of()).stream()
+                .filter(e -> e.slot().overlaps(slot)).toList();
+    }
 
-### Design decisions & trade-offs
-
-**1. Overlap in O(log n).** With a calendar sorted by start and no internal overlaps (true for rooms), check `floorEntry(newStart)` (does it end after `newStart`?) and `ceilingEntry(newStart)` (does it start before `newEnd`?). People *can* have overlapping events, so use an interval tree, or accept the O(log n + k) scan for a person.
-
-**2. Common free slot.** Gather all attendees' busy intervals in `[from, to]`, sort by start, merge the overlapping ones, then walk the gaps and return the first gap ≥ D (respecting working hours). That's O(M log M) for M intervals. It's the classic "merge intervals" pattern from DSA.
-
-**3. Room booking atomicity.** Lock per room (`ConcurrentHashMap<RoomId, ReentrantLock>`), re-check the conflict and insert. In a database: a range-exclusion constraint, or `INSERT … WHERE NOT EXISTS (overlapping)` under serializable isolation.
-
-**4. Recurring meetings.** Store the rule plus exceptions, not 520 copies. Expand on read within the query window. Editing "this and following" splits the rule into two series.
-
-**5. Time zones.** Store instants in UTC and the organiser's zone with the rule. "9am every Monday" must survive DST shifts, so expand recurrence in the event's zone.
-
-### Ownership, boundaries and invariants
-
-**Central design question:** Meeting time is an interval plus a time-zone interpretation; recurrence is a rule, not an infinite row list.
-
-Calendar owns Events and access rules. Event contains organizer, attendees, start/end instants and display zone. RecurrenceRule defines repeated local times; OccurrenceOverride changes or cancels a single instance. AvailabilityService merges busy intervals; Invitation tracks response independently.
-
-**Correctness rule:** End is after start, resource calendars cannot contain overlapping confirmed reservations, and an occurrence identity remains stable when one instance is edited. Personal calendars may intentionally allow overlaps.
-
-```text
-event(id,start_instant,end_instant,zone,recurrence_rule,version); occurrence_override(event_id,original_start,status); invitation(event_id,attendee,response)
+    /** Earliest gap of `length` inside `window` when everyone is free. */
+    Optional<Slot> firstCommonFree(Set<String> people, Slot window, Duration length) {
+        List<Slot> busy = people.stream()
+                .flatMap(p -> byPerson.getOrDefault(p, List.of()).stream())
+                .map(Event::slot)
+                .filter(s -> s.overlaps(window))
+                .sorted(Comparator.comparing(Slot::start))
+                .toList();
+        Instant cursor = window.start();
+        for (Slot b : busy) {
+            if (!cursor.plus(length).isAfter(b.start()))            // gap before this meeting
+                return Optional.of(new Slot(cursor, cursor.plus(length)));
+            if (b.end().isAfter(cursor)) cursor = b.end();          // skip past this meeting
+        }
+        Instant end = cursor.plus(length);
+        if (end.isAfter(window.end())) return Optional.empty();
+        return Optional.of(new Slot(cursor, end));
+    }
+}
 ```
 
-### End-to-end execution trace
+### Worked example
 
-Validate organizer permissions and interval; expand only the requested recurrence horizon; check resource conflicts; save event and invitation intent atomically; notify after commit; track accept/decline responses with versions; apply single-occurrence overrides separately.
+Wednesday 28 Oct 2026, times in IST.
 
-### Concurrency and recovery walkthrough
+| Step | Request | Result |
+| --- | --- | --- |
+| 1 | Asha: Design review 10:00–11:00 with Bilal, room Kaveri | Booked |
+| 2 | Bilal: 1:1 with Chetan 11:30–12:00, no room | Booked |
+| 3 | Chetan: Standup 10:30–10:45 in Kaveri | **Refused** – Kaveri busy |
+| 4 | Bilal's conflicts for 10:30–11:45 | 2 (design review, 1:1) |
+| 5 | Bilal's conflicts for 11:00–11:30 | none – back-to-back is fine |
+| 6 | First common 45 min, 09:30–18:00 | **12:00–12:45** (09:30–10:00 is only 30 min) |
+| 7 | First common 30 min | **09:30–10:00** |
+| 8 | Weekly standup, Mon 09:00 New York | 26 Oct → 18:30 IST; 2 Nov → **19:30 IST** (US clocks changed) |
 
-Two organizers reserve one room for overlapping intervals. An authoritative room-schedule lock or range exclusion constraint decides the winner. Availability lookup alone is advisory.
+### Edge cases
 
-### Policy choices and extension seams
+| Case | Behaviour |
+| --- | --- |
+| End before start | Rejected |
+| Meeting spanning midnight | Fine – instants don't care about dates |
+| No common gap in the window | `Optional.empty()` |
+| Organiser not in attendees | Added to the organiser's calendar anyway |
 
-Persisting local recurrence rule plus zone preserves a recurring 09:00 meeting across daylight-saving changes. Persisting only UTC repetitions can shift local time. Strategy can rank suggested slots; it must not bypass room constraints.
+## Step 5: The free-slot algorithm
 
-### Edge cases that change the design
+To find the first gap of 45 minutes for Asha, Bilal and Chetan:
 
-A daylight-saving gap may make a local time nonexistent, while an overlap makes it ambiguous. Choose and display a resolution policy. Half-open intervals allow back-to-back meetings. All-day events should use dates rather than pretending every day is exactly 24 hours.
+1. Collect everyone's busy slots inside the window and **sort them by start**: 10:00–11:00, 10:00–11:00, 11:30–12:00, 11:30–12:00.
+2. Start a cursor at the window start, 09:30.
+3. For each busy slot: if `cursor + 45 min` fits before it starts, that's the answer. Otherwise move the cursor to the end of that busy slot (if later).
+4. 09:30 + 45 = 10:15 > 10:00 → no; cursor → 11:00. 11:45 > 11:30 → no; cursor → 12:00.
+5. No more meetings: 12:00–12:45 fits inside the window → answer.
 
-**Topic-specific cases:** Adjacent slots; room conflict; personal overlap policy; daylight-saving gap/overlap; single-occurrence edit; duplicate invitation; unauthorized calendar access.
+This is the classic "merge intervals" idea: sort once, sweep once – O(n log n).
 
-### Further reading
+![Animation: busy meetings for three people are sorted on a timeline; a cursor starts at 9:30 and needs 45 minutes; the gap before 10:00 is too short so the cursor jumps to 11:00; the gap before 11:30 is too short so it jumps to 12:00; there the 45-minute slot from 12:00 to 12:45 fits.](learning-figures/lld-20-freeslot.gif)
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+> **⚠️ Common mistake**
+> Storing recurring events as "UTC 13:00 every Monday". When the organiser's country changes its clocks, the meeting silently moves by an hour in their own time. Store the local time **and** the zone ID, and expand with time-zone rules.
 
-### Work through edits and concurrency
+> **🎯 In the interview**
+> Room booking across servers needs the same atomic check as any booking: a database exclusion constraint (PostgreSQL `EXCLUDE USING gist` on room + time range) makes overlapping room bookings impossible.
 
-Two organizers can race for an empty room. A preflight availability search is useful but cannot establish the reservation. The room's transaction/interval constraint decides. Changing room or time should release the old reservation only if acquiring the new one succeeds atomically under the chosen storage design.
+## Step 6: Deep dives
 
-Editing one occurrence creates an exception; editing “this and future” may split the recurring series. Expanding an infinite series into database rows is impossible, so use a bounded scheduling horizon and extend it with conflict handling. Version invitations so late responses to an old time do not overwrite responses to the replacement event.
+### Invitations and responses
 
-## 6. Interviewer follow-ups
+Add an `Invitation` per attendee with status (pending, accepted, declined, tentative). Free-slot search can ignore events the person declined.
 
-**Does a declined attendee response free the room?** No. The organizer's event owns it until cancellation or modification.
+### Full recurrence rules
 
-**Does storing UTC solve recurrence?** It solves concrete instants, not recurring local-time intent.
+Real calendars use iCalendar RRULEs ("every 2nd Tuesday", "last weekday of the month") and exceptions ("skip 25 Dec", "move this one to 11:00"). Store the rule plus a list of exceptions, and expand only the range being viewed.
 
-## 7. Closing answer
+### Fast day and week views
 
-I separate event intent, dated occurrences and exclusive room allocation. Half-open intervals define conflicts, timezone-aware recurrence preserves local intent, and versioned edits acquire replacement reservations before releasing old ones. Invitation responses cannot silently alter room ownership.
+Keep each person's events in a sorted structure (a `TreeMap` by start, or a database index on (person, start)), so "events this week" is a range query.
+
+### Working hours and time zones per person
+
+Each user has a zone and working hours; the free-slot search intersects the window with every attendee's working hours, converted to instants.
+
+## Interviewer follow-ups
+
+**Why half-open intervals?** So back-to-back meetings don't conflict and adjacent slots tile perfectly with no gaps or overlaps.
+
+**Why not store local date-times?** "10:00" means different moments in Bengaluru and New York. Instants are unambiguous; local times are for display and for rules.
+
+**How do you handle a 500-person all-hands?** Store the event once and reference it from attendees, rather than copying it 500 times; free-slot search for 500 people is rarely needed.
+
+**How would you suggest several options, not just the first?** Keep sweeping after the first match and collect up to N gaps, maybe preferring mid-morning.
+
+## Wrap up
+
+Slots are half-open ranges of instants; rooms are protected by an overlap check; free slots come from sorting busy times and sweeping; recurring events keep their local time and zone and are expanded with time-zone rules.
+
+> **📝 Key takeaways**
+> - Store instants; keep the zone with the recurrence rule.
+> - Half-open intervals: back-to-back is not a conflict.
+> - Rooms are booked atomically; people may be double-booked with a warning.
+> - Free-slot search = sort busy slots, sweep with a cursor.
+
+## Going deeper (optional)
+
+The complete, runnable code is [CalendarDemo.java](reference-code/learning/kb/calendar/CalendarDemo.java). It replays the worked example, including the New York daylight-saving change, and checks every result.
+
+[![Expand recurring occurrences using a timezone identifier and policy.](lessons/lld-20-failure.svg)](lessons/lld-20-failure.svg)
+
+## Closing answer
+
+"A Slot is a half-open range of two Instants, so comparisons are time-zone-proof and back-to-back meetings don't conflict. An Event has an organiser, attendees, a slot and an optional room. The CalendarService indexes events by person and by room: scheduling refuses any overlap in the room – across servers that's a database exclusion constraint – while personal overlaps are shown as conflicts. To find a common free slot I collect everyone's busy slots in the window, sort them by start and sweep a cursor until a gap of the required length fits. Recurring events store the local time and the zone ID and are expanded with Java's time-zone rules, so a 9:00 New York standup correctly moves from 18:30 to 19:30 in India when US clocks change."
+

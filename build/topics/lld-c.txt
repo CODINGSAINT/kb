@@ -1,645 +1,1141 @@
 === LLD 12 ===
-N|n0|Cart|0|0|200|rect
-N|n1|CartLine|250|0|200|rect
-N|n2|PricingService|500|0|200|rect
-N|n3|Quote|0|110|200|rect
-N|n4|CheckoutService|250|110|200|rect
-N|n5|InventoryPort|500|110|200|rect
-N|n6|Order|0|220|200|rect
-E|n0|n1|owns
-E|n0|n2|priced by
-E|n2|n3|creates
-E|n4|n3|accepts
-E|n4|n5|reserves through
-E|n4|n6|creates once
+N|cart|Cart|0|0|100|rect
+N|eng|Pricing engine|160|0|150|rect
+N|rules|Ordered rules|370|0|150|rect
+N|quote|Quote (15 min)|370|130|150|rect
+N|chk|Checkout|160|130|120|rect
+N|cust|Customer|0|130|120|rect
+E|cart|eng|lines
+E|eng|rules|apply in order
+E|rules|quote|discounts
+E|quote|cust|breakdown
+E|cust|chk|confirm quote
+E|chk|eng|re-price|dashed
 ---
 ## Problem
 
-Design the shopping cart and pricing engine of an e-commerce site: add or remove items, change quantities, apply promotions (coupons, BOGO, category discounts, cart-value thresholds) and compute the final price, then check out. The real test is a **pricing rules engine** that's extensible and gives predictable results when multiple promotions apply.
+Design the shopping cart and pricing engine of an online store. Asha adds 3 pairs of running socks (₹299 each) and trail shoes (₹3,499). There's a "buy 2 socks, get 1 free" deal and she has a coupon **RUN10**: 10% off orders of ₹999 or more, up to ₹200.
+
+The cart must show her an exact price breakdown, apply deals in a predictable order, and make sure the price she pays at checkout is the price she saw.
 
 ## Requirements
 
-**Functional**
-- Add, update and remove items. The cart persists for logged-in users and merges with the guest cart on login.
-- Promotions: percentage or flat off on an item or category, buy X get Y, cart-level "₹200 off above ₹1500", coupon codes, free shipping.
-- Show a price breakdown: subtotal, each discount line, tax, shipping, total.
-- At checkout, validate stock and prices again, then create an order.
+- Add items, change quantities, remove items.
+- Apply pricing rules: item deals (buy X get Y), coupons with minimums and caps, delivery fee.
+- Show a clear breakdown: subtotal, each discount with its reason, delivery, total.
+- New promotion types can be added without rewriting the cart.
+- At checkout, charge the quoted price – or show a new quote if it changed.
 
-**Non-functional**
-- Totals are deterministic and reproducible: money in minor units (paise), never floating point.
-- New promotion types plug in without changing the pricing engine (open/closed).
-- Correct when the same cart is edited from two devices at once.
-- Checkout re-validation is fast (well under 200 ms), as it sits on the purchase path.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Which kinds of promotions do we need?
 
-I support variant quantities, coupons, price quotation and conversion to an order. `Cart` owns selection; `PricingService` calculates a bounded quote; Checkout coordinates stock and order creation. Product ID alone is insufficient when size/colour variants have distinct inventory.
+**Interviewer:** Buy-X-get-Y on items, percentage coupons with a cap, free delivery above a threshold.
 
-## 2. Checkout contract and algorithm
+**Candidate:** Can promotions stack?
 
-```text
-setQuantity(cartId,expectedVersion,variantId,quantity) -> CartVersion
-quote(cartId,cartVersion,address) -> Quote(id,total,lines,expiry)
-checkout(checkoutId,quoteId,customer) -> ExistingOrder | NewOrder | Requote
-```
+**Interviewer:** Item deals first, then one coupon on what's left.
 
-An edit validates positive bounded quantities and advances the version. Quote snapshots item, discount, shipping, currency and tax-policy inputs. Checkout locks the quote/cart boundary, rejects expired or mismatched versions, and records one accepted intent. Inventory reservation follows its authoritative conditional contract; a failed reservation resolves payment/order state explicitly. Two ₹950 shirts with 10% discount give ₹1,710; ₹50 shipping gives ₹1,760 before stated taxes. A retry returns the same order; another payload under the same checkout identity conflicts. Catalogue repricing does not silently change the accepted quote.
+**Candidate:** What if a price changes while the item sits in the cart?
 
-## 3. Final design diagram
+**Interviewer:** The customer must never pay more than they saw without being told.
 
-[![Design Shopping Cart: Cart owns CartLine; Cart priced by PricingService; PricingService creates Quote; CheckoutService accepts Quote; CheckoutService reserves through InventoryPort; CheckoutService creates once Order](designs/lld-12.svg)](designs/lld-12.svg)
+**Candidate:** How is money represented?
 
-A **cart line** represents a product variant and quantity. A **price quote** includes prices, discounts, tax assumptions and expiry. An **order** freezes accepted commercial facts. Inventory is a separate authority: adding something to a cart does not necessarily reserve it.
+**Interviewer:** Your choice – but no rounding surprises.
 
-## 4. Critical operation: worked execution
+**Candidate:** Do we handle tax?
 
-![The customer accepts an explicit quote before order creation.](lessons/lld-12-flow.svg)
+**Interviewer:** Assume prices include GST.
 
-*The customer accepts an explicit quote before order creation.*
+> **🎯 In the interview**
+> Ask about stacking order. "10% off, then ₹299 off" and "₹299 off, then 10% off" give different totals; the order must be a deliberate rule.
 
-![An expired quote triggers a new visible offer, not a silent charge.](lessons/lld-12-failure.svg)
+| Functional | Non-functional |
+| --- | --- |
+| Cart operations | Exact money (no floating point) |
+| Pricing rules and breakdown | Predictable rule order |
+| Quote and checkout | Easy to add new promotions |
 
-*An expired quote triggers a new visible offer, not a silent charge.*
+## Step 2: Identify the core objects
 
-### Worked calculation and implementation
+- **Product** – SKU, name, price, category.
+- **Cart** – products and quantities; produces cart lines.
+- **PricingRule** – one promotion; returns a discount or nothing.
+- **Discount** – an amount and a reason shown to the customer.
+- **PricingEngine** – runs the rules in order and builds a quote.
+- **Quote** – the full breakdown plus an expiry time.
+- **Checkout** – accepts a quote only if it's still valid.
 
-For two ₹950 shirts, a 10% item discount gives ₹1,710. Adding ₹50 shipping gives ₹1,760 before the selected tax policy. A shipping discount and an item discount are not interchangeable if tax treatment differs. Specify discount order and rounding in the quote.
+[![Selected design: the cart holds products and quantities; the pricing engine runs an ordered list of pricing rules over the cart lines to produce a quote with every discount and an expiry; checkout re-prices and accepts the quote only if nothing changed.](designs/lld-12.svg)](designs/lld-12.svg)
 
-```text
-CartLine(variantId, quantity)
-Quote(quoteId, cartVersion, lines, discounts, shipping, tax, total, expiresAt)
-Order(orderId, acceptedQuoteSnapshot, checkoutId)
-```
+> **⚖️ Design choice**
+> Each promotion is a **Strategy** (`PricingRule`) and the engine applies a list of them in order – a simple **chain**. A new promotion type is a new class added to the list; the cart and engine don't change.
 
-## 5. Detailed decisions, algorithms and failure behaviour
+## Step 3: Design the classes
 
-### Key abstractions
+### Product and Cart
 
-| Type | Responsibility |
-|---|---|
-| `Product`, `Category` | Catalogue (price comes from a `PriceService`, not cached in the cart) |
-| `Cart`, `CartItem` | productId, quantity, `addedAt` |
-| `PricingEngine` | Runs a pipeline of `PromotionRule`s and produces a `PriceBreakdown` |
-| `PromotionRule` (Strategy) | `isApplicable(ctx)`, `apply(ctx)`, `priority()`, `stackable()` |
-| `PricingContext` | Line items with running prices, applied promos, user, coupon |
-| `Coupon` | Code, validity, usage limits, eligibility (Specification pattern) |
-| `CheckoutService` | Re-price, reserve inventory, create `Order` |
+A `Product` is an immutable record. The `Cart` maps SKUs to quantities and hands out `Line`s (product + quantity).
+
+### PricingRule and Discount
+
+The interface has one method: given the lines and the subtotal left so far, return an optional `Discount`. `BuyTwoGetOne` and `PercentCoupon` are two implementations.
+
+### PricingEngine and Quote
+
+The engine starts from the item subtotal, applies each rule in order, reduces the subtotal after each one, then adds delivery. The `Quote` keeps everything the customer saw and when it expires.
+
+### Checkout
+
+Re-prices the cart; if the total differs or the quote expired, it refuses with a new quote.
+
+[![Class diagram: a Cart has Lines of Products; PricingEngine holds an ordered list of PricingRules, implemented by BuyTwoGetOne and PercentCoupon, and produces a Quote with Discounts; Checkout uses the engine to confirm a quote.](learning-figures/lld-12-classes.svg)](learning-figures/lld-12-classes.svg)
+
+## Step 4: Write the code
+
+### Cart
 
 ```java
-interface PromotionRule {
-    int priority();                      // item-level before cart-level
-    boolean isApplicable(PricingContext ctx);
-    void apply(PricingContext ctx);      // adds DiscountLine(s) to ctx
+record Product(String sku, String name, long pricePaise, String category) {}
+
+class Cart {
+    private final Map<String, Integer> qty = new LinkedHashMap<>();
+    private final Map<String, Product> products = new HashMap<>();
+
+    void add(Product p, int n) {
+        if (n <= 0) throw new IllegalArgumentException("Quantity must be positive");
+        products.put(p.sku(), p);
+        qty.merge(p.sku(), n, Integer::sum);
+    }
+    void setQuantity(String sku, int n) {
+        if (n <= 0) { qty.remove(sku); products.remove(sku); } else qty.put(sku, n);
+    }
+    List<Line> lines() {
+        return qty.entrySet().stream()
+                .map(e -> new Line(products.get(e.getKey()), e.getValue())).toList();
+    }
+    record Line(Product product, int qty) {
+        long totalPaise() { return product.pricePaise() * qty; }
+    }
 }
 ```
 
-### Design decisions & trade-offs
+### Pricing rules
 
-**1. Rules are Strategies in an ordered pipeline.** Apply item-level rules first, then category, then cart-level, then shipping. Order matters: 10% off then ₹200 off is not the same as ₹200 off then 10% off. Make the order explicit with `priority()` rather than relying on insertion order.
+```java
+record Discount(String reason, long amountPaise) {}
 
-**2. Stacking and exclusivity.** Mark rules `stackable` or put them in an exclusive group. For exclusive groups, either pick the best discount for the customer (evaluate each and keep the max) or the first by priority. State which business rule you're assuming.
+/** One pricing rule. Each looks at the cart and the subtotal left after earlier rules. */
+interface PricingRule {
+    Optional<Discount> apply(List<Cart.Line> lines, long subtotalPaise);
+}
 
-**3. Never trust cached prices.** The cart stores product IDs and quantities. Price is computed at view time and **recomputed at checkout**. If the price changed, show it before payment.
+/** Buy 2, get 1 free on one SKU: every third unit is free. */
+record BuyTwoGetOne(String sku) implements PricingRule {
+    public Optional<Discount> apply(List<Cart.Line> lines, long subtotal) {
+        return lines.stream().filter(l -> l.product().sku().equals(sku)).findFirst()
+                .filter(l -> l.qty() >= 3)
+                .map(l -> new Discount("Buy 2 get 1: " + l.product().name(),
+                        (l.qty() / 3) * l.product().pricePaise()));
+    }
+}
 
-**4. Eligibility as Specification.** `MinCartValue(1500).and(CategoryIn("shoes")).and(FirstOrder())` composes conditions without one huge `if`.
-
-**5. Explainable output.** Return a `PriceBreakdown` with a line per discount. That's needed for the UI, for refunds on partial returns (allocate discounts per line), and for debugging.
-
-**6. Inventory at checkout, not at add-to-cart.** Reserving on add-to-cart lets carts hog stock. Reserve with a TTL during checkout.
-
-### Ownership, boundaries and invariants
-
-**Central design question:** A cart is editable intent; checkout is a validated price-and-inventory commitment.
-
-Cart owns CartLines keyed by product and selected options. ProductCatalogue and InventoryPort are external views. PricingEngine applies an ordered set of rules and returns a Quote with expiry. CheckoutService creates Order snapshots; CouponPolicy does not mutate inventory.
-
-**Correctness rule:** Line quantities are positive and bounded; totals use one currency; the same checkout request cannot create two orders. A stale cart price cannot establish the payable amount.
-
-```text
-cart(id,user_id,version,state); cart_line(cart_id,sku,options,quantity); quote(id,cart_version,total_minor,expires_at)
+/** Percentage coupon with a cap, e.g. 10% off up to Rs 200 on orders from Rs 999. */
+record PercentCoupon(String code, int percent, long minOrderPaise, long capPaise)
+        implements PricingRule {
+    public Optional<Discount> apply(List<Cart.Line> lines, long subtotal) {
+        if (subtotal < minOrderPaise) return Optional.empty();
+        long off = Math.min(subtotal * percent / 100, capPaise);
+        return Optional.of(new Discount("Coupon " + code, off));
+    }
+}
 ```
 
-### End-to-end execution trace
+### PricingEngine and Quote
 
-Add or merge a line; validate option compatibility; calculate an explanatory quote; at checkout refresh price and inventory; reserve stock; obtain payment authorization; create an immutable order with line snapshots; mark the cart checked out or expose a recoverable pending state.
+```java
+record Quote(List<Cart.Line> lines, List<Discount> discounts, long subtotalPaise,
+             long deliveryPaise, long totalPaise, Instant expiresAt) {}
 
-### Concurrency and recovery walkthrough
+class PricingEngine {
+    private final List<PricingRule> rules;     // order matters: item deals, then coupons
+    private final long freeDeliveryFromPaise = 49_900, deliveryFeePaise = 4_000;
 
-Two browser tabs edit the same cart version, or both submit checkout. Optimistic cart versioning prevents lost updates; a durable checkout idempotency key prevents duplicate orders.
+    PricingEngine(List<PricingRule> rules) { this.rules = List.copyOf(rules); }
 
-### Policy choices and extension seams
+    Quote quote(Cart cart, Instant now) {
+        List<Cart.Line> lines = cart.lines();
+        long subtotal = lines.stream().mapToLong(Cart.Line::totalPaise).sum();
+        List<Discount> applied = new ArrayList<>();
+        for (PricingRule rule : rules) {
+            Optional<Discount> d = rule.apply(lines, subtotal);
+            if (d.isPresent()) {
+                long off = Math.min(d.get().amountPaise(), subtotal);  // never below 0
+                applied.add(new Discount(d.get().reason(), off));
+                subtotal -= off;
+            }
+        }
+        long delivery = subtotal >= freeDeliveryFromPaise ? 0 : deliveryFeePaise;
+        return new Quote(lines, applied, subtotal, delivery, subtotal + delivery,
+                now.plusSeconds(15 * 60));
+    }
+}
+```
 
-A pricing chain is useful when rule ordering is explicit: item promotions, order discount, tax and delivery may not commute. Keeping price as a single stored mutable cart total creates unexplained drift.
+### Checkout
 
-### Edge cases that change the design
+```java
+class Checkout {
+    private final PricingEngine engine;
+    Checkout(PricingEngine engine) { this.engine = engine; }
 
-Coupons may have per-user limits requiring atomic redemption. Product deletion leaves an unavailable line rather than silently dropping intent. Refunds use order snapshots, not current catalogue prices.
+    /** The customer pays the quote they saw – or sees a new one if it changed. */
+    Quote confirm(Cart cart, Quote shown, Instant now) {
+        Quote fresh = engine.quote(cart, now);
+        if (now.isAfter(shown.expiresAt()) || fresh.totalPaise() != shown.totalPaise())
+            throw new QuoteChangedException(fresh);
+        return shown;
+    }
+}
 
-**Topic-specific cases:** Concurrent tab update; empty checkout; coupon cap; price change; inventory shortage; duplicate order prevention; currency validation.
+class QuoteChangedException extends RuntimeException {
+    final Quote newQuote;
+    QuoteChangedException(Quote q) { super("Price changed: please review"); newQuote = q; }
+}
+```
 
-### Further reading
+### Worked example
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+Money is in paise (`long`): ₹299 = 29,900.
 
-### Work through concurrent changes
+| Step | Calculation | Result |
+| --- | --- | --- |
+| 3 socks | 3 × ₹299 = ₹897 | |
+| Buy 2 get 1 | 1 free × ₹299 | − ₹299 → ₹598 |
+| RUN10 | ₹598 < ₹999 minimum | not applied |
+| Delivery | ₹598 ≥ ₹499 | free → **₹598** |
+| + trail shoes ₹3,499 | ₹897 + ₹3,499 = ₹4,396 | |
+| Buy 2 get 1 | − ₹299 | ₹4,097 |
+| RUN10 | 10% of ₹4,097 = ₹409.70, capped | − ₹200 → ₹3,897 |
+| Checkout after 1 minute | same total, not expired | charged ₹3,897 |
+| Checkout after 16 minutes | quote expired | new quote shown (₹3,897) |
+| Asha drops to 1 pair of socks | deal no longer applies | new quote ₹3,598 |
 
-Two browser tabs edit cart version 7: one changes quantity, another removes the line. Require an expected cart version or use clearly defined merge operations. A stale “set quantity to 3” must not silently resurrect an intentionally removed item.
+### Edge cases
 
-Two checkout retries with identity X9 should return the same order. A different cart or accepted quote under the same identity is a conflict. If stock reservation later fails, record order failure and resolve payment rather than deleting history and losing the explanation.
+| Case | Behaviour |
+| --- | --- |
+| Quantity 0 or negative | Remove the line / reject |
+| Discount larger than the subtotal | Capped so the total never goes below 0 |
+| Coupon minimum not met | Rule returns nothing; breakdown doesn't show it |
+| Product price changes after quoting | Checkout sees a different total and shows the new quote |
 
-Do not use product ID alone when size/colour variants have separate stock. Bound quantity, distinct lines and coupon applications so pricing complexity cannot grow without limit.
+## Step 5: The pricing algorithm: order and honesty
 
-## 6. Interviewer follow-ups
+Two rules make pricing predictable:
 
-**Does removing a cart line cancel a submitted order?** No. They are separate lifecycles.
+1. **Rules run in a fixed order**, and each one sees the subtotal left by the rules before it. Item deals come first; cart-level coupons apply to what remains. That's why RUN10 is calculated on ₹4,097, not ₹4,396.
+2. **The customer pays the quote they saw.** At checkout, re-price. If the total changed (a price update, a coupon expiring, a cart change) or the quote is older than 15 minutes, show the new quote instead of silently charging a different amount.
 
-**Where does the accepted address belong?** In the order snapshot; subsequent profile edits should not mutate it.
+![Animation: three socks get the buy-two-get-one discount, the coupon is skipped because the subtotal is below 999 rupees; adding shoes raises the subtotal so the coupon applies, capped at 200 rupees; at checkout the quote is confirmed, but after the cart changes a new quote is shown instead of a silent charge.](learning-figures/lld-12-pricing.gif)
 
-## 7. Closing answer
+> **⚠️ Common mistake**
+> Using `double` for prices. `0.1 + 0.2` is not `0.3` in binary floating point, and a percentage discount can be off by a paisa. Use `long` paise or `BigDecimal` with explicit rounding.
 
-I treat the cart as mutable intent and the accepted quote as the commercial contract. Versioned edits prevent stale tabs from silently overwriting selections, while idempotent checkout creates one order with frozen prices and address. Adding to a cart does not claim stock.
+> **🎯 In the interview**
+> If asked about "best discount for the customer", say you'd try the valid combinations of stackable rules and pick the lowest total – but keep it deterministic and explainable on the receipt.
+
+## Step 6: Deep dives
+
+### A new promotion type
+
+"₹100 off any footwear" is a new `PricingRule` that sums footwear lines and returns a `Discount`. Add it to the engine's list in the right position.
+
+### Exclusive coupons
+
+Give rules a `group` (e.g. "coupon"). The engine applies at most one rule per group – the first that matches, or the one giving the biggest discount.
+
+### Inventory at checkout
+
+Pricing doesn't reserve stock. Checkout also asks inventory to reserve the items (see the e-commerce lesson, HLD-12) before taking payment.
+
+### Saving the cart
+
+Store carts by user ID (logged in) or a cookie ID (guest), and merge the guest cart into the user's cart at login.
+
+## Interviewer follow-ups
+
+**Why return a Discount instead of changing prices directly?** The receipt needs every reason and amount, and rules stay independent and testable.
+
+**How do you round a percentage?** Decide once – usually round down in the customer's favour – and do it in one place (here, integer division of paise).
+
+**How long should a quote last?** Long enough to pay comfortably – 15 minutes is common – and never longer than the shortest promotion or price guarantee behind it.
+
+**How would you test the engine?** Table-driven tests: cart contents + rules → expected breakdown, exactly like the worked example.
+
+## Wrap up
+
+The cart holds products and quantities; an ordered chain of pricing rules turns it into a quote with every discount explained; checkout charges that quote or shows a new one.
+
+> **📝 Key takeaways**
+> - Money in paise (`long`) or `BigDecimal` – never `double`.
+> - Each promotion is a `PricingRule`; the engine applies them in a fixed order.
+> - The quote is the contract: show it, then charge exactly it.
+> - Re-price at checkout; changes produce a visible new quote.
+
+## Going deeper (optional)
+
+The complete, runnable code is [CartPricingDemo.java](reference-code/learning/kb/cartpricing/CartPricingDemo.java). It replays the worked example and checks every result.
+
+The production version has the customer accept an explicit quote before the order is created, and an expired quote always produces a new visible offer, never a silent charge.
+
+[![The customer accepts an explicit quote before order creation.](lessons/lld-12-flow.svg)](lessons/lld-12-flow.svg)
+
+## Closing answer
+
+"A Cart maps products to quantities and produces lines. Each promotion is a PricingRule strategy that looks at the lines and the subtotal left so far and returns an optional Discount with a reason. The PricingEngine applies the rules in a fixed order – item deals like buy-two-get-one first, then a capped percentage coupon on what remains – then adds delivery, and returns a Quote with the full breakdown and a 15-minute expiry. All money is in paise. At checkout I re-price: if the total changed or the quote expired, the customer sees the new quote rather than being charged silently. New promotions are new rule classes added to the list."
 
 === LLD 13 ===
-N|n0|NotificationService|0|0|200|rect
-N|n1|NotificationIntent|250|0|200|rect
-N|n2|TemplateRenderer|500|0|200|rect
-N|n3|ChannelPolicy|0|110|200|rect
-N|n4|DeliveryChannel|250|110|200|rect
-N|n5|Attempt|500|110|200|rect
-N|n6|Receipt|0|220|200|rect
-E|n0|n1|records
-E|n1|n2|rendered by
-E|n1|n3|routes through
-E|n3|n4|selects
-E|n4|n5|creates
-E|n5|n6|records
+N|caller|Order service|0|0|150|rect
+N|svc|NotificationService|200|0|190|rect
+N|tpl|Templates|440|0|130|cylinder
+N|pref|User preferences|440|130|160|cylinder
+N|ch|Channel interface|200|130|170|rect
+N|prov|Email / SMS / Push|0|130|170|rect
+E|caller|svc|event + data
+E|svc|tpl|render
+E|svc|pref|enabled channels
+E|svc|ch|send with retry
+E|ch|prov|deliver
 ---
 ## Problem
 
-Design a notification system (as an in-process library or service) that sends messages over email, SMS, push and in-app channels, respects user preferences, renders templates, retries failures and is easy to extend with new channels. It's an extensibility problem: **Strategy** per channel, **Factory** to create senders, and **Observer** to decouple producers from delivery.
+Design a notification library (or a small service) that other parts of an app call to send messages over email, SMS and push. The order service says: *"Tell Asha that order 847 ships today"* – and the library works out the text, the channels Asha has turned on, and delivers each one.
+
+Providers fail. Email servers time out; a user may have no phone number. The library must retry what can succeed later, give up on what can't, and never send the same notification twice because a caller retried.
 
 ## Requirements
 
-**Functional**
-- `send(userId, eventType, payload)`. The system picks channels from user preferences and event priority.
-- Template per event and channel, with variables and localisation.
-- Retry with backoff. Fallback (push fails, so use SMS for critical events).
-- Rate-limit per user. Respect quiet hours. Deduplicate.
+- One call to notify a user through one or more channels (email, SMS, push).
+- Messages come from templates filled with data ("Hi {name}, order {orderId} ships today!").
+- Respect each user's channel preferences.
+- Retry temporary failures with backoff; don't retry permanent ones.
+- A repeated event (same event ID) is sent only once; adding a channel is easy.
 
-**Non-functional**
-- High throughput (millions per day) and asynchronous: `send()` never blocks the caller.
-- At-least-once delivery with idempotency keys, so retries don't produce duplicate messages.
-- Adding a channel (e.g. WhatsApp) needs no change to existing senders.
-- Observable: delivery status can be tracked per message and channel.
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Is this the large-scale notification system or the class design?
 
-I deliver email, SMS and push for typed business events. NotificationIntent freezes template version, recipient scope, urgency and expiry. `DeliveryChannel` is an interface implemented per provider/channel; rendering and route policy remain separate so adding a channel does not modify domain events.
+**Interviewer:** The class design inside one service. HLD-4 covers the distributed version.
 
-## 2. Dispatch and retry algorithm
+**Candidate:** Which channels?
 
-```text
-notify(eventId,recipient,templateVersion,parameters) -> notificationId
-deliver(notificationId) -> Accepted | RetryScheduled | PermanentFailure | Unknown
-Attempt: attemptId, notificationId, providerRef, outcome, nextAttemptAt
-```
+**Interviewer:** Email and SMS now, push soon, maybe WhatsApp later.
 
-I deduplicate the intent, validate consent/expiry, render bounded channel content and record the attempt before the provider call. Definitive invalid addresses terminate; throttling schedules bounded backoff; timeout-after-acceptance remains uncertain and uses provider query/idempotency where available. Expired OTPs are not replayed later. At 200 SMS/minute against a 100/minute provider quota, backlog grows 100/minute, so channel admission must honor quota rather than adding unlimited threads. Receipts advance only supported states and duplicate callbacks cannot create another intent.
+**Candidate:** What counts as a failure worth retrying?
 
-## 3. Final design diagram
+**Interviewer:** Timeouts and server errors. A missing phone number won't fix itself.
 
-[![Design Notification System: NotificationService records NotificationIntent; NotificationIntent rendered by TemplateRenderer; NotificationIntent routes through ChannelPolicy; ChannelPolicy selects DeliveryChannel; DeliveryChannel creates Attempt; Attempt records Receipt](designs/lld-13.svg)](designs/lld-13.svg)
+**Candidate:** Can callers send the same event twice?
 
-A **notification** is the intent to inform someone. A **delivery attempt** is one provider call. A **template version** determines rendered content. Provider acceptance means the provider received the message; it does not prove the recipient read it.
+**Interviewer:** Yes, if their own request is retried.
 
-## 4. Critical operation: worked execution
+**Candidate:** Do we send synchronously?
 
-![Intent is stable while attempts and provider receipts accumulate.](lessons/lld-13-flow.svg)
+**Interviewer:** Keep it synchronous for now, but design so it can move to a queue.
 
-*Intent is stable while attempts and provider receipts accumulate.*
+> **🎯 In the interview**
+> Ask "which failures are retryable?" early. Retrying a permanent error wastes time; not retrying a timeout loses messages.
 
-![A timeout is not proof that the message was never sent.](lessons/lld-13-failure.svg)
+| Functional | Non-functional |
+| --- | --- |
+| Templates, channels, preferences | No duplicate sends for the same event |
+| Retry with backoff | Adding a channel touches no existing code |
+| Report what happened per channel | Easy to test without real providers |
 
-*A timeout is not proof that the message was never sent.*
+## Step 2: Identify the core objects
 
-### Worked calculation and implementation
+- **Template** – named text with placeholders; renders with data.
+- **User** – contact details and the channels they've enabled.
+- **Message** – one rendered text for one user on one channel.
+- **Channel** – an interface; `EmailChannel`, `SmsChannel`, `PushChannel` implement it.
+- **TemporaryFailure** – the exception type that means "try again later".
+- **NotificationService** – renders, checks preferences, sends with retry, de-duplicates events.
+- **Attempt** – the result per channel: SENT, FAILED or SKIPPED, with the number of tries.
+
+[![Selected design: a caller sends an event to the notification service, which renders the template, checks the user's preferences and sends one message per channel through a channel interface; temporary failures are retried with backoff and every attempt is recorded.](designs/lld-13.svg)](designs/lld-13.svg)
+
+> **⚖️ Design choice**
+> Each channel is a **Strategy** behind one `Channel` interface. The service doesn't know how SMS works; adding WhatsApp is one new class registered with the service.
+
+## Step 3: Design the classes
+
+### Template, User and Message
+
+Small immutable records. `Template.render` fails loudly if a placeholder has no value, so nobody receives "Hi {name}".
+
+### Channel and TemporaryFailure
+
+`send(message)` either returns (sent), throws `TemporaryFailure` (retry), or throws anything else (permanent).
+
+### NotificationService
+
+Holds the channels by type, the templates, and the set of event IDs already handled. `notify` returns one `Attempt` per requested channel.
+
+[![Class diagram: NotificationService has Channels and Templates and returns Attempts; EmailChannel and SmsChannel implement Channel; a Message is built from a User, a ChannelType and rendered Template text.](learning-figures/lld-13-classes.svg)](learning-figures/lld-13-classes.svg)
+
+## Step 4: Write the code
+
+### Messages and templates
 
 ```java
-// Adapter contract sketch; no provider credentials in the domain object.
-interface DeliveryChannel {
-    DeliveryReceipt send(RenderedMessage message, String attemptKey);
+enum ChannelType { EMAIL, SMS, PUSH }
+
+record Template(String name, String text) {
+    String render(Map<String, String> data) {
+        String out = text;
+        for (var e : data.entrySet()) out = out.replace("{" + e.getKey() + "}", e.getValue());
+        if (out.contains("{")) throw new IllegalArgumentException("Missing value in " + name);
+        return out;
+    }
 }
+
+record User(String id, String email, String phone, String deviceToken,
+            Set<ChannelType> enabled) {}
+
+record Message(String eventId, User to, ChannelType channel, String text) {}
 ```
 
-Keep `EmailChannel`, `SmsChannel` and `PushChannel` responsible for their provider contracts. A policy chooses a channel; a renderer applies its length and formatting rules. An SMS long enough to become multiple billed segments needs channel-specific calculation rather than one universal “character count.”
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Key abstractions
-
-| Type | Responsibility |
-|---|---|
-| `NotificationService` | Facade: resolve channels, render, dispatch |
-| `NotificationChannel` (Strategy) | `EmailChannel`, `SmsChannel`, `PushChannel`, `InAppChannel`; `send(Message)` |
-| `ChannelFactory` | `get(ChannelType)` (registry map, so new channels self-register) |
-| `TemplateEngine` | `render(templateId, locale, vars)` |
-| `PreferenceService` | Per-user, per-event channel opt-ins and quiet hours |
-| `Notification` | id, user, event, channel, status (PENDING, SENT, FAILED, RETRYING) |
-| `RetryPolicy` | Exponential backoff with jitter, max attempts |
-| Filters (Chain of Responsibility) | `DedupFilter → RateLimitFilter → QuietHoursFilter` |
+### Channels
 
 ```java
-public interface NotificationChannel {
+/** Thrown for failures worth retrying (timeouts, 5xx). Others are permanent. */
+class TemporaryFailure extends RuntimeException {
+    TemporaryFailure(String why) { super(why); }
+}
+
+interface Channel {
     ChannelType type();
-    DeliveryResult send(RenderedMessage msg);
+    void send(Message m);              // throws TemporaryFailure or another exception
+}
+
+class EmailChannel implements Channel {
+    final List<String> sent = new ArrayList<>();
+    int failNextCalls;                 // lets the demo simulate an outage
+    public ChannelType type() { return ChannelType.EMAIL; }
+    public void send(Message m) {
+        if (failNextCalls-- > 0) throw new TemporaryFailure("SMTP timeout");
+        sent.add(m.to().email() + ": " + m.text());
+    }
+}
+
+class SmsChannel implements Channel {
+    final List<String> sent = new ArrayList<>();
+    public ChannelType type() { return ChannelType.SMS; }
+    public void send(Message m) {
+        if (m.to().phone() == null) throw new IllegalArgumentException("No phone number");
+        sent.add(m.to().phone() + ": " + m.text());
+    }
 }
 ```
 
-### Design decisions & trade-offs
+### NotificationService
 
-**1. Open/closed via registry.** Adding WhatsApp is one class implementing `NotificationChannel`, registered with the factory. No `switch` to edit. Vendor adapters (SES vs. SendGrid) sit behind each channel as a second Strategy level.
+```java
+enum Status { SENT, FAILED, SKIPPED }
 
-**2. Pre-send filters as a chain.** Dedup, rate limit, quiet hours and preference checks are independent rules. A chain lets you reorder them and add new ones, and each filter can short-circuit (drop or delay).
+record Attempt(Message message, Status status, int tries, String note) {}
 
-**3. Async dispatch.** Producers call `send`, which enqueues work (`BlockingQueue`, or Kafka in HLD). A worker pool delivers. Producers never block on a slow SMS gateway.
+class NotificationService {
+    private final Map<ChannelType, Channel> channels = new EnumMap<>(ChannelType.class);
+    private final Map<String, Template> templates;
+    private final Set<String> seenEvents = new HashSet<>();   // de-duplicates retries
+    private final int maxTries;
+    final List<Long> backoffsMillis = new ArrayList<>();      // recorded, not slept
 
-**4. Retries and idempotency.** Keep a notification ID through retries so vendors or your dedup can drop duplicates. Classify failures: transient (timeout, 5xx) gets retried; permanent (invalid number) fails fast.
+    NotificationService(List<Channel> list, Map<String, Template> templates, int maxTries) {
+        list.forEach(c -> channels.put(c.type(), c));
+        this.templates = templates; this.maxTries = maxTries;
+    }
 
-**5. Priority.** OTPs and security alerts skip quiet hours and use a separate high-priority queue, so a marketing blast can't delay them.
+    List<Attempt> notify(String eventId, User user, String template,
+                         Map<String, String> data, Set<ChannelType> wanted) {
+        String text = templates.get(template).render(data);    // fails before anything is sent
+        if (!seenEvents.add(eventId)) return List.of();          // already handled
+        List<Attempt> results = new ArrayList<>();
+        for (ChannelType type : wanted) {
+            Message m = new Message(eventId, user, type, text);
+            if (!user.enabled().contains(type)) {
+                results.add(new Attempt(m, Status.SKIPPED, 0, "user turned it off"));
+                continue;
+            }
+            results.add(sendWithRetry(channels.get(type), m));
+        }
+        return results;
+    }
 
-### Ownership, boundaries and invariants
-
-**Central design question:** Creating a notification and delivering it through an unreliable provider are different responsibilities.
-
-NotificationRequest contains recipient, template version, channel preference and deduplication key. Renderer produces channel-specific payloads; ChannelAdapter calls email/SMS/push providers. DeliveryAttempt records outcome and retry schedule; PreferencePolicy decides consent and quiet hours.
-
-**Correctness rule:** A request identity maps to one logical notification. Retries may create several provider attempts but must not be misreported as several user intents. A successful enqueue is not confirmed delivery.
-
-```text
-notification(id,request_key,recipient,template_version,status); attempt(id,notification_id,provider_ref,outcome,next_at)
+    private Attempt sendWithRetry(Channel channel, Message m) {
+        for (int attempt = 1; attempt <= maxTries; attempt++) {
+            try {
+                channel.send(m);
+                return new Attempt(m, Status.SENT, attempt, "ok");
+            } catch (TemporaryFailure e) {
+                backoffsMillis.add(1000L << (2 * (attempt - 1)));  // 1 s, 4 s, 16 s
+            } catch (RuntimeException e) {
+                return new Attempt(m, Status.FAILED, attempt, e.getMessage());  // permanent
+            }
+        }
+        return new Attempt(m, Status.FAILED, maxTries, "gave up after retries");
+    }
+}
 ```
 
-### End-to-end execution trace
+### Worked example
 
-Authorize the request; validate recipient and preference; snapshot the template inputs; persist the notification and durable dispatch intent; render; send with provider idempotency when supported; classify result; retry transient failures within budget; record callbacks independently.
+| Step | What happens | Result |
+| --- | --- | --- |
+| Order service: "order-847-shipped" for Asha via email, SMS, push | Template → "Hi Asha, order 847 ships today!" | |
+| Email: SMTP times out twice | Retry after 1 s, then 4 s | SENT on the 3rd try |
+| SMS | Asha has a phone number | SENT on the 1st try |
+| Push | Asha hasn't enabled push | SKIPPED |
+| Same event sent again | Event ID already seen | Nothing sent |
+| Bilal has SMS on but no phone number | Permanent error | FAILED after 1 try, no retries |
+| Template data missing `orderId` | Render fails before sending | Error to the caller |
 
-### Concurrency and recovery walkthrough
+### Edge cases
 
-A timeout occurs after the provider accepts a message. Query using provider reference or retry with its idempotency key; when unsupported, document possible duplicate delivery. Local deduplication alone cannot undo an already sent SMS.
+| Case | Behaviour |
+| --- | --- |
+| Unknown template | Error before anything is sent |
+| Channel not registered | Treat as configuration error at start-up |
+| All retries fail | FAILED, "gave up after retries" – caller can alert |
+| User disabled every requested channel | All SKIPPED |
 
-### Policy choices and extension seams
+## Step 5: The retry algorithm: retry the right failures
 
-Factory selects an adapter; Strategy expresses channel fallback. Decorators can add metrics and retries only if retry policy understands idempotency. Avoid a generic retry decorator around every side effect.
+For each channel:
 
-### Edge cases that change the design
+1. Try to send.
+2. **Success** → record SENT with the number of tries.
+3. **TemporaryFailure** → wait longer each time (1 s, then 4 s, then 16 s) and try again, up to 3 tries.
+4. **Any other exception** → permanent: record FAILED immediately.
+5. Out of tries → FAILED, "gave up".
 
-Unsubscribe takes precedence over queued marketing work under a documented cut-off policy. Missing template variables are permanent validation failures. Quiet hours depend on the recipient zone, not server local time.
+![Animation: Asha's order-shipped notification goes to email and SMS; email times out, waits one second, times out again, waits four seconds and succeeds on the third try; SMS succeeds at once; push is skipped because Asha turned it off; a repeated event ID sends nothing.](learning-figures/lld-13-retry.gif)
 
-**Topic-specific cases:** Duplicate intent; missing variables; opt-out; retry budget; permanent provider error; out-of-order delivery callback; timezone quiet hours.
+> **⚠️ Common mistake**
+> Retrying every exception. Retrying "no phone number" three times just delays the failure, and retrying a 400 Bad Request can't succeed. Classify failures first.
 
-### Further reading
+> **🎯 In the interview**
+> A retry after a timeout can still create a duplicate: the provider may have sent the email before timing out. Pass a stable key (the event ID + channel) to providers that support idempotency, and accept a rare duplicate otherwise.
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+## Step 6: Deep dives
 
-### Work through policy choices
+### Sending asynchronously
 
-At 1,000 intents/minute with 20% SMS, nominal SMS traffic is 200/minute before retries. If the provider permits 100/minute, queueing will grow by 100/minute unless admission, alternate channels or the product's delay promise changes. More worker threads cannot remove the provider quota.
+Put each `Message` on a queue and let workers call `sendWithRetry`. The caller returns immediately; retries no longer block it. Backoff becomes "re-queue with a delay". (That's the HLD-4 design.)
 
-Preserve the original event identity across retries. Distinguish permanent invalid-address failures from temporary throttling. Expire stale password-reset intents instead of sending an obsolete security code hours later. A notification system must not let an arbitrary template parameter override the recipient's authorization or consent.
+### Priorities and quiet hours
 
-## 6. Interviewer follow-ups
+Add a `priority` to the request. OTPs bypass quiet hours and rate limits; marketing messages wait until 9 a.m.
 
-**Should email formatting live in the order aggregate?** No. The order emits a business fact; notification rendering adapts it to a channel.
+### Rate limiting per user
 
-**Is at-least-once processing enough to prevent duplicate SMS?** No. Worker deduplication and provider idempotency capabilities are separate considerations.
+Before sending marketing messages, check a per-user token bucket (see the Rate Limiter lesson, LLD-14) so nobody gets 20 pushes a day.
 
-## 7. Closing answer
+### Templates per language and channel
 
-I separate notification intent from channel-specific attempts and delivery evidence. Strategy chooses the channel, adapters integrate providers, and stable identities make retries inspectable. Accepted, delivered and read are separate outcomes; consent and expiry are checked before sending.
+Key templates by name + channel + language: SMS needs a 160-character version, email a subject and HTML body.
+
+## Interviewer follow-ups
+
+**Why not one big `send(type, ...)` with a switch?** Every new channel would edit that switch. With the `Channel` interface, new channels are added, not edited in (open/closed principle).
+
+**How do you test without sending real SMS?** Inject fake channels, like the demo's `EmailChannel` that fails a set number of times and records what it "sent".
+
+**Where do preferences come from?** A preferences store keyed by user, read for each event – checked again just before sending if delivery is delayed.
+
+**How do you keep the "seen events" set from growing forever?** Store event IDs with a time-to-live (for example 24 hours) in a database or Redis.
+
+## Wrap up
+
+A notification service renders templates, respects preferences, sends through pluggable channels, retries only temporary failures with backoff, and ignores repeated events.
+
+> **📝 Key takeaways**
+> - One `Channel` interface; each provider is a strategy.
+> - Fail early on template errors – before anything is sent.
+> - Retry temporary failures with exponential backoff; never retry permanent ones.
+> - De-duplicate by event ID; report a result per channel.
+
+## Going deeper (optional)
+
+The complete, runnable code is [NotifierDemo.java](reference-code/learning/kb/notifier/NotifierDemo.java). It replays the worked example and checks every result.
+
+The production version keeps the notification intent stable while attempts and provider receipts accumulate, and treats a timeout as "unknown", not as "not sent".
+
+[![A timeout is not proof that the message was never sent.](lessons/lld-13-failure.svg)](lessons/lld-13-failure.svg)
+
+## Closing answer
+
+"Callers send an event ID, a user, a template name, data and the channels they want. The NotificationService renders the template first – failing loudly on a missing value – then ignores the event if its ID was already handled. For each channel it checks the user's preferences and sends through a Channel strategy: email, SMS and push are separate classes behind one interface, so a new channel is just a new class. Channels throw a TemporaryFailure for timeouts and server errors, which we retry with exponential backoff up to three tries; other errors fail immediately. Each channel's result – sent, failed or skipped – is returned. To scale, the same send-with-retry moves behind a queue."
 
 === LLD 14 ===
-N|n0|RateLimiter|0|0|200|rect
-N|n1|KeyPolicy|250|0|200|rect
-N|n2|BucketRegistry|500|0|200|rect
-N|n3|TokenBucket|0|110|200|rect
-N|n4|MonotonicClock|250|110|200|rect
-N|n5|AdmissionResult|500|110|200|rect
-E|n0|n1|resolves key
-E|n0|n2|looks up
-E|n2|n3|owns per key
-E|n3|n4|measures elapsed
-E|n3|n5|returns
+N|req|Request (key)|0|0|140|rect
+N|lim|TokenBucketLimiter|190|0|180|rect
+N|map|Buckets by key|420|0|160|cylinder
+N|bucket|TokenBucket.tryTake|420|130|190|rect
+N|clock|Clock (nanos)|190|130|140|rect
+N|res|allow / reject|0|130|140|rect
+E|req|lim|allow(key)
+E|lim|map|computeIfAbsent
+E|map|bucket|this key's bucket
+E|clock|bucket|now
+E|bucket|res|refill + take
 ---
 ## Problem
 
-Design a rate limiter class in Java (the LLD version, inside one JVM): `boolean allow(String key)` limits each user or API key to N requests per time window. You must implement the algorithms correctly, make them **thread-safe**, and make the algorithm swappable (**Strategy**).
+Design a rate limiter class in Java – the low-level version that runs inside one service. The API is one method: `boolean allow(String key)`. For example, each user may make at most 5 requests in a burst and 2 requests per second after that.
+
+Asha's app fires 7 requests at once: 5 go through, 2 are refused. A second later she can send 2 more. Bilal, meanwhile, has his own limit. And when 100 threads call `allow` for the same key at once, exactly the right number must succeed.
 
 ## Requirements
 
-**Functional**
-- Per-key limits (user ID, IP, API key), with different limits per tier or endpoint.
-- Algorithms: fixed window, sliding window log, sliding window counter, token bucket, leaky bucket.
-- Return allowed or denied, plus metadata (remaining requests, retry-after).
+- `allow(key)` returns true if the request may go ahead.
+- Each key (user, API key, IP) has its own limit.
+- Allow short bursts up to a capacity, with a steady refill rate.
+- Correct under many threads; fast (no locks shared by all keys).
+- Easy to test without waiting for real time; easy to swap the algorithm.
 
-**Non-functional**
-- O(1) per call where possible, safe under many concurrent threads, and bounded memory (evict idle keys).
+## Step 1: Clarify the requirements
 
-## 1. Scope and chosen solution
+**Candidate:** Is this inside one JVM, or across many servers?
 
-I enforce capacity 5 and refill 2 permits/second per authenticated caller in one JVM. `RateLimiter` resolves keys, `TokenBucket` owns state, and an injected monotonic clock makes arithmetic testable. Costs are positive and no larger than capacity.
+**Interviewer:** One JVM. The distributed version is HLD-2.
 
-## 2. Atomic decision
+**Candidate:** Do we allow bursts, or a strict per-second count?
 
-```text
-synchronized tryAcquire(cost,nowNanos):
-  elapsed = max(0,nowNanos-lastNanos)
-  tokens = min(capacity,tokens + elapsed/1e9*rate)
-  lastNanos = max(lastNanos,nowNanos)
-  if tokens >= cost: tokens -= cost; return ALLOW
-  return DENY with retryAfterNanos = ceil((cost-tokens)/rate * 1e9)
-```
+**Interviewer:** Allow a small burst, then a steady rate.
 
-After depletion, 1.25 seconds refills 2.5 permits: two unit requests pass, then the next waits 0.25 seconds before HTTP-header rounding. I use fine-grained retry durations internally; a whole-second header rounds upward. Registry lookup is thread-safe but bucket synchronization covers the multi-field calculation. Idle eviction occurs only after a period long enough to restore a full bucket under the policy; premature deletion would grant another burst. Twenty-four simultaneous calls with frozen time admit exactly five. Multiple servers do not share this lock, so I do not claim global enforcement from this implementation.
+**Candidate:** Are limits the same for every key?
 
-## 3. Final design diagram
+**Interviewer:** For now, yes: burst 5, then 2 per second.
 
-[![Design Rate Limiter: RateLimiter resolves key KeyPolicy; RateLimiter looks up BucketRegistry; BucketRegistry owns per key TokenBucket; TokenBucket measures elapsed MonotonicClock; TokenBucket returns AdmissionResult](designs/lld-14.svg)](designs/lld-14.svg)
+**Candidate:** What happens to refused requests – queue or reject?
 
-I start with one JVM and one caller. Then add multiple callers and finally multiple servers. The algorithm's arithmetic and its deployment authority are separate lessons; a correct local bucket does not automatically become a global quota.
+**Interviewer:** Reject. The caller returns 429.
 
-## 4. Critical operation: worked execution
+**Candidate:** How many keys?
 
-![Refill and consumption form one atomic operation.](lessons/lld-14-flow.svg)
+**Interviewer:** Up to a million active users.
 
-*Refill and consumption form one atomic operation.*
+> **🎯 In the interview**
+> Name the algorithm you'll use and why before coding. "Token bucket, because it allows bursts and has a steady average rate" is a strong opening.
 
-![Atomic check-and-consume prevents overspending the bucket.](lessons/lld-14-failure.svg)
+| Functional | Non-functional |
+| --- | --- |
+| `allow(key)` per key | Thread-safe: no token spent twice |
+| Burst + steady rate | Low contention between keys |
+| Pluggable algorithm | Testable with a fake clock |
 
-*Atomic check-and-consume prevents overspending the bucket.*
+## Step 2: Identify the core objects
 
-![Five-token capacity empties after five requests; at two tokens per second, 1.25 seconds refills 2.5 tokens.](lessons/lld-14-bucket.svg)
+- **RateLimiter** – the interface with `allow(key)`.
+- **TokenBucket** – the state for one key: tokens left and when it was last refilled.
+- **TokenBucketLimiter** – maps each key to its bucket; implements `RateLimiter`.
+- **SlidingWindowLimiter** – an alternative algorithm behind the same interface.
+- **Clock** – a `LongSupplier` of nanoseconds, so tests control time.
 
-*Fractional permits explain why two requests can pass now while the next must wait.*
+[![Selected design: a request for a key reaches the rate limiter, which finds or creates that key's token bucket in a concurrent map, refills it for the time passed and takes one token in a single atomic step, returning allow or reject.](designs/lld-14.svg)](designs/lld-14.svg)
 
-### Worked calculation and implementation
+> **⚖️ Design choice**
+> **Token bucket.** It allows a burst up to the capacity and then a steady rate, needs only two numbers per key, and has no "boundary" problem like fixed windows.
 
-With capacity 5, rate 2/s and an empty bucket at t=0, t=1.25 has 2.5 tokens. Two unit-cost requests succeed, leaving 0.5. The next needs another 0.5 token, so its earliest retry is 0.25 seconds later. Do not round retry delay downward.
+## Step 3: Design the classes
 
-```text
-elapsed = max(0, nowNanos - previousNanos)
-tokens = min(capacity, tokens + elapsedSeconds * rate)
-if tokens >= requestCost: tokens -= requestCost; ALLOW
-else: DENY, retryAfter = (requestCost - tokens) / rate
-```
+### RateLimiter
 
-Handle nonpositive capacity/rate and cost greater than capacity explicitly. Floating-point arithmetic can be acceptable for an educational bucket with bounded values; fixed-point arithmetic is an alternative when exact quotas and reproducibility require it.
+One method. Callers don't care which algorithm is behind it (Strategy).
 
-## 5. Detailed decisions, algorithms and failure behaviour
+### TokenBucket
 
-### Key abstractions
+Stores `tokens` and `lastNanos`. `tryTake(now)` adds tokens for the time passed (never above capacity), then takes one if available. It is `synchronized` so refill and take happen together.
 
-| Type | Responsibility |
-|---|---|
-| `RateLimiter` | Facade: `allow(key)`; looks up the key's limiter |
-| `RateLimitAlgorithm` (Strategy) | `allow()` on one key's state |
-| `TokenBucket`, `SlidingWindowLog`, `SlidingWindowCounter`, `FixedWindow` | Implementations |
-| `RateLimitConfig` | capacity, refill rate or window, per tier |
-| `LimiterRegistry` | `ConcurrentHashMap<String, RateLimitAlgorithm>` plus idle eviction |
-| `Clock` | Injected time source, so tests are deterministic |
+### TokenBucketLimiter
 
+A `ConcurrentHashMap<String, TokenBucket>`. `computeIfAbsent` creates a bucket the first time a key is seen – safely, even if two threads ask at once.
 
-### Design decisions & trade-offs
+[![Class diagram: TokenBucketLimiter and SlidingWindowLimiter implement RateLimiter; TokenBucketLimiter has a map of TokenBuckets and a clock; each TokenBucket has capacity, refill rate, tokens and last refill time.](learning-figures/lld-14-classes.svg)](learning-figures/lld-14-classes.svg)
 
-| Algorithm | Pros | Cons |
-|---|---|---|
-| Fixed window | Tiny state, simple | Up to 2× burst at window edges |
-| Sliding log | Exact | O(N) memory per key |
-| Sliding counter | ~Exact, O(1) memory (weighted previous window) | Approximation |
-| Token bucket | Allows controlled bursts, smooth refill | Two params to tune |
-| Leaky bucket | Smooths output rate | Queues add latency |
+## Step 4: Write the code
 
-**1. Lazy refill.** Never use a background thread to add tokens. Compute the refill from elapsed time on each call. That's O(1) and scales to millions of keys.
+### RateLimiter
 
-**2. Thread safety.** `synchronized` per bucket means contention only on the same key, which is usually fine. For a lock-free version, pack state into an `AtomicLong` or use `AtomicReference<State>` with a CAS loop. `computeIfAbsent` on the registry avoids creating duplicate buckets.
-
-**3. Memory.** Evict keys idle longer than the window (a Caffeine cache with `expireAfterAccess`, or a periodic sweep).
-
-**4. Testability.** Inject a `Clock`. Never call `System.currentTimeMillis()` inside the algorithm.
-
-**5. Distributed version (preview of HLD #2).** State moves to Redis, and the logic runs atomically as a Lua script.
-
-### Ownership, boundaries and invariants
-
-**Central design question:** Time measurement and atomic token accounting define a limiter more than the chosen class pattern.
-
-RateLimitKey identifies principal, route and policy version. RatePolicy contains capacity and refill rate. TokenBucket owns tokens and last refill time. Clock is monotonic for elapsed time. LimiterRegistry supplies bounded per-key state; Decision includes allowed, remaining and retry delay.
-
-**Correctness rule:** At a fixed instant, accepted requests never spend more tokens than available. Refilling cannot exceed capacity, and elapsed-time calculations cannot create tokens from a backward wall clock jump.
-
-```text
-key(principal,route,policy_version); bucket(tokens,last_refill_nanos); policy(capacity,rate_per_second)
-```
-
-### End-to-end execution trace
-
-Resolve policy; locate the bucket; acquire its synchronization boundary; calculate elapsed monotonic time; refill with a cap; consume if enough; return a retry delay based on the deficit; release the lock before request processing.
-
-### Concurrency and recovery walkthrough
-
-One hundred threads request the final token simultaneously. Refill and consume must be one critical section; a thread-safe map does not make a read-modify-write bucket sequence atomic.
-
-### Policy choices and extension seams
-
-Token bucket permits bounded bursts; leaky bucket smooths output; fixed windows permit boundary bursts; sliding logs offer exact windows at higher memory cost. Single-JVM correctness does not imply global quotas across replicas.
-
-### Edge cases that change the design
-
-Idle-key eviction can reset quota if implemented carelessly. Fractional refill needs numeric care and overflow-safe elapsed handling. Costs must be positive; reject configuration with zero refill when retry calculation divides by rate.
-
-**Topic-specific cases:** Initial burst cap; concurrent last-token race; fractional refill; clock behavior; bounded key eviction; exact retry-after calculation.
-
-### Further reading
-
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
-
-### Work through deployment boundaries
-
-Three servers each allowing five immediate requests can collectively allow fifteen. For a global five-request burst, use a shared atomic decision store, route each key to one owner, or explicitly allocate sub-budgets. The latter can underuse quota and needs reassignment rules.
-
-Use monotonic elapsed time for a local bucket; wall-clock corrections must not mint tokens. Evicting idle callers is safe only when the recreated state matches the policy. Deleting an exhausted bucket and recreating it full immediately grants another burst.
-
-## 6. Interviewer follow-ups
-
-**Does a thread-safe map make the whole bucket algorithm atomic?** No. Coordinate state calculation and consumption for each key.
-
-**Does a denied request consume a token?** Define it; a common admission policy consumes only allowed work.
-
-## 7. Closing answer
-
-I choose a per-key token bucket with atomic refill-and-consume, monotonic time and explicit retry delay. The local implementation serializes one bucket without blocking unrelated keys. A global quota needs one shared decision authority or consciously allocated local sub-budgets.
-
-=== LLD 15 ===
-N|n0|TransferService|0|0|200|rect
-N|n1|Wallet|250|0|200|rect
-N|n2|Transfer|500|0|200|rect
-N|n3|LedgerEntry|0|110|200|rect
-N|n4|BalanceProjection|250|110|200|rect
-N|n5|PaymentPort|500|110|200|rect
-N|n6|Reconciler|0|220|200|rect
-E|n0|n1|locks in order
-E|n0|n2|records once
-E|n2|n3|posts balanced
-E|n3|n4|projects
-E|n0|n5|external boundary
-E|n6|n2|resolves pending
----
-## Problem
-
-Design a digital wallet like Paytm or PhonePe: users top up from a bank or card, pay merchants, transfer to other users, and see a history. Money moves must be **atomic**, **idempotent** and **auditable**. This combines a transaction **State machine**, **Strategy** for payment instruments, and careful concurrency.
-
-## Requirements
-
-**Functional**
-- Create a wallet, top up via a gateway, pay a merchant, P2P transfer, withdraw to a bank, view the statement.
-- Limits (per-transaction, daily, KYC tier). Refunds and reversals.
-
-**Non-functional**
-- Never lose or create money. Balances must match the ledger exactly.
-- Client retries must not double-charge. Concurrent transfers must not overdraw.
-
-## 1. Scope and chosen solution
-
-I transfer INR minor units between internal wallets with no overdraft. Wallet identity and transfer identity are separate; the ledger explains balances. External top-up/cash-out uses a separate provider workflow, not the internal atomic transfer transaction.
-
-## 2. Internal transfer transaction
-
-```text
-transfer(id,from,to,amount,currency):
-  validate positive amount, same currency, distinct wallets and actor permission
-  return existing result for matching id/payload, reject conflicting reuse
-  lock wallets in stable ID order
-  verify spendable balance; insert transfer and debit/credit entries
-  update protected balance projection and commit
-```
-
-For ₹500 in A and a ₹200 transfer, entries are A −20,000 paise and B +20,000. The sum is zero and A becomes ₹300. Two ₹400 debits against ₹500 cannot both pass the locked funds check. Fee collection adds balanced entries to an explicit fee account. Reversal is another uniquely identified transfer linked to the original. A provider timeout remains pending under its original reference; reconciliation confirms whether collection happened before another attempt or refund is authorized.
-
-## 3. Final design diagram
-
-[![Design Wallet / Payment System: TransferService locks in order Wallet; TransferService records once Transfer; Transfer posts balanced LedgerEntry; LedgerEntry projects BalanceProjection; TransferService external boundary PaymentPort; Reconciler resolves pending Transfer](designs/lld-15.svg)](designs/lld-15.svg)
-
-I begin with one currency and one database transaction. A wallet identifies an account; a transfer identifies the business operation; balanced ledger entries explain its effect. External card or bank payments add a separate uncertain network boundary.
-
-## 4. Critical operation: worked execution
-
-![Both sides commit together under one transfer identity.](lessons/lld-15-flow.svg)
-
-*Both sides commit together under one transfer identity.*
-
-![Retry returns the original transfer instead of debiting again.](lessons/lld-15-failure.svg)
-
-*Retry returns the original transfer instead of debiting again.*
-
-### Worked calculation and implementation
-
-If A has 50,000 paise and transfers 20,000 to B, A ends with 30,000 and B increases by 20,000. The signed entry sum for the internal transfer is zero. Fees require explicit entries to a fee account; otherwise conservation appears to break.
-
-```text
-Transfer(id, fromWallet, toWallet, currency, amountMinor, payloadHash)
-LedgerEntry(transferId, walletId, signedAmountMinor)
-T4/A: -20000 INR paise
-T4/B: +20000 INR paise
-```
-
-## 5. Detailed decisions, algorithms and failure behaviour
-
-### Key abstractions
-
-| Type | Responsibility |
-|---|---|
-| `Wallet` | id, user, `balance` (derived or cached), status, version |
-| `LedgerEntry` | Immutable: txnId, walletId, `DEBIT/CREDIT`, amount, balanceAfter |
-| `Transfer` | id, type, amount, from, to, `TransferState`, idempotencyKey |
-| `TransferState` | `POSTED → REVERSED`; external funding intents separately track pending/unknown results |
-| `PaymentInstrument` (Strategy) | `Card`, `UPI`, `NetBanking` for top-ups |
-| `IdempotencyStore` | key → result (first result wins) |
-| `LimitPolicy` | Chain of checks: KYC tier, daily cap, velocity |
-
-### Design decisions & trade-offs
-
-**1. Double-entry ledger as the source of truth.** Each transfer writes two entries (debit A, credit B) that sum to zero, in one transaction. A balance is the sum of entries. Cache it on the wallet row for speed, but you can always rebuild and reconcile it.
-
-**2. Atomic transfer without deadlocks.**
 ```java
-void transfer(Wallet a, Wallet b, Money amt) {
-    Wallet first = a.id().compareTo(b.id()) < 0 ? a : b, second = first == a ? b : a;
-    synchronized (first) { synchronized (second) {
-        if (a.balance().lt(amt)) throw new InsufficientFunds();
-        a.debit(amt); b.credit(amt); ledger.append(/* two entries */);
-    }}
+/** Decides whether one request for a key may go ahead now. */
+interface RateLimiter {
+    boolean allow(String key);
 }
 ```
-Lock in a global order (by ID) to avoid A→B / B→A deadlock. In a DB: `SELECT … FOR UPDATE` in ID order, or a conditional `UPDATE wallet SET balance = balance - :x WHERE id=:a AND balance >= :x`.
 
-**3. Idempotency.** The client sends `Idempotency-Key`. The first request stores `key → PROCESSING`, then the result. Retries return the stored result. The key's insert must be atomic (unique constraint).
+### TokenBucket
 
-**4. External top-ups are a State machine.** Gateway calls are slow and may time out with an unknown outcome. Mark the transaction `PROCESSING`, credit the wallet only on a confirmed webhook or status poll, and reconcile pending ones on a schedule.
+```java
+/** Holds up to `capacity` tokens and refills at `perSecond`. One request = one token. */
+class TokenBucket {
+    private final double capacity, perNano;
+    private double tokens;
+    private long lastNanos;
 
-**5. Reversal, never deletion.** A refund is a new transaction with opposite entries. The ledger is append-only for audit.
+    TokenBucket(int capacity, double perSecond, long nowNanos) {
+        this.capacity = capacity;
+        this.perNano = perSecond / 1_000_000_000.0;
+        this.tokens = capacity;                         // start full
+        this.lastNanos = nowNanos;
+    }
 
-### Ownership, boundaries and invariants
-
-**Central design question:** An append-only balanced ledger is the authority; a wallet balance is a projection of that ledger.
-
-Wallet holds owner and currency. Transfer identifies source, destination, amount and idempotency key. LedgerTransaction owns balanced Debit/Credit entries. PaymentGateway handles external funding; ReconciliationService resolves uncertain external outcomes. Money stores currency plus integral minor units.
-
-**Correctness rule:** Each posted transfer balances to zero per currency, and a wallet cannot go negative unless overdraft is explicitly permitted. A repeated operation key with the same payload returns the same transfer; a different payload is rejected.
-
-```text
-wallet(id,currency,balance_minor,version); transfer(id,request_key,payload_hash,status); entry(transfer_id,wallet_id,delta_minor)
+    /** Refill and take in one step, so two threads can't spend the same token. */
+    synchronized boolean tryTake(long nowNanos) {
+        tokens = Math.min(capacity, tokens + (nowNanos - lastNanos) * perNano);
+        lastNanos = nowNanos;
+        if (tokens < 1) return false;
+        tokens -= 1;
+        return true;
+    }
+}
 ```
 
-### End-to-end execution trace
+### TokenBucketLimiter
 
-Authenticate and authorize; validate positive amount and currency; lock wallet rows in stable ID order; check balance; insert transfer and balanced entries atomically; update cached balances; commit; publish events using an outbox. External funding follows a separate pending/settled protocol.
+```java
+class TokenBucketLimiter implements RateLimiter {
+    private final int capacity;
+    private final double perSecond;
+    private final LongSupplier clock;                   // System::nanoTime in production
+    private final ConcurrentHashMap<String, TokenBucket> buckets = new ConcurrentHashMap<>();
 
-### Concurrency and recovery walkthrough
+    TokenBucketLimiter(int capacity, double perSecond, LongSupplier clock) {
+        this.capacity = capacity; this.perSecond = perSecond; this.clock = clock;
+    }
 
-Concurrent debits both observe enough funds. A database conditional debit or row lock serializes the balance check with the debit. An in-memory synchronized method cannot protect other service instances.
+    public boolean allow(String key) {
+        long now = clock.getAsLong();
+        TokenBucket b = buckets.computeIfAbsent(key,
+                k -> new TokenBucket(capacity, perSecond, now));
+        return b.tryTake(now);
+    }
+}
+```
 
-### Policy choices and extension seams
+### Worked example
 
-Storing just a mutable balance is quick but loses auditability. Ledger entries enable reconstruction and reconciliation. Avoid distributed transactions with a card provider; use operation identities and compensation.
+Capacity 5, refill 2 tokens per second, fake clock.
 
-### Edge cases that change the design
+| Time | Requests | Tokens before → after | Result |
+| --- | --- | --- | --- |
+| 0 s | Asha × 7 | 5 → 0 | 5 allowed, 2 refused |
+| 0 s | Bilal × 1 | his own bucket: 5 → 4 | allowed |
+| 1.25 s | Asha × 3 | 0 + 2.5 = 2.5 → 0.5 | 2 allowed, 1 refused |
+| 60 s | Asha × 10 | refill capped at 5 → 0 | 5 allowed, 5 refused |
+| 0 s | 100 threads, new key, no refill | 5 → 0 | exactly 5 allowed |
 
-Timeout after bank acceptance means UNKNOWN. Reversal is a new balanced transaction, never deletion of the original. Currency conversion needs an explicit rate snapshot and balancing entries in each currency domain.
+[![Five-token capacity empties after five requests; at two tokens per second, 1.25 seconds refills 2.5 tokens.](lessons/lld-14-bucket.svg)](lessons/lld-14-bucket.svg)
 
-**Topic-specific cases:** Concurrent overdraft prevention; payload mismatch; self-transfer policy; arithmetic overflow; balanced reversal; provider timeout; ledger-to-balance reconciliation.
+### Edge cases
 
-### Further reading
+| Case | Behaviour |
+| --- | --- |
+| Long idle time | Tokens capped at capacity – no giant burst |
+| Fractional tokens | Kept as `double`; a request needs a whole token |
+| First request for a key | Bucket starts full |
+| Clock goes backwards | `System.nanoTime` is monotonic; never use wall-clock time |
 
-- [Java 21 concurrency contracts](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html) — synchronization and executor semantics.
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — database guarantees differ from process locks.
+## Step 5: The tricky part: a race on the last token
 
-### Work through contention and corrections
+Two threads call `allow("asha")` when she has exactly 1 token left.
 
-Two transfers of ₹400 each compete against ₹500. Checking the balance before entering the transaction permits both. Serialize the spendable-funds decision or use a conditional debit; one must lose. Locking A then B in one transfer and B then A in another can deadlock, so establish a consistent order and a retry policy for transaction conflicts.
+1. Thread A reads `tokens = 1`.
+2. Thread B reads `tokens = 1`.
+3. Both decide "allowed" and both write `tokens = 0`.
 
-A correction is a reversing transaction linked to the original, never deletion of posted ledger history. For an external provider timeout, record `PENDING` or `UNKNOWN` and reconcile by provider reference. A database rollback cannot reverse a successful card charge.
+Two requests passed on one token. The fix: refill, check and take inside **one** synchronized method on that key's bucket. Different keys use different buckets, so Asha's requests never wait on Bilal's lock.
 
-## 6. Interviewer follow-ups
+![Animation: two threads ask for Asha's last token at the same time; without a lock both read one token and both are allowed; with the synchronized tryTake, the first thread refills, takes the token and leaves zero, and the second thread sees zero and is refused.](learning-figures/lld-14-race.gif)
 
-**Can different currencies share one arithmetic balance?** No. Model conversion with explicit amounts, currency pair, rate and rounding.
+> **⚠️ Common mistake**
+> Making `allow` itself `synchronized` on the limiter. It's correct but every user in the system now waits on one lock. Lock per key (per bucket) instead.
 
-**Can the same transfer ID carry another amount?** Reject it as conflicting intent, even if the original operation succeeded.
+> **🎯 In the interview**
+> Mention injecting the clock. With a `LongSupplier`, tests move time forward instantly – no `Thread.sleep`, no flaky tests.
 
-## 7. Closing answer
+## Step 6: Deep dives
 
-I use immutable balanced ledger entries, stable transfer identities and one transactional spendable-funds decision. Corrections reverse rather than erase entries. External provider uncertainty has a pending reconciliation state because a database rollback cannot undo a captured payment.
+### Sliding window log: an alternative
+
+```java
+/** Alternative: at most `limit` requests in any rolling window. Stores timestamps. */
+class SlidingWindowLimiter implements RateLimiter {
+    private final int limit;
+    private final long windowNanos;
+    private final LongSupplier clock;
+    private final ConcurrentHashMap<String, Deque<Long>> log = new ConcurrentHashMap<>();
+
+    SlidingWindowLimiter(int limit, long windowMillis, LongSupplier clock) {
+        this.limit = limit; this.windowNanos = windowMillis * 1_000_000; this.clock = clock;
+    }
+
+    public boolean allow(String key) {
+        long now = clock.getAsLong();
+        Deque<Long> times = log.computeIfAbsent(key, k -> new ArrayDeque<>());
+        synchronized (times) {
+            while (!times.isEmpty() && now - times.peekFirst() >= windowNanos) {
+                times.pollFirst();                      // drop requests outside the window
+            }
+            if (times.size() >= limit) return false;
+            times.addLast(now);
+            return true;
+        }
+    }
+}
+```
+
+Exact "at most N in any rolling second", but it stores one timestamp per request – fine for small limits, heavy for large ones. Fixed windows are cheaper but allow 2× bursts at window edges.
+
+### Different limits per key
+
+Pass a `Function<String, Limit>` (e.g. free plan 5/2s, paid plan 50/20s) and create each bucket with its own limit.
+
+### Cleaning up idle keys
+
+A million keys means a million buckets. Use a cache with expiry (Caffeine's `expireAfterAccess`) instead of a plain map, so idle buckets disappear.
+
+### Many servers
+
+Per-JVM limits multiply by the number of servers. For a global limit, keep buckets in Redis and update them atomically with a Lua script (see HLD-2).
+
+## Interviewer follow-ups
+
+**Token bucket vs leaky bucket?** Token bucket allows bursts up to capacity; leaky bucket smooths output to a constant rate, queuing or dropping the excess.
+
+**Why `double` tokens?** Refill happens continuously; 1.25 s × 2/s = 2.5 tokens. Rounding down each time would slowly lose tokens.
+
+**Could you use `AtomicLong` instead of `synchronized`?** Yes – store tokens and time in one value and update with compare-and-set in a loop. It's lock-free but harder to read; `synchronized` per key is usually fast enough.
+
+**How do you tell the client when to retry?** Compute the time until one token is available and return it in a `Retry-After` header.
+
+## Wrap up
+
+A `RateLimiter` interface with a token bucket per key: refill for elapsed time, take one token, all in one synchronized step per key, with an injectable clock for testing.
+
+> **📝 Key takeaways**
+> - Token bucket: burst up to capacity, steady refill rate.
+> - Refill-check-take must be atomic – per key, not one global lock.
+> - `ConcurrentHashMap.computeIfAbsent` creates buckets safely.
+> - Inject the clock; swap algorithms behind one interface.
+
+## Going deeper (optional)
+
+The complete, runnable code is [RateLimiterDemo.java](reference-code/learning/kb/ratelimiterlld/RateLimiterDemo.java). It replays the worked example, including the 100-thread race, and checks every result.
+
+[![Refill and consumption form one atomic operation.](lessons/lld-14-flow.svg)](lessons/lld-14-flow.svg)
+
+## Closing answer
+
+"I define a RateLimiter interface with `allow(key)`. The default implementation is a token bucket per key, held in a ConcurrentHashMap and created with computeIfAbsent. Each bucket stores fractional tokens and the last refill time; `tryTake` adds tokens for the elapsed time, capped at capacity, then takes one if at least one is available – all inside one synchronized method, so two threads can never spend the same token, while different keys never block each other. Time comes from an injected nanosecond clock, so tests are instant. A sliding-window log is an alternative behind the same interface, and across servers the bucket moves to Redis with an atomic script."
+
+=== LLD 15 ===
+N|app|Asha's app|0|0|130|rect
+N|svc|WalletService|180|0|160|rect
+N|keys|Idempotency keys|400|0|170|cylinder
+N|locks|Lock wallets in ID order|400|130|210|rect
+N|w|Debit + credit|180|130|150|rect
+N|ledger|Ledger (append-only)|0|130|180|cylinder
+E|app|svc|transfer + key
+E|svc|keys|seen before?
+E|svc|locks|new request
+E|locks|w|both wallets
+E|w|ledger|one transaction
+---
+## Problem
+
+Design the core of a digital wallet like Paytm or PhonePe. Asha tops up ₹2,000 from her bank by UPI, then sends ₹500 to Bilal. Her app's network is flaky, so it sends the transfer request twice.
+
+The wallet must move money exactly once, never let a balance go negative, respect each wallet's limit, and stay correct when thousands of transfers run at the same time – including Asha paying Bilal while Bilal pays Asha.
+
+## Requirements
+
+- Open wallets with a maximum balance (for example ₹10,000).
+- Top up from a bank; transfer between wallets; pay merchants.
+- A transfer changes both wallets or neither.
+- A retried request (same idempotency key) moves money only once.
+- Every movement is recorded in an append-only ledger; concurrent transfers never deadlock.
+
+## Step 1: Clarify the requirements
+
+**Candidate:** Which operations do we need?
+
+**Interviewer:** Top-up, wallet-to-wallet transfer, and merchant payment.
+
+**Candidate:** Are there balance limits?
+
+**Interviewer:** Yes. A basic wallet can hold at most ₹10,000.
+
+**Candidate:** How should retries from the app be handled?
+
+**Interviewer:** The app sends an idempotency key. A retry must not move money again.
+
+**Candidate:** Do we need history?
+
+**Interviewer:** Yes, every transaction, never edited.
+
+**Candidate:** Is this one server or many?
+
+**Interviewer:** Design the classes for one service; tell me what changes with a database.
+
+> **🎯 In the interview**
+> Say the three money rules out loud: never negative, all-or-nothing, exactly once. Interviewers check every design choice against them.
+
+| Functional | Non-functional |
+| --- | --- |
+| Top-up, transfer, pay | Exactly once per idempotency key |
+| Wallet limits | Atomic: both wallets or neither |
+| Ledger | No deadlocks; money is conserved |
+
+## Step 2: Identify the core objects
+
+- **Wallet** – an owner, a balance and a maximum balance; can credit and debit.
+- **Transaction** – one recorded movement: type, from, to, amount, idempotency key, time.
+- **TxType** – top-up, payment, transfer.
+- **WalletService** – runs operations, enforces idempotency and records the ledger.
+- **WalletException** – a business rule was broken (insufficient balance, limit exceeded).
+
+[![Selected design: the app sends a transfer with an idempotency key; the wallet service returns the earlier result for a repeated key, otherwise locks both wallets in a fixed order, debits and credits them together and appends one transaction to the ledger.](designs/lld-15.svg)](designs/lld-15.svg)
+
+> **⚖️ Design choice**
+> Store money as `long` **paise** and record every movement as an immutable `Transaction`. Balances are the result of the ledger; nothing in the ledger is ever updated.
+
+## Step 3: Design the classes
+
+### Wallet
+
+Holds the balance. `debit` refuses to go negative; `credit` refuses to exceed the limit. It doesn't lock itself – the service decides the locking, because a transfer needs two wallets at once.
+
+### Transaction and TxType
+
+An immutable record. The `idempotencyKey` links it to the request that created it.
+
+### WalletService
+
+`topUp` and `transfer`. Both run inside `once(key, …)`, which returns the earlier result for a repeated key.
+
+[![Class diagram: WalletService has Wallets and an append-only list of Transactions; a Transaction has a TxType, a from wallet, a to wallet, an amount and an idempotency key; Wallet has an owner, a balance and a maximum balance.](learning-figures/lld-15-classes.svg)](learning-figures/lld-15-classes.svg)
+
+## Step 4: Write the code
+
+### Wallet
+
+```java
+class Wallet {
+    private final String id, owner;
+    private final long maxBalancePaise;
+    private long balancePaise;
+
+    Wallet(String id, String owner, long maxBalancePaise) {
+        this.id = id; this.owner = owner; this.maxBalancePaise = maxBalancePaise;
+    }
+    String getId()        { return id; }
+    String getOwner()     { return owner; }
+    long getBalance()     { return balancePaise; }
+
+    void credit(long amount) {
+        if (balancePaise + amount > maxBalancePaise)
+            throw new WalletException("Wallet limit exceeded for " + owner);
+        balancePaise += amount;
+    }
+    void debit(long amount) {
+        if (balancePaise < amount) throw new WalletException("Insufficient balance");
+        balancePaise -= amount;
+    }
+}
+
+class WalletException extends RuntimeException {
+    WalletException(String msg) { super(msg); }
+}
+```
+
+### Transaction
+
+```java
+enum TxType { TOP_UP, PAYMENT, TRANSFER }
+
+/** One money movement, recorded once and never edited. */
+record Transaction(String id, String idempotencyKey, TxType type,
+                   String fromWallet, String toWallet, long amountPaise, Instant at) {}
+```
+
+### WalletService
+
+```java
+class WalletService {
+    private final Map<String, Wallet> wallets = new ConcurrentHashMap<>();
+    private final Map<String, Transaction> byKey = new ConcurrentHashMap<>();
+    private final List<Transaction> ledger = Collections.synchronizedList(new ArrayList<>());
+    private final Map<String, Object> keyLocks = new ConcurrentHashMap<>();
+    private final AtomicLong nextTx = new AtomicLong(1);
+
+    Wallet open(String id, String owner, long maxBalancePaise) {
+        Wallet w = new Wallet(id, owner, maxBalancePaise);
+        wallets.put(id, w);
+        return w;
+    }
+
+    Transaction topUp(String key, String walletId, long amount) {
+        return once(key, () -> {
+            Wallet w = wallet(walletId);
+            synchronized (w) { w.credit(amount); }
+            return record(key, TxType.TOP_UP, "BANK", walletId, amount);
+        });
+    }
+
+    /** Move money between two wallets: both change, or neither does. */
+    Transaction transfer(String key, String fromId, String toId, long amount) {
+        if (amount <= 0) throw new WalletException("Amount must be positive");
+        if (fromId.equals(toId)) throw new WalletException("Same wallet");
+        return once(key, () -> {
+            Wallet from = wallet(fromId), to = wallet(toId);
+            Wallet first = fromId.compareTo(toId) < 0 ? from : to;   // fixed lock order
+            Wallet second = first == from ? to : from;
+            synchronized (first) {
+                synchronized (second) {
+                    from.debit(amount);                 // throws before anything changes
+                    try { to.credit(amount); }
+                    catch (WalletException e) { from.credit(amount); throw e; }   // undo
+                }
+            }
+            return record(key, TxType.TRANSFER, fromId, toId, amount);
+        });
+    }
+
+    /** The same idempotency key always returns the first result. */
+    private Transaction once(String key, Callable<Transaction> work) {
+        synchronized (keyLocks.computeIfAbsent(key, k -> new Object())) {   // per key only
+            Transaction done = byKey.get(key);
+            if (done != null) return done;
+            try { return work.call(); }
+            catch (WalletException e) { throw e; }
+            catch (Exception e) { throw new IllegalStateException(e); }
+        }
+    }
+
+    private Transaction record(String key, TxType type, String from, String to, long amt) {
+        Transaction t = new Transaction("TX-" + nextTx.getAndIncrement(), key, type,
+                from, to, amt, Instant.now());
+        ledger.add(t);
+        byKey.put(key, t);
+        return t;
+    }
+
+    Wallet wallet(String id) {
+        Wallet w = wallets.get(id);
+        if (w == null) throw new WalletException("No wallet " + id);
+        return w;
+    }
+    List<Transaction> ledger() { return List.copyOf(ledger); }
+}
+```
+
+### Worked example
+
+Amounts in paise: ₹500 = 50,000.
+
+| Step | What happens | Asha | Bilal |
+| --- | --- | --- | --- |
+| Top-up ₹2,000 (key `upi-ref-771`) | Credit | ₹2,000 | ₹0 |
+| Transfer ₹500 (key `asha-pay-1`) | Debit + credit | ₹1,500 | ₹500 |
+| Same request again (network retry) | Key seen → same transaction returned | ₹1,500 | ₹500 |
+| Transfer ₹9,000 | Insufficient balance – nothing changes | ₹1,500 | ₹500 |
+| Bilal tops up ₹9,400 | Credit | ₹1,500 | ₹9,900 |
+| Asha sends ₹200 | Bilal would exceed ₹10,000 → debit undone | ₹1,500 | ₹9,900 |
+| 100 transfers each way at once | No deadlock | Total unchanged | |
+
+### Edge cases
+
+| Case | Behaviour |
+| --- | --- |
+| Amount ≤ 0 | Rejected |
+| Same wallet on both sides | Rejected |
+| Unknown wallet | Rejected before any change |
+| Credit fails after debit | Debit is reversed inside the same locks |
+
+## Step 5: The transfer algorithm: locks without deadlock
+
+Asha → Bilal and Bilal → Asha start at the same moment.
+
+1. Thread 1 locks Asha's wallet, then waits for Bilal's.
+2. Thread 2 locks Bilal's wallet, then waits for Asha's.
+3. Each waits for the other forever – a **deadlock**.
+
+The fix is a **fixed lock order**: always lock the wallet with the smaller ID first. Both threads now try `W-ASHA` first; one waits for the other to finish, and nobody waits in a circle.
+
+![Animation: Asha-to-Bilal and Bilal-to-Asha transfers start together; in the naive version each locks its own sender first and they wait on each other forever; with a fixed lock order both lock W-ASHA first, so one transfer finishes and then the other runs.](learning-figures/lld-15-deadlock.gif)
+
+Inside the locks, debit first (it may fail with no change made), then credit; if the credit fails, reverse the debit before releasing the locks. Nobody can see the in-between state.
+
+> **⚠️ Common mistake**
+> Checking the balance, then debiting in a separate step without a lock. Two ₹1,500 payments from a ₹1,500 balance can both pass the check. Check and change must happen together.
+
+> **🎯 In the interview**
+> With a database, the same ideas become: one transaction that updates both rows with `balance >= amount` conditions (or `SELECT … FOR UPDATE` in ID order), and a unique constraint on the idempotency key.
+
+## Step 6: Deep dives
+
+### Double-entry ledger
+
+Real wallets record each transfer as two entries – a debit on Asha's account and a credit on Bilal's – that must sum to zero. Balances can be rebuilt from entries for audits (see the Payments lesson, HLD-14).
+
+### Merchant payments and refunds
+
+A payment is a transfer to a merchant wallet with its own type. A refund is a **new** transaction in the other direction – never an edit of the original.
+
+### Top-up from a bank
+
+The bank or UPI call can time out after the money left Asha's bank. Mark the top-up PENDING, confirm with the bank's status, and only then credit the wallet.
+
+### Limits and KYC
+
+Limits come from the wallet's KYC level (basic vs full KYC) and may include monthly caps. Put them in a `LimitPolicy` checked before credit.
+
+## Interviewer follow-ups
+
+**Why not `synchronized` on every method of the service?** It's correct but turns the whole wallet system into one queue. Locking just the two wallets involved lets unrelated transfers run in parallel.
+
+**Why is the idempotency check per key?** So two different requests run in parallel while retries of the same request wait for, and then reuse, the first result.
+
+**How long do you keep idempotency keys?** Long enough to cover client retries – typically 24 hours – stored with a unique constraint in the database.
+
+**How do you keep balances and ledger consistent in a database?** Update the balances and insert the ledger rows in one database transaction.
+
+## Wrap up
+
+Wallets hold balances in paise; transfers lock both wallets in a fixed order, debit and credit together, and record one immutable transaction; idempotency keys make retries harmless.
+
+> **📝 Key takeaways**
+> - Never negative, all-or-nothing, exactly once.
+> - Lock two wallets in a fixed order to avoid deadlock.
+> - Debit first, credit second, undo inside the same lock if needed.
+> - Idempotency key → same result; ledger entries are never edited.
+
+## Going deeper (optional)
+
+The complete, runnable code is [WalletDemo.java](reference-code/learning/kb/wallet/WalletDemo.java). It replays the worked example, including 200 concurrent opposite transfers, and checks that money is conserved.
+
+The production version commits both sides together under one transfer identity, and a retry returns the original transfer instead of debiting again.
+
+[![Both sides commit together under one transfer identity.](lessons/lld-15-flow.svg)](lessons/lld-15-flow.svg)
+
+## Closing answer
+
+"A Wallet holds a balance in paise and a maximum; debit refuses to go negative and credit refuses to exceed the limit. The WalletService runs top-ups and transfers. Every request carries an idempotency key: a per-key lock and a map of completed keys mean a retry returns the original transaction instead of moving money again. A transfer locks both wallets in a fixed order – smallest ID first – so opposite transfers can't deadlock, debits first, credits second, and reverses the debit if the credit fails, all before releasing the locks. Each movement is appended to an immutable ledger. In a database this becomes one transaction with conditional updates and a unique idempotency key."
 
 === LLD 16 ===
 N|ui|Console / UI / Bot|0|0|180|rect
