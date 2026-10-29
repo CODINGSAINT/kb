@@ -348,31 +348,86 @@ cd kb && npm install && npm start</code></pre>
     navigator.clipboard?.writeText(b.dataset.copy).then(() => { b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1200); });
   });
 
-  // The "Discuss with the AI tutor" card, inserted after `anchor`. Used by topic, DSA and fundamentals pages.
+  // The KB buddy: a small mascot docked bottom-right that opens the tutor chat (text + voice).
+  // One per page; topic, DSA and fundamentals pages create it, the router removes it on navigation.
+  const MASCOT = (cls) => `<svg class="kb-face ${cls}" viewBox="0 0 64 64" aria-hidden="true">
+      <defs><linearGradient id="kbg-${cls}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4b67e0"/><stop offset="1" stop-color="#1c39bb"/></linearGradient></defs>
+      <ellipse class="kb-shadow" cx="32" cy="61" rx="15" ry="2.6"/>
+      <g class="kb-body">
+        <rect x="8" y="15" width="48" height="43" rx="20" fill="url(#kbg-${cls})"/>
+        <path class="kb-book" d="M32 18C26.5 12.5 19 12 13.5 14v6.5c5.5-2 12.5-1.4 18.5 3.5 6-4.9 13-5.5 18.5-3.5V14C45 12 37.5 12.5 32 18Z"/>
+        <path class="kb-spine" d="M32 18v6"/>
+        <rect x="14.5" y="26" width="35" height="25" rx="12.5" fill="#fff"/>
+        <g class="kb-eyes"><circle cx="25" cy="37" r="3.6"/><circle cx="39" cy="37" r="3.6"/>
+          <circle class="kb-glint" cx="26.3" cy="35.7" r="1.2"/><circle class="kb-glint" cx="40.3" cy="35.7" r="1.2"/></g>
+        <ellipse class="kb-cheek" cx="19.5" cy="43" rx="2.8" ry="1.8"/><ellipse class="kb-cheek" cx="44.5" cy="43" rx="2.8" ry="1.8"/>
+        <path class="kb-smile" d="M28.5 43.5q3.5 3.4 7 0"/>
+        <ellipse class="kb-mouth" cx="32" cy="45" rx="3" ry="2.2"/>
+      </g>
+      <g class="kb-waves"><path d="M4 30q-2.5 5 0 10"/><path d="M60 30q2.5 5 0 10"/></g>
+    </svg>`;
+  const ss = { get(k) { try { return sessionStorage.getItem(k); } catch { return null; } }, set(k, v) { try { sessionStorage.setItem(k, v); } catch {} } };
+
   function tutorCard(anchor, item, ctx) {
     if (DEMO) return; // no AI in the read-only demo
+    document.getElementById("kbBuddy")?.remove();
     const clarifyCmd = `kb clarify ${ctx.cli} "your question"`;
-    anchor.insertAdjacentHTML("afterend", `
-      <section class="card tutor" id="tutorCard">
-        <h2>${esc(ctx.tutorTitle || "Discuss with the AI tutor")} <span class="spacer"></span>
-          <span class="muted small" id="tutorModel"></span>
-          <span class="voice-tools">
-            <button type="button" class="vbtn" id="vRead" aria-pressed="false" title="Read the tutor's replies aloud">${KBVoice.ICON.speaker}<span>Read aloud</span></button>
-            <button type="button" class="vbtn" id="vTalk" aria-pressed="false" title="Hands-free: talk, hear the reply, then it listens again">${KBVoice.ICON.mic}<span>Talk mode</span></button>
-            <button type="button" class="vbtn icon" id="vGear" title="Voice settings">${KBVoice.ICON.gear}</button>
-          </span>
-          <button class="btn small" id="chatClear" title="Start a fresh conversation">Clear</button></h2>
-        <div class="chat" id="chatLog" aria-live="polite"></div>
-        <div class="chips" id="chatChips"></div>
-        <form class="chat-input" id="chatForm">
-          <textarea id="chatText" rows="2" placeholder="${esc(ctx.chatPlaceholder || "Ask about this topic or your answer…  (Enter sends · Shift+Enter for a new line)")}"></textarea>
-          <button type="button" class="mic" id="chatMic" title="Speak your question (click again to stop)" aria-label="Speak your question">${KBVoice.ICON.mic}</button>
-          <button class="btn primary" id="chatSend" type="submit">Send</button>
-        </form>
-        <div class="voice-status" id="voiceStatus" hidden></div>
-        <div class="cli-hint muted small">Same conversation from a terminal: <code>${esc(clarifyCmd)}</code> ${copyButton(clarifyCmd)}</div>
-      </section>`);
+    const title = ctx.tutorTitle || "Discuss with the AI tutor";
+    document.body.insertAdjacentHTML("beforeend", `
+      <div class="kb-buddy" id="kbBuddy" data-mood="idle">
+        <section class="kb-panel" id="tutorCard" role="dialog" aria-label="${esc(title)}" hidden>
+          <header class="kb-head">
+            ${MASCOT("kb-avatar")}
+            <div class="kb-title"><b>${esc(title)}</b><span class="muted small" id="tutorModel"></span></div>
+            <button type="button" class="kb-x" id="kbClose" aria-label="Close chat" title="Close (Esc)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+          </header>
+          <div class="kb-tools">
+            <span class="voice-tools">
+              <button type="button" class="vbtn" id="vRead" aria-pressed="false" title="Read the tutor's replies aloud">${KBVoice.ICON.speaker}<span>Read aloud</span></button>
+              <button type="button" class="vbtn" id="vTalk" aria-pressed="false" title="Hands-free: talk, hear the reply, then it listens again">${KBVoice.ICON.mic}<span>Talk mode</span></button>
+              <button type="button" class="vbtn icon" id="vGear" title="Voice settings">${KBVoice.ICON.gear}</button>
+            </span>
+            <span class="spacer"></span>
+            <button class="btn small" id="chatClear" title="Start a fresh conversation">Clear</button>
+          </div>
+          <div class="chat" id="chatLog" aria-live="polite"></div>
+          <div class="chips" id="chatChips"></div>
+          <form class="chat-input" id="chatForm">
+            <textarea id="chatText" rows="1" placeholder="${esc(ctx.chatPlaceholderShort || "Type, or tap the mic and talk…")}" title="Enter sends · Shift+Enter for a new line"></textarea>
+            <button type="button" class="mic" id="chatMic" title="Speak your question (click again to stop)" aria-label="Speak your question">${KBVoice.ICON.mic}</button>
+            <button class="kb-send" id="chatSend" type="submit" aria-label="Send" title="Send"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg></button>
+          </form>
+          <div class="voice-status" id="voiceStatus" hidden></div>
+          <details class="cli-hint muted small"><summary>Same chat from a terminal</summary><code>${esc(clarifyCmd)}</code> ${copyButton(clarifyCmd)}</details>
+        </section>
+        <div class="kb-bubble" id="kbBubble" hidden>Hi! Stuck on something? <b>Ask me</b>, by text or voice.</div>
+        <button type="button" class="kb-launch" id="kbLaunch" aria-expanded="false" aria-controls="tutorCard" aria-label="Chat with the KB tutor" title="Chat with the KB tutor">
+          ${MASCOT("kb-mascot")}<span class="kb-unread" id="kbUnread" hidden></span>
+        </button>
+      </div>`);
+    const buddy = $("#kbBuddy"), panel = $("#tutorCard"), launch = $("#kbLaunch"), bubble = $("#kbBubble");
     const chatLog = $("#chatLog"), chatText = $("#chatText"), chatSend = $("#chatSend");
+    const setMood = (m) => { buddy.dataset.mood = m; };
+    const grow = () => { chatText.style.height = "auto"; chatText.style.height = Math.min(chatText.scrollHeight, 140) + "px"; };
+    chatText.addEventListener("input", grow);
+    const isOpen = () => !panel.hidden;
+    function setOpen(open) {
+      panel.hidden = !open;
+      buddy.classList.toggle("open", open);
+      launch.setAttribute("aria-expanded", String(open));
+      ss.set("kb.buddy.open", open ? "1" : "0");
+      if (open) {
+        bubble.hidden = true; ss.set("kb.buddy.hi", "1");
+        $("#kbUnread").hidden = true;
+        requestAnimationFrame(() => { chatLog.scrollTop = chatLog.scrollHeight; if (window.innerWidth > 600) chatText.focus(); });
+      }
+    }
+    launch.addEventListener("click", () => setOpen(!isOpen()));
+    $("#kbClose").addEventListener("click", () => { setOpen(false); launch.focus(); });
+    panel.addEventListener("keydown", (e) => { if (e.key === "Escape") { setOpen(false); launch.focus(); } });
+    bubble.addEventListener("click", () => setOpen(true));
+    if (ss.get("kb.buddy.open") === "1") setOpen(true);
+    else if (!ss.get("kb.buddy.hi")) { const t = setTimeout(() => { if (!isOpen() && document.body.contains(bubble)) bubble.hidden = false; }, 1400); buddy._hiTimer = t; }
     const showModel = () => { $("#tutorModel").textContent = aiCfg && aiCfg.ready ? `${shortName(aiCfg.provider)} · ${aiCfg.model}` : "AI not set up"; };
     state.onAiChange = showModel; showModel();
     function appendMsg(role, content, raw) {
@@ -421,7 +476,7 @@ cd kb && npm install && npm start</code></pre>
       const before = chatText.value;
       try {
         const text = await V.listen({
-          onInterim: (t) => { chatText.value = (before ? before + " " : "") + t; },
+          onInterim: (t) => { chatText.value = (before ? before + " " : "") + t; grow(); },
           onCountdown: (sec) => {
             if (sec) status(`<span class="dot"></span> Sending in ${sec}s… keep talking to add more, or click the mic to send now`, "live");
             else if (V.isListening()) status(listeningMsg(), "live");
@@ -429,14 +484,14 @@ cd kb && npm install && npm start</code></pre>
           onState: (st, detail) => {
             micBtn.classList.toggle("on", st === "listening");
             micBtn.classList.toggle("busy", st === "transcribing" || st === "loading");
-            if (st === "listening") status(listeningMsg(), "live");
-            else if (st === "transcribing") status("Turning your speech into text…");
+            if (st === "listening") { status(listeningMsg(), "live"); setMood("listening"); }
+            else if (st === "transcribing") { status("Turning your speech into text…"); setMood("thinking"); }
             else if (st === "loading") status(esc(detail || "Loading Whisper…"));
-            else status("");
+            else { status(""); if (!sending && buddy.dataset.mood !== "speaking") setMood("idle"); }
           },
         });
         const full = ((before ? before + " " : "") + (text || "")).trim();
-        chatText.value = full;
+        chatText.value = full; grow();
         if (!text) { if (talkMode) status("Didn't catch that. Click the mic or say something.", "warn"); return; }
         if (talkMode || V.get().autoSend) sendChat(full, { voice: true });
         else chatText.focus();
@@ -472,13 +527,13 @@ cd kb && npm install && npm start</code></pre>
       // Spoken question -> spoken answer by default; typed questions are spoken only with Read aloud / Talk mode.
       const speak = (readAloud() || (opts.voice && V.get().replyByVoice)) && V.get().output !== "off";
       const spk = speak ? (speaker = V.createSpeaker({
-        onIdle: () => { if (speaker === spk) speaker = null; setTimeout(() => { if (talkMode && !sending && !V.isListening()) startListening(); }, 60); },
+        onIdle: () => { if (speaker === spk) speaker = null; if (!sending) setMood("idle"); setTimeout(() => { if (talkMode && !sending && !V.isListening()) startListening(); }, 60); },
         onError: (er) => status(esc(er.message), "err"),
       })) : null;
-      sending = true; chatSend.disabled = true;
+      sending = true; chatSend.disabled = true; setMood("thinking");
       chatLog.querySelector(".chat-empty")?.remove();
       appendMsg("user", text);
-      chatText.value = "";
+      chatText.value = ""; grow();
       const body = appendMsg("assistant", "", true);
       body.innerHTML = `<div class="thinking"><i></i><i></i><i></i></div>`;
       scrollChat();
@@ -500,7 +555,7 @@ cd kb && npm install && npm start</code></pre>
             const ev = JSON.parse(line);
             if (ev.error) throw Object.assign(new Error(ev.error), { code: ev.code });
             if (ev.t) {
-              if (!started) { body.textContent = ""; body.classList.add("streaming"); started = true; }
+              if (!started) { body.textContent = ""; body.classList.add("streaming"); started = true; setMood("speaking"); }
               acc += ev.t; body.textContent = acc; scrollChat();
               if (spk) spk.feed(ev.t);
             }
@@ -513,6 +568,7 @@ cd kb && npm install && npm start</code></pre>
         if (spk) spk.end();
         item.chat = [...(item.chat || []), { role: "user", content: text }, { role: "assistant", content: acc.trim() }];
         $("#chatClear").hidden = false;
+        if (!isOpen()) $("#kbUnread").hidden = false;
         scrollChat();
       } catch (e) {
         if (spk) spk.stop();
@@ -520,10 +576,11 @@ cd kb && npm install && npm start</code></pre>
         if (talkMode) { talkMode = false; syncVoiceButtons(); }
         body.classList.remove("streaming");
         body.innerHTML = `<p class="err">${esc(e.message)}</p><p class="muted small">Your message wasn't saved. It's back in the box so you can retry.</p>`;
-        chatText.value = text;
+        chatText.value = text; grow();
         if (e.code === "NO_KEY") openAiSettings(e.message);
       } finally {
         sending = false; chatSend.disabled = false;
+        if (!spk || !speaker) setMood("idle");
         if (talkMode && !spk) startListening();
         if (state.chatAbort === ctrl) state.chatAbort = null;
       }
@@ -1107,6 +1164,7 @@ cd kb && npm install && npm start</code></pre>
     state.dirty = false; lastHash = location.hash;
     if (state.chatAbort) { state.chatAbort.abort(); state.chatAbort = null; }
     if (state.voiceCleanup) { state.voiceCleanup(); state.voiceCleanup = null; }
+    document.getElementById("kbBuddy")?.remove();
     state.onAiChange = null;
     destroyEditors();
     document.body.classList.remove("landing");
