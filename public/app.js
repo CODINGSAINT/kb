@@ -390,12 +390,22 @@ cd kb && npm install && npm start</code></pre>
             <span class="spacer"></span>
             <button class="btn small" id="chatClear" title="Start a fresh conversation">Clear</button>
           </div>
+          <div class="kb-voice" id="kbVoice" hidden>
+            <button type="button" class="kb-stage" id="kbStage" title="Tap to interrupt, or to send now">${MASCOT("kb-big")}</button>
+            <div class="kb-vstate" id="kbVState" aria-live="polite">Listening…</div>
+            <p class="kb-caption" id="kbCaption"></p>
+            <div class="kb-vctl">
+              <button type="button" class="kb-vc" id="kbVLog" aria-pressed="false" title="Show the transcript"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M5 11h14M5 16h9"/></svg></button>
+              <button type="button" class="kb-vc end" id="kbVEnd" title="End voice chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+            </div>
+          </div>
           <div class="chat" id="chatLog" aria-live="polite"></div>
           <div class="chips" id="chatChips"></div>
           <form class="chat-input" id="chatForm">
             <textarea id="chatText" rows="1" placeholder="${esc(ctx.chatPlaceholderShort || "Type, or tap the mic and talk…")}" title="Enter sends · Shift+Enter for a new line"></textarea>
             <button type="button" class="mic" id="chatMic" title="Speak your question (click again to stop)" aria-label="Speak your question">${KBVoice.ICON.mic}</button>
-            <button class="kb-send" id="chatSend" type="submit" aria-label="Send" title="Send"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg></button>
+            <button type="button" class="kb-send kb-talk" id="chatTalk" aria-label="Start a voice chat" title="Voice chat: just talk, like a call"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></svg></button>
+            <button class="kb-send" id="chatSend" type="submit" aria-label="Send" title="Send" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg></button>
           </form>
           <div class="voice-status" id="voiceStatus" hidden></div>
           <details class="cli-hint muted small"><summary>Same chat from a terminal</summary><code>${esc(clarifyCmd)}</code> ${copyButton(clarifyCmd)}</details>
@@ -408,7 +418,13 @@ cd kb && npm install && npm start</code></pre>
     const buddy = $("#kbBuddy"), panel = $("#tutorCard"), launch = $("#kbLaunch"), bubble = $("#kbBubble");
     const chatLog = $("#chatLog"), chatText = $("#chatText"), chatSend = $("#chatSend");
     const setMood = (m) => { buddy.dataset.mood = m; };
-    const grow = () => { chatText.style.height = "auto"; chatText.style.height = Math.min(chatText.scrollHeight, 140) + "px"; };
+    const grow = () => {
+      chatText.style.height = "auto"; chatText.style.height = Math.min(chatText.scrollHeight, 140) + "px";
+      const has = !!chatText.value.trim(); chatSend.hidden = !has; $("#chatTalk").hidden = has;
+    };
+    const vState = $("#kbVState"), caption = $("#kbCaption");
+    const say = (t) => { caption.textContent = t || ""; };
+    const tell = (t) => { vState.textContent = t || ""; };
     chatText.addEventListener("input", grow);
     const isOpen = () => !panel.hidden;
     function setOpen(open) {
@@ -468,7 +484,9 @@ cd kb && npm install && npm start</code></pre>
     const offVoice = V.onChange(syncVoiceButtons);
     state.voiceCleanup = () => { offVoice(); talkMode = false; V.cancelListening(); if (speaker) speaker.stop(); V.stopSpeaking(); };
     syncVoiceButtons();
-    const listeningMsg = () => `<span class="dot"></span> Listening… take your time. Pause for ${(V.get().pauseMs / 1000).toFixed(V.get().pauseMs % 1000 ? 1 : 0)}s or click the mic when you're done`;
+    const listeningMsg = () => V.get().turn === "patient"
+      ? `<span class="dot"></span> Listening… take your time. Pause for ${(V.get().pauseMs / 1000).toFixed(V.get().pauseMs % 1000 ? 1 : 0)}s or click the mic when you're done`
+      : `<span class="dot"></span> Listening… just talk. I'll reply when you stop`;
     async function startListening() {
       if (V.isListening()) { V.stopListening(); return; }
       if (speaker) { speaker.stop(); speaker = null; }
@@ -476,7 +494,7 @@ cd kb && npm install && npm start</code></pre>
       const before = chatText.value;
       try {
         const text = await V.listen({
-          onInterim: (t) => { chatText.value = (before ? before + " " : "") + t; grow(); },
+          onInterim: (t) => { chatText.value = (before ? before + " " : "") + t; grow(); say(t.length > 140 ? "…" + t.slice(-140) : t); },
           onCountdown: (sec) => {
             if (sec) status(`<span class="dot"></span> Sending in ${sec}s… keep talking to add more, or click the mic to send now`, "live");
             else if (V.isListening()) status(listeningMsg(), "live");
@@ -484,29 +502,46 @@ cd kb && npm install && npm start</code></pre>
           onState: (st, detail) => {
             micBtn.classList.toggle("on", st === "listening");
             micBtn.classList.toggle("busy", st === "transcribing" || st === "loading");
-            if (st === "listening") { status(listeningMsg(), "live"); setMood("listening"); }
-            else if (st === "transcribing") { status("Turning your speech into text…"); setMood("thinking"); }
+            if (st === "listening") { status(listeningMsg(), "live"); setMood("listening"); tell("Listening…"); say(""); }
+            else if (st === "transcribing") { status("Turning your speech into text…"); setMood("thinking"); tell("Got it…"); }
             else if (st === "loading") status(esc(detail || "Loading Whisper…"));
             else { status(""); if (!sending && buddy.dataset.mood !== "speaking") setMood("idle"); }
           },
         });
         const full = ((before ? before + " " : "") + (text || "")).trim();
         chatText.value = full; grow();
-        if (!text) { if (talkMode) status("Didn't catch that. Click the mic or say something.", "warn"); return; }
+        if (!text) { if (talkMode) { status("Didn't catch that. Click the mic or say something.", "warn"); tell("I didn't catch that. Tap me and try again."); setMood("idle"); } return; }
         if (talkMode || V.get().autoSend) sendChat(full, { voice: true });
         else chatText.focus();
       } catch (e) {
         status(esc(e.message), "err");
         if (e.code === "NO_KEY") openAiSettings(e.message);
-        if (talkMode) { talkMode = false; syncVoiceButtons(); }
+        if (talkMode) setTalk(false);
       }
     }
     micBtn.addEventListener("click", startListening);
     $("#vRead").addEventListener("click", () => { const on = !V.get().readAloud; V.set({ readAloud: on }); if (!on) { if (speaker) speaker.stop(); V.stopSpeaking(); } });
-    $("#vTalk").addEventListener("click", () => {
-      talkMode = !talkMode; syncVoiceButtons();
-      if (talkMode) { if (V.get().output === "off") V.set({ output: "browser" }); if (!sending) startListening(); }
-      else { V.cancelListening(); if (speaker) speaker.stop(); V.stopSpeaking(); status(""); }
+    // Voice chat (Talk mode): a call-like view. The mascot listens, thinks and talks; only a short caption
+    // shows, and the full transcript stays in the chat log (the list button, or End, shows it).
+    function setTalk(on) {
+      talkMode = on; syncVoiceButtons();
+      panel.classList.toggle("voice", on);
+      $("#kbVoice").hidden = !on;
+      if (!on) { panel.classList.remove("show-log"); $("#kbVLog").setAttribute("aria-pressed", "false"); }
+      if (on) { if (V.get().output === "off") V.set({ output: "browser" }); say(""); tell(sending ? "Thinking…" : "Listening…"); if (!sending) startListening(); }
+      else { V.cancelListening(); if (speaker) speaker.stop(); V.stopSpeaking(); status(""); setMood("idle"); chatText.value = ""; grow(); scrollChat(); }
+    }
+    $("#vTalk").addEventListener("click", () => setTalk(!talkMode));
+    $("#chatTalk").addEventListener("click", () => setTalk(true));
+    $("#kbVEnd").addEventListener("click", () => setTalk(false));
+    $("#kbVLog").addEventListener("click", () => {
+      const on = panel.classList.toggle("show-log"); $("#kbVLog").setAttribute("aria-pressed", String(on)); scrollChat();
+    });
+    // Tap the mascot: interrupt it while it talks, or say "I'm done" while it listens.
+    $("#kbStage").addEventListener("click", () => {
+      if (V.isListening()) { V.stopListening(); return; }
+      if (speaker || buddy.dataset.mood === "speaking") { if (speaker) { speaker.stop(); speaker = null; } V.stopSpeaking(); if (!sending) startListening(); return; }
+      if (!sending) startListening();
     });
     $("#vGear").addEventListener("click", () => V.openSettings());
     chatLog.addEventListener("click", (e) => {
@@ -521,22 +556,23 @@ cd kb && npm install && npm start</code></pre>
     async function sendChat(text, opts = {}) {
       text = String(text || "").trim();
       if (!text || sending) return;
-      if (!ensureAi()) { if (talkMode) { talkMode = false; syncVoiceButtons(); } return; }
+      if (!ensureAi()) { if (talkMode) setTalk(false); return; }
       if (speaker) { speaker.stop(); speaker = null; }
       V.stopSpeaking();
       // Spoken question -> spoken answer by default; typed questions are spoken only with Read aloud / Talk mode.
       const speak = (readAloud() || (opts.voice && V.get().replyByVoice)) && V.get().output !== "off";
       const spk = speak ? (speaker = V.createSpeaker({
         onIdle: () => { if (speaker === spk) speaker = null; if (!sending) setMood("idle"); setTimeout(() => { if (talkMode && !sending && !V.isListening()) startListening(); }, 60); },
-        onError: (er) => status(esc(er.message), "err"),
+        onError: (er) => { status(esc(er.message), "err"); tell(er.message); },
+        onSay: (t) => { setMood("speaking"); tell("Speaking · tap me to interrupt"); say(t); },
       })) : null;
-      sending = true; chatSend.disabled = true; setMood("thinking");
+      sending = true; chatSend.disabled = true; setMood("thinking"); tell("Thinking…"); say("");
       chatLog.querySelector(".chat-empty")?.remove();
-      appendMsg("user", text);
+      const userBody = appendMsg("user", text);
       chatText.value = ""; grow();
       const body = appendMsg("assistant", "", true);
       body.innerHTML = `<div class="thinking"><i></i><i></i><i></i></div>`;
-      scrollChat();
+      pinQuestion(userBody.closest(".msg"), body.closest(".msg"));
       let acc = "", started = false;
       const ctrl = new AbortController(); state.chatAbort = ctrl;
       try {
@@ -556,7 +592,7 @@ cd kb && npm install && npm start</code></pre>
             if (ev.error) throw Object.assign(new Error(ev.error), { code: ev.code });
             if (ev.t) {
               if (!started) { body.textContent = ""; body.classList.add("streaming"); started = true; setMood("speaking"); }
-              acc += ev.t; body.textContent = acc; scrollChat();
+              acc += ev.t; body.textContent = acc; // like ChatGPT: the question stays put, the answer grows below it
               if (spk) spk.feed(ev.t);
             }
           }
@@ -569,11 +605,11 @@ cd kb && npm install && npm start</code></pre>
         item.chat = [...(item.chat || []), { role: "user", content: text }, { role: "assistant", content: acc.trim() }];
         $("#chatClear").hidden = false;
         if (!isOpen()) $("#kbUnread").hidden = false;
-        scrollChat();
+        if (!spk) tell("");
       } catch (e) {
         if (spk) spk.stop();
         if (e.name === "AbortError") return;
-        if (talkMode) { talkMode = false; syncVoiceButtons(); }
+        if (talkMode) setTalk(false);
         body.classList.remove("streaming");
         body.innerHTML = `<p class="err">${esc(e.message)}</p><p class="muted small">Your message wasn't saved. It's back in the box so you can retry.</p>`;
         chatText.value = text; grow();
@@ -584,6 +620,14 @@ cd kb && npm install && npm start</code></pre>
         if (talkMode && !spk) startListening();
         if (state.chatAbort === ctrl) state.chatAbort = null;
       }
+    }
+    // Scroll the new question to the top of the log and give the reply room below it.
+    function pinQuestion(userEl, replyEl) {
+      chatLog.querySelectorAll(".msg.pin").forEach((m) => { m.style.minHeight = ""; m.classList.remove("pin"); });
+      if (!chatLog.clientHeight) return;
+      replyEl.classList.add("pin");
+      replyEl.style.minHeight = Math.max(0, chatLog.clientHeight - userEl.offsetHeight - 28) + "px";
+      chatLog.scrollTo({ top: userEl.offsetTop - 8, behavior: "smooth" });
     }
     $("#chatForm").addEventListener("submit", (e) => { e.preventDefault(); sendChat(chatText.value); });
     chatText.addEventListener("keydown", (e) => {
