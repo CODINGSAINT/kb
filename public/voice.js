@@ -31,7 +31,8 @@
     openaiVoice: "alloy",
     readAloud: false,
     autoSend: true,
-    pauseMs: 4000,          // how long a pause ends a spoken question (thinking pauses are normal)
+    turn: "natural",        // "natural": reply about a second after you stop, like a real chat; "patient": wait pauseMs
+    pauseMs: 4000,          // patient mode: how long a pause ends a spoken question (thinking pauses are normal)
     replyByVoice: true,     // spoken question -> spoken answer, even when "Read aloud" is off
   };
   function get() {
@@ -69,9 +70,13 @@
     return listenRecorder(s, engine, opts);
   }
 
-  // Silence rules. Chat questions end after the chosen pause (default 4 s), so you can stop and think mid-sentence.
+  // Silence rules. Natural turn-taking (default) ends your turn about a second after you stop, and waits a bit
+  // longer if you trail off mid-thought ("so…", "and the…"). Patient mode waits the chosen pause (default 4 s).
   // Dictation keeps going until you click Stop (or 30 s of silence).
-  const pauseFor = (s, opts) => (opts.continuous ? 30000 : Math.max(1500, Number(s.pauseMs) || 4000));
+  const natural = (s, opts) => !opts.continuous && s.turn !== "patient";
+  const pauseFor = (s, opts) => (opts.continuous ? 30000 : natural(s, opts) ? 1300 : Math.max(1500, Number(s.pauseMs) || 4000));
+  const TRAILING = /\b(and|or|but|so|because|cause|like|um+|uh+|er|hmm+|the|a|an|to|of|for|with|in|on|is|are|if|then|which|that|what|how|when|my|i|we)\s*$/i;
+  const naturalPause = (said, stillInterim) => (TRAILING.test(said) ? 2200 : stillInterim ? 1300 : 800);
 
   function listenWebSpeech(s, opts) {
     return new Promise((resolve, reject) => {
@@ -116,8 +121,9 @@
       timer = setInterval(() => {
         const now = performance.now(), quiet = now - last;
         if (!heard && now - t0 > Math.max(15000, pauseMs)) return finish();
-        if (heard && quiet >= pauseMs) return finish();
-        const left = heard && quiet > 1000 && !opts.continuous ? Math.ceil((pauseMs - quiet) / 1000) : null;
+        const need = natural(s, opts) ? naturalPause(text(), !!sessionInterim) : pauseMs;
+        if (heard && quiet >= need) return finish();
+        const left = heard && quiet > 1000 && !opts.continuous && !natural(s, opts) ? Math.ceil((pauseMs - quiet) / 1000) : null;
         if (left !== lastCount) { lastCount = left; opts.onCountdown && opts.onCountdown(left); }
       }, 150);
       active = { stop: finish, cancel: () => { cancelled = true; finish(); } };
@@ -152,7 +158,7 @@
       const rms = Math.sqrt(sum / buf.length), now = performance.now();
       if (rms > 0.02) { heard = true; lastLoud = now; }
       if ((heard && now - lastLoud > silenceMs) || now - started > maxMs || (!heard && now - started > Math.max(15000, silenceMs))) { stop(); return; }
-      const quiet = now - lastLoud, left = heard && quiet > 1000 && !opts.continuous ? Math.ceil((silenceMs - quiet) / 1000) : null;
+      const quiet = now - lastLoud, left = heard && quiet > 1000 && !opts.continuous && !natural(s, opts) ? Math.ceil((silenceMs - quiet) / 1000) : null;
       if (left !== lastCount) { lastCount = left; opts.onCountdown && opts.onCountdown(left); }
       timer = setTimeout(tick, 80);
     };
@@ -290,6 +296,7 @@
       if (playing || stopped || !queue.length) return;
       playing = true; hooks.onState && hooks.onState(true);
       const text = queue.shift();
+      hooks.onSay && hooks.onSay(text);
       const next = () => {
         playing = false;
         if (stopped) return;
@@ -402,9 +409,15 @@
         <button type="button" class="btn small" id="vPrevO" title="Hear this voice">▶ Preview</button></div></label>
       <label class="field"><span class="lbl">Speaking speed <span id="vRateVal" class="muted">${Number(s.rate).toFixed(2)}×</span></span>
         <input id="vRate" type="range" min="0.7" max="1.6" step="0.05" value="${s.rate}"></label>
-      <label class="field"><span class="lbl">Wait after I stop talking <span id="vPauseVal" class="muted">${(s.pauseMs / 1000).toFixed(1)} s</span></span>
+      <label class="field"><span class="lbl">Turn-taking</span>
+        <select id="vTurn">
+          ${opt("natural", "Natural: replies about a second after you stop, like a real chat", s.turn)}
+          ${opt("patient", "Patient: waits longer, so you can stop and think mid-answer", s.turn)}
+        </select>
+        <span class="hint">Natural waits a little longer when you trail off ("so…", "and the…"). Either way, tap the mascot or the mic to finish your turn straight away.</span></label>
+      <label class="field" id="vPauseRow"><span class="lbl">Wait after I stop talking <span id="vPauseVal" class="muted">${(s.pauseMs / 1000).toFixed(1)} s</span></span>
         <input id="vPause" type="range" min="1500" max="8000" step="500" value="${s.pauseMs}">
-        <span class="hint">How long a pause means you've finished. Longer lets you stop and think mid-answer. You can always click the mic to send straight away.</span></label>
+        <span class="hint">How long a pause means you've finished.</span></label>
       <label class="check"><input type="checkbox" id="vReply" ${s.replyByVoice ? "checked" : ""}> Answer spoken questions out loud (even when Read aloud is off)</label>
       <label class="check"><input type="checkbox" id="vAuto" ${s.autoSend ? "checked" : ""}> Send my question automatically after the pause</label>
       <div class="dlg-actions"><span class="save-state" id="vMsg"></span><span class="spacer"></span>
@@ -421,11 +434,12 @@
       $("vWhisperRow").hidden = $("vIn").value !== "whisper";
       $("vBrowserRow").hidden = $("vOut").value !== "browser";
       $("vOpenaiRow").hidden = $("vOut").value !== "openai";
+      $("vPauseRow").hidden = $("vTurn").value !== "patient";
     };
     rows();
     const save = () => { set({ input: $("vIn").value, whisperModel: $("vWhisper").value, lang: $("vLang").value, output: $("vOut").value,
       browserVoice: $("vVoice").value, openaiVoice: $("vOpenai").value, rate: Number($("vRate").value), autoSend: $("vAuto").checked,
-      pauseMs: Number($("vPause").value), replyByVoice: $("vReply").checked }); rows(); };
+      pauseMs: Number($("vPause").value), turn: $("vTurn").value, replyByVoice: $("vReply").checked }); rows(); };
     const SAMPLE = "Good question. Let's think about where the bottleneck is first, then pick the data store.";
     const preview = () => { save(); $("vMsg").className = "save-state"; $("vMsg").textContent = "";
       speakNow(SAMPLE, { onError: (e) => { $("vMsg").className = "save-state err"; $("vMsg").textContent = e.message; } }); };
